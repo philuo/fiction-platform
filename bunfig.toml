@@ -1,0 +1,4 @@
+# bun 配置：缓存目录放到工作区内（~/.bun 被 macOS TCC 保护，不可写）
+# 注意：不能用 ~ 或 $HOME（bun 有 bug 会字面复制 home 目录），用绝对/相对路径
+[install.cache]
+dir = "/Users/fanchong/.reasonix/global-workspace/ai-novel/.bun-cache"
