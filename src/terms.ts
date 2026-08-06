@@ -9,7 +9,7 @@ export const LENS_CN: Record<string, string> = {
   character_state: "角色状态",
   logic: "逻辑",
   foreshadow: "伏笔",
-  outline: "章纲",
+  outline: "本章计划",
   aiTone: "AI 腔",
   intervention: "干预",
   // 评分维度（scores / 评估）

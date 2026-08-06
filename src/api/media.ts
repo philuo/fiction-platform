@@ -504,7 +504,7 @@ export function i2iPreservePrefix(target: "portrait" | "avatar" | "scene", name?
 }
 
 // —— 分镜上下文：人物形象（外貌锚点词）+ 人物状态 + 场景素材（不注入媒体 prompt，仅供分镜 LLM 理解） ——
-/** 组装分镜上下文：出场角色外貌/状态、时代地点基调、世界规则、章纲、画风锚点（全部截断控量） */
+/** 组装分镜上下文：出场角色外貌/状态、时代地点基调、世界规则、本章计划、画风锚点（全部截断控量） */
 export function planContext(w: WorldState, chapterIndex: number): string {
   const ch = w.chapters.find((c) => c.index === chapterIndex);
   const text = ch?.text ?? "";
@@ -538,7 +538,7 @@ export function planContext(w: WorldState, chapterIndex: number): string {
     }
   }
   const plan = (w.chapterPlans ?? []).find((p) => p.index === chapterIndex);
-  if (plan) lines.push(`本章章纲：${plan.goal}${plan.beats.length ? `；关键节拍：${plan.beats.slice(0, 3).join("；")}` : ""}`);
+  if (plan) lines.push(`本章计划：${plan.goal}${plan.beats.length ? `；关键节拍：${plan.beats.slice(0, 3).join("；")}` : ""}`);
   lines.push(`全书画风锚点（scene 的风格段必须引用）：${styleAnchor(w)}`);
   return lines.join("\n");
 }

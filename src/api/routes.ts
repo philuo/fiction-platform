@@ -14,6 +14,7 @@ import { pollVideoTask, downloadVideo, saveVideo } from "./videos";
 import { planScenes, generateSceneImage, createSceneVideo, styleAnchor, findCharacterRef, findVideoFirstFrame, generateCharacterPortrait, generateCharacterAvatar, mediaDataUri, mediaId, identityDress, MAX_IMAGES_PER_CHAPTER, markOrphanMedia } from "./media";
 import { auditWorld, autoRepair, alignWorld, collectOrphanMediaFiles } from "./integrity";
 import { resetChapterLedger, settleChapter } from "./chronicler";
+import { applyStateChange, finalizeStateChange } from "./statechange";
 import { migrateChapterMedia, touchChapter, genOf, type WorldState, type ChapterMedia, type ConsistencyFinding, type PendingChapter } from "./world";
 import type { CardType } from "./cards";
 import { renameSync, existsSync, readFileSync, readdirSync } from "node:fs";
@@ -141,55 +142,6 @@ function schedulePortraitFor(title: string, w0: WorldState, anchor: string): voi
   })();
 }
 
-/** 角色立绘+头像自动补全（容貌一致：先立绘作样貌基准，再以立绘为参考图图生图生成头像）：
- * 锁外生成、锁内落盘，失败不阻塞调用方；内存去重防并发重复生成同一角色。调用方勿持锁。
- * 供「新角色提案确认入册」（同步等待）与「新建小说立项后初始角色」（fire-and-forget）共用。 */
-const charMediaInFlight = new Set<string>();
-async function ensureCharacterMedia(title: string, characterId: string): Promise<void> {
-  const key = `${slug(title)}::${characterId}`;
-  if (charMediaInFlight.has(key)) return;
-  charMediaInFlight.add(key);
-  try {
-    const w1 = loadWorld(title);
-    const nc = w1?.characters.find((x) => x.id === characterId);
-    if (!w1 || !nc) return;
-    // ① 立绘（样貌基准）
-    if (!nc.portrait?.path) {
-      try {
-        const portrait = await generateCharacterPortrait(title, w1, nc);
-        await withTitleLock(slug(title), async () => {
-          const w = loadWorld(title);
-          const cc = w?.characters.find((x) => x.id === characterId);
-          // 锁内复查：生成期间用户可能已手动生成立绘，不覆盖
-          if (w && cc && !cc.portrait?.path) { cc.portrait = portrait; saveWorld(w); }
-        });
-      } catch (e) {
-        console.warn(`[media] 角色立绘自动生成失败（稍后可手动补）: ${nc.name}`, (e as Error).message);
-      }
-    }
-    // ② 头像（以新立绘为参考图，容貌与立绘一致）
-    const w2 = loadWorld(title);
-    const cc2 = w2?.characters.find((x) => x.id === characterId) ?? nc;
-    if ((w2 ?? w1) && !cc2.image) {
-      try {
-        const ref = cc2.portrait?.path
-          ? mediaDataUri(title, { id: cc2.portrait.mediaId, kind: "image", anchor: cc2.name, path: cc2.portrait.path, status: "ready" })
-          : undefined;
-        const avatar = await generateCharacterAvatar(title, w2 ?? w1, cc2, { refImage: ref });
-        await withTitleLock(slug(title), async () => {
-          const w = loadWorld(title);
-          const cc = w?.characters.find((x) => x.id === characterId);
-          // 锁内复查：生成期间用户可能已手动生成头像，不覆盖
-          if (w && cc && !cc.image) { cc.image = avatar.path; saveWorld(w); }
-        });
-      } catch (e) {
-        console.warn(`[media] 角色头像自动生成失败（稍后可手动补）: ${cc2.name}`, (e as Error).message);
-      }
-    }
-  } finally {
-    charMediaInFlight.delete(key);
-  }
-}
 
 /** 返回 null 表示非 API 路径（由调用方继续处理页面渲染） */
 export async function handleApi(pathname: string, req: Request): Promise<Response | null> {
@@ -291,14 +243,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       if (!idea) return json({ error: "缺少 idea" }, 400);
       try {
         const world = await director.newStory(idea, body.genre ? String(body.genre) : undefined);
-        // 立项初始角色自动生成头像 + 立绘（fire-and-forget：不阻塞立项返回，失败静默；
-        // 后台生成完毕落盘后，前端打开设置/刷新即可看到。容貌一致：先立绘再以立绘为参考图生成头像）
-        const fresh = loadWorld(world.title);
-        for (const c of fresh?.characters ?? []) {
-          if (!c.image && !c.portrait?.path) {
-            void ensureCharacterMedia(world.title, c.id).catch(() => {});
-          }
-        }
+        // 立项初始角色不自动生成头像/立绘：视觉由用户按需在角色面板手动生成（「AI 生成头像」「查看/生成全局立绘」）
         return json({ ok: true, world: sanitize(world) });
       } catch (e) {
         console.error("[api/novel/new]", e);
@@ -314,7 +259,10 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       let dirty = director.recomputeAppearedIn(w);
       if (migrateChapterMedia(w)) dirty = true;
       if (autoRepair(w).length) dirty = true;
-      if (dirty) saveWorld(w);
+      if (dirty) {
+        applyStateChange(w, { actor: "system", commandId: "CMD-S08", field: "appearedIn", reason: "读时自愈：重算登场记录/媒体迁移/一致性修复", chapter: w.nextChapter });
+        saveWorld(w);
+      }
       return json({ world: sanitize(w) });
     }
 
@@ -499,10 +447,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           } else {
             throw new AppError("未知操作: " + action);
           }
-          steering.logChange(w, { chapter: w.nextChapter, actor: "user", kind: `foreshadow-${action}`, detail: fsDetail });
-          // 全局账本确定性对齐（零 LLM、幂等；修复项随存档落盘）
-          alignWorld(w);
-          saveWorld(w);
+          applyStateChange(w, { actor: "user", commandId: "CMD-L07", field: "foreshadowing", reason: fsDetail, chapter: w.nextChapter });
+          finalizeStateChange(w, { ok: true });
           // 返回完整 world：alignWorld 修复/回收章联动等变更全部同步到前端，避免局部浅合并丢字段
           return { foreshadowing: w.foreshadowing, world: sanitize(w) };
         });
@@ -543,7 +489,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           if (action === "generate") {
             const options = await buildBlueprint(w, body.hint ? String(body.hint).slice(0, 300) : undefined);
             w.blueprintOptions = options;
-            saveWorld(w);
+            applyStateChange(w, { actor: "user", commandId: "CMD-W02", field: "blueprintOptions", reason: "生成蓝图候选", chapter: w.nextChapter });
+            finalizeStateChange(w, { ok: true });
             return { options };
           } else if (action === "confirm") {
             const idx = Number(body.optionIndex ?? 0);
@@ -559,8 +506,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             if (typeof patch.progressContract === "string") w.blueprint.progressContract = patch.progressContract.slice(0, 300);
             if (typeof patch.mainPlot === "string") w.blueprint.mainPlot = patch.mainPlot.slice(0, 400);
             if (typeof patch.ending === "string") w.blueprint.ending = patch.ending.slice(0, 300);
-            steering.logChange(w, { chapter: w.nextChapter, actor: "user", kind: "blueprint-edit", detail: `编辑蓝图（${Object.keys(patch).filter((k) => ["compass", "progressContract", "mainPlot", "ending"].includes(k)).join("/") || "字段"}）` });
-            saveWorld(w);
+            applyStateChange(w, { actor: "user", commandId: "CMD-W04", field: "blueprint", reason: `编辑蓝图（${Object.keys(patch).filter((k) => ["compass", "progressContract", "mainPlot", "ending"].includes(k)).join("/") || "字段"}）`, chapter: w.nextChapter });
+            finalizeStateChange(w, { ok: true });
             return { world: sanitize(w) };
           }
           throw new AppError("未知操作: " + action);
@@ -573,7 +520,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
     }
 
     case "/api/novel/plans": {
-      // 章纲/弧：list 查看 / expand 手动展开弧 / edit 编辑未写章纲（L1）（P3）
+      // 本章计划/弧：list 查看 / expand 手动展开弧 / edit 编辑未写本章计划（L1）（P3）
       if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
       const title = String(body.title ?? "").trim();
       const action = String(body.action ?? "list");
@@ -597,15 +544,15 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             return { plans: w.chapterPlans ?? [], expanded: plans, arcs: w.storyArcs ?? [] };
           } else if (action === "edit") {
             const index = Number(body.index);
-            if (!Number.isInteger(index) || index < w.nextChapter) throw new AppError("仅可编辑未写章节的章纲");
+            if (!Number.isInteger(index) || index < w.nextChapter) throw new AppError("仅可编辑未写章节的本章计划");
             const plan = (w.chapterPlans ?? []).find((p) => p.index === index);
-            if (!plan) throw new AppError("章纲不存在: " + index);
+            if (!plan) throw new AppError("本章计划不存在: " + index);
             const patch = (body.patch ?? {}) as Record<string, unknown>;
             if (typeof patch.goal === "string") plan.goal = patch.goal.slice(0, 200);
             if (Array.isArray(patch.beats)) plan.beats = patch.beats.map(String).filter(Boolean).slice(0, 4).map((b) => b.slice(0, 120));
             if (typeof patch.hookType === "string") plan.hookType = patch.hookType as typeof plan.hookType;
-            steering.logChange(w, { chapter: index, actor: "user", kind: "plan-edit", detail: `编辑第 ${index} 章章纲（${Object.keys(patch).join("/") || "字段"}）` });
-            saveWorld(w);
+            applyStateChange(w, { actor: "user", commandId: "CMD-W07", field: "chapterPlans", reason: `编辑第 ${index} 章本章计划（${Object.keys(patch).join("/") || "字段"}）`, chapter: index });
+            finalizeStateChange(w, { ok: true });
             return { plans: w.chapterPlans ?? [] };
           }
           throw new AppError("未知操作: " + action);
@@ -613,7 +560,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         return json({ ok: true, ...out });
       } catch (e) {
         console.error("[api/novel/plans]", e);
-        return json({ error: e instanceof AppError ? e.message : "章纲操作失败" }, e instanceof AppError ? 400 : 502);
+        return json({ error: e instanceof AppError ? e.message : "本章计划操作失败" }, e instanceof AppError ? 400 : 502);
       }
     }
 
@@ -677,9 +624,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           } else {
             throw new AppError("未知操作: " + action);
           }
-          // 全局账本确定性对齐（零 LLM、幂等）
-          alignWorld(w);
-          saveWorld(w);
+          applyStateChange(w, { actor: "user", commandId: "CMD-W14", field: "lore", reason: action === "auto" ? "自动重建世界书" : "保存世界书", chapter: w.nextChapter });
+          finalizeStateChange(w, { ok: true });
           return w.lore ?? [];
         });
         return json({ ok: true, entries });
@@ -766,7 +712,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         return json({ ok: true, world: (out as { world: unknown }).world, aborted: (out as { aborted?: boolean }).aborted, autoFixed: (out as { autoFixed?: string[] }).autoFixed ?? [] });
       } catch (e) {
         console.error("[api/novel/world]", e);
-        return json({ error: e instanceof AppError ? e.message : "保存失败，请稍后重试" }, 502);
+        // 透传业务校验错误（角色重名/撞名等），前端可显示具体原因
+        return json({ error: e instanceof AppError ? e.message : ((e as Error)?.message ?? "保存失败，请稍后重试") }, e instanceof AppError ? 400 : 502);
       }
     }
 
@@ -824,7 +771,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           const w = loadWorld(title);
           if (!w) throw new AppError("故事不存在: " + title);
           steering.setFieldLock(w, characterId, field, body.locked === true);
-          saveWorld(w);
+          applyStateChange(w, { actor: "user", commandId: "CMD-G03", field: "lockedFields", reason: `${body.locked === true ? "上锁" : "解锁"}角色字段 ${characterId}.${field}`, chapter: w.nextChapter });
+          finalizeStateChange(w, { ok: true });
           return sanitize(w);
         });
         return json({ ok: true, world });
@@ -841,7 +789,6 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const proposalId = String(body.proposalId ?? "");
       const action = String(body.action ?? "confirm");
       if (!title || !proposalId) return json({ error: "缺少参数" }, 400);
-      let createdName: string | undefined;
       try {
         const world = await withTitleLock(slug(title), async () => {
           const w = loadWorld(title);
@@ -850,7 +797,6 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           if (!p) throw new AppError("提案不存在");
           if (action === "confirm") {
             if (!w.characters.some((c) => c.name === p.name)) {
-              createdName = p.name;
               w.characters.push({
                 id: `c${Date.now().toString(36)}`,
                 name: p.name,
@@ -868,25 +814,16 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
               });
             }
             p.status = "confirmed";
-            steering.logChange(w, { chapter: w.nextChapter, actor: "user", kind: "proposal-confirm", detail: `确认新角色「${p.name}」入册` });
+            applyStateChange(w, { actor: "user", commandId: "CMD-L11", field: "characterProposals", reason: `确认新角色「${p.name}」入册`, chapter: w.nextChapter });
           } else {
             p.status = "rejected";
-            steering.logChange(w, { chapter: w.nextChapter, actor: "user", kind: "proposal-reject", detail: `驳回新角色提案「${p.name}」` });
+            applyStateChange(w, { actor: "user", commandId: "CMD-L11", field: "characterProposals", reason: `驳回新角色提案「${p.name}」`, chapter: w.nextChapter });
           }
-          saveWorld(w);
+          finalizeStateChange(w, { ok: true });
           return sanitize(w);
         });
-        // 新增角色自动生成头像 + 立绘（容貌一致：先立绘作样貌基准，再以立绘为参考图图生图生成头像）；锁外生成、锁内落盘，失败不阻塞入册
-        let finalWorld = world;
-        if (action === "confirm" && createdName) {
-          const w1 = loadWorld(title);
-          const nc = w1?.characters.find((x) => x.name === createdName);
-          if (w1 && nc) {
-            await ensureCharacterMedia(title, nc.id);
-            finalWorld = sanitize(loadWorld(title)!);
-          }
-        }
-        return json({ ok: true, world: finalWorld });
+        // 确认入册不自动生成头像/立绘：返回即时（前端立即刷新），视觉由用户在角色面板手动生成
+        return json({ ok: true, world });
       } catch (e) {
         console.error("[api/novel/proposal]", e);
         return json({ error: e instanceof AppError ? e.message : "提案处理失败" }, e instanceof AppError ? 400 : 502);
@@ -916,8 +853,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           const fingerprint = await extractFingerprint(sample);
           if (!fingerprint) throw new AppError("指纹提取失败，请稍后重试");
           w.gen = { ...(w.gen ?? {}), styleSample: sample.slice(0, 2000), styleFingerprint: fingerprint };
-          steering.logChange(w, { chapter: w.nextChapter, actor: "user", kind: "style-fingerprint", detail: `风格仿写：提取样章指纹注入全书（指纹 ${fingerprint.length} 字）` });
-          saveWorld(w);
+          applyStateChange(w, { actor: "user", commandId: "CMD-W16", field: "gen", reason: `风格仿写：提取样章指纹注入全书（指纹 ${fingerprint.length} 字）`, chapter: w.nextChapter });
+          finalizeStateChange(w, { ok: true });
           return { world: sanitize(w), fingerprint };
         });
         return json({ ok: true, ...out });
@@ -1023,7 +960,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
     }
 
     case "/api/novel/auto/skip": {
-      // 跳过暂存区章节（git：放弃该章工作区）：清草稿 + 删未核销章纲 + nextChapter 前移（章节号空洞由 integrity 支持）
+      // 跳过暂存区章节（git：放弃该章工作区）：清草稿 + 删未核销本章计划 + nextChapter 前移（章节号空洞由 integrity 支持）
       if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
       const title = String(body.title ?? "").trim();
       if (!title) return json({ error: "缺少 title" }, 400);
@@ -1038,7 +975,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           const pi = plans.findIndex((p) => p.index === pending.chapterIndex && p.status === "planned");
           if (pi >= 0) plans.splice(pi, 1);
           if (w.nextChapter <= pending.chapterIndex) w.nextChapter = pending.chapterIndex + 1;
-          saveWorld(w);
+          applyStateChange(w, { actor: "user", commandId: "CMD-N14", field: "chapterPlans", reason: `跳过第 ${pending.chapterIndex} 章暂存草稿`, chapter: pending.chapterIndex });
+          finalizeStateChange(w, { ok: true });
         });
         return json({ ok: true });
       } catch (e) {
@@ -1072,8 +1010,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           if (!ch) throw new AppError("章节不存在");
           const report = await settleChapter(w, ch, (w.chapterPlans ?? []).find((p) => p.index === index) ?? null);
           w.chapterDeltas = { ...(w.chapterDeltas ?? {}), [index]: report.delta };
-          steering.logChange(w, { chapter: index, actor: "user", kind: "chapter-resettle", detail: `重结算第 ${index} 章《${ch.title}》账本（摘要/伏笔/角色状态/时间线覆盖式重算）` });
-          saveWorld(w);
+          applyStateChange(w, { actor: "user", commandId: "CMD-L03", field: "chapterDeltas", reason: `重结算第 ${index} 章《${ch.title}》账本（摘要/伏笔/角色状态/时间线覆盖式重算）`, chapter: index });
+          finalizeStateChange(w, { ok: true });
           return { world: sanitize(w), report };
         });
         return json({ ok: true, ...out });
@@ -1095,7 +1033,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           if (!w) throw new AppError("故事不存在: " + title);
           if (action === "clear") {
             w.rewriteQueue = [];
-            saveWorld(w);
+            applyStateChange(w, { actor: "user", commandId: "CMD-G07", field: "rewriteQueue", reason: "清空回溯重写队列", chapter: w.nextChapter });
+            finalizeStateChange(w, { ok: true });
             return { rewritten: 0, world: sanitize(w) };
           }
           const queue = (w.rewriteQueue ?? []).filter((i) => i >= 1 && i < w.nextChapter).sort((a, b) => a - b);
@@ -1109,7 +1048,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             }
           }
           w.rewriteQueue = [];
-          saveWorld(w);
+          applyStateChange(w, { actor: "user", commandId: "CMD-G06", field: "rewriteQueue", reason: `回溯重写队列消费完成（重写 ${rewritten} 章）`, chapter: w.nextChapter });
+          finalizeStateChange(w, { ok: true });
           return { rewritten, world: sanitize(w) };
         });
         return json({ ok: true, ...out });
@@ -1156,7 +1096,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             item.status = "ignored";
           } else if (action === "fix") {
             item.status = "fixed";
-            // 注入修复任务到下一章纲的弥合列表
+            // 注入修复任务到下一章本章计划的弥合列表
             const nextPlan = (w.chapterPlans ?? []).find((p) => p.status === "planned");
             const task = `修复质量债务（第${item.chapterIndex}章[${item.lens}]）：${item.issue}`;
             if (nextPlan) nextPlan.mergeTasks = [...(nextPlan.mergeTasks ?? []), task].slice(0, 3);
@@ -1164,8 +1104,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           } else {
             throw new AppError("未知操作: " + action);
           }
-          steering.logChange(w, { chapter: item.chapterIndex, actor: "user", kind: action === "fix" ? "debt-fix" : "debt-ignore", detail: `质量债务${action === "fix" ? "修复（注入下一章弥合任务）" : "忽略"}：第${item.chapterIndex}章[${item.lens}]${item.issue.slice(0, 60)}` });
-          saveWorld(w);
+          applyStateChange(w, { actor: "user", commandId: "CMD-L13", field: "qualityDebt", reason: `质量债务${action === "fix" ? "修复（注入下一章弥合任务）" : "忽略"}：第${item.chapterIndex}章[${item.lens}]${item.issue.slice(0, 60)}`, chapter: item.chapterIndex });
+          finalizeStateChange(w, { ok: true });
           return { debt: w.qualityDebt ?? [], world: sanitize(w) };
         });
         return json({ ok: true, ...out });
@@ -1213,7 +1153,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             oldRel = c.image ?? "";
             c.image = path;
           }
-          saveWorld(w);
+          applyStateChange(w, { actor: "user", commandId: kind === "cover" ? "CMD-M09" : "CMD-M08", field: kind === "cover" ? "cover" : "characters", reason: kind === "cover" ? "生成小说封面" : "生成角色头像", chapter: w.nextChapter });
+          finalizeStateChange(w, { ok: true });
           return { path, prompt, oldRel };
         });
         // 重生成/替换：删旧文件（与新文件不同路径时；best-effort，引用守卫在 deleteMediaFile 内）
@@ -1243,7 +1184,11 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         await withTitleLock(slug(title), async () => {
           const w = loadWorld(title);
           const c = w?.characters.find((x) => x.id === characterId);
-          if (w && c) { c.portrait = portrait; saveWorld(w); }
+          if (w && c) {
+            c.portrait = portrait;
+            applyStateChange(w, { actor: "user", commandId: "CMD-M07", field: "characters", reason: `生成立绘（${c.name}）`, chapter: w.nextChapter });
+            finalizeStateChange(w, { ok: true });
+          }
         });
         // 重生成：删旧立绘文件（与新文件不同路径时；best-effort，引用守卫在 deleteMediaFile 内）
         if (oldPortraitPath && oldPortraitPath !== portrait.path) deleteMediaFile(title, oldPortraitPath);
@@ -1323,6 +1268,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             if (!ch) throw new AppError("章节不存在");
             ch.media = [...(ch.media ?? []), media];
             touchChapter(w, idx);
+            applyStateChange(w, { actor: "user", commandId: "CMD-M03", field: "chapters[].media", reason: `生成第 ${idx} 章视频（${(media.caption ?? "").slice(0, 40) || media.anchor.slice(0, 20)}）`, chapter: idx });
             saveWorld(w);
           });
           return json({ ok: true, mediaId: media.id, videoId: media.videoId, mode: firstFrame ? "i2v" : "t2v" });
@@ -1359,6 +1305,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           });
           ch.media = [...(ch.media ?? []), ...items];
           touchChapter(w, idx);
+          applyStateChange(w, { actor: "user", commandId: "CMD-M02", field: "chapters[].media", reason: `创建第 ${idx} 章插画任务（${items.length} 张）`, chapter: idx });
           saveWorld(w);
           return items;
         });
@@ -1407,6 +1354,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
                 m.status = "ready";
                 m.error = undefined;
                 touchChapter(w, idx);
+                applyStateChange(w, { actor: "user", commandId: "CMD-M02", field: "chapters[].media", reason: `第 ${idx} 章插画生成完成（${item.id}）`, chapter: idx });
                 saveWorld(w);
               });
               ok++;
@@ -1420,6 +1368,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
                   m.status = "failed";
                   m.error = (e as Error).message;
                   touchChapter(w, idx);
+                  applyStateChange(w, { actor: "user", commandId: "CMD-M02", field: "chapters[].media", reason: `第 ${idx} 章插画生成失败（${item.id}）：${(e as Error).message.slice(0, 60)}`, chapter: idx });
                   saveWorld(w);
                 }
               });
@@ -1463,6 +1412,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
               m.status = "failed";
               m.error = "生成任务已中断（服务重启），请删除后重新生成";
               touchChapter(w, idx);
+              applyStateChange(w, { actor: "system", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章媒体任务中断标记 failed（${mediaId}）`, chapter: idx });
               saveWorld(w);
             }
           });
@@ -1479,7 +1429,10 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             const ch = w?.chapters.find((x) => x.index === idx);
             const m = (ch?.media ?? []).find((x) => x.id === mediaId);
             if (m) m.status = "failed";
-            if (w) saveWorld(w);
+            if (w) {
+              applyStateChange(w, { actor: "user", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章视频生成失败（${mediaId}）：${st.error ?? ""}`, chapter: idx });
+              saveWorld(w);
+            }
           });
           return json({ ok: true, status: "failed", error: st.error ?? "视频生成失败" });
         }
@@ -1496,6 +1449,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             m.path = rel;
             m.status = "ready";
             touchChapter(w, idx);
+            applyStateChange(w, { actor: "user", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章视频生成完成（${mediaId}）`, chapter: idx });
             saveWorld(w);
             return rel;
           });
@@ -1586,6 +1540,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           }
           steering.logChange(w, { chapter: idx, actor: "user", kind: "media-regenerate", detail: `改词重生成第 ${idx} 章${snap.kind === "image" ? "插画" : "视频"}：${(snap.prompt ?? "").slice(0, 60)}` });
           touchChapter(w, idx);
+          applyStateChange(w, { actor: "user", commandId: "CMD-M05", field: "chapters[].media", reason: `改词重生成第 ${idx} 章${snap.kind === "image" ? "插画" : "视频"}（${mediaId}）`, chapter: idx });
           saveWorld(w);
           return true;
         });
@@ -1623,7 +1578,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           const m = (ch.media ?? []).find((x) => x.id === mediaId);
           if (!m) throw new AppError("媒体不存在");
           ch.media = (ch.media ?? []).filter((x) => x.id !== mediaId);
-          steering.logChange(w, { chapter: idx, actor: "user", kind: "media-delete", detail: `删除第 ${idx} 章${m.kind === "image" ? "插画" : "视频"}（${(m.caption ?? m.prompt ?? "").slice(0, 40) || "无题"}）` });
+          applyStateChange(w, { actor: "user", commandId: "CMD-M06", field: "chapters[].media", reason: `删除第 ${idx} 章${m.kind === "image" ? "插画" : "视频"}（${(m.caption ?? m.prompt ?? "").slice(0, 40) || "无题"}）`, chapter: idx });
           touchChapter(w, idx);
           saveWorld(w);
           return m.path;
@@ -1676,8 +1631,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           const oldRel = w.cover ?? ""; // 旧封面（替换后锁外删盘，避免本地残留）
           const rel = saveImage(title, `cover.${ext}`, new Uint8Array(buf));
           w.cover = rel;
-          steering.logChange(w, { chapter: w.nextChapter, actor: "user", kind: "cover-upload", detail: `上传封面（${ext}，替换旧封面）` });
-          saveWorld(w);
+          applyStateChange(w, { actor: "user", commandId: "CMD-M10", field: "cover", reason: `上传封面（${ext}，替换旧封面）`, chapter: w.nextChapter });
+          finalizeStateChange(w, { ok: true });
           return { rel, oldRel };
         });
         // 替换封面：删旧文件（与新文件不同路径时；best-effort，引用守卫在 deleteMediaFile 内）
@@ -1829,6 +1784,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             if (!w) throw new AppError("故事不存在: " + title);
             const fixed = autoRepair(w);
             for (const c of w.chapters) markOrphanMedia(c); // 同步 orphan 标记并持久化
+            applyStateChange(w, { actor: "user", commandId: "CMD-S02", field: "多字段", reason: `一致性自动修复（${fixed.length} 项）`, chapter: w.nextChapter });
             saveWorld(w);
             return { fixed, w };
           });
@@ -1851,6 +1807,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             const settleReport = await settleChapter(w, ch, (w.chapterPlans ?? []).find((p) => p.index === index) ?? null);
             w.chapterDeltas = { ...(w.chapterDeltas ?? {}), [index]: settleReport.delta }; // 重结算覆盖该章变更快照
             markOrphanMedia(ch);
+            applyStateChange(w, { actor: "user", commandId: "CMD-L04", field: "chapterDeltas", reason: `完整性重结算第 ${index} 章《${ch.title}》账本（先撤账再结算）`, chapter: index });
             saveWorld(w);
             return { w, settleReport };
           });

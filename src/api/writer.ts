@@ -45,11 +45,11 @@ export interface WriteChapterOpts {
   revisionNotes?: string; // 审查意见（修订稿）
   draft?: string; // 修订时提供上一稿
   chapterIndex?: number;
-  plan?: ChapterPlan | null; // 本章章纲（P3 接入，无则 null）
+  plan?: ChapterPlan | null; // 本章计划（P3 接入，无则 null）
   onDelta?: (delta: string) => void; // 流式增量（SSE 透传）
 }
 
-/** 组装 writer 用户消息（记忆层上下文 + 章纲 + 参数 + 指令） */
+/** 组装 writer 用户消息（记忆层上下文 + 本章计划 + 参数 + 指令） */
 function buildUserMsg(o: WriteChapterOpts): string {
   const w = o.world;
   const idx = o.chapterIndex ?? w.nextChapter;
@@ -64,7 +64,7 @@ function buildUserMsg(o: WriteChapterOpts): string {
   const lore = loreBlock(w, loreCtx);
   if (lore) parts.push(lore);
 
-  // 章纲（写作目标；P3 起由 planner 供给）
+  // 本章计划（写作目标；P3 起由 planner 供给）
   if (o.plan) {
     parts.push(`\n[本章任务] 目标：${o.plan.goal}\n节拍：\n${o.plan.beats.map((b, i) => `${i + 1}. ${b}`).join("\n")}`);
     if (o.plan.mergeTasks?.length) parts.push(`[弥合任务·必须自然融入] ${o.plan.mergeTasks.join("；")}`);
@@ -118,7 +118,7 @@ export async function writeChapter(o: WriteChapterOpts): Promise<WriterResult> {
   const w = o.world;
   const idx = o.chapterIndex ?? w.nextChapter;
   const g = genOf(w, idx);
-  // 标题兜底：有章纲时用章纲目标提炼（比"第N章"更有信息量），无章纲才退回"第N章"
+  // 标题兜底：有本章计划时用本章计划目标提炼（比"第N章"更有信息量），无本章计划才退回"第N章"
   const fallbackTitle = o.plan?.goal?.slice(0, 20) || `第${idx}章`;
 
   const raw = await chatStream(

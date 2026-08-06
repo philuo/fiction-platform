@@ -314,16 +314,49 @@ export type CharacterProposal = {
 
 export type LockedField = { characterId: string; field: string }; // 人工上锁字段，chronicler 跳过
 
+/** 审计日志条目（中枢架构扩展：commandId/level/reason/meta 可选，旧存档向后兼容） */
 export type ChangeLogEntry = {
   at: string;
   chapter: number;
-  actor: "user" | "ai";
+  actor: "user" | "ai" | "brain" | "integrity" | "system";
   kind: string;
   detail: string;
   strategy?: "merge" | "rewrite" | "abort";
+  /** HARNESS 指令 ID（如 CMD-N06），操作可追溯锚点 */
+  commandId?: string;
+  /** 指令破坏级别（L0-L3，对已完成叙事/账本的破坏性） */
+  level?: "L0" | "L1" | "L2" | "L3";
+  /** 中枢审查结论 / 降级原因（brain_unavailable 等） */
+  reason?: string;
+  /** 附加元数据（受影响字段/章集合等，供操作日志面板展示） */
+  meta?: Record<string, unknown>;
 };
 
 export type SteeringItem = { id: string; kind: string; payload: unknown; at: string }; // 待处理干预
+
+/** BookGoal 统一目标对象（BRAIN.md §3，可选字段向后兼容）：
+ * 收编 progressContract/isBookComplete/autorun 停下策略/eval 地板，供中枢报告 goal disposition */
+export type BookGoal = {
+  /** 结构目标 */
+  structure?: {
+    targetChapters?: number; // 目标章数（缺省 = 蓝图 estChapters 汇总）
+    targetVolumes?: number; // 目标卷数
+    progressContract?: string; // 收编既有字段
+  };
+  /** 质量目标 */
+  quality?: {
+    minOverall?: number; // eval overall 下限
+    floorDimensions?: { name: string; min: number }[]; // 单维地板（eval 8 维名）
+    chapterFloor?: number; // 单章 critic 地板
+  };
+  /** 预算 */
+  budget?: {
+    maxChaptersPerRun?: number; // 收编 autorun maxChapters（≤30）
+    quotaGuard?: boolean; // 配额熔断开关
+  };
+  /** 完结条件（complete = structure 达成 ∧ quality 达标；blocked = budget 耗尽或熔断） */
+  completion?: "structure" | "structure+quality";
+};
 
 export type WorldState = {
   title: string;
@@ -360,6 +393,8 @@ export type WorldState = {
   lockedFields?: LockedField[]; // 人工上锁字段
   changeLog?: ChangeLogEntry[]; // 干预审计日志
   rewriteQueue?: number[]; // 回溯重写队列（L2 策略 rewrite：受影响章节按序重写）
+  /** BookGoal 统一目标对象（BRAIN.md §3，可选，未设置时各字段回落现状默认，行为零变化） */
+  goal?: BookGoal;
 };
 
 // 左栏 / 设置面板共用的世界保存补丁（统一由 Home.saveWorld 提交）

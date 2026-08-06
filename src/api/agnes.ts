@@ -25,6 +25,8 @@ export type ToolDef = {
 };
 
 export type AgnesOptions = {
+  /** 模型名覆盖（中枢架构 P0：exec/brain 双模型路由，缺省回落 TEXT_MODEL/AGNES_MODEL） */
+  model?: string;
   temperature?: number;
   maxTokens?: number;
   tools?: ToolDef[];
@@ -215,15 +217,16 @@ export async function complete(messages: ChatMessage[], opts: AgnesOptions = {})
   const msgChars = messages.reduce((n, m) => n + (m.content?.length ?? 0), 0);
   // 工具循环（tools 定义 / tool 消息 / tool_calls 回填）仅 chat/completions 支持，不迁移
   const useResponses = USE_RESPONSES_API && !opts.tools && messages.every((m) => m.role !== "tool" && !m.tool_calls?.length);
+  const model = opts.model ?? MODEL;
   if (useResponses) {
     try {
       const r = await withSmartRetry(
         (attemptOpts) =>
-          callResponsesOnce(MODEL, messages, attemptOpts).then((res) => parseResponses(res, { model: MODEL, msgChars })),
+          callResponsesOnce(model, messages, attemptOpts).then((res) => parseResponses(res, { model, msgChars })),
         opts,
         retries,
       ) as { content: string };
-      console.log(`[agnes] responses 完成 耗时${((Date.now() - t0) / 1000).toFixed(1)}s model=${MODEL} 重试上限${retries} msgChars=${msgChars}`);
+      console.log(`[agnes] responses 完成 耗时${((Date.now() - t0) / 1000).toFixed(1)}s model=${model} 重试上限${retries} msgChars=${msgChars}`);
       return r;
     } catch (e) {
       console.warn(`[agnes] Responses API 失败，降级 chat/completions 兜底 耗时${((Date.now() - t0) / 1000).toFixed(1)}s: ${(e as Error).message}`);
@@ -232,13 +235,13 @@ export async function complete(messages: ChatMessage[], opts: AgnesOptions = {})
   try {
     const r = (await withSmartRetry(
       (attemptOpts) =>
-        callOnce(MODEL, messages, attemptOpts).then((res) =>
-          parseMessage(res, { model: MODEL, msgChars }),
+        callOnce(model, messages, attemptOpts).then((res) =>
+          parseMessage(res, { model, msgChars }),
         ),
       opts,
       retries,
     )) as { content: string; tool_calls?: ToolCall[] };
-    console.log(`[agnes] complete 完成 耗时${((Date.now() - t0) / 1000).toFixed(1)}s model=${MODEL} 重试上限${retries} msgChars=${msgChars}`);
+    console.log(`[agnes] complete 完成 耗时${((Date.now() - t0) / 1000).toFixed(1)}s model=${model} 重试上限${retries} msgChars=${msgChars}`);
     return r;
   } catch (e) {
     console.error(`[agnes] complete 失败 耗时${((Date.now() - t0) / 1000).toFixed(1)}s:`, (e as Error).message);
@@ -298,16 +301,17 @@ export async function chatStream(
 ): Promise<string> {
   const retries = opts.retries ?? 4;
   const t0 = Date.now();
+  const model = opts.model ?? MODEL;
   try {
     const r = (await withSmartRetry(
       (attemptOpts) => {
         const streamOpts = { ...attemptOpts, stream: true };
-        return callOnce(MODEL, messages, streamOpts).then((res) => readStream(res, onChunk));
+        return callOnce(model, messages, streamOpts).then((res) => readStream(res, onChunk));
       },
       opts,
       retries,
     )) as string;
-    console.log(`[agnes] chatStream 完成 耗时${((Date.now() - t0) / 1000).toFixed(1)}s model=${MODEL} 重试上限${retries} msgChars=${messages.reduce((n, m) => n + (m.content?.length ?? 0), 0)}`);
+    console.log(`[agnes] chatStream 完成 耗时${((Date.now() - t0) / 1000).toFixed(1)}s model=${model} 重试上限${retries} msgChars=${messages.reduce((n, m) => n + (m.content?.length ?? 0), 0)}`);
     return r;
   } catch (e) {
     console.error(`[agnes] chatStream 失败 耗时${((Date.now() - t0) / 1000).toFixed(1)}s:`, (e as Error).message);

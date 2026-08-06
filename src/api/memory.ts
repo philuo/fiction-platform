@@ -96,7 +96,7 @@ function jaccard(a: Set<string>, b: Set<string>): number {
   return inter / (a.size + b.size - inter);
 }
 
-/** 以章纲 beats+角色名+活跃伏笔为查询，对历史章摘要评分，返回 Top-k 相关章节摘要 */
+/** 以本章计划 beats+角色名+活跃伏笔为查询，对历史章摘要评分，返回 Top-k 相关章节摘要 */
 export function retrieveRelevant(w: WorldState, plan: ChapterPlan | null, k = 3): ChapterSummary[] {
   const summaries = (w.chapterSummaries ?? []).filter((s) => s.index < w.nextChapter);
   if (!summaries.length) return [];
@@ -155,7 +155,7 @@ function settingBlock(w: WorldState, participants: string[]): string {
   parts.push(`时代地点: ${w.setting.time} / ${w.setting.place}｜基调: ${w.setting.tone}`);
   if (w.current) parts.push(`当前全局状态: ${w.current}`);
   if (w.setting.rules.length) parts.push(`规则: ${w.setting.rules.join("；")}`);
-  // 参与者筛选（资源账本思路）：只注入本章相关角色 + 活跃关系角色；无章纲时退化为全量（上限 12）
+  // 参与者筛选（资源账本思路）：只注入本章相关角色 + 活跃关系角色；无本章计划时退化为全量（上限 12）
   const pool = participants.length
     ? w.characters.filter((c) => participants.includes(c.name) || Object.keys(c.relations ?? {}).some((k) => participants.includes(k)))
     : w.characters.slice(0, 12);
@@ -197,11 +197,11 @@ export type WriterContext = {
 
 /**
  * 组装 writer 上下文（带预算，超预算按 检索层→世界书→伏笔 顺序确定性截断）。
- * 章纲/风格/指令段由 director 另行拼接（它们不属于记忆层）。
+ * 本章计划/风格/指令段由 director 另行拼接（它们不属于记忆层）。
  */
 export function buildWriterContext(w: WorldState, plan: ChapterPlan | null, budget = 6000): WriterContext {
   const tier = contextTier(w);
-  // 章纲 beats 里出现的角色名即参与者（资源账本筛选）
+  // 本章计划 beats 里出现的角色名即参与者（资源账本筛选）
   const pNames: string[] = [];
   if (plan) {
     const beatText = `${plan.goal} ${plan.beats.join(" ")}`;

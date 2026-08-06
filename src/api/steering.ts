@@ -2,6 +2,7 @@
 // 用户决策：L2 每次弹影响报告三选一；写作中干预立即打断；字段锁（status 手改即锁）
 import { chatJson } from "./jsonutil";
 import { saveWorld } from "./storage";
+import { getCommand } from "./harness";
 import type { ChangeLogEntry, SteeringItem, WorldState } from "./world";
 
 // —— 立即打断（用户决策②）：内存态信号，writeOneChapter 每阶段边界轮询 ——
@@ -36,6 +37,19 @@ export function logChange(w: WorldState, entry: Omit<ChangeLogEntry, "at">): voi
   list.push({ at: new Date().toISOString(), ...entry });
   // 上限 500 条，防无限增长
   w.changeLog = list.slice(-500);
+}
+
+/** 带 HARNESS 指令元数据的日志（中枢架构：所有写操作落 commandId/level，实现「所有操作可追溯」） */
+export function logCommandChange(
+  w: WorldState,
+  entry: Omit<ChangeLogEntry, "at" | "commandId" | "level"> & { commandId?: string; level?: ChangeLogEntry["level"] },
+): void {
+  const cmd = entry.commandId ? getCommand(entry.commandId) : undefined;
+  logChange(w, {
+    ...entry,
+    commandId: entry.commandId ?? cmd?.id,
+    level: entry.level ?? cmd?.level,
+  });
 }
 
 // —— 变更分级（决定是否需要影响评估） ——
@@ -136,7 +150,7 @@ export async function applyStrategy(
     return {};
   }
   if (strategy === "merge") {
-    // 弥合：注入弥合任务到后续 1-2 章章纲（没有章纲则挂到 outline 提示）
+    // 弥合：注入弥合任务到后续 1-2 章本章计划（没有本章计划则挂到 outline 提示）
     const task = `自然弥合人工变更（${change.kind}）：${change.detail}——需在剧情中给出合理铺垫/解释，不得生硬提及「设定修改」字样`;
     const plans = (w.chapterPlans ?? []).filter((p) => p.status === "planned").slice(0, 2);
     if (plans.length) {

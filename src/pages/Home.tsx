@@ -87,6 +87,7 @@ const Home: React.FC<HomeProps> = (props) => {
   const [showSettings, setShowSettings] = useState(false);
   const [showMemoryAudit, setShowMemoryAudit] = useState(false); // 中枢弹窗一：分层记忆·台账·操作日志
   const [showTaskCenter, setShowTaskCenter] = useState(false); // 任务中心（弹窗二）：连载/推进任务进度与控制
+  const [advanceMenu, setAdvanceMenu] = useState(false); // 底部"推进剧情"下拉（本章续写/章节连载）展开态
   const [pendingCommitIdx, setPendingCommitIdx] = useState<number | null>(null); // 推进剧情待人工确认入册的章节号（commitPolicy=confirm）
   const [showForeshadow, setShowForeshadow] = useState(false); // 伏笔账编辑弹窗（底部控制条角色与关系旁）
   /** 角色与关系弹窗（底部按钮=可编辑模式；脉络/审查面板角色点击=只读模式，顶层共享同一实例渲染，避免弹窗被困在区域内部） */
@@ -474,7 +475,7 @@ const Home: React.FC<HomeProps> = (props) => {
       if (!data.ok || !data.world) throw new Error(data.error ?? "保存失败");
       setWorld(data.world);
       setIntervene(null);
-      showToast(strategy === "merge" ? "设定已保存，弥合任务已注入后续章纲。" : strategy === "rewrite" ? "设定已保存，受影响章节已入重写队列。" : "设定已保存，将影响后续写作。");
+      showToast(strategy === "merge" ? "设定已保存，弥合任务已注入后续章节计划。" : strategy === "rewrite" ? "设定已保存，受影响章节已入重写队列。" : "设定已保存，将影响后续写作。");
       return true;
     } catch (e) {
       showToast("保存失败: " + (e as Error).message);
@@ -1537,6 +1538,7 @@ const Home: React.FC<HomeProps> = (props) => {
     const keyHandler = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         if (chapterMenu) setChapterMenu(null);
+        else if (advanceMenu) setAdvanceMenu(false);
         else if (confirmMsg) cancelConfirm();
         else if (deletePreview) setDeletePreview(null);
         else if (integrityView) setIntegrityView(null);
@@ -1554,13 +1556,15 @@ const Home: React.FC<HomeProps> = (props) => {
       }
     };
     const clickOutsideHandler = (e: MouseEvent) => {
-      if (!chapterMenu) return;
       const target = e.target as HTMLElement;
-      if (!target.closest(".float-dropdown") && !target.closest("[data-menu-trigger]")) {
+      if (chapterMenu && !target.closest(".float-dropdown") && !target.closest("[data-menu-trigger]")) {
         setChapterMenu(null);
       }
+      if (advanceMenu && !target.closest(".advance-wrap")) {
+        setAdvanceMenu(false);
+      }
     };
-    const scrollHandler = () => { if (chapterMenu) setChapterMenu(null); };
+    const scrollHandler = () => { if (chapterMenu) setChapterMenu(null); if (advanceMenu) setAdvanceMenu(false); };
     document.addEventListener("keydown", keyHandler);
     document.addEventListener("mousedown", clickOutsideHandler);
     document.addEventListener("scroll", scrollHandler, true);
@@ -1570,7 +1574,7 @@ const Home: React.FC<HomeProps> = (props) => {
       document.removeEventListener("scroll", scrollHandler, true);
       document.body.style.overflow = "";
     };
-  }, [chapterMenu, confirmMsg, showNewStory, showGacha, showSettings, relModal, showVersions, reviewOpen, regenMedia, mediaPlan, deletePreview, integrityView]);
+  }, [chapterMenu, advanceMenu, confirmMsg, showNewStory, showGacha, showSettings, relModal, showVersions, reviewOpen, regenMedia, mediaPlan, deletePreview, integrityView]);
 
   // 流派标签高亮同步（active 类仅客户端同步，避免 SSR 差异；点击事件内联在按钮上）
   const genreTagsRef = useRef<HTMLDivElement | null>(null);
@@ -1711,9 +1715,6 @@ const Home: React.FC<HomeProps> = (props) => {
             <LeftPanel
               world={world}
               activeChapter={activeIdx}
-              taskActive={taskActive}
-              onWorldUpdate={(nw) => setWorld(nw)}
-              onToast={showToast}
               onOpenChar={(id) => setRelModal({ editable: false, charId: id })}
               onSelectChapter={(i) => {
                 setActiveIdx(i);
@@ -1862,13 +1863,22 @@ const Home: React.FC<HomeProps> = (props) => {
               <List size={15} /> 任务中心
             </button>
             {!autoRunning && (
-              <button className="btn btn-ghost" onClick={() => setShowAutoStart(true)} disabled={busy || reviseChapters.length > 0} title={reviseChapters.length > 0 ? `存在 ${reviseChapters.length} 章需修改，请先 AI 修复或手动修改后再自动连载` : "自动连续写多章：每章审查通过才提交，审查不过会停下登记问题（可重试/跳过）"}>
-                <Play size={15} /> 自动连载
-              </button>
+              <div className="advance-wrap">
+                <button className="btn btn-primary" onClick={() => { if (!busy) setAdvanceMenu((m) => !m); }} disabled={busy} title="推进剧情：写下一章（点击展开更多选项）">
+                  {busy ? "进行中…" : (<><Play size={15} /> 推进剧情 <ChevronDown size={13} /></>)}
+                </button>
+                {advanceMenu && !busy && (
+                  <div className="advance-menu">
+                    <button className="advance-menu-item" onClick={() => { setAdvanceMenu(false); advance(); }} title="写一章：AI 导演按本章计划写下一章并自动审查提交">
+                      <Play size={13} /> 本章续写
+                    </button>
+                    <button className="advance-menu-item" onClick={() => { setAdvanceMenu(false); setShowAutoStart(true); }} disabled={reviseChapters.length > 0} title={reviseChapters.length > 0 ? `存在 ${reviseChapters.length} 章需修改（第 ${reviseChapters.map((c) => c.index).join("、")} 章），请先 AI 修复或手动修改后再章节连载` : "章节连载：自动连续写多章，每章审查通过才提交，审查不过会停下登记问题（可重试/跳过）"}>
+                      <BookOpen size={13} /> 章节连载{reviseChapters.length > 0 ? `（${reviseChapters.length} 章需修改）` : ""}
+                    </button>
+                  </div>
+                )}
+              </div>
             )}
-            <button className="btn btn-primary" onClick={advance} disabled={busy}>
-              {busy ? "进行中…" : (<><Play size={15} /> 推进剧情</>)}
-            </button>
           </nav>
           {(world.rewriteQueue ?? []).length > 0 && (
             <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", marginTop: "0.5rem", fontSize: "0.78rem", padding: "0.4rem 0.7rem", background: "var(--paper-dark)", border: "1px dashed var(--line)" }}>
@@ -1899,7 +1909,6 @@ const Home: React.FC<HomeProps> = (props) => {
           onPause={pauseAutoRun}
           onResume={() => { setShowTaskCenter(false); void resumeAutoRun(); }}
           onRemove={removeAutoTask}
-          onOpenAutoStart={() => { setShowTaskCenter(false); setShowAutoStart(true); }}
           onCancelAdvance={cancelAdvance}
           onConfirmPending={confirmPendingCommit}
           onRejectPending={rejectPendingCommit}
@@ -1950,7 +1959,7 @@ const Home: React.FC<HomeProps> = (props) => {
               <span style={{ color: "var(--ink-soft)" }}>（1~30）</span>
             </div>
             <p style={{ fontSize: "0.76rem", color: "var(--ink-soft)", marginBottom: "0.9rem", lineHeight: 1.7 }}>
-              每章写作→审查→通过才提交（入册/记账/伏笔/章纲联动）；<br />
+              每章写作→审查→通过才提交（入册/记账/伏笔/本章计划联动）；<br />
               审查不通过会停下并登记问题，可重试修正或跳过本章继续。<br />
               中途可随时停止/打断；刷新页面与服务重启均不会中断任务。
             </p>
@@ -1993,6 +2002,7 @@ const Home: React.FC<HomeProps> = (props) => {
           selectedCharId={relModal.editable ? undefined : relModal.charId}
           onSelectCharacter={relModal.editable ? undefined : (id) => setRelModal((m) => (m ? { ...m, charId: id } : m))}
           onSaveRelations={relModal.editable ? (chars) => saveWorld({ characters: chars }) : undefined}
+          onAddCharacter={relModal.editable ? (c) => saveWorld({ characters: [{ id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`, ...c, relations: {}, introducedAt: world.nextChapter }] }) : undefined}
           onViewPortrait={(c) => openPortrait(c, !relModal.editable)}
           onClose={() => setRelModal(null)}
         />
@@ -2065,11 +2075,16 @@ const Home: React.FC<HomeProps> = (props) => {
             <hr style={{ border: "none", borderTop: "1px dashed var(--line)", margin: "0.8rem 0" }} />
             {[...(shownChapter.versions ?? [])].reverse().map((v, i) => {
               const realIdx = (shownChapter.versions?.length ?? 1) - 1 - i;
+              const sameAsCurrent =
+                v.title === shownChapter.title &&
+                v.text === shownChapter.text &&
+                JSON.stringify(v.review ?? null) === JSON.stringify(shownChapter.review ?? null);
               return (
                 <VersionItem
                   key={`${v.at}-${i}`}
                   v={v}
                   realIdx={realIdx}
+                  isCurrent={sameAsCurrent}
                   world={world}
                   onRollback={(vi) => askConfirm(`确定回滚到版本 ${vi + 1}？当前内容将被替换。`, () => rollback(vi))}
                   onOpenChar={(id) => setRelModal({ editable: false, charId: id })}
@@ -2318,6 +2333,8 @@ const Home: React.FC<HomeProps> = (props) => {
 const VersionItem: React.FC<{
   v: NonNullable<Chapter["versions"]>[number];
   realIdx: number;
+  /** 该版本内容与章节当前内容完全一致（标题/正文/审查）→ 无回滚意义，禁用按钮 */
+  isCurrent?: boolean;
   world: WorldState;
   onRollback: (versionIndex: number) => void;
   /** 版本内审查面板的角色弹窗接线（顶层共享实例） */
@@ -2350,8 +2367,13 @@ const VersionItem: React.FC<{
             {showReviewV ? "隐藏审查" : "查看审查"}
           </button>
         )}
-        <button className="btn-save btn-danger-sm" onClick={() => p.onRollback(p.realIdx)}>
-          回滚到此版本
+        <button
+          className="btn-save btn-danger-sm"
+          disabled={p.isCurrent}
+          title={p.isCurrent ? "当前内容已与该版本一致，无需回滚" : undefined}
+          onClick={() => p.onRollback(p.realIdx)}
+        >
+          {p.isCurrent ? "= 当前内容" : "回滚到此版本"}
         </button>
       </div>
       {showReviewV && p.v.review && (

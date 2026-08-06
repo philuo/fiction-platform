@@ -2,6 +2,7 @@
 // 数据源：world（SSR/拉取）+ /api/novel/changelog（操作日志端点）
 import { useEffect, useMemo, useState } from "react";
 import type { ChangeLogEntry, WorldState } from "../api/world";
+import { getCommand } from "../api/harness";
 import { lensCn, severityCn } from "../terms";
 import { X } from "./icons";
 
@@ -9,6 +10,14 @@ type Tab = "memory" | "ledger" | "log";
 
 const FS_STATUS_TEXT: Record<string, string> = { planted: "已埋设", active: "推进中", resolved: "已回收" };
 const ACTOR_TEXT: Record<string, string> = { user: "用户", ai: "AI", brain: "中枢", system: "系统", integrity: "自检" };
+/** 指令级别徽章样式（L0-L3，对已完成叙事/账本的破坏性） */
+const LEVEL_TEXT: Record<string, string> = { L0: "L0·只读", L1: "L1·前瞻", L2: "L2·回溯", L3: "L3·不可逆" };
+/** 操作者筛选三档：全部 / 用户 / AI（含中枢·系统·自检等自动操作） */
+const ACTOR_FILTERS: { value: string; label: string }[] = [
+  { value: "all", label: "全部操作者" },
+  { value: "user", label: "用户" },
+  { value: "auto", label: "AI" },
+];
 
 export const MemoryAuditModal: React.FC<{ world: WorldState; onClose: () => void }> = (p) => {
   const w = p.world;
@@ -81,7 +90,7 @@ export const MemoryAuditModal: React.FC<{ world: WorldState; onClose: () => void
         <div className="mem-modal-body">
           {tab === "memory" && (
             <>
-              {layer("L1", "设定层", "setting / 世界书 / 指南针 / 角色", (
+              {layer("L1", "设定层", "基础 / 自定义", (
                 <>
                   <div className="mem-group-title">世界设定</div>
                   {kv("时间", w.setting.time)}
@@ -207,23 +216,27 @@ export const MemoryAuditModal: React.FC<{ world: WorldState; onClose: () => void
             <>
               <div className="mem-log-filter">
                 <select value={actorFilter} onChange={(e) => setActorFilter(e.target.value)}>
-                  <option value="all">全部操作者</option>
-                  <option value="user">用户</option>
-                  <option value="ai">AI</option>
+                  {ACTOR_FILTERS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
                 </select>
                 <input placeholder="筛选 kind / 内容关键字…" value={kindFilter} onChange={(e) => setKindFilter(e.target.value)} />
                 <span className="mem-log-count">{logLoading ? "加载中…" : `${filteredEntries.length} / ${entries.length} 条`}</span>
               </div>
               <div className="mem-log-list">
-                {filteredEntries.map((e, i) => (
-                  <div key={`${e.at}-${i}`} className="mem-log-item">
-                    <span className="mem-log-time">{e.at ? new Date(e.at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) : "—"}</span>
-                    <span className={`mem-badge ${e.actor === "user" ? "" : "mem-badge-off"}`}>{ACTOR_TEXT[e.actor] ?? e.actor}</span>
-                    <span className="mem-log-kind">{e.kind}</span>
-                    {e.strategy && <span className="mem-badge mem-badge-warn">{e.strategy}</span>}
-                    <span className="mem-log-detail">第{e.chapter}章 · {e.detail}</span>
-                  </div>
-                ))}
+                {filteredEntries.map((e, i) => {
+                  const cmd = e.commandId ? getCommand(e.commandId) : undefined;
+                  return (
+                    <div key={`${e.at}-${i}`} className="mem-log-item">
+                      <span className="mem-log-time">{e.at ? new Date(e.at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) : "—"}</span>
+                      <span className={`mem-badge ${e.actor === "user" ? "" : "mem-badge-off"}`}>{ACTOR_TEXT[e.actor] ?? e.actor}</span>
+                      {cmd && <span className="mem-badge mem-badge-cmd" title={cmd.name}>{e.commandId}</span>}
+                      {e.level && <span className={`mem-badge ${e.level === "L3" ? "mem-badge-warn" : e.level === "L2" ? "" : "mem-badge-off"}`} title="对已完成叙事/账本的破坏级别">{LEVEL_TEXT[e.level] ?? e.level}</span>}
+                      <span className="mem-log-kind">{e.kind}</span>
+                      {e.strategy && <span className="mem-badge mem-badge-warn">{e.strategy}</span>}
+                      <span className="mem-log-detail">第{e.chapter}章 · {e.detail}</span>
+                      {e.reason && <div className="mem-log-reason">中枢：{e.reason}</div>}
+                    </div>
+                  );
+                })}
                 {filteredEntries.length === 0 && <div className="mem-empty">{logLoading ? "正在加载操作日志…" : "暂无操作日志（写操作后自动记录）"}</div>}
               </div>
             </>

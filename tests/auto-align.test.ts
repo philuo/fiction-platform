@@ -111,6 +111,55 @@ describe("变更自动触发账本治理", () => {
     expect(after.chapterDeltas?.[1]).toBeDefined(); // 快照覆盖，删除可精确恢复
   });
 
+  test("回滚到与当前内容一致的版本被拒绝且不产生重复快照（自我回滚 bug）", async () => {
+    const TITLE = "自我回滚测试";
+    const w = makeWorld(TITLE);
+    w.chapters.push({
+      index: 1,
+      title: "第一章",
+      text: "当前版本正文",
+      review: null,
+      versions: [
+        { at: new Date().toISOString(), title: "第一章", text: "历史版本正文：阿青在山村。", review: null, why: "历史" },
+        { at: new Date().toISOString(), title: "第一章", text: "当前版本正文", review: null, why: "当前" },
+      ] as never,
+      versionFiles: [],
+    } as never);
+    saveWorld(w);
+    const before = loadWorld(TITLE)!;
+    const versionsBefore = before.chapters[0].versions?.length ?? 0;
+    await expect(rollbackChapter(before, 1, 1)).rejects.toThrow("无需回滚");
+    const after = loadWorld(TITLE)!;
+    expect(after.chapters[0].versions?.length).toBe(versionsBefore); // 未新增重复快照
+    expect(after.chapters[0].text).toBe("当前版本正文"); // 内容未被破坏
+  });
+
+  test("来回回滚同一版本不累积重复条目（版本表保持唯一）", async () => {
+    const TITLE = "往返回滚测试";
+    const w = makeWorld(TITLE);
+    w.chapters.push({
+      index: 1,
+      title: "第一章",
+      text: "当前版本正文",
+      review: null,
+      versions: [
+        { at: new Date().toISOString(), title: "第一章", text: "历史版本正文：阿青在山村。", review: null, why: "历史" },
+        { at: new Date().toISOString(), title: "第一章", text: "当前版本正文", review: null, why: "当前" },
+      ] as never,
+      versionFiles: [],
+    } as never);
+    saveWorld(w);
+    // A→B→A→B 连续切换：每次回滚前都会快照当前内容，修复前会不断复制已存在的版本
+    await rollbackChapter(loadWorld(TITLE)!, 1, 0); // 当前=V1 → 目标=V0
+    await rollbackChapter(loadWorld(TITLE)!, 1, 1); // 当前=V0 → 目标=V1
+    await rollbackChapter(loadWorld(TITLE)!, 1, 0); // 当前=V1 → 目标=V0
+    const after = loadWorld(TITLE)!;
+    const versions = after.chapters[0].versions ?? [];
+    expect(versions.length).toBe(2); // 只保留 V0、V1 两条，无重复
+    expect(new Set(versions.map((v) => v.text)).size).toBe(2); // 内容全部唯一
+    expect(after.chapters[0].text).toContain("历史版本正文"); // 最后一次回滚生效
+  });
+
   test("alignWorld 幂等：孤儿引用首次修复后第二次无修复项", async () => {
     const TITLE = "对齐测试";
     const w = makeWorld(TITLE);

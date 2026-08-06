@@ -1,7 +1,7 @@
 // ⚙️ 设置面板：小说级 / 章节级设定统一管控
 // Tab：全局生成参数 / 章节覆盖 / 设定（基础·自定义）/ 角色 / 大纲 / 导出
-import { useState } from "react";
-import { BookMarked, FileText, Settings, Upload, Wand2, X, Sparkles } from "../components/icons";
+import { useState, useEffect } from "react";
+import { BookMarked, FileText, Settings, Upload, Wand2, X, Sparkles, Plus } from "../components/icons";
 import { DEFAULT_GEN, type Character, type FidelityRule, type GenProfile, type LoreEntry, type WorldState, type WorldPatch } from "../api/world";
 import { RangeSlider } from "./RangeSlider";
 import { IntegrityModal, type IntegrityReportView } from "./IntegrityModal";
@@ -707,9 +707,36 @@ const CharacterEditor: React.FC<{ world: WorldState; onSave: Props["onSave"]; on
   const [msg, setMsg] = useState("");
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  // 手动新增角色：creating=true 时表单显示空字段，保存后按新 id 创建
+  const [creating, setCreating] = useState(false);
+  const [justCreatedId, setJustCreatedId] = useState<string | null>(null);
+
+  // 新建模式：保存成功后服务端返回的 world 刷新，自动选中并载入新角色表单
+  useEffect(() => {
+    if (!justCreatedId) return;
+    const nc = p.world.characters.find((c) => c.id === justCreatedId);
+    if (nc) {
+      pick(nc);
+      setJustCreatedId(null);
+      setCreating(false);
+      setMsg("新角色已创建（可在角色面板继续编辑，或手动生成头像/立绘）");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [p.world.characters, justCreatedId]);
+
+  function startCreate() {
+    setSelId(null);
+    setCreating(true);
+    setName(""); setRole("配角"); setGender(""); setAge(""); setIdentity("");
+    setLook(""); setTraits(""); setMotivation(""); setVoice(""); setStatus("");
+    setMsg("");
+    setConfirmDelete(null);
+  }
 
   function pick(c: Character) {
     setSelId(c.id);
+    setCreating(false);
+    setJustCreatedId(null); // 手动选择优先：清掉待选中，防止 world 刷新后 effect 把选中切回新角色
     setName(c.name);
     setRole(c.role);
     setGender(c.gender ?? "");
@@ -724,12 +751,16 @@ const CharacterEditor: React.FC<{ world: WorldState; onSave: Props["onSave"]; on
   }
 
   async function save() {
-    if (!selected) return;
+    // 新建模式：不要求已选中角色，校验姓名后以新 id 创建
+    if (!creating && !selected) return;
+    if (!name.trim()) { setMsg("请填写角色姓名"); return; }
+    if (p.taskActive) { setMsg("任务运行中，角色编辑已禁止——请先取消任务。"); return; }
     setSaving(true);
+    const id = creating ? `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}` : selected!.id;
     const ok = await p.onSave({
       characters: [
         {
-          id: selected.id,
+          id,
           name,
           role,
           gender: gender.trim() || undefined,
@@ -743,7 +774,14 @@ const CharacterEditor: React.FC<{ world: WorldState; onSave: Props["onSave"]; on
         },
       ],
     });
-    setMsg(ok ? "已保存" : "保存失败");
+    if (ok && creating) {
+      setJustCreatedId(id);
+      setMsg("已保存");
+    } else if (ok) {
+      setMsg("已保存");
+    } else {
+      setMsg("保存失败");
+    }
     setSaving(false);
   }
 
@@ -766,7 +804,16 @@ const CharacterEditor: React.FC<{ world: WorldState; onSave: Props["onSave"]; on
       <div className="character-settings">
       {/* 左栏：角色列表（同章节面板左右布局） */}
       <div className="chapter-list">
-        {p.world.characters.length === 0 && (
+        <button
+          className="btn-save"
+          style={{ marginBottom: "0.5rem", width: "100%" }}
+          disabled={p.taskActive || saving}
+          onClick={startCreate}
+          title={p.taskActive ? "任务运行中，角色编辑已禁止" : "手动新增角色（保存后可继续编辑并手动生成头像/立绘）"}
+        >
+          <Plus size={13} /> 新增角色
+        </button>
+        {p.world.characters.length === 0 && !creating && (
           <div style={{ fontSize: "0.72rem", color: "var(--ink-soft)" }}>（暂无角色）</div>
         )}
         {p.world.characters.map((c) => (
@@ -811,15 +858,16 @@ const CharacterEditor: React.FC<{ world: WorldState; onSave: Props["onSave"]; on
       {/* 右栏：编辑表单（滚动区）+ 底部保存按钮（固定区） */}
       <div className="settings-right">
       <div className="settings-page">
-      {selected ? (
+      {selected || creating ? (
         <>
-          {selected.image && (
+          {selected?.image && (
             <img
               src={`/api/novel/asset?title=${encodeURIComponent(p.world.title)}&path=${encodeURIComponent(selected.image)}`}
               alt={selected.name}
               style={{ width: "72px", border: "1px solid var(--line-strong)", marginBottom: "0.4rem", display: "block", aspectRatio: "1", background: "var(--paper-dark)", objectFit: "cover" }}
             />
           )}
+          {selected && (
           <button
             className="btn"
             style={{ marginBottom: "0.5rem" }}
@@ -836,6 +884,8 @@ const CharacterEditor: React.FC<{ world: WorldState; onSave: Props["onSave"]; on
           >
             <Wand2 size={13} /> {imgBusy ? "生成中…" : "AI 生成头像"}
           </button>
+          )}
+          {selected && (
           <button
             className="btn"
             style={{ marginBottom: "0.5rem", marginLeft: "0.4rem" }}
@@ -843,24 +893,28 @@ const CharacterEditor: React.FC<{ world: WorldState; onSave: Props["onSave"]; on
           >
             <Sparkles size={13} /> 查看/生成全局立绘
           </button>
+          )}
           <div className="field">
             <label>姓名</label>
             <input value={name} onChange={(e) => setName(e.target.value)} />
           </div>
           <div className="field">
-            <label>定位（枚举）</label>
-            <select value={role} onChange={(e) => setRole(e.target.value)}>
-              {/* 存量数据中的非枚举值保留显示，避免静默丢值 */}
-              {!["主角", "反派", "配角", "关键人物", "待登场", "其他"].includes(role) && (
-                <option value={role}>{role}（保留）</option>
-              )}
-              <option value="主角">主角</option>
-              <option value="反派">反派</option>
-              <option value="配角">配角</option>
-              <option value="关键人物">关键人物</option>
-              <option value="待登场">待登场</option>
-              <option value="其他">其他</option>
-            </select>
+            <label>定位</label>
+            {/* 定位为自由字段：可从常用建议中选择，也可直接输入任意自定义定位（如"死者""案件起点"等剧情定位） */}
+            <input
+              list="char-role-options"
+              value={role}
+              placeholder="如：主角 / 反派 / 配角，或自定义（死者、案件起点…）"
+              onChange={(e) => setRole(e.target.value)}
+            />
+            <datalist id="char-role-options">
+              <option value="主角" />
+              <option value="反派" />
+              <option value="配角" />
+              <option value="关键人物" />
+              <option value="待登场" />
+              <option value="其他" />
+            </datalist>
           </div>
           <div style={{ display: "flex", gap: "0.6rem" }}>
             <div className="field" style={{ flex: 1 }}>
@@ -915,9 +969,11 @@ const CharacterEditor: React.FC<{ world: WorldState; onSave: Props["onSave"]; on
           <div className="char-readonly-row">
             <label>登场章节</label>
             <span>
-              {(selected.appearedIn?.length ?? 0) > 0
-                ? `第 ${selected.appearedIn!.join("、")} 章`
-                : "尚未登场（AI 在正文中写入该角色后自动登记）"}
+              {(selected?.appearedIn?.length ?? 0) > 0
+                ? `第 ${selected!.appearedIn!.join("、")} 章`
+                : creating
+                  ? "新角色尚未入册（保存后可在后续章节登场）"
+                  : "尚未登场（AI 在正文中写入该角色后自动登记）"}
             </span>
           </div>
           <div className="field">
@@ -941,15 +997,15 @@ const CharacterEditor: React.FC<{ world: WorldState; onSave: Props["onSave"]; on
         </>
       ) : (
         <div style={{ fontSize: "0.8rem", color: "var(--ink-soft)", padding: "0.8rem 0" }}>
-          在左侧选择一个角色进行编辑
+          点击左上角「新增角色」创建第一个角色
         </div>
       )}
       </div>
       <div className="settings-footer">
-        {selected && (
+        {(selected || creating) && (
           <>
             <button className="btn btn-primary" onClick={save} disabled={saving}>
-              {saving ? "保存中…" : "保存"}
+              {saving ? "保存中…" : creating ? "创建角色" : "保存"}
             </button>
             {msg && <div className="form-msg" style={{ margin: 0 }}>{msg}</div>}
           </>

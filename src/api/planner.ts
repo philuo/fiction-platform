@@ -1,4 +1,4 @@
-// 分层滚动规划（P3，修 A1-A4）：蓝图（指南针+进度承诺+卷骨架）→ 弧（滚动展开）→ 章纲（核销）
+// 分层滚动规划（P3，修 A1-A4）：蓝图（指南针+进度承诺+卷骨架）→ 弧（滚动展开）→ 本章计划（核销）
 // 参考 ainovel-cli：初始只规划 2 卷骨架 + 第 1 弧详章；弧/卷边界触发摘要归并 + 展开下一弧
 import { chatJson } from "./jsonutil";
 import { saveWorld } from "./storage";
@@ -107,9 +107,9 @@ export async function confirmBlueprint(w: WorldState, opt: BlueprintOption): Pro
   return w;
 }
 
-// —— 弧展开（滚动规划：只详展当前弧，3-6 章章纲） ——
+// —— 弧展开（滚动规划：只详展当前弧，3-6 章章节计划） ——
 
-const EXPAND_SYSTEM = `你是小说分卷编辑。把一个故事弧展开为接下来 3-6 章的详细章纲。
+const EXPAND_SYSTEM = `你是小说分卷编辑。把一个故事弧展开为接下来 3-6 章的详细章节计划。
 要求：章与章之间因果递进；每章有明确目标与 2-4 个节拍（beats，具体到"发生什么"）；钩子类型尽量与[近期钩子历史]错开，避免连续雷同；必须推进至少 1 条活跃伏笔（若有）。
 输出必须是合法 JSON（不要 markdown 围栏）：
 {"chapters":[{"goal":"本章目标","beats":["节拍1","节拍2"],"hookType":"悬念|反转|危机|情感|承诺|无"}]}
@@ -119,6 +119,11 @@ export async function expandArc(w: WorldState, arcId: string): Promise<ChapterPl
   const arc = (w.storyArcs ?? []).find((a) => a.id === arcId);
   if (!arc) throw new Error("弧不存在: " + arcId);
   const startIdx = w.nextChapter + (w.chapterPlans ?? []).filter((p) => p.status === "planned").length;
+  // 防御：跳过已被既有计划占用的章号（弧/卷边界展开时 nextChapter 可能已递增但与既有计划冲突，
+  // 重叠计划会导致该弧永远无法全 done、卷边界卡死）
+  let safeStart = startIdx;
+  const usedIdx = new Set((w.chapterPlans ?? []).map((p) => p.index));
+  while (usedIdx.has(safeStart)) safeStart++;
 
   const summaries = (w.chapterSummaries ?? []).slice(-3).map((s) => `第${s.index}章：${s.summary}`).join("\n");
   const fs = (w.foreshadowing ?? []).filter((f) => f.status !== "resolved").map((f) => `[${f.id}] ${f.text}`).join("\n");
@@ -134,7 +139,7 @@ export async function expandArc(w: WorldState, arcId: string): Promise<ChapterPl
     fs ? `[活跃伏笔]\n${fs}` : "",
     `[近期钩子历史] ${hookHistory}（避免连续雷同）`,
     guard ? `[节奏警报] ${guard}` : "",
-    `\n从第 ${startIdx} 章开始展开 ${Math.min(arc.estChapters, 6)} 章章纲（只输出 JSON）。`,
+    `\n从第 ${startIdx} 章开始展开 ${Math.min(arc.estChapters, 6)} 章章节计划（只输出 JSON）。`,
   ].filter(Boolean).join("\n");
 
   const out = await chatJson<{ chapters?: { goal?: string; beats?: string[]; hookType?: string }[] }>(
@@ -151,7 +156,7 @@ export async function expandArc(w: WorldState, arcId: string): Promise<ChapterPl
     const c = list[i];
     if (!c?.goal) continue;
     plans.push({
-      index: startIdx + i,
+      index: safeStart + i,
       arcId: arc.id,
       goal: String(c.goal).slice(0, 200),
       beats: (Array.isArray(c.beats) ? c.beats : []).map(String).filter(Boolean).slice(0, 4).map((b) => b.slice(0, 120)),
@@ -160,8 +165,8 @@ export async function expandArc(w: WorldState, arcId: string): Promise<ChapterPl
     });
   }
   if (!plans.length) {
-    // 兜底：至少生成 1 章泛用章纲，保证管线不卡死
-    plans.push({ index: startIdx, arcId: arc.id, goal: arc.goal, beats: ["推进弧目标"], hookType: "悬念", status: "planned" });
+    // 兜底：至少生成 1 章泛用章节计划，保证管线不卡死
+    plans.push({ index: safeStart, arcId: arc.id, goal: arc.goal, beats: ["推进弧目标"], hookType: "悬念", status: "planned" });
   }
   w.chapterPlans = [...(w.chapterPlans ?? []), ...plans];
   arc.status = "expanded";
@@ -169,7 +174,7 @@ export async function expandArc(w: WorldState, arcId: string): Promise<ChapterPl
   return plans;
 }
 
-/** 确保某章有章纲（缺失时自动展开当前写作弧） */
+/** 确保某章有本章计划（缺失时自动展开当前写作弧） */
 export async function ensureChapterPlan(w: WorldState, index: number): Promise<ChapterPlan | null> {
   const plans = w.chapterPlans ?? [];
   const existing = plans.find((p) => p.index === index);
@@ -180,16 +185,16 @@ export async function ensureChapterPlan(w: WorldState, index: number): Promise<C
   // 优先取覆盖 index 的预估范围的弧（按顺序消费）
   const pending = plans.filter((p) => p.status === "planned");
   if (!pending.length && target) {
-    // 上一个弧的章纲已耗尽 → 推进到下一个骨架弧
+    // 上一个弧的本章计划已耗尽 → 推进到下一个骨架弧
     const nextSkeleton = arcs.find((a) => a.status === "skeleton");
     if (nextSkeleton && target.status !== "skeleton") target = nextSkeleton;
   }
-  if (!target) return null; // 无蓝图/弧（旧故事未自愈前）→ 走无章纲模式
+  if (!target) return null; // 无蓝图/弧（旧故事未自愈前）→ 走无本章计划模式
   const created = await expandArc(w, target.id);
   return created.find((p) => p.index === index) ?? created[0] ?? null;
 }
 
-/** 章纲核销：置 done；弧内章纲全部完成 → 返回弧边界事件 */
+/** 本章计划核销：置 done；弧内本章计划全部完成 → 返回弧边界事件 */
 export function markChapterDone(w: WorldState, index: number): { arcId: string } | null {
   const plan = (w.chapterPlans ?? []).find((p) => p.index === index);
   if (plan) plan.status = "done";
@@ -307,7 +312,7 @@ export async function healLegacyStory(w: WorldState): Promise<boolean> {
     estChapters: 4,
   };
   w.storyArcs = [arc];
-  // 已写章节回填 done 章纲（无细节，仅作核销基线）
+  // 已写章节回填 done 本章计划（无细节，仅作核销基线）
   const plans: ChapterPlan[] = w.chapters.map((c) => ({
     index: c.index,
     arcId: arc.id,

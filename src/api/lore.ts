@@ -47,7 +47,7 @@ export function sanitizeLore(entries: unknown[]): LoreEntry[] {
 }
 
 /** 注入用条目（修 B3：启用关键词匹配）：
- * 传入 ctxText（章纲 beats+指令+上章结尾等）时，关键词命中的条目优先注入，
+ * 传入 ctxText（本章计划 beats+指令+上章结尾等）时，关键词命中的条目优先注入，
  * 未命中条目按 enabled 顺序补足到上限 8 条；不传 ctxText 则退化为顺序取前 8 条。 */
 export function activeLore(w: WorldState, ctxText?: string): LoreEntry[] {
   const enabled = (w.lore ?? []).filter((e) => e.enabled);

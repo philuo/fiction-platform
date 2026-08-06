@@ -1,13 +1,13 @@
 // 纯函数单元测试（P0/J1）：不依赖真实 API key，bun test tests/unit.test.ts
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { extractJson, clampScore } from "../src/api/jsonutil";
 import { slugify, allocateTitle, storyExists, migrateWorld, saveWorld, loadWorld } from "../src/api/storage";
 import { autoPick } from "../src/api/cards";
-import { recomputeAppearedIn } from "../src/api/director";
+import { recomputeAppearedIn, editWorld } from "../src/api/director";
 import { normAnchor, styleAnchor, ensureStyleSuffix, planContext, findCharacterRef, identityDress } from "../src/api/media";
 import { toAgnesSize } from "../src/api/images";
 import { durationToNumFrames, normalizeNumFrames, VIDEO_WIDTH, VIDEO_HEIGHT } from "../src/api/videos";
@@ -100,6 +100,71 @@ describe("storage.migrateWorld / versions 外置", () => {
     expect(raw.includes("旧稿")).toBe(false);
     expect(raw.includes("versionFiles")).toBe(true);
   });
+  test("loadWorld 存量版本表去重：内存合并、saveWorld 收敛磁盘孤儿文件、幂等", () => {
+    const w = emptyWorld();
+    w.title = "去重存量测试";
+    const mk = (text: string, at: string) => ({ title: "第一章", text, review: null, at, reason: "r" });
+    w.chapters.push({
+      index: 1,
+      title: "第一章",
+      text: "正文A",
+      review: null,
+      versions: [
+        mk("正文A", "2026-01-01T00:00:00.000Z"), // 与当前内容一致
+        mk("正文B", "2026-01-02T00:00:00.000Z"),
+        mk("正文A", "2026-01-03T00:00:00.000Z"), // 重复（at 较新 → 内容重复时保留较新元数据）
+        mk("正文B", "2026-01-04T00:00:00.000Z"), // 重复
+      ],
+    });
+    saveWorld(w);
+    const vDir = join(tmp, "data", "去重存量测试", "versions");
+    expect(readdirSync(vDir).length).toBe(4); // 落盘 4 个版本文件
+
+    // loadWorld 只改内存：去重为 2 条，但只读路径不触发任何磁盘写
+    const loaded = loadWorld("去重存量测试")!;
+    const vs = loaded.chapters[0].versions ?? [];
+    expect(vs.map((v) => v.text)).toEqual(["正文A", "正文B"]); // 内容唯一
+    expect(vs[0].at).toBe("2026-01-03T00:00:00.000Z"); // 内容重复时保留 at 较新者
+    expect(loaded.chapters[0].versionFiles?.length).toBe(2); // versionFiles 同步收缩
+    expect(readdirSync(vDir).length).toBe(4); // 磁盘文件未被动（纯内存去重）
+
+    // 下一次 saveWorld 收敛磁盘孤儿文件
+    saveWorld(loaded);
+    expect(readdirSync(vDir).length).toBe(2); // 孤儿版本文件已清理
+
+    // 幂等：再加载再保存不再变化
+    const again = loadWorld("去重存量测试")!;
+    expect(again.chapters[0].versions?.map((v) => v.text)).toEqual(["正文A", "正文B"]);
+    saveWorld(again);
+    expect(readdirSync(vDir).length).toBe(2);
+  });
+  test("旧格式存量（state.json 内嵌 versions、无 versionFiles）加载即去重", () => {
+    const w = emptyWorld();
+    w.title = "内嵌存量测试";
+    w.chapters.push({
+      index: 1,
+      title: "第一章",
+      text: "正文X",
+      review: null,
+      versions: [
+        { title: "第一章", text: "正文X", review: null, at: "2026-02-01T00:00:00.000Z", reason: "r" },
+        { title: "第一章", text: "正文Y", review: null, at: "2026-02-02T00:00:00.000Z", reason: "r" },
+        { title: "第一章", text: "正文X", review: null, at: "2026-02-03T00:00:00.000Z", reason: "r" }, // 重复
+      ],
+    });
+    // 手工写旧格式存档：versions 内嵌在 state.json，无 versionFiles 字段
+    const dir = join(tmp, "data", "内嵌存量测试");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "state.json"), JSON.stringify(w), "utf-8");
+
+    const loaded = loadWorld("内嵌存量测试")!;
+    const vs = loaded.chapters[0].versions ?? [];
+    expect(vs.map((v) => v.text)).toEqual(["正文X", "正文Y"]); // 内嵌存量同样去重
+    expect(vs[0].at).toBe("2026-02-03T00:00:00.000Z"); // 保留 at 较新者
+    expect(loaded.chapters[0].versionFiles?.length).toBe(2); // versionFiles 补齐，可正常外置
+    saveWorld(loaded); // 首次保存：外置 + 无孤儿可清
+    expect(readdirSync(join(dir, "versions")).length).toBe(2);
+  });
 });
 
 describe("cards.autoPick", () => {
@@ -122,6 +187,42 @@ describe("director.recomputeAppearedIn", () => {
     expect(recomputeAppearedIn(w)).toBe(true);
     expect(w.characters[0].appearedIn).toEqual([1]);
     expect(recomputeAppearedIn(w)).toBe(false); // 幂等
+  });
+});
+
+describe("director.editWorld 手动新增角色", () => {
+  test("id 不存在时创建角色：默认值补齐，重名/缺名拒绝，已有 id 走更新", () => {
+    const w = emptyWorld();
+    w.nextChapter = 3;
+    w.characters.push({ id: "c1", name: "阿青", role: "主角", traits: [], motivation: "", status: "调查中", relations: {}, introducedAt: 1 });
+    // 新增（性别仅男/女，非法值丢弃）
+    editWorld(w, { characters: [{ id: "c-new", name: "沈夜", role: "反派", gender: "男", age: "三十", identity: "东厂提督", traits: ["冷峻", "缜密"], status: "待登场", motivation: "复仇" }] });
+    expect(w.characters.length).toBe(2);
+    const nc = w.characters.find((c) => c.id === "c-new")!;
+    expect(nc.name).toBe("沈夜");
+    expect(nc.role).toBe("反派");
+    expect(nc.gender).toBe("男");
+    expect(nc.age).toBe("三十");
+    expect(nc.identity).toBe("东厂提督");
+    expect(nc.traits).toEqual(["冷峻", "缜密"]);
+    expect(nc.status).toBe("待登场");
+    expect(nc.motivation).toBe("复仇");
+    expect(nc.introducedAt).toBe(3); // 按 nextChapter 登记
+    expect(nc.relations).toEqual({});
+    expect(nc.appearedIn).toBeUndefined();
+    // 重名拒绝（不静默跳过）
+    expect(() => editWorld(w, { characters: [{ id: "c-new2", name: "沈夜" }] })).toThrow("已存在");
+    expect(w.characters.length).toBe(2);
+    // 缺名跳过（不创建）
+    editWorld(w, { characters: [{ id: "c-new3", name: "   " }] });
+    expect(w.characters.length).toBe(2);
+    // 已有 id 走更新（不重复创建）
+    editWorld(w, { characters: [{ id: "c1", name: "阿青", status: "结案" }] });
+    expect(w.characters.length).toBe(2);
+    expect(w.characters[0].status).toBe("结案");
+    // 重命名撞名：把已有角色改成其他角色名 → 拒绝
+    expect(() => editWorld(w, { characters: [{ id: "c1", name: "沈夜" }] })).toThrow("已存在");
+    expect(w.characters.find((c) => c.id === "c1")?.name).toBe("阿青"); // 未被改名
   });
 });
 

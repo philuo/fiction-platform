@@ -84,12 +84,12 @@ export async function reviewChapter(
     `[全书基调] ${world.setting.tone || world.genre}｜POV: ${g.pov}｜风格: ${g.styleOverride || "默认"}`,
     plan
       ? `[本章任务] 目标：${plan.goal}\n节拍：\n${plan.beats.map((b, i) => `${i + 1}. ${b}`).join("\n")}${plan.mergeTasks?.length ? `\n弥合任务：${plan.mergeTasks.join("；")}` : ""}`
-      : "[本章任务] （无章纲，按常规审查）",
+      : "[本章任务] （无本章计划，按常规审查）",
     `\n${globalCtx}`,
     `\n[进行中的情节弧线] ${threads.length ? threads.map((a) => `- ${a.name}：${a.note}`).join("\n") : "无"}`,
     `\n[待核查的活跃伏笔] ${fs.length ? fs.map((f) => `「${f.text}」（埋于第${f.plantedAt}章）`).join("\n") : "无"}`,
     `\n[审查对象：第${idx}章《${chapterTitle}》全文]\n${chapterText}`,
-    "\n请输出审查结论（只输出 JSON）。重点：全书一致性、章纲落实、AI 腔。",
+    "\n请输出审查结论（只输出 JSON）。重点：全书一致性、本章计划落实、AI 腔。",
   ].join("\n");
 
   const out = await chatJson<{

@@ -142,7 +142,7 @@ export function applyChapterDeltaRevert(w: WorldState, chapterIndex: number, del
 
 /**
  * 确定性全书审计（零 LLM，纯函数可单测）：孤儿引用 / 悬空键 / 伏笔章号异常 / 摘要人物偏离名册。
- * 只产出 findings，不改状态；chapterPlans 中 status=planned 的未来章纲不算孤儿。
+ * 只产出 findings，不改状态；chapterPlans 中 status=planned 的未来本章计划不算孤儿。
  */
 export function auditWorld(w: WorldState): ConsistencyFinding[] {
   const findings: ConsistencyFinding[] = [];
@@ -167,9 +167,9 @@ export function auditWorld(w: WorldState): ConsistencyFinding[] {
     }
   }
   for (const p of w.chapterPlans ?? []) {
-    // 仅已核销（done）的章纲需要章节存在；planned 指向未来章节是正常态
+    // 仅已核销（done）的本章计划需要章节存在；planned 指向未来章节是正常态
     if (p.status === "done" && !has(p.index)) {
-      findings.push({ id: fid("orphan-plan", p.index), level: "warning", kind: "orphan-plan", chapterIndex: p.index, issue: `第 ${p.index} 节章纲已核销但章节不存在`, suggestion: "运行一键修复清除孤儿章纲" });
+      findings.push({ id: fid("orphan-plan", p.index), level: "warning", kind: "orphan-plan", chapterIndex: p.index, issue: `第 ${p.index} 节本章计划已核销但章节不存在`, suggestion: "运行一键修复清除孤儿本章计划" });
     }
   }
   for (const d of w.qualityDebt ?? []) {
@@ -221,7 +221,7 @@ export function autoRepair(w: WorldState): string[] {
 
   const pBefore = (w.chapterPlans ?? []).length;
   w.chapterPlans = (w.chapterPlans ?? []).filter((p) => !(p.status === "done" && !valid.has(p.index)));
-  if ((w.chapterPlans ?? []).length < pBefore) fixed.push(`清除 ${pBefore - (w.chapterPlans ?? []).length} 条孤儿章纲`);
+  if ((w.chapterPlans ?? []).length < pBefore) fixed.push(`清除 ${pBefore - (w.chapterPlans ?? []).length} 条孤儿本章计划`);
 
   const dBefore = (w.qualityDebt ?? []).length;
   w.qualityDebt = (w.qualityDebt ?? []).filter((d) => valid.has(d.chapterIndex));
@@ -242,7 +242,7 @@ export function autoRepair(w: WorldState): string[] {
   return fixed;
 }
 
-/** 全局账本确定性对齐（零 LLM、幂等）：复用 autoRepair（孤儿摘要/时间线/章纲/债务/章节覆盖 + 登场重算）。
+/** 全局账本确定性对齐（零 LLM、幂等）：复用 autoRepair（孤儿摘要/时间线/本章计划/债务/章节覆盖 + 登场重算）。
  * 供角色/伏笔/大纲/设定/世界书等全局变更后自动调用，保持引用与索引一致。 */
 export function alignWorld(w: WorldState): string[] {
   return autoRepair(w);
@@ -287,7 +287,7 @@ export type DeleteCascadeResult = {
 /**
  * 删章级联（纯函数，不碰磁盘）：允许空洞、绝不重排 index。
  * 变更快照恢复（git 式）：有 chapterDelta 时先按快照逆操作恢复角色形象/当前状态/弧线/伏笔回收/提案，
- * 无快照（旧存档）则降级为基础清理并提示；随后清理该章摘要/时间线/章纲/质量债务/参数覆盖；
+ * 无快照（旧存档）则降级为基础清理并提示；随后清理该章摘要/时间线/本章计划/质量债务/参数覆盖；
  * 伏笔保守策略（未回收者删除并列明，已回收者留痕）；清该章离场记录；重算登场；仅删尾章时回退 nextChapter。
  */
 export function deleteChapterCascade(w: WorldState, index: number): DeleteCascadeResult {

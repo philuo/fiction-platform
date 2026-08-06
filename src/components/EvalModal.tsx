@@ -59,7 +59,7 @@ export const EvalModal: React.FC<{
       if (!data.ok) throw new Error(data.error ?? "操作失败");
       setDebt((data.debt ?? []).filter((d) => d.status === "open"));
       if (data.world) p.onWorldUpdate?.(data.world);
-      p.onToast?.(action === "fix" ? "已注入修复任务到后续章纲。" : "已忽略该问题。");
+      p.onToast?.(action === "fix" ? "已注入修复任务到后续章节计划。" : "已忽略该问题。");
     } catch (e) {
       p.onToast?.("操作失败: " + (e as Error).message);
     }
@@ -73,7 +73,7 @@ export const EvalModal: React.FC<{
           <button className="modal-close" onClick={p.onClose}><X size={16} /></button>
         </div>
         <div className="modal-body">
-          {busy && <div style={{ textAlign: "center", padding: "1.5rem 0", fontSize: "0.8rem", color: "var(--ink-soft)" }}>主编审读中（约需 1 次 LLM 调用）…</div>}
+          {busy && <div style={{ textAlign: "center", padding: "1.5rem 0", fontSize: "0.8rem", color: "var(--ink-soft)" }}>主编审读中…</div>}
           {err && <div className="form-msg">评估失败：{err}</div>}
           {report && !busy && cached && (
             <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", fontSize: "0.74rem", color: "var(--ink-soft)", background: "var(--paper-dark)", border: "1px solid var(--line)", padding: "0.4rem 0.6rem", marginBottom: "0.7rem" }}>

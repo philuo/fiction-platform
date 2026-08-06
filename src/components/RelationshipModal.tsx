@@ -62,6 +62,8 @@ export const RelationshipModal: React.FC<{
   onWorldUpdate?: (w: WorldState) => void;
   /** 保存关系到服务端（持久化 + 同步角色/写作 prompt）；返回 false 表示保存失败，弹窗不关闭 */
   onSaveRelations?: (characters: Character[]) => Promise<boolean>;
+  /** 手动新增角色（服务端持久化）；返回 false 表示失败 */
+  onAddCharacter?: (c: { name: string; role?: string; gender?: string; age?: string; identity?: string; traits?: string[]; motivation?: string; voice?: string; status?: string }) => Promise<boolean>;
   /** 点击角色查看全局立绘（大图预览 + 生成入口） */
   onViewPortrait?: (c: Character) => void;
   /** 只读模式：角色与关系图均不可编辑（审查面板复用）；缺省 false */
@@ -99,6 +101,47 @@ export const RelationshipModal: React.FC<{
   const [edgeLabel, setEdgeLabel] = useState("");
   const [nodeList, setNodeList] = useState<GNode[]>([]);
   const [saving, setSaving] = useState(false);
+  /** 手动新增角色折叠表单 */
+  const [showAddChar, setShowAddChar] = useState(false);
+  const [acName, setAcName] = useState("");
+  const [acRole, setAcRole] = useState("配角");
+  const [acGender, setAcGender] = useState("");
+  const [acAge, setAcAge] = useState("");
+  const [acIdentity, setAcIdentity] = useState("");
+  const [acTraits, setAcTraits] = useState("");
+  const [acMotivation, setAcMotivation] = useState("");
+  const [acStatus, setAcStatus] = useState("");
+  const [acMsg, setAcMsg] = useState("");
+  const [addingChar, setAddingChar] = useState(false);
+
+  async function addCharacter() {
+    if (addingChar || !p.onAddCharacter) return;
+    if (!acName.trim()) { setAcMsg("请填写角色姓名"); return; }
+    if (p.world.characters.some((c) => c.name === acName.trim())) { setAcMsg(`角色「${acName.trim()}」已存在`); return; }
+    setAddingChar(true);
+    try {
+      const ok = await p.onAddCharacter({
+        name: acName.trim(),
+        role: acRole.trim() || undefined,
+        gender: acGender || undefined,
+        age: acAge.trim() || undefined,
+        identity: acIdentity.trim() || undefined,
+        traits: acTraits.split(/[、,，]/).map((s) => s.trim()).filter(Boolean),
+        motivation: acMotivation.trim() || undefined,
+        voice: undefined,
+        status: acStatus.trim() || undefined,
+      });
+      if (ok) {
+        setShowAddChar(false);
+        setAcName(""); setAcRole("配角"); setAcGender(""); setAcAge(""); setAcIdentity("");
+        setAcTraits(""); setAcMotivation(""); setAcStatus(""); setAcMsg("");
+      } else {
+        setAcMsg("保存失败");
+      }
+    } finally {
+      setAddingChar(false);
+    }
+  }
   /** 非受控选中（未传 selectedCharId 时内部自管，点击角色项高亮） */
   const [localSel, setLocalSel] = useState<string | null>(null);
   const selectedId = p.selectedCharId ?? localSel;
@@ -480,6 +523,52 @@ export const RelationshipModal: React.FC<{
         {tab === "角色" ? (
           /* Tab 1：角色列表（只读总览，编辑请前往「设置 · 角色」；审查面板只读复用） */
           <div>
+            {!p.readOnly && p.onAddCharacter && (
+              <>
+                <button className="btn-save" onClick={() => { setShowAddChar(!showAddChar); setAcMsg(""); }} style={{ marginBottom: "0.5rem" }}>
+                  <Plus size={13} /> {showAddChar ? "收起新增表单" : "新增角色"}
+                </button>
+                {showAddChar && (
+                  <div style={{ border: "1px dashed var(--line-strong)", padding: "0.7rem", marginBottom: "0.7rem", background: "var(--paper-dark)" }}>
+                    <div style={{ fontSize: "0.78rem", color: "var(--ink-soft)", marginBottom: "0.4rem" }}>
+                      手动新增角色（保存后可在设置面板继续编辑；头像/立绘按需手动生成）
+                    </div>
+                    <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+                      <input className="rp-add-input" placeholder="姓名（必填）" value={acName} onChange={(e) => setAcName(e.target.value)} style={{ width: "8rem" }} />
+                      <select value={acRole} onChange={(e) => setAcRole(e.target.value)} style={{ width: "6rem" }}>
+                        <option value="主角">主角</option>
+                        <option value="反派">反派</option>
+                        <option value="配角">配角</option>
+                        <option value="关键人物">关键人物</option>
+                        <option value="待登场">待登场</option>
+                        <option value="其他">其他</option>
+                      </select>
+                      <select value={acGender} onChange={(e) => setAcGender(e.target.value)} style={{ width: "5rem" }}>
+                        {!acGender && <option value="" disabled>性别</option>}
+                        <option value="男">男</option>
+                        <option value="女">女</option>
+                      </select>
+                      <input className="rp-add-input" placeholder="年龄" value={acAge} onChange={(e) => setAcAge(e.target.value)} style={{ width: "6rem" }} />
+                      <input className="rp-add-input" placeholder="身份/职业" value={acIdentity} onChange={(e) => setAcIdentity(e.target.value)} style={{ width: "9rem" }} />
+                    </div>
+                    <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.4rem", flexWrap: "wrap" }}>
+                      <input className="rp-add-input" placeholder="特质（顿号分隔）" value={acTraits} onChange={(e) => setAcTraits(e.target.value)} style={{ flex: 1, minWidth: "10rem" }} />
+                      <input className="rp-add-input" placeholder="当前状态" value={acStatus} onChange={(e) => setAcStatus(e.target.value)} style={{ flex: 1, minWidth: "8rem" }} />
+                    </div>
+                    <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.4rem" }}>
+                      <input className="rp-add-input" placeholder="动机（可选）" value={acMotivation} onChange={(e) => setAcMotivation(e.target.value)} style={{ flex: 1 }} />
+                    </div>
+                    <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem", alignItems: "center" }}>
+                      <button className="btn-save" onClick={addCharacter} disabled={addingChar}>
+                        {addingChar ? "创建中…" : "创建角色"}
+                      </button>
+                      <button className="btn-save" onClick={() => { setShowAddChar(false); setAcMsg(""); }}>取消</button>
+                      {acMsg && <span className="form-msg" style={{ margin: 0 }}>{acMsg}</span>}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
             {p.world.characters.map((c) => (
               <div
                 className={`rp-char-item ${selectedId === c.id ? "rp-char-item-selected" : ""}`}
@@ -549,13 +638,13 @@ export const RelationshipModal: React.FC<{
         {!p.readOnly && showAddEdge && (
           <div className="rel-add-edge">
             <select value={edgeFrom} onChange={(e) => setEdgeFrom(e.target.value)}>
-              <option value="">选择角色A</option>
-              {nodeList.map((n) => <option value={n.id} key={n.id}>{n.name}</option>)}
+              <option value="" disabled>选择角色 A…</option>
+              {nodeList.map((n) => (n.id === edgeTo ? null : <option value={n.id} key={n.id}>{n.name}</option>))}
             </select>
             <span>↔</span>
             <select value={edgeTo} onChange={(e) => setEdgeTo(e.target.value)}>
-              <option value="">选择角色B</option>
-              {nodeList.map((n) => <option value={n.id} key={n.id}>{n.name}</option>)}
+              <option value="" disabled>选择角色 B…</option>
+              {nodeList.map((n) => (n.id === edgeFrom ? null : <option value={n.id} key={n.id}>{n.name}</option>))}
             </select>
             <input placeholder="关系描述" value={edgeLabel} onChange={(e) => setEdgeLabel(e.target.value)} />
             <button className="btn-save" onClick={addEdge}>确认</button>

@@ -1,6 +1,6 @@
 // 持久化：data/<slug>/state.json（原子写：tmp + rename，写前备份 .bak）
 // 长篇架构：versions 外置到 data/<slug>/versions/；meta.json 供列表页快读；checkpoint.jsonl 断点日志
-import { mkdirSync, readFileSync, writeFileSync, existsSync, copyFileSync, mkdtempSync, rmSync, renameSync, appendFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, copyFileSync, mkdtempSync, rmSync, renameSync, appendFileSync, unlinkSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -91,6 +91,57 @@ function hydrateVersions(w: WorldState): void {
   }
 }
 
+/** 存量清理：移除章节版本表中的重复条目（title/text/review 全等；内容重复时保留 at 较新者）。
+ * 纯内存操作（幂等，零磁盘写）：重建 versionFiles 与新索引对齐；磁盘孤儿文件由 saveWorld 的
+ * pruneVersionFiles 收敛——保证只读路径（changelog/state 等）绝不触发删文件/重写。 */
+function dedupeVersions(w: WorldState): boolean {
+  let changed = false;
+  for (const ch of w.chapters) {
+    const vs = ch.versions ?? [];
+    if (vs.length < 2) continue;
+    const kept: ChapterVersion[] = [];
+    const seenIdx = new Map<string, number>(); // 内容键 → kept 索引
+    let chChanged = false;
+    for (const v of vs) {
+      const key = JSON.stringify([v.title, v.text, v.review ?? null]);
+      const idx = seenIdx.get(key);
+      if (idx !== undefined) {
+        // 内容重复：保留时间点较新的条目（内容相同，元数据跟随后者，时间线不倒退）
+        if ((v.at ?? "") > (kept[idx].at ?? "")) kept[idx] = v;
+        chChanged = true;
+        continue;
+      }
+      seenIdx.set(key, kept.length);
+      kept.push(v);
+    }
+    if (!chChanged) continue;
+    ch.versions = kept;
+    ch.versionFiles = kept.map((v, i) => versionFileName(ch.index, v, i));
+    changed = true;
+  }
+  return changed;
+}
+
+/** 清理 versions/ 目录中不再被任何章节引用的孤儿版本文件（去重/删章后收敛磁盘）。
+ * 单进程假设：仅由 saveWorld 在 state.json 落盘后调用；失败静默（孤儿残留无害，下次再清）。 */
+function pruneVersionFiles(title: string, referenced: Set<string>): void {
+  const dir = versionsDir(title);
+  let files: string[];
+  try {
+    files = readdirSync(dir);
+  } catch {
+    return; // 目录不存在（无版本）直接跳过
+  }
+  for (const f of files) {
+    if (referenced.has(f)) continue;
+    try {
+      unlinkSync(join(dir, f));
+    } catch {
+      /* 权限失败等：孤儿残留，下次 saveWorld 再清理 */
+    }
+  }
+}
+
 export function saveWorld(w: WorldState): string {
   const dir = storyDir(w.title);
   mkdirSync(dir, { recursive: true });
@@ -111,6 +162,11 @@ export function saveWorld(w: WorldState): string {
   const tmp = join(dir, `state.json.tmp-${process.pid}`);
   writeFileSync(tmp, JSON.stringify(snapshot, null, 2), "utf-8");
   renameSync(tmp, path);
+  // 孤儿版本文件收敛：state.json 已落盘，删除不再被引用的版本文件（去重/删章后的磁盘清理）
+  pruneVersionFiles(
+    w.title,
+    new Set(snapshot.chapters.flatMap((c) => c.versionFiles ?? [])),
+  );
   // meta.json：列表页快读（修 G4）
   try {
     const meta = { slug: slugify(w.title), title: w.title, genre: w.genre ?? "", chapters: w.chapters?.length ?? 0, updatedAt: w.updatedAt, cover: w.cover };
@@ -156,6 +212,7 @@ export function loadWorld(title: string): WorldState | null {
   const w = JSON.parse(readFileSync(path, "utf-8")) as WorldState;
   migrateWorld(w);
   hydrateVersions(w);
+  dedupeVersions(w); // 存量版本表去重（纯内存，幂等；磁盘孤儿文件由下次 saveWorld 收敛）
   return w;
 }
 
@@ -296,7 +353,7 @@ function escXml(s: string): string {
 }
 
 export function exportEpub(w: WorldState): Blob {
-  // 卷映射（P5）：章纲 index → 弧 → 卷标题，卷切换处插入卷题
+  // 卷映射（P5）：本章计划 index → 弧 → 卷标题，卷切换处插入卷题
   const volOf = new Map<number, string>();
   if (w.blueprint && (w.chapterPlans ?? []).length) {
     const arcVol = new Map((w.storyArcs ?? []).map((a) => [a.id, a.volumeId]));

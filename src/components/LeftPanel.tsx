@@ -15,10 +15,6 @@ type Props = {
   world: WorldState;
   activeChapter: number;
   onSelectChapter: (index: number) => void;
-  onWorldUpdate?: (w: WorldState) => void;
-  onToast?: (msg: string) => void;
-  /** 运行锁：任务运行中禁止大纲编辑（透传 PlanPanel） */
-  taskActive?: boolean;
   /** 点击出场角色：通知外部打开顶层共享只读角色弹窗（与审查面板一致） */
   onOpenChar?: (charId: string) => void;
 };
@@ -54,7 +50,13 @@ export const LeftPanel: React.FC<Props> = (p) => {
                 onClick={() => p.onSelectChapter(p.activeChapter === c.index ? -1 : c.index)}
                 key={c.index}
               >
-                {c.review?.verdict === "pass" ? <span className="pass-mark">◎</span> : "○"} 第{c.index}章 {c.title}
+                {c.review?.verdict === "pass" ? (
+                  <span className="pass-mark" title="审查通过">◎</span>
+                ) : c.review?.verdict === "revise" ? (
+                  <span className="revise-mark" title="审查未通过，需修改后再自动连载">✕</span>
+                ) : (
+                  "○"
+                )}{" "}第{c.index}章 {c.title}
               </div>
             ))}
             {p.world.chapters.length === 0 && (
@@ -64,7 +66,7 @@ export const LeftPanel: React.FC<Props> = (p) => {
         )}
 
         {tab === "脉络" && <ContextView world={p.world} chapterIdx={currentIdx} onOpenChar={p.onOpenChar} />}
-        {tab === "规划" && <PlanPanel world={p.world} onWorldUpdate={p.onWorldUpdate} onToast={p.onToast} taskActive={p.taskActive} />}
+        {tab === "规划" && <PlanPanel world={p.world} />}
       </div>
     </div>
   );

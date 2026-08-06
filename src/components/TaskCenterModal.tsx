@@ -7,7 +7,7 @@ import type { AutoSessionView, PendingChapterView } from "./AutoRunPanel";
 /** 从阶段文字推导步骤序号（SSE phase / busyPhase / session.phase 的关键字匹配） */
 function stepIndex(phase: string): number {
   if (phase.includes("考据")) return 1;
-  if (phase.includes("章纲") || phase.includes("大纲")) return 2;
+  if (phase.includes("本章计划") || phase.includes("大纲")) return 2;
   if (phase.includes("写作")) return 3;
   if (phase.includes("审查")) return 4;
   if (phase.includes("修补")) return 5;
@@ -16,7 +16,7 @@ function stepIndex(phase: string): number {
   return 0;
 }
 
-const STEP_NAMES = ["准备", "考据", "章纲", "写作", "审查", "修补", "结算", "存档"];
+const STEP_NAMES = ["准备", "考据", "本章计划", "写作", "审查", "修补", "结算", "存档"];
 
 const StepBar: React.FC<{ phase: string; failed?: boolean }> = (p) => {
   const cur = stepIndex(p.phase);
@@ -45,7 +45,6 @@ type Props = {
   onPause: () => void;
   onResume: () => void;
   onRemove: () => void;
-  onOpenAutoStart: () => void;
   onCancelAdvance: () => void;
   onConfirmPending: () => void;
   onRejectPending: () => void;
@@ -96,20 +95,14 @@ export const TaskCenterModal: React.FC<Props> = (p) => {
                     <button className="btn btn-danger-sm" onClick={p.onRemove} title="取消任务：立即打断并清理会话与暂存区，回到空闲状态后才可手动操作"><X size={14} /> 取消任务</button>
                   </>
                 )}
-                {!running && !paused && (
-                  <button className="btn btn-ghost" onClick={p.onOpenAutoStart}><Play size={14} /> 开始新的连载</button>
-                )}
-                {(running || paused) && p.pending && !hasPendingCommit && (
+                {p.pending && !hasPendingCommit && (
                   <button className="btn btn-ghost" onClick={p.onOpenAutoPanel} title="重试/跳过审查未过的暂存章节"><RefreshCw size={14} /> 处理暂存章节</button>
                 )}
               </div>
             </>
           ) : (
             <>
-              <div className="mem-empty">暂无连载任务</div>
-              <div className="task-actions">
-                <button className="btn btn-primary" onClick={p.onOpenAutoStart}><Play size={14} /> 开始自动连载</button>
-              </div>
+              <div className="mem-empty">暂无连载任务 · 在底部「推进剧情」下拉选「章节连载」开始</div>
             </>
           )}
 

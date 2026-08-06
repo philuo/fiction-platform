@@ -17,10 +17,11 @@ import { auditWorld, deleteChapterCascade } from "./integrity";
 import { buildAutoLore, sanitizeLore } from "./lore";
 import {
   activeForeshadows, emptyWorld, genOf, worldSummary, DEFAULT_GEN,
-  type Card, type Character, type Chapter, type ChapterPlan, type ConsistencyReport, type GenProfile,
+  type Card, type Character, type Chapter, type ChapterPlan, type ChapterVersion, type ConsistencyReport, type GenProfile,
   type LoreEntry, type PendingChapter, type ReviewResult, type SteeringItem, type WorldState,
 } from "./world";
 import { writeChapter } from "./writer";
+import { applyBrainReview, brainGateEnabled, brainReviewAfterCommit, computeDisposition } from "./brain";
 
 // —— SSE v2 事件协议（保留旧 writing/reviewing/saving/result 字段向后兼容） ——
 export type StepPhase = "writing" | "delta" | "selfcheck" | "reviewing" | "patching" | "settling" | "saving" | "interrupted" | "done";
@@ -194,7 +195,7 @@ function registerDebtFindings(w: WorldState, chapterIndex: number, findings: { s
 
 /**
  * 统一章节管线（P2 核心）：写 → 自检 → 审 → patch/重写(≤1轮) → 记账 → 存档。
- * plan 为章纲（P3 planner 供给，当前可为 null）；onEvent 透传 SSE v2 事件。
+ * plan 为本章计划（P3 planner 供给，当前可为 null）；onEvent 透传 SSE v2 事件。
  * 阶段边界检测 steering 打断：命中即抛 InterruptedError（草稿未 commit，零污染）。
  */
 /** 审查已通过但 commitPolicy=confirm：章节暂存待人工确认（未 commit，草稿进暂存区） */
@@ -243,17 +244,17 @@ export async function writeOneChapter(
     try {
       await healLegacyStory(world);
     } catch {
-      /* 自愈失败则走无章纲模式 */
+      /* 自愈失败则走无本章计划模式 */
     }
   }
 
-  // ①' 取章纲（外部指定优先；缺失 → 滚动展开当前弧）
+  // ①' 取本章计划（外部指定优先；缺失 → 滚动展开当前弧）
   let plan: ChapterPlan | null = overridePlan ?? null;
   if (!plan) {
     try {
       plan = await ensureChapterPlan(world, idx);
     } catch {
-      /* 展开失败不阻塞写作（降级无章纲模式） */
+      /* 展开失败不阻塞写作（降级无本章计划模式） */
     }
   }
 
@@ -391,7 +392,7 @@ async function reviewFixLoop(
 }
 
 /**
- * 章节提交（git commit 语义）：入册 + 版本快照基线 + 记账结算 + 质量债务 + 章纲核销/弧边界 + nextChapter + 存档 + checkpoint。
+ * 章节提交（git commit 语义）：入册 + 版本快照基线 + 记账结算 + 质量债务 + 本章计划核销/弧边界 + nextChapter + 存档 + checkpoint。
  * 供新章写入（writeOneChapter）与暂存区重试（retryChapter）复用。
  */
 export async function commitChapter(
@@ -424,9 +425,33 @@ export async function commitChapter(
     resolvedForeshadows: report.resolvedForeshadows,
     newProposals: report.newProposals,
   });
+  // 中枢章末一致性审查（P1 窗口：settleChapter 后、registerDebt 前；BRAIN §5.1 / DEEP-DIVE §1.1）
+  // 仅 AGNES_BRAIN_GATE=on 时执行 LLM 审查（revise→注入 mergeTasks 通道；reject→记录不强制回滚）；
+  // off 时仅记确定性 goal disposition（零 LLM、零行为变化，BRAIN §3.3 P1 确定性版本）
+  const disposition = computeDisposition(world);
+  if (brainGateEnabled()) {
+    const brainOut = await brainReviewAfterCommit(world, index, {
+      text,
+      settleSummary: report.summary.summary,
+      planGoal: plan?.goal,
+    });
+    applyBrainReview(world, index, brainOut, `章末一致性审查（${brainOut.verdict}）：${brainOut.reason ?? "放行"}；goal=${disposition}`);
+  } else {
+    logChange(world, {
+      chapter: index,
+      actor: "brain",
+      kind: "brain-disposition",
+      detail: `goal disposition: ${disposition}（第 ${index} 章《${title}》提交后）`,
+      commandId: "CMD-L01",
+      meta: { goal: world.goal ?? null },
+    });
+  }
   // 质量债务登记（minor 不阻塞）
   registerDebt(world, index, verdict);
-  // 章纲核销 + 弧/卷边界（滚动规划：弧摘要→展开下一弧；卷边界→指南针校准）
+  // 下一章号先递增：弧/卷边界处理内 expandArc 的 startIdx 依赖已递增的 nextChapter，
+  // 若后置会与刚完成的本章章号重叠（弧计划残留 planned、弧/卷永不 done）
+  world.nextChapter++;
+  // 本章计划核销 + 弧/卷边界（滚动规划：弧摘要→展开下一弧；卷边界→指南针校准）
   const boundary = markChapterDone(world, index);
   if (boundary) {
     try {
@@ -435,7 +460,6 @@ export async function commitChapter(
       /* 弧边界处理失败不阻塞存档，下回合重试 */
     }
   }
-  world.nextChapter++;
   onEvent?.({ phase: "saving" });
   saveWorld(world);
   appendCheckpoint(world.title, args.checkpointStep ?? "commit", index);
@@ -464,7 +488,7 @@ export async function retryChapter(
   onEvent?: (e: StepEvent) => void,
 ): Promise<StepResult> {
   const chapterIndex = pending.chapterIndex;
-  // 取章纲（缺失时滚动展开；失败降级无章纲模式）
+  // 取本章计划（缺失时滚动展开；失败降级无本章计划模式）
   let plan: ChapterPlan | null = null;
   try {
     plan = await ensureChapterPlan(world, chapterIndex);
@@ -548,7 +572,7 @@ export async function confirmPendingChapter(world: WorldState): Promise<StepResu
     { index: pending.chapterIndex, title: pending.title, text: pending.text, verdict, plan, rounds: verdict.round, instructions: [], appliedCards: [], checkpointStep: "confirm-commit" },
   );
   clearPendingChapter(world.title);
-  logChange(world, { chapter: pending.chapterIndex, actor: "user", kind: "chapter-confirm", detail: `人工确认第 ${pending.chapterIndex} 章《${pending.title}》入册（审查通过后待确认模式）` });
+  logChange(world, { chapter: pending.chapterIndex, actor: "user", kind: "chapter-confirm", detail: `人工确认第 ${pending.chapterIndex} 章《${pending.title}》入册（审查通过后待确认模式）`, commandId: "CMD-N04" });
   saveWorld(world);
   return { chapter, review: toReviewResult(verdict), critic: verdict, rounds: verdict.round, instructions: [], appliedCards: [], world };
 }
@@ -577,7 +601,7 @@ export function gachaApply(
   if (!picked.length) throw new Error("未选中任何卡牌");
   const { instructions, applied } = applyCards(world, picked);
   world.pendingCards = []; // 清空已用卡池
-  logChange(world, { chapter: world.nextChapter, actor: "user", kind: "gacha-apply", detail: `抽卡应用 ${applied.length} 张：${applied.map((c) => `「${c.title}」(${c.type})`).join("、").slice(0, 200)}` });
+  logChange(world, { chapter: world.nextChapter, actor: "user", kind: "gacha-apply", detail: `抽卡应用 ${applied.length} 张：${applied.map((c) => `「${c.title}」(${c.type})`).join("、").slice(0, 200)}`, commandId: "CMD-W18" });
   saveWorld(world);
   return { instructions, applied };
 }
@@ -736,9 +760,41 @@ export function editWorld(world: WorldState, patch: {
     for (const pc of patch.characters) {
       if (!pc || typeof pc !== "object") continue;
       const target = pc.id ? world.characters.find((c) => c.id === pc.id) : undefined;
-      if (!target) continue;
+      if (!target) {
+        // 手动新增角色：id 与姓名均有效且不与既有角色重名时创建（性别仅接受男/女，与立项/提案一致）
+        const name = typeof pc.name === "string" ? pc.name.trim() : "";
+        if (!pc.id || !name) continue;
+        const id = String(pc.id).slice(0, 64);
+        if (world.characters.some((c) => c.id === id)) {
+          throw new Error(`角色 id 冲突：${id} 已存在`);
+        }
+        if (world.characters.some((c) => c.name === name)) {
+          throw new Error(`角色「${name}」已存在`);
+        }
+        world.characters.push({
+          id,
+          name: name.slice(0, 40),
+          role: typeof pc.role === "string" && pc.role.trim() ? pc.role.trim().slice(0, 20) : "配角",
+          gender: pc.gender === "男" || pc.gender === "女" ? pc.gender : undefined,
+          age: typeof pc.age === "string" ? pc.age.trim().slice(0, 20) || undefined : undefined,
+          identity: typeof pc.identity === "string" ? pc.identity.trim().slice(0, 30) || undefined : undefined,
+          traits: Array.isArray(pc.traits) ? pc.traits.map(String).filter((s) => s.trim()) : [],
+          motivation: typeof pc.motivation === "string" ? pc.motivation : "",
+          voice: typeof pc.voice === "string" ? pc.voice.trim().slice(0, 80) || undefined : undefined,
+          status: typeof pc.status === "string" && pc.status.trim() ? pc.status.trim() : "待登场",
+          look: typeof pc.look === "string" ? pc.look.trim().slice(0, 120) || undefined : undefined,
+          relations: {},
+          introducedAt: world.nextChapter,
+        });
+        continue;
+      }
       if (typeof pc.name === "string" && pc.name.trim()) {
         const newName = pc.name.trim();
+        // 重命名撞名拦截：目标名已属于其他角色时拒绝（含同一 patch 内先新增后改名的组合）
+        if (newName !== target.name) {
+          const clash = world.characters.find((c) => c.id !== target.id && c.name === newName);
+          if (clash) throw new Error(`角色「${newName}」已存在`);
+        }
         // 角色重命名：先记录，字段合并完成后全局传播（关系键/章节/大纲/世界书/伏笔/弧线/时间线）
         if (newName !== target.name && target.name.length >= 2) {
           renames.push({ from: target.name, to: newName });
@@ -829,7 +885,7 @@ function applyRename(w: WorldState, from: string, to: string): void {
     note: a.note.includes(from) ? rep(a.note) : a.note,
   }));
   w.timeline = w.timeline.map((t) => ({ ...t, summary: t.summary.includes(from) ? rep(t.summary) : t.summary }));
-  // 章纲与摘要同步（长篇架构新字段）
+  // 本章计划与摘要同步（长篇架构新字段）
   w.chapterPlans = (w.chapterPlans ?? []).map((p) => ({
     ...p,
     goal: p.goal.includes(from) ? rep(p.goal) : p.goal,
@@ -849,9 +905,16 @@ function applyRename(w: WorldState, from: string, to: string): void {
   recomputeAppearedIn(w); // 重命名后按新角色名重算登场记录
 }
 
-/** 章节版本快照：变更前保存当前版本（上限 10） */
+/** 版本内容与当前章节内容是否完全一致（标题/正文/审查）——快照去重与无意义回滚判定共用 */
+function versionMatchesCurrent(ch: Chapter, v: ChapterVersion): boolean {
+  return v.title === ch.title && v.text === ch.text && JSON.stringify(v.review ?? null) === JSON.stringify(ch.review ?? null);
+}
+
+/** 章节版本快照：变更前保存当前版本（上限 10）。
+ * 内容与任一已有版本完全一致时不重复快照——避免来回回滚/自我回滚让版本表塞满重复项、挤掉真实历史。 */
 function snapshotVersion(ch: Chapter, reason?: string): void {
   const versions = ch.versions ?? [];
+  if (versions.some((v) => versionMatchesCurrent(ch, v))) return;
   versions.push({ title: ch.title, text: ch.text, review: ch.review, at: new Date().toISOString(), reason });
   ch.versions = versions.slice(-10);
 }
@@ -879,7 +942,7 @@ export async function editChapter(world: WorldState, index: number, text: string
   ch.updatedAt = new Date().toISOString();
   recomputeAppearedIn(world); // 正文变更后同步出场角色
   markOrphanMedia(ch); // 媒体锚定失配检测（落盘前，orphan 标记随存档持久化）
-  logChange(world, { chapter: index, actor: "user", kind: "chapter-edit", detail: `手动编辑第 ${index} 章《${ch.title}》正文（自动留版本快照）` });
+  logChange(world, { chapter: index, actor: "user", kind: "chapter-edit", detail: `手动编辑第 ${index} 章《${ch.title}》正文（自动留版本快照）`, commandId: "CMD-N06" });
   saveWorld(world);
   // 人工编辑后自动审查，但不自动重写
   let review: ReviewResult | null = null;
@@ -920,6 +983,8 @@ export async function rollbackChapter(world: WorldState, index: number, versionI
   const versions = ch.versions ?? [];
   const v = versions[versionIndex];
   if (!v) throw new Error(`版本不存在: ${versionIndex}`);
+  // 目标版本与当前内容完全一致（标题/正文/审查）→ 拒绝无意义回滚，避免"自己回滚自己"产生重复快照
+  if (versionMatchesCurrent(ch, v)) throw new Error("当前内容已与该版本一致，无需回滚");
   snapshotVersion(ch, `回滚到版本 ${versionIndex + 1}`);
   ch.title = v.title;
   ch.text = v.text;
@@ -944,7 +1009,7 @@ export async function rollbackChapter(world: WorldState, index: number, versionI
     /* 记账失败不阻塞回滚 */
   }
   const report = chapterChangeReport(world, ch);
-  logChange(world, { chapter: index, actor: "user", kind: "chapter-rollback", detail: `回滚第 ${index} 章《${ch.title}》到版本 ${versionIndex + 1}（账本已重算）` });
+  logChange(world, { chapter: index, actor: "user", kind: "chapter-rollback", detail: `回滚第 ${index} 章《${ch.title}》到版本 ${versionIndex + 1}（账本已重算）`, commandId: "CMD-N07" });
   saveWorld(world);
   return { world, report };
 }
@@ -1030,7 +1095,7 @@ export async function regenerateChapter(
   onEvent?.({ phase: "saving" });
   recomputeAppearedIn(world);
   const report = chapterChangeReport(world, ch); // 重写后媒体 anchor 大概率失配：检测并标记
-  logChange(world, { chapter: index, actor: "user", kind: "chapter-regenerate", detail: `AI 重写第 ${index} 章《${ch.title}》（第 ${rounds} 轮通过审查，账本已重算）` });
+  logChange(world, { chapter: index, actor: "user", kind: "chapter-regenerate", detail: `AI 重写第 ${index} 章《${ch.title}》（第 ${rounds} 轮通过审查，账本已重算）`, commandId: "CMD-N05" });
   saveWorld(world);
   appendCheckpoint(world.title, "regenerate", index);
   return { chapter: ch, review: toReviewResult(verdict), rounds, world, report };
@@ -1049,6 +1114,7 @@ export function deleteChapter(world: WorldState, index: number): { world: WorldS
     actor: "user",
     kind: "chapter-delete",
     detail: `删除第 ${index} 章《${ch.title}》（随删 ${cascade.removedForeshadows} 条活跃伏笔、${cascade.mediaPaths.length} 个媒体文件、${cascade.versionFilePaths.length} 个版本快照）`,
+    commandId: "CMD-N08",
   });
   appendCheckpoint(world.title, "delete", index);
   // 级联 findings + 残留审计（按稳定 id 去重）
