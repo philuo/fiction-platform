@@ -1571,18 +1571,11 @@ const Home: React.FC<HomeProps> = (props) => {
     };
   }, [chapterMenu, confirmMsg, showNewStory, showGacha, showSettings, relModal, showVersions, reviewOpen, regenMedia, mediaPlan, deletePreview, integrityView]);
 
-  // 流派标签事件委托（避免 hydration 不匹配）
+  // 流派标签高亮同步（active 类仅客户端同步，避免 SSR 差异；点击事件内联在按钮上）
   const genreTagsRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     const el = genreTagsRef.current;
     if (!el) return;
-    const onClick = (e: MouseEvent) => {
-      const btn = (e.target as HTMLElement).closest("[data-gi]") as HTMLElement | null;
-      if (!btn) return;
-      const idx = Number(btn.dataset.gi);
-      const t = GENRE_TEMPLATES[idx];
-      if (t) { setIdea(t.idea); setGenre(t.genre); }
-    };
     const syncActive = () => {
       const btns = el.querySelectorAll("[data-gi]");
       btns.forEach((btn) => {
@@ -1590,10 +1583,8 @@ const Home: React.FC<HomeProps> = (props) => {
         btn.classList.toggle("active", GENRE_TEMPLATES[idx]?.genre === genre);
       });
     };
-    el.addEventListener("click", onClick);
-    syncActive(); // 挂载时同步一次（客户端 only）
-    return () => el.removeEventListener("click", onClick);
-  }, [genre]);
+    syncActive(); // 弹窗打开 / 题材变化时同步高亮（客户端 only）
+  }, [genre, showNewStory]);
 
   return (
     <>
@@ -1649,7 +1640,7 @@ const Home: React.FC<HomeProps> = (props) => {
 
       {/* 新建小说弹窗 */}
       {showNewStory && (
-        <div className="modal-mask" onClick={() => setShowNewStory(false)}>
+        <div className="modal-mask" onMouseDown={(e) => { if (e.target === e.currentTarget) setShowNewStory(false); }}>
           <div className="modal modal-new-story" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">
               <b style={{ fontFamily: "var(--sans)", letterSpacing: "0.25em" }}><Sparkles size={14} /> 新建小说</b>
@@ -1670,7 +1661,13 @@ const Home: React.FC<HomeProps> = (props) => {
               <label>或选择流派模板（点击即填充）</label>
               <div className="genre-tags" ref={genreTagsRef}>
                 {GENRE_TEMPLATES.map((t, i) => (
-                  <button className="genre-tag" data-gi={i} type="button" key={i}>
+                  <button
+                    className="genre-tag"
+                    data-gi={i}
+                    type="button"
+                    key={i}
+                    onClick={() => { setIdea(t.idea); setGenre(t.genre); }}
+                  >
                     {t.name}
                   </button>
                 ))}
