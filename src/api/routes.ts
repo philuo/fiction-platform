@@ -141,6 +141,56 @@ function schedulePortraitFor(title: string, w0: WorldState, anchor: string): voi
   })();
 }
 
+/** 角色立绘+头像自动补全（容貌一致：先立绘作样貌基准，再以立绘为参考图图生图生成头像）：
+ * 锁外生成、锁内落盘，失败不阻塞调用方；内存去重防并发重复生成同一角色。调用方勿持锁。
+ * 供「新角色提案确认入册」（同步等待）与「新建小说立项后初始角色」（fire-and-forget）共用。 */
+const charMediaInFlight = new Set<string>();
+async function ensureCharacterMedia(title: string, characterId: string): Promise<void> {
+  const key = `${slug(title)}::${characterId}`;
+  if (charMediaInFlight.has(key)) return;
+  charMediaInFlight.add(key);
+  try {
+    const w1 = loadWorld(title);
+    const nc = w1?.characters.find((x) => x.id === characterId);
+    if (!w1 || !nc) return;
+    // ① 立绘（样貌基准）
+    if (!nc.portrait?.path) {
+      try {
+        const portrait = await generateCharacterPortrait(title, w1, nc);
+        await withTitleLock(slug(title), async () => {
+          const w = loadWorld(title);
+          const cc = w?.characters.find((x) => x.id === characterId);
+          // 锁内复查：生成期间用户可能已手动生成立绘，不覆盖
+          if (w && cc && !cc.portrait?.path) { cc.portrait = portrait; saveWorld(w); }
+        });
+      } catch (e) {
+        console.warn(`[media] 角色立绘自动生成失败（稍后可手动补）: ${nc.name}`, (e as Error).message);
+      }
+    }
+    // ② 头像（以新立绘为参考图，容貌与立绘一致）
+    const w2 = loadWorld(title);
+    const cc2 = w2?.characters.find((x) => x.id === characterId) ?? nc;
+    if ((w2 ?? w1) && !cc2.image) {
+      try {
+        const ref = cc2.portrait?.path
+          ? mediaDataUri(title, { id: cc2.portrait.mediaId, kind: "image", anchor: cc2.name, path: cc2.portrait.path, status: "ready" })
+          : undefined;
+        const avatar = await generateCharacterAvatar(title, w2 ?? w1, cc2, { refImage: ref });
+        await withTitleLock(slug(title), async () => {
+          const w = loadWorld(title);
+          const cc = w?.characters.find((x) => x.id === characterId);
+          // 锁内复查：生成期间用户可能已手动生成头像，不覆盖
+          if (w && cc && !cc.image) { cc.image = avatar.path; saveWorld(w); }
+        });
+      } catch (e) {
+        console.warn(`[media] 角色头像自动生成失败（稍后可手动补）: ${cc2.name}`, (e as Error).message);
+      }
+    }
+  } finally {
+    charMediaInFlight.delete(key);
+  }
+}
+
 /** 返回 null 表示非 API 路径（由调用方继续处理页面渲染） */
 export async function handleApi(pathname: string, req: Request): Promise<Response | null> {
   if (!pathname.startsWith("/api/")) return null;
@@ -241,6 +291,14 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       if (!idea) return json({ error: "缺少 idea" }, 400);
       try {
         const world = await director.newStory(idea, body.genre ? String(body.genre) : undefined);
+        // 立项初始角色自动生成头像 + 立绘（fire-and-forget：不阻塞立项返回，失败静默；
+        // 后台生成完毕落盘后，前端打开设置/刷新即可看到。容貌一致：先立绘再以立绘为参考图生成头像）
+        const fresh = loadWorld(world.title);
+        for (const c of fresh?.characters ?? []) {
+          if (!c.image && !c.portrait?.path) {
+            void ensureCharacterMedia(world.title, c.id).catch(() => {});
+          }
+        }
         return json({ ok: true, world: sanitize(world) });
       } catch (e) {
         console.error("[api/novel/new]", e);
@@ -400,15 +458,15 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         const out = await withTitleLock(slug(title), async () => {
           const w = loadWorld(title);
           if (!w) throw new AppError("故事不存在: " + title);
+          // 最新已写章节号（add 默认埋设章 / update 手动回收章的默认回收章共用）
+          const latestChapter = w.chapters.length ? Math.max(...w.chapters.map((c) => c.index)) : (w.nextChapter ?? 1);
           let fsDetail = "";
           if (action === "add") {
             const text = String(body.text ?? "").trim();
             if (!text) throw new AppError("伏笔内容不能为空");
             const id = `fs_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
             // 默认归属最新已写章节（手动登记属既有账目）；无章节时才落下一章（待埋设）
-            const plantedAt = typeof body.plantedAt === "number"
-              ? body.plantedAt
-              : (w.chapters.length ? Math.max(...w.chapters.map((c) => c.index)) : (w.nextChapter ?? 1));
+            const plantedAt = typeof body.plantedAt === "number" ? body.plantedAt : latestChapter;
             w.foreshadowing.push({ id, text, plantedAt, status: "planted", note: String(body.note ?? "") || undefined });
             fsDetail = `新增伏笔「${text.slice(0, 40)}」（埋设于第 ${plantedAt} 章）`;
           } else if (action === "update") {
@@ -417,7 +475,15 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             if (!f) throw new AppError("伏笔不存在: " + id);
             if (body.text !== undefined) f.text = String(body.text).trim();
             if (body.note !== undefined) f.note = String(body.note).trim() || undefined;
-            if (body.status !== undefined) f.status = String(body.status) as "planted" | "active" | "resolved";
+            if (body.status !== undefined) {
+              const nextStatus = String(body.status) as "planted" | "active" | "resolved";
+              f.status = nextStatus;
+              // 状态联动回收章（数据一致性）：标为已回收 → 自动填当前最新已写章节；解除已回收 → 清除回收记录
+              if (nextStatus === "resolved") f.resolvedAt = f.resolvedAt ?? latestChapter;
+              else delete f.resolvedAt;
+            }
+            // 存量数据兜底：已是已回收但缺回收章的补齐（旧数据修复）
+            if (f.status === "resolved" && f.resolvedAt == null) f.resolvedAt = latestChapter;
             fsDetail = `修改伏笔「${f.text.slice(0, 40)}」（${[body.text !== undefined ? "内容" : null, body.note !== undefined ? "备注" : null, body.status !== undefined ? `状态→${body.status}` : null].filter(Boolean).join("/") || "字段"}）`;
           } else if (action === "delete") {
             const id = String(body.id ?? "");
@@ -437,7 +503,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           // 全局账本确定性对齐（零 LLM、幂等；修复项随存档落盘）
           alignWorld(w);
           saveWorld(w);
-          return { foreshadowing: w.foreshadowing };
+          // 返回完整 world：alignWorld 修复/回收章联动等变更全部同步到前端，避免局部浅合并丢字段
+          return { foreshadowing: w.foreshadowing, world: sanitize(w) };
         });
         return json({ ok: true, ...out });
       } catch (e) {
@@ -788,7 +855,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
                 id: `c${Date.now().toString(36)}`,
                 name: p.name,
                 role: p.role || "配角",
-                gender: p.gender,
+                // 与立项一致：性别只接受「男/女」，非法值一律丢弃（面板无 AI 推断选项）
+                gender: p.gender === "男" || p.gender === "女" ? p.gender : undefined,
                 age: p.age,
                 identity: p.identity,
                 traits: p.traits,
@@ -808,44 +876,14 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           saveWorld(w);
           return sanitize(w);
         });
-        // 新增角色自动生成立绘 + 头像（容貌一致：先立绘作样貌基准，再以立绘为参考图图生图生成头像）；均锁外生成、锁内落盘，失败不阻塞入册
+        // 新增角色自动生成头像 + 立绘（容貌一致：先立绘作样貌基准，再以立绘为参考图图生图生成头像）；锁外生成、锁内落盘，失败不阻塞入册
         let finalWorld = world;
         if (action === "confirm" && createdName) {
           const w1 = loadWorld(title);
           const nc = w1?.characters.find((x) => x.name === createdName);
           if (w1 && nc) {
-            // ① 立绘（样貌基准）
-            if (!nc.portrait?.path) {
-              try {
-                const portrait = await generateCharacterPortrait(title, w1, nc);
-                await withTitleLock(slug(title), async () => {
-                  const w = loadWorld(title);
-                  const cc = w?.characters.find((x) => x.id === nc.id);
-                  if (w && cc) { cc.portrait = portrait; saveWorld(w); }
-                });
-              } catch (e) {
-                console.warn("[api/novel/proposal] 新角色立绘自动生成失败（稍后可手动补）:", (e as Error).message);
-              }
-            }
-            // ② 头像（以新立绘为参考图，容貌与立绘一致）
-            if (!nc.image) {
-              try {
-                const w2 = loadWorld(title);
-                const cc2 = w2?.characters.find((x) => x.id === nc.id) ?? nc;
-                const ref = cc2.portrait?.path
-                  ? mediaDataUri(title, { id: cc2.portrait.mediaId, kind: "image", anchor: cc2.name, path: cc2.portrait.path, status: "ready" })
-                  : undefined;
-                const avatar = await generateCharacterAvatar(title, w2 ?? w1, cc2, { refImage: ref });
-                await withTitleLock(slug(title), async () => {
-                  const w = loadWorld(title);
-                  const cc = w?.characters.find((x) => x.id === nc.id);
-                  if (w && cc) { cc.image = avatar.path; saveWorld(w); }
-                });
-                finalWorld = sanitize(loadWorld(title)!);
-              } catch (e) {
-                console.warn("[api/novel/proposal] 新角色头像自动生成失败（稍后可手动补）:", (e as Error).message);
-              }
-            }
+            await ensureCharacterMedia(title, nc.id);
+            finalWorld = sanitize(loadWorld(title)!);
           }
         }
         return json({ ok: true, world: finalWorld });

@@ -1695,7 +1695,7 @@ const Home: React.FC<HomeProps> = (props) => {
             status={statusText}
             chapter={shownChapter}
             onBackToList={backToList}
-            onOpenSettings={() => setShowSettings(true)}
+            onOpenSettings={() => { setShowSettings(true); void refreshWorld(); }}
             brain={(
               <BrainIndicator
                 action={busyPhase || ((autoSession?.status === "running" || autoSession?.status === "paused") && autoSession.phase ? `连载·${autoSession.phase}` : "")}

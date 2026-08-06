@@ -81,8 +81,8 @@ export function toReviewResult(v: CriticVerdict): ReviewResult {
 
 const INIT_SYSTEM = `你是小说立项导演。根据用户的一句话灵感，生成世界设定与核心人物。
 输出必须是合法 JSON（不要 markdown 围栏）：
-{"title":"书名","genre":"题材","premise":"一句话梗概","setting":{"time":"时代","place":"主要地点","rules":["世界规则/约束 2-4条"],"tone":"文风基调"},"characters":[{"name":"名字","role":"主角/反派/配角","traits":["特质"],"motivation":"动机","secret":"秘密或没有","status":"初始状态","relations":{},"voice":"说话风格（如：简短冷峻，爱用反问句；或：温婉绵长，常用比喻）"}]}
-要求：人物 2-4 个，性格鲜明有冲突；设定规则具体（能力体系/社会规则/禁忌）。
+{"title":"书名","genre":"题材","premise":"一句话梗概","setting":{"time":"时代","place":"主要地点","rules":["世界规则/约束 2-4条"],"tone":"文风基调"},"characters":[{"name":"名字","gender":"男或女","age":"年龄（如：二十出头）","identity":"社会身份/职业","role":"主角/反派/配角","traits":["特质"],"motivation":"动机","secret":"秘密或没有","status":"初始状态","relations":{},"voice":"说话风格（如：简短冷峻，爱用反问句；或：温婉绵长，常用比喻）"}]}
+要求：人物 2-4 个，性格鲜明有冲突；性别必须且只能是「男」或「女」，不得留空、不得写「未知」；设定规则具体（能力体系/社会规则/禁忌）。
 字符串值内部一律使用中文引号「」/『』，禁止英文双引号。`;
 
 export async function newStory(idea: string, genre?: string): Promise<WorldState> {
@@ -91,7 +91,7 @@ export async function newStory(idea: string, genre?: string): Promise<WorldState
     genre?: string;
     premise?: string;
     setting?: { time?: string; place?: string; rules?: string[]; tone?: string };
-    characters?: { name?: string; role?: string; traits?: string[]; motivation?: string; secret?: string; status?: string; relations?: Record<string, string>; voice?: string }[];
+    characters?: { name?: string; gender?: string; age?: string; identity?: string; role?: string; traits?: string[]; motivation?: string; secret?: string; status?: string; relations?: Record<string, string>; voice?: string }[];
   }>(
     [
       { role: "system", content: INIT_SYSTEM },
@@ -114,6 +114,10 @@ export async function newStory(idea: string, genre?: string): Promise<WorldState
   w.characters = (Array.isArray(out.characters) ? out.characters : []).map((c, i) => ({
     id: `c${i + 1}`,
     name: String(c.name ?? `角色${i + 1}`).trim(),
+    // 性别只接受「男/女」：非法值（空/未知/AI 推断）一律丢弃，保证立项角色性别明确
+    gender: c.gender === "男" || c.gender === "女" ? c.gender : undefined,
+    age: c.age ? String(c.age).trim().slice(0, 20) : undefined,
+    identity: c.identity ? String(c.identity).trim().slice(0, 40) : undefined,
     role: String(c.role ?? "配角").trim(),
     traits: Array.isArray(c.traits) ? c.traits.map(String) : [],
     motivation: String(c.motivation ?? "").trim(),

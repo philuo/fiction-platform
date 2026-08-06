@@ -866,7 +866,8 @@ const CharacterEditor: React.FC<{ world: WorldState; onSave: Props["onSave"]; on
             <div className="field" style={{ flex: 1 }}>
               <label>性别</label>
               <select value={gender} onChange={(e) => setGender(e.target.value)}>
-                <option value="">未知（AI 推断）</option>
+                {/* 只有男/女可选；存量数据未设置性别的角色显示不可选占位，保存前必须选择 */}
+                {!gender && <option value="" disabled>（未设置，请选择）</option>}
                 <option value="男">男</option>
                 <option value="女">女</option>
               </select>

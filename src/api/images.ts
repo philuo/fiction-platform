@@ -90,7 +90,9 @@ export function saveImage(storyTitle: string, name: string, data: Uint8Array): s
 export function readImage(storyTitle: string, rel: string): Uint8Array | null {
   const base = join(process.cwd(), "data", slugify(storyTitle));
   const full = join(base, rel);
-  if (!full.startsWith(base + "/") && full !== base) return null;
+  // Windows/Unix 分隔符兼容：归一化后比较前缀，防止 base/ 与 join 结果（反斜杠）不匹配
+  const norm = (p: string) => p.replace(/[\\/]+/g, "/");
+  if (!norm(full).startsWith(norm(base) + "/") || norm(full) === norm(base)) return null;
   try {
     if (!statSync(full).isFile()) return null;
   } catch {
@@ -103,7 +105,8 @@ export function readImage(storyTitle: string, rel: string): Uint8Array | null {
 export function deleteMediaFile(storyTitle: string, rel: string): boolean {
   const base = join(process.cwd(), "data", slugify(storyTitle));
   const full = join(base, rel);
-  if (!full.startsWith(base + "/") || full === base) return false;
+  const norm = (p: string) => p.replace(/[\\/]+/g, "/");
+  if (!norm(full).startsWith(norm(base) + "/") || norm(full) === norm(base)) return false;
   try {
     if (!statSync(full).isFile()) return false;
     rmSync(full);

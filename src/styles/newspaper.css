@@ -1186,6 +1186,64 @@ video.chapter-media { aspect-ratio: 896 / 560; object-fit: cover; background: #1
   transform: rotate(90deg);
 }
 
+/* 立绘弹窗：头部固定 + 图片区自适应 + 底部操作区固定（编辑状态底部留足空间，textarea 不被图片挤压；超高时图片区内滚动） */
+.portrait-modal { max-width: 640px; }
+.portrait-media {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.7rem;
+  padding: 1.2rem;
+}
+.portrait-media .portrait-img {
+  /* 关键：flex-shrink:0 防压缩 + max-height:100% 在可用空间内等比缩放，超高时交由 .portrait-media 滚动 */
+  flex-shrink: 0;
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: 9 / 16;
+  object-fit: cover;
+  border: 1px solid var(--line-strong);
+  background: var(--paper-dark);
+  box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.12);
+}
+.portrait-placeholder {
+  flex-shrink: 0;
+  width: 100%;
+  max-width: min(100%, calc(58vh * 9 / 16));
+  max-height: 100%;
+  aspect-ratio: 9 / 16;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  border: 1px dashed var(--line-strong);
+  background: var(--paper-dark);
+  color: var(--ink-soft);
+  font-size: 0.8rem;
+}
+.portrait-actions {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.6rem;
+  border-top: 1px solid var(--line-strong);
+  background: var(--paper);
+  padding: 0.9rem 1.2rem 1.1rem;
+}
+.portrait-actions .regen-prompt-input { min-height: 3.6rem; }
+.portrait-hint {
+  font-size: 0.72rem;
+  color: var(--ink-soft);
+  text-align: center;
+  margin: 0;
+}
+
 /* ============ 双滑块范围（可复用 RangeSlider） ============ */
 .range-wrap { position: relative; height: 30px; }
 .range-wrap input[type="range"] {
@@ -3439,3 +3497,6 @@ html { scroll-behavior: smooth; }
   color: var(--ink);
   padding: 0.15rem 0.25rem;
 }
+/* 删除两段确认：待确认行整行高亮，明确当前危险操作对象 */
+.fs-row-del-confirm td { background: rgba(176, 58, 46, 0.07); }
+.fs-row-del-confirm .fs-cell-input:focus { background: var(--paper); }
