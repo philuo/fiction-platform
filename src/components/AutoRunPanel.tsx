@@ -1,5 +1,6 @@
 // 连载控制台（git 式自动连载可视化）：进度 / 每章状态 / 审查失败详情 / 停止·重试·跳过·放弃
 import { AlertTriangle, RefreshCw, X } from "./icons";
+import { lensCn } from "../terms";
 
 export type AutoSessionView = {
   status: "running" | "paused" | "stopped" | "done";
@@ -97,12 +98,12 @@ export const AutoRunPanel: React.FC<Props> = (p) => {
               </b>
             </div>
             <div style={{ fontSize: "0.76rem", color: "var(--ink-soft)", marginBottom: "0.3rem" }}>
-              已登记 {majors.length} 条 major / {findings.length} 条问题至质量债务（共 {p.debtCount} 条未处置），修复通过后再继续连载。
+              已登记 {majors.length} 条严重 / {findings.length} 条问题至质量债务（共 {p.debtCount} 条未处置），修复通过后再继续连载。
             </div>
             {findings.map((f, i) => (
               <div key={i} style={{ fontSize: "0.74rem", marginBottom: "0.25rem", lineHeight: 1.6 }}>
-                <span className={`fs-status ${f.severity === "major" ? "fs-active" : ""}`}>{f.severity === "major" ? "● major" : "○ minor"}</span>{" "}
-                <b>[{f.lens}]</b> {f.issue}
+                <span className={`fs-status ${f.severity === "major" ? "fs-active" : ""}`}>{f.severity === "major" ? "● 严重" : "○ 轻微"}</span>{" "}
+                <b>[{lensCn(f.lens)}]</b> {f.issue}
                 {f.suggestion && <div style={{ color: "var(--ink-soft)", marginLeft: "1.1rem" }}>建议：{f.suggestion}</div>}
               </div>
             ))}

@@ -2,6 +2,7 @@
 // 数据源：world（SSR/拉取）+ /api/novel/changelog（操作日志端点）
 import { useEffect, useMemo, useState } from "react";
 import type { ChangeLogEntry, WorldState } from "../api/world";
+import { lensCn, severityCn } from "../terms";
 import { X } from "./icons";
 
 type Tab = "memory" | "ledger" | "log";
@@ -43,7 +44,8 @@ export const MemoryAuditModal: React.FC<{ world: WorldState; onClose: () => void
     const kw = kindFilter.trim().toLowerCase();
     return [...entries]
       .sort((a, b) => (b.at ?? "").localeCompare(a.at ?? ""))
-      .filter((e) => (actorFilter === "all" || e.actor === actorFilter))
+      // 操作者筛选合并为三档：全部 / 用户（user）/ AI（其余全部归 AI 组：ai/brain/system/integrity 等自动操作）
+      .filter((e) => actorFilter === "all" || (actorFilter === "user" ? e.actor === "user" : e.actor !== "user"))
       .filter((e) => !kw || (e.kind ?? "").toLowerCase().includes(kw) || (e.detail ?? "").toLowerCase().includes(kw));
   }, [entries, actorFilter, kindFilter]);
 
@@ -145,52 +147,54 @@ export const MemoryAuditModal: React.FC<{ world: WorldState; onClose: () => void
           {tab === "ledger" && (
             <>
               <div className="mem-group-title">伏笔账（{w.foreshadowing.length}：活跃 {w.foreshadowing.filter((f) => f.status !== "resolved").length}）</div>
-              <table className="mem-table">
-                <thead><tr><th>内容</th><th>状态</th><th>埋设</th><th>回收</th><th>备注</th></tr></thead>
+              <table className="mem-table fs-ledger">
+                <thead><tr><th className="mem-col-main">内容</th><th className="mem-col-narrow">状态</th><th className="mem-col-narrow">埋设</th><th className="mem-col-narrow">回收</th><th className="mem-col-main">备注</th></tr></thead>
                 <tbody>
                   {w.foreshadowing.map((f) => (
                     <tr key={f.id}>
-                      <td>{f.text}</td>
-                      <td><span className={`mem-badge ${f.status === "resolved" ? "" : f.status === "active" ? "mem-badge-warn" : "mem-badge-off"}`}>{FS_STATUS_TEXT[f.status] ?? f.status}</span></td>
-                      <td>第{f.plantedAt}章</td>
-                      <td>{f.resolvedAt ? `第${f.resolvedAt}章` : "—"}</td>
-                      <td>{f.note ?? "—"}</td>
+                      <td className="mem-col-main">{f.text}</td>
+                      <td className="mem-col-narrow"><span className={`mem-badge ${f.status === "resolved" ? "" : f.status === "active" ? "mem-badge-warn" : "mem-badge-off"}`}>{FS_STATUS_TEXT[f.status] ?? f.status}</span></td>
+                      <td className="mem-col-narrow">第{f.plantedAt}章</td>
+                      <td className="mem-col-narrow">{f.resolvedAt ? `第${f.resolvedAt}章` : "—"}</td>
+                      <td className="mem-col-main">{f.note ?? "—"}</td>
                     </tr>
                   ))}
                   {w.foreshadowing.length === 0 && <tr><td colSpan={5} className="mem-empty">暂无伏笔</td></tr>}
                 </tbody>
               </table>
               <div className="mem-group-title">时间线</div>
-              <table className="mem-table">
-                <thead><tr><th>章</th><th>事件</th></tr></thead>
+              <table className="mem-table tl-ledger">
+                <thead><tr><th className="mem-col-narrow">章</th><th className="mem-col-main">事件</th></tr></thead>
                 <tbody>
-                  {(w.timeline ?? []).map((t) => (<tr key={t.chapter}><td>第{t.chapter}章</td><td>{t.summary}</td></tr>))}
+                  {(w.timeline ?? []).map((t) => (<tr key={t.chapter}><td className="mem-col-narrow">第{t.chapter}章</td><td className="mem-col-main">{t.summary}</td></tr>))}
                   {(w.timeline ?? []).length === 0 && <tr><td colSpan={2} className="mem-empty">暂无</td></tr>}
                 </tbody>
               </table>
               <div className="mem-group-title">情节弧线（{(w.plotThreads ?? []).length}）</div>
-              <table className="mem-table">
-                <thead><tr><th>弧线</th><th>状态</th><th>最近进展</th></tr></thead>
+              <table className="mem-table arc-ledger">
+                <thead><tr><th className="mem-col-main">弧线</th><th className="mem-col-narrow">状态</th><th className="mem-col-main">最近进展</th></tr></thead>
                 <tbody>
                   {(w.plotThreads ?? []).map((a) => (
                     <tr key={a.id}>
-                      <td>{a.name}</td>
-                      <td><span className={`mem-badge ${a.status === "已解决" ? "" : "mem-badge-warn"}`}>{a.status}</span></td>
-                      <td>{a.note || "—"}</td>
+                      <td className="mem-col-main">{a.name}</td>
+                      <td className="mem-col-narrow"><span className={`mem-badge ${a.status === "已解决" ? "" : "mem-badge-warn"}`}>{a.status}</span></td>
+                      <td className="mem-col-main">{a.note || "—"}</td>
                     </tr>
                   ))}
                   {(w.plotThreads ?? []).length === 0 && <tr><td colSpan={3} className="mem-empty">暂无弧线</td></tr>}
                 </tbody>
               </table>
               <div className="mem-group-title">质量债（{(w.qualityDebt ?? []).length}：未清 {(w.qualityDebt ?? []).filter((d) => d.status === "open").length}）</div>
-              <table className="mem-table">
-                <thead><tr><th>章</th><th>维度</th><th>问题</th><th>级别</th><th>状态</th></tr></thead>
+              <table className="mem-table qd-ledger">
+                <thead><tr><th className="mem-col-narrow">章</th><th className="mem-col-narrow">维度</th><th className="mem-col-main">问题</th><th className="mem-col-narrow">级别</th><th className="mem-col-narrow">状态</th></tr></thead>
                 <tbody>
                   {(w.qualityDebt ?? []).map((d) => (
                     <tr key={d.id}>
-                      <td>第{d.chapterIndex}章</td><td>{d.lens}</td><td>{d.issue}</td>
-                      <td><span className={`mem-badge ${d.severity === "major" ? "mem-badge-warn" : "mem-badge-off"}`}>{d.severity}</span></td>
-                      <td>{d.status === "open" ? "待处理" : d.status === "fixed" ? "已修复" : "已忽略"}</td>
+                      <td className="mem-col-narrow">第{d.chapterIndex}章</td>
+                      <td className="mem-col-narrow">{lensCn(d.lens)}</td>
+                      <td className="mem-col-main">{d.issue}</td>
+                      <td className="mem-col-narrow"><span className={`mem-badge ${d.severity === "major" ? "mem-badge-warn" : "mem-badge-off"}`}>{severityCn(d.severity)}</span></td>
+                      <td className="mem-col-narrow">{d.status === "open" ? "待处理" : d.status === "fixed" ? "已修复" : "已忽略"}</td>
                     </tr>
                   ))}
                   {(w.qualityDebt ?? []).length === 0 && <tr><td colSpan={5} className="mem-empty">暂无质量债</td></tr>}
@@ -206,8 +210,6 @@ export const MemoryAuditModal: React.FC<{ world: WorldState; onClose: () => void
                   <option value="all">全部操作者</option>
                   <option value="user">用户</option>
                   <option value="ai">AI</option>
-                  <option value="brain">中枢</option>
-                  <option value="system">系统</option>
                 </select>
                 <input placeholder="筛选 kind / 内容关键字…" value={kindFilter} onChange={(e) => setKindFilter(e.target.value)} />
                 <span className="mem-log-count">{logLoading ? "加载中…" : `${filteredEntries.length} / ${entries.length} 条`}</span>

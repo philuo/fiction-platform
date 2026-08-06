@@ -1,6 +1,7 @@
 // 整书评估面板（P4）：8 维雷达式列表 + 质量债务处置（修复/忽略）
 import { useEffect, useState } from "react";
 import { X } from "./icons";
+import { lensCn } from "../terms";
 import type { WorldState, QualityDebt } from "../api/world";
 
 type EvalReportView = {
@@ -112,7 +113,7 @@ export const EvalModal: React.FC<{
               <h4 style={{ fontFamily: "var(--sans)", fontSize: "0.82rem" }}>待处理质量债务（{debt.length}）</h4>
               {debt.slice(0, 8).map((d) => (
                 <div key={d.id} style={{ display: "flex", alignItems: "center", gap: "0.5rem", fontSize: "0.74rem", marginTop: "0.3rem" }}>
-                  <span className="panel-tag tag-muted">第{d.chapterIndex}章·{d.lens}</span>
+                  <span className="panel-tag tag-muted">第{d.chapterIndex}章·{lensCn(d.lens)}</span>
                   <span style={{ flex: 1 }}>{d.issue.slice(0, 50)}</span>
                   <button className="btn-save btn-xs" disabled={p.taskActive} title={p.taskActive ? "任务运行中已禁止" : undefined} onClick={() => debtAction(d.id, "fix")}>修复</button>
                   <button className="btn-save btn-xs" disabled={p.taskActive} title={p.taskActive ? "任务运行中已禁止" : undefined} onClick={() => debtAction(d.id, "ignore")}>忽略</button>

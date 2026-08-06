@@ -20,6 +20,7 @@ import { MemoryAuditModal } from "../components/MemoryAuditModal";
 import { BrainIndicator } from "../components/BrainIndicator";
 import { TaskCenterModal } from "../components/TaskCenterModal";
 import { ForeshadowModal } from "../components/ForeshadowModal";
+import { lensCn, severityCn } from "../terms";
 
 export type HomeProps = {
   url?: string;
@@ -619,7 +620,7 @@ const Home: React.FC<HomeProps> = (props) => {
     try {
       // 需修改章节：默认按审查意见定向修复（无需用户输入指令）
       const findingsText = (c.review?.findings ?? [])
-        .map((f) => `[${f.lens}/${f.severity}] ${f.issue}（原文：${f.evidence}）建议：${f.suggestion}`)
+        .map((f) => `[${lensCn(f.lens)}/${severityCn(f.severity)}] ${f.issue}（原文：${f.evidence}）建议：${f.suggestion}`)
         .join("\n");
       const autoFix = c.review?.verdict === "revise" && findingsText ? `按以下审查意见修复本章：\n${findingsText}` : undefined;
       const res = await fetch("/api/novel/chapter/regenerate", {

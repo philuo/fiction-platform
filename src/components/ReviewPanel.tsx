@@ -1,14 +1,10 @@
 // 审查报告面板 —— 引用定位高亮 + 伏笔只读弹窗；涉及角色点击打开顶层共享的角色弹窗（由 Home 统一渲染）
 import { useEffect, useRef, useState } from "react";
 import type { Character, Foreshadow, ReviewResult, WorldState } from "../api/world";
+import { LENS_CN } from "../terms";
 import { Stamp } from "./Stamp";
 import { Sparkles } from "./icons";
 
-const LENS_CN: Record<string, string> = {
-  continuity: "连续性", character_state: "角色状态", foreshadow: "伏笔",
-  logic: "逻辑", prose: "文笔", pacing: "节奏", dialogue: "对话",
-  style: "风格", arc: "弧线", general: "综合",
-};
 const SCORE_CN: Record<string, string> = {
   coherence: "连贯", tension: "张力", prose: "文笔", pacing: "节奏", dialogue: "对话",
 };

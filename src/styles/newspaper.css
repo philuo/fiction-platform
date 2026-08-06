@@ -3362,8 +3362,12 @@ html { scroll-behavior: smooth; }
   color: var(--ink-soft);
   border-bottom: 2px solid var(--line-strong);
   padding: 0.25rem 0.4rem;
+  white-space: nowrap; /* 表头不折行 */
 }
-.mem-table td { border-bottom: 1px dotted var(--line); padding: 0.3rem 0.4rem; vertical-align: top; }
+.mem-table td { border-bottom: 1px dotted var(--line); padding: 0.3rem 0.4rem; vertical-align: top; word-break: break-word; }
+/* 台账列宽：窄列（章/状态/级别/埋设/回收）自适应内容不折行，宽列（内容/问题/事件/备注/进展）占据剩余空间 */
+.mem-col-narrow { width: 1%; white-space: nowrap; }
+.mem-col-main { width: auto; }
 /* 操作日志 */
 .mem-log-filter { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.7rem; flex-wrap: wrap; }
 .mem-log-filter select, .mem-log-filter input {
