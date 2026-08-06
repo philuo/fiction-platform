@@ -1,0 +1,382 @@
+// 持久化：data/<slug>/state.json（原子写：tmp + rename，写前备份 .bak）
+// 长篇架构：versions 外置到 data/<slug>/versions/；meta.json 供列表页快读；checkpoint.jsonl 断点日志
+import { mkdirSync, readFileSync, writeFileSync, existsSync, copyFileSync, mkdtempSync, rmSync, renameSync, appendFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
+import type { Arc, ChapterVersion, PendingChapter, WorldState } from "./world";
+import type { EvalReport } from "./eval";
+
+export function slugify(title: string): string {
+  const s = title.trim().replace(/[\\/:*?"<>|\s]+/g, "-").slice(0, 40);
+  // 排除 "." / ".." 等路径逃逸（安全审查 LOW：slugify 结果不得使路径回退到项目根）
+  if (!s || s === "." || s === ".." || /^\.+$/.test(s)) return "story";
+  return s;
+}
+
+export function storyDir(title: string): string {
+  // process.cwd()：bun 直接运行与 bun build 产物下均指向项目根
+  return join(process.cwd(), "data", slugify(title));
+}
+
+/** 同名冲突检测：已存在同 slug 的存档则返回 true（修 G1：立项同名书不得静默覆盖） */
+export function storyExists(title: string): boolean {
+  return existsSync(join(storyDir(title), "state.json"));
+}
+
+/** 为新立项分配不冲突的书名：已存在则追加 -2 / -3 …（修 G1） */
+export function allocateTitle(title: string): string {
+  const base = title.trim();
+  if (!storyExists(base)) return base;
+  for (let i = 2; i < 100; i++) {
+    const candidate = `${base}-${i}`;
+    if (!storyExists(candidate)) return candidate;
+  }
+  return `${base}-${Date.now().toString(36)}`;
+}
+
+/** 存档迁移（旧字段兼容）：arcs→plotThreads（补稳定 id）；返回是否有变更 */
+export function migrateWorld(w: WorldState): boolean {
+  let changed = false;
+  const legacy = w as WorldState & { arcs?: Arc[] };
+  if (Array.isArray(legacy.arcs) && !w.plotThreads) {
+    w.plotThreads = legacy.arcs.map((a, i) => (a.id ? a : { ...a, id: `pt${i + 1}` }));
+    delete legacy.arcs;
+    changed = true;
+  }
+  return changed;
+}
+
+// —— versions 外置（修 G2：state.json 不膨胀）：落盘时写文件，加载时 hydrate ——
+function versionsDir(title: string): string {
+  return join(storyDir(title), "versions");
+}
+
+function versionFileName(chIndex: number, v: ChapterVersion, i: number): string {
+  const ts = (v.at || "").replace(/[^0-9T]/g, "").slice(0, 19) || `v${i}`;
+  return `ch${chIndex}-${i}-${ts}.json`;
+}
+
+/** 落盘前把内存中的 versions 写入 versions/ 目录（幂等：已存在的文件不重写），返回外置文件名数组 */
+function externalizeVersions(title: string, chIndex: number, versions: ChapterVersion[], existing: string[]): string[] {
+  if (!versions.length) return [];
+  const dir = versionsDir(title);
+  mkdirSync(dir, { recursive: true });
+  const files: string[] = [];
+  versions.forEach((v, i) => {
+    const name = existing[i] ?? versionFileName(chIndex, v, i);
+    const full = join(dir, name);
+    if (!existsSync(full)) {
+      writeFileSync(full, JSON.stringify(v), "utf-8");
+    }
+    files.push(name);
+  });
+  return files;
+}
+
+/** 加载后把 versionFiles hydrate 回 chapter.versions（前端契约不变） */
+function hydrateVersions(w: WorldState): void {
+  for (const ch of w.chapters) {
+    if (ch.versions?.length || !ch.versionFiles?.length) continue;
+    const dir = versionsDir(w.title);
+    const vs: ChapterVersion[] = [];
+    for (const f of ch.versionFiles) {
+      try {
+        vs.push(JSON.parse(readFileSync(join(dir, f), "utf-8")) as ChapterVersion);
+      } catch {
+        /* 版本文件损坏跳过 */
+      }
+    }
+    if (vs.length) ch.versions = vs;
+  }
+}
+
+export function saveWorld(w: WorldState): string {
+  const dir = storyDir(w.title);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, "state.json");
+  if (existsSync(path)) copyFileSync(path, join(dir, "state.json.bak"));
+  w.updatedAt = new Date().toISOString();
+  // versions 外置：序列化副本中用 versionFiles 替换 versions
+  const snapshot = {
+    ...w,
+    chapters: w.chapters.map((c) => {
+      if (!c.versions?.length) return c;
+      const files = externalizeVersions(w.title, c.index, c.versions, c.versionFiles ?? []);
+      const { versions: _v, ...rest } = c;
+      return { ...rest, versionFiles: files };
+    }),
+  };
+  // 原子写：tmp + rename（修 G3：写一半崩溃不损坏存档）
+  const tmp = join(dir, `state.json.tmp-${process.pid}`);
+  writeFileSync(tmp, JSON.stringify(snapshot, null, 2), "utf-8");
+  renameSync(tmp, path);
+  // meta.json：列表页快读（修 G4）
+  try {
+    const meta = { slug: slugify(w.title), title: w.title, genre: w.genre ?? "", chapters: w.chapters?.length ?? 0, updatedAt: w.updatedAt, cover: w.cover };
+    writeFileSync(join(dir, "meta.json"), JSON.stringify(meta), "utf-8");
+  } catch {
+    /* meta 写失败不影响主存档 */
+  }
+  return path;
+}
+
+/** Step 级断点日志（追加 jsonl；autorun 断点恢复与调试用） */
+export function appendCheckpoint(title: string, step: string, chapter: number): void {
+  try {
+    const dir = storyDir(title);
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(join(dir, "checkpoint.jsonl"), `${JSON.stringify({ step, chapter, at: new Date().toISOString() })}\n`, "utf-8");
+  } catch {
+    /* checkpoint 失败不阻塞主流程 */
+  }
+}
+
+/** 读取最后一条断点记录（autorun 启动时对齐进度/审计用）；不存在或损坏返回 null */
+export function readLastCheckpoint(title: string): { step: string; chapter: number; at: string } | null {
+  try {
+    const p = join(storyDir(title), "checkpoint.jsonl");
+    if (!existsSync(p)) return null;
+    const lines = readFileSync(p, "utf-8").split("\n").filter(Boolean);
+    if (!lines.length) return null;
+    const last = JSON.parse(lines[lines.length - 1]) as { step?: unknown; chapter?: unknown; at?: unknown };
+    return {
+      step: String(last.step ?? ""),
+      chapter: Number(last.chapter),
+      at: String(last.at ?? ""),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function loadWorld(title: string): WorldState | null {
+  const path = join(storyDir(title), "state.json");
+  if (!existsSync(path)) return null;
+  const w = JSON.parse(readFileSync(path, "utf-8")) as WorldState;
+  migrateWorld(w);
+  hydrateVersions(w);
+  return w;
+}
+
+// —— 连载暂存区（git 工作区语义）：审查不通过的草稿落盘，供重试/跳过 ——
+
+function pendingPath(title: string): string {
+  return join(storyDir(title), "pending-chapter.json");
+}
+
+export function savePendingChapter(title: string, p: PendingChapter): void {
+  try {
+    const dir = storyDir(title);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(pendingPath(title), JSON.stringify(p, null, 2), "utf-8");
+  } catch (e) {
+    console.warn("[storage] 暂存区草稿写入失败:", (e as Error).message);
+  }
+}
+
+export function loadPendingChapter(title: string): PendingChapter | null {
+  try {
+    const p = pendingPath(title);
+    if (!existsSync(p)) return null;
+    const d = JSON.parse(readFileSync(p, "utf-8")) as PendingChapter;
+    return d.chapterIndex && d.text ? d : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearPendingChapter(title: string): void {
+  try {
+    const p = pendingPath(title);
+    if (existsSync(p)) rmSync(p, { force: true });
+  } catch {
+    /* 清理失败不影响主流程 */
+  }
+}
+
+// —— 连载会话状态（刷新/服务重启恢复用） ——
+
+export type AutoSession = {
+  status: "running" | "paused" | "stopped" | "done";
+  target: number; // 目标章数（绝对目标）
+  written: number; // 已提交章数
+  phase: string; // 最近阶段文字（写作/审查/结算/重试中）
+  pauseReason?: string; // 暂停原因（如：第 N 章审查未通过）
+  failedChapter?: number;
+  failedFindings?: { severity: string; lens: string; issue: string; evidence: string; suggestion: string }[];
+  lastEval?: EvalReport | null;
+  startedAt: string;
+  updatedAt: string;
+};
+
+function sessionPath(title: string): string {
+  return join(storyDir(title), "autorun-session.json");
+}
+
+export function saveAutoSession(title: string, s: AutoSession): void {
+  try {
+    const dir = storyDir(title);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(sessionPath(title), JSON.stringify(s, null, 2), "utf-8");
+  } catch (e) {
+    console.warn("[storage] 会话状态写入失败:", (e as Error).message);
+  }
+}
+
+export function loadAutoSession(title: string): AutoSession | null {
+  try {
+    const p = sessionPath(title);
+    if (!existsSync(p)) return null;
+    return JSON.parse(readFileSync(p, "utf-8")) as AutoSession;
+  } catch {
+    return null;
+  }
+}
+
+export function clearAutoSession(title: string): void {
+  try {
+    const p = sessionPath(title);
+    if (existsSync(p)) rmSync(p, { force: true });
+  } catch {
+    /* 清理失败不影响主流程 */
+  }
+}
+
+export function listStories(): string[] {
+  const dir = join(process.cwd(), "data");
+  if (!existsSync(dir)) return [];
+  return readdir(dir);
+}
+
+export type StoryMeta = { slug: string; title: string; genre: string; chapters: number; updatedAt: string; cover?: string };
+
+/** 列出所有故事的元信息（优先读 meta.json，缺失时回退解析 state.json） */
+export function listStoriesMeta(): StoryMeta[] {
+  const dir = join(process.cwd(), "data");
+  if (!existsSync(dir)) return [];
+  const slugs = readdir(dir);
+  const metas: StoryMeta[] = [];
+  for (const s of slugs) {
+    try {
+      const metaPath = join(dir, s, "meta.json");
+      if (existsSync(metaPath)) {
+        metas.push(JSON.parse(readFileSync(metaPath, "utf-8")) as StoryMeta);
+        continue;
+      }
+      const raw = readFileSync(join(dir, s, "state.json"), "utf-8");
+      const w = JSON.parse(raw) as WorldState;
+      metas.push({ slug: s, title: w.title, genre: w.genre ?? "", chapters: w.chapters?.length ?? 0, updatedAt: w.updatedAt ?? "", cover: w.cover });
+    } catch {
+      // 损坏的存档跳过
+      metas.push({ slug: s, title: s, genre: "", chapters: 0, updatedAt: "", cover: undefined });
+    }
+  }
+  // 按更新时间倒序
+  metas.sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
+  return metas;
+}
+
+function readdir(dir: string): string[] {
+  const { readdirSync } = require("node:fs") as typeof import("node:fs");
+  return readdirSync(dir).filter((d) => d !== ".DS_Store");
+}
+
+export function exportMarkdown(w: WorldState): string {
+  const lines: string[] = [`# 《${w.title}》`, "", `> ${w.genre} · ${w.setting.time} / ${w.setting.place} · ${w.setting.tone}`, ""];
+  for (const ch of w.chapters) {
+    lines.push(`## 第${ch.index}章 ${ch.title}`, "", ch.text, "");
+  }
+  return lines.join("\n");
+}
+
+// —— EPUB 导出（Bun.zipSync 原生 zip，含 content.opf / toc.ncx / xhtml 章节） ——
+function escXml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+export function exportEpub(w: WorldState): Blob {
+  // 卷映射（P5）：章纲 index → 弧 → 卷标题，卷切换处插入卷题
+  const volOf = new Map<number, string>();
+  if (w.blueprint && (w.chapterPlans ?? []).length) {
+    const arcVol = new Map((w.storyArcs ?? []).map((a) => [a.id, a.volumeId]));
+    const volTitle = new Map((w.blueprint.volumes ?? []).map((v) => [v.id, v.title]));
+    for (const p of w.chapterPlans ?? []) {
+      const t = volTitle.get(arcVol.get(p.arcId) ?? "");
+      if (t) volOf.set(p.index, t);
+    }
+  }
+  let curVol = "";
+  const chapters = w.chapters.map((c, i) => {
+    const vol = volOf.get(c.index);
+    const volHead = vol && vol !== curVol ? `<h1>${escXml(vol)}</h1>\n` : "";
+    if (vol) curVol = vol;
+    const body =
+      volHead +
+      `<h2>第${c.index}章 ${escXml(c.title)}</h2>\n` +
+      c.text
+        .split(/\n{2,}/)
+        .map((p) => `<p>${escXml(p.trim())}</p>`)
+        .join("\n");
+    return {
+      index: c.index,
+      title: c.title,
+      name: `chapter${i + 1}.xhtml`,
+      html: `<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml"><head><title>${escXml(c.title)}</title></head><body>${body}</body></html>`,
+    };
+  });
+  const uuid = `urn:uuid:${crypto.randomUUID?.() ?? "ai-novel-export"}`;
+  const contentOpf = `<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">${uuid}</dc:identifier>
+    <dc:title>${escXml(w.title)}</dc:title>
+    <dc:language>zh-CN</dc:language>
+    <dc:creator>墨枢</dc:creator>
+    <meta property="dcterms:modified">${new Date().toISOString().replace(/\.\d+Z$/, "Z")}</meta>
+  </metadata>
+  <manifest>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+    ${chapters.map((c, i) => `<item id="ch${i + 1}" href="${c.name}" media-type="application/xhtml+xml"/>`).join("\n    ")}
+  </manifest>
+  <spine toc="ncx">
+    ${chapters.map((_, i) => `<itemref idref="ch${i + 1}"/>`).join("\n    ")}
+  </spine>
+</package>`;
+  const tocNcx = `<?xml version="1.0" encoding="utf-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <head><meta name="dtb:uid" content="${uuid}"/></head>
+  <docTitle><text>${escXml(w.title)}</text></docTitle>
+  <navMap>
+    ${chapters.map((c, i) => `<navPoint id="nav${i + 1}" playOrder="${i + 1}"><navLabel><text>第${c.index}章 ${escXml(c.title)}</text></navLabel><content src="${c.name}"/></navPoint>`).join("\n    ")}
+  </navMap>
+</ncx>`;
+  const container = `<?xml version="1.0" encoding="utf-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>`;
+
+  const entries: Record<string, string> = {
+    "META-INF/container.xml": container,
+    "OEBPS/content.opf": contentOpf,
+    "OEBPS/toc.ncx": tocNcx,
+  };
+  for (const c of chapters) entries[`OEBPS/${c.name}`] = c.html;
+
+  // EPUB = zip：mimetype 必须无压缩（stored）且为首文件；用系统 zip 生成
+  const dir = mkdtempSync(join(tmpdir(), "ai-novel-epub-"));
+  try {
+    writeFileSync(join(dir, "mimetype"), "application/epub+zip", "utf-8");
+    for (const [rel, content] of Object.entries(entries)) {
+      const full = join(dir, rel);
+      mkdirSync(dirname(full), { recursive: true });
+      writeFileSync(full, content, "utf-8");
+    }
+    const epubPath = join(dir, "book.epub");
+    const r1 = spawnSync("zip", ["-0", "-X", "book.epub", "mimetype"], { cwd: dir, encoding: "utf-8" });
+    if (r1.status !== 0) throw new Error("zip mimetype 失败: " + r1.stderr);
+    const r2 = spawnSync("zip", ["-r", "-X", "book.epub", "META-INF", "OEBPS"], { cwd: dir, encoding: "utf-8" });
+    if (r2.status !== 0) throw new Error("zip 打包失败: " + r2.stderr);
+    return new Blob([readFileSync(epubPath)], { type: "application/epub+zip" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}

@@ -1,0 +1,25 @@
+# 密钥与本地配置
+.env
+
+# 生成的小说数据
+node_modules/
+data/
+*.bak
+.reasonix
+
+# bun 缓存（~/.bun 被 TCC 拦截，缓存已重定向到项目内）
+.bun-cache/
+.bun-tmp/
+.home/
+bun.lock
+bunfig.toml
+
+# 构建产物
+dist/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+**/*.DS_Store
+.DS_Store
