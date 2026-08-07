@@ -909,7 +909,7 @@ export function editWorld(world: WorldState, patch: {
       if (typeof pc.motivation === "string") target.motivation = pc.motivation;
       if (typeof pc.voice === "string") target.voice = pc.voice.trim().slice(0, 80) || undefined;
       if (typeof pc.status === "string") target.status = pc.status;
-      if (typeof pc.gender === "string") target.gender = pc.gender.trim().slice(0, 8) || undefined;
+      if (typeof pc.gender === "string") target.gender = pc.gender === "男" || pc.gender === "女" ? pc.gender : target.gender;
       if (typeof pc.age === "string") target.age = pc.age.trim().slice(0, 20) || undefined;
       if (typeof pc.identity === "string") target.identity = pc.identity.trim().slice(0, 30) || undefined;
       if (typeof pc.look === "string") target.look = pc.look.trim().slice(0, 120) || undefined;

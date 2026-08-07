@@ -900,19 +900,8 @@ const CharacterEditor: React.FC<{ world: WorldState; onSave: Props["onSave"]; on
           </div>
           <div className="field">
             <label>定位</label>
-            {/* 定位为自由字段：可从常用建议中选择，也可直接输入任意自定义定位（如"死者""案件起点"等剧情定位） */}
-            <input
-              list="char-role-options"
-              value={role}
-              placeholder="如：主角 / 反派 / 配角"
-              onChange={(e) => setRole(e.target.value)}
-            />
-            <datalist id="char-role-options">
-              <option value="主角" />
-              <option value="反派" />
-              <option value="配角" />
-              <option value="关键人物" />
-            </datalist>
+            {/* 定位 combobox：输入框 + 下拉候选过滤；点击候选覆盖输入框值；也可自由输入任意自定义定位 */}
+            <RoleCombo value={role} onChange={setRole} />
           </div>
           <div style={{ display: "flex", gap: "0.6rem" }}>
             <div className="field" style={{ flex: 1 }}>
@@ -1107,3 +1096,57 @@ const ExportTab: React.FC<{ onExport: Props["onExport"] }> = (p) => (
   </div>
   </div>
 );
+
+// —— 角色定位 combobox：输入框 + 下拉候选过滤，点击候选覆盖输入框值 ——
+const ROLE_OPTIONS = [
+  // 核心定位
+  "主角", "反派", "配角", "关键人物",
+  // 叙事功能
+  "视角人物", "叙述者", "引导者", "线索人物", "见证者", "推动者",
+  // 关系定位
+  "恋人", "挚友", "宿敌", "师徒", "盟友", "背叛者", "保护者", "竞争者",
+  // 身份功能
+  "智者", "守护者", "复仇者", "探索者", "牺牲者", "幸存者", "救赎者",
+  // 剧情定位
+  "死者", "嫌疑人", "案件起点", "谜团核心", "转折推手", "暗线人物",
+  // 阵营
+  "正方核心", "反方核心", "第三方势力", "中立观察者",
+];
+
+const RoleCombo: React.FC<{ value: string; onChange: (v: string) => void }> = ({ value, onChange }) => {
+  const [open, setOpen] = useState(false);
+  const filtered = value
+    ? ROLE_OPTIONS.filter((o) => o.includes(value) && o !== value)
+    : ROLE_OPTIONS;
+  return (
+    <div style={{ position: "relative" }}>
+      <input
+        value={value}
+        placeholder="如：主角 / 反派 / 配角，或自定义输入"
+        onChange={(e) => { onChange(e.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+      />
+      {open && filtered.length > 0 && (
+        <div style={{
+          position: "absolute", top: "100%", left: 0, right: 0, zIndex: 10,
+          maxHeight: "12rem", overflowY: "auto",
+          background: "var(--paper, #fff)", border: "1px solid var(--ink-faint, #ccc)",
+          boxShadow: "0 2px 8px rgba(0,0,0,0.12)", borderRadius: "0 0 4px 4px",
+        }}>
+          {filtered.map((opt) => (
+            <div
+              key={opt}
+              style={{ padding: "0.3rem 0.6rem", cursor: "pointer", fontSize: "0.85rem" }}
+              onMouseDown={(e) => { e.preventDefault(); onChange(opt); setOpen(false); }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = "var(--gold-light, #f5e6c8)")}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+            >
+              {opt}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};

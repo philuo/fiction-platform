@@ -385,9 +385,7 @@ export const IDENTITY_DRESS_RULES: { keys: string[]; dress: string }[] = [
   { keys: ["仵作", "仵役"], dress: "仵作短褐：灰褐短褐布衣，袖口挽起，腰系布带" },
   { keys: ["郎中", "大夫", "杏林", "医馆", "药堂", "坐堂", "神医", "医者", "医师"], dress: "医者布衣：素色长衫，肩挎药箱或背搭裢" },
   { keys: ["将军", "武将", "统领", "校尉", "都尉", "元帅", "总兵", "副将"], dress: "武将戎装：玄色战袍配轻甲或山文甲，束甲带，佩兵刃" },
-  { keys: ["皇帝", "帝王", "太子", "亲王", "国主", "天子", "皇上", "圣上", "陛下"], dress: "帝王衮服：明黄龙袍或衮冕" },
   { keys: ["皇后", "太后", "皇贵妃", "贵妃", "嫔妃", "妃子", "娘娘", "皇妃"], dress: "后妃宫装：凤冠霞帔或华贵宫装，仪态雍容" },
-  { keys: ["尚书", "侍郎", "御史", "知府", "知县", "宰相", "内阁", "官员", "巡抚", "总督", "节度使", "太守", "刺史"], dress: "官员朝服：靛蓝或藏青补子官服，束发露顶不戴帽" },
   { keys: ["书生", "学子", "秀才", "举人", "文人", "才子", "进士", "儒生", "童生"], dress: "书生青衫：青布长衫，束发，手持书卷或折扇" },
   { keys: ["侠", "剑客", "镖", "杀手", "刺客", "江湖", "游侠", "刀客"], dress: "江湖劲装：玄色劲装短打，束腰带，佩刀剑" },
   { keys: ["僧", "和尚", "道士", "尼姑", "禅", "方丈", "住持", "僧人", "师太", "行者", "沙弥"], dress: "僧道衣袍：灰褐僧袍或青灰道袍，手持拂尘或念珠" },
@@ -513,12 +511,88 @@ export function genderFaceHint(c: Character): string {
 }
 
 /** 禁帽条款（实测修复：弱模型对古代人物有「发髻+帽」强先验，纯禁止压不住）：
- * 给正面具体画法（只画发髻+发簪、发髻裸露）+ 反面禁止，双管齐下 */
+ * 给正面具体画法（只画发髻+发簪、发髻裸露）+ 反面禁止，双管齐下。
+ * 现仅作为 headwearOf 的兑底（身份/性别均无匹配时）；差异化头饰见 headwearOf */
 export const NO_HAT_CLAUSE = "头顶只画束起的发髻与发簪，发髻裸露，发髻外不包裹任何布料，不戴任何帽子（包括小帽、布冠、头巾类帽饰）";
+
+/** 头饰/发型体系（实测收敛：NO_HAT_CLAUSE 全局锁「束发+发簪」导致发饰同质化；改为按身份/性别/年龄差异化）：
+ * - 主身份优先：官人压诗人等（identityDress 同款 PRIMARY 规则）；官人戴乌纱帽、武官戴盔、书生布带束发、
+ *   诗人/画家束发或散发（hash 定）、僧光头、道挽髻、乞丐蓬发；
+ * - 女按年龄/身份多样：丫鬟/少女双丫髻、成年高髻/坠马髻/圆髻（hash）、中年圆髻；
+ * - 男默认三式 hash 分化（发簪束发/布带束发/半束半披）；非古代时代用短发/披发。
+ * 每条带「无其他头饰」尾巴防模型自行加帽。 */
+export function headwearOf(c: Character, w?: WorldState): string {
+  const hay = `${c.identity ?? ""} ${c.role ?? ""} ${c.name ?? ""}`;
+  const has = (...ks: string[]) => ks.some((k) => hay.includes(k));
+  const T = "头上无其他头饰、无包裹布料";
+  // 非古代时代：短发/披发（时代一致性优先）
+  if (w) {
+    const eraHay = `${w.setting?.time ?? ""} ${w.setting?.place ?? ""} ${w.genre ?? ""}`;
+    if (/(民国|近现代|现代|都市|当代|未来|星际|赛博|末世)/.test(eraHay)) {
+      return c.gender === "女" ? "利落短发或长发披肩，头顶无发髻无发簪，不戴帽子" : "利落短发，头顶无发髻无发簪，不戴帽子";
+    }
+  }
+  // 身份头饰（主身份优先：帝/官/武在前）
+  if (has("皇帝", "帝王", "天子", "皇上", "圣上", "陛下", "太子", "亲王")) return `头戴冕冠（翼善冠），非裸露发髻，${T}`;
+  if (has("皇后", "太后", "贵妃", "皇贵妃", "嫔妃", "妃子", "娘娘", "皇妃")) return `头戴凤冠或高髻插金簪，${T}`;
+  if (has("尚书", "侍郎", "御史", "知府", "知县", "宰相", "内阁", "官员", "巡抚", "总督", "节度使", "太守", "刺史")) return `头戴乌纱帽，非裸露发髻，${T}`;
+  if (has("将军", "武将", "统领", "校尉", "都尉", "元帅", "总兵", "副将")) return `头戴红缨盔或武冠，${T}`;
+  if (has("僧", "和尚", "方丈", "住持", "沙弥")) return "光头，无发无帽";
+  if (has("道士", "道姑", "居士")) return "发挽道髻插簪，顶裸露，不戴帽";
+  if (has("书生", "学子", "秀才", "举人", "文人", "才子", "进士", "儒生", "童生")) return "布带束发（蓝色布带系扎发髻），髻顶裸露，不戴帽";
+  if (has("诗人", "作家", "画家", "画师", "丹青", "琴师")) {
+    return nameSeed(c.name) % 2 ? "长发披肩以布带系之，不戴帽" : "布带束发，髻顶裸露，不戴帽";
+  }
+  if (has("乞丐", "流民", "难民", "流浪汉")) return "头发蓬松散乱，不戴帽";
+  // 女：按年龄/身份多样发髻
+  if (c.gender === "女") {
+    if (has("丫鬟", "婢女")) return "头扎双丫髻系红绳，不戴帽";
+    const ageHay = `${c.age ?? ""}${hay}`;
+    if (/十六|十五|少女|十二|十三|十四/.test(ageHay)) return "头扎双丫髻系红绳，不戴帽";
+    if (/中年|四十|五十|夫人|嬷嬷|稳婆|媒婆/.test(ageHay)) return "圆髻插簪，髻顶裸露，不戴帽";
+    const buns = ["高髻插簪", "坠马髻插簪", "圆髻插簪"];
+    return `${buns[nameSeed(c.name) % buns.length]}，髻顶裸露，不戴帽`;
+  }
+  // 男：默认两式分化（实测「布带束发」有效、「半束半披」被忽略已删；差异化不足时靠脸型/眉眼/身份头饰补）
+  if (c.gender === "男") {
+    if (/十五|十六|少年|十二|十三|十四/.test(`${c.age ?? ""}`)) return "发半束成小髻插簪、余发垂肩，不戴帽";
+    const m = ["束发插簪、头顶裸露", "蓝布带束发、头顶裸露"];
+    return `${m[nameSeed(c.name) % m.length]}，不戴帽`;
+  }
+  return NO_HAT_CLAUSE;
+}
+
+/** 头饰前置强化（实测：官帽/武盔/冕冠/光头等逆模型先验的头饰放句中遵循率不足，前置句首利用首句注意力）：
+ * 返回应置于 prompt 句首的头饰词；无特殊头饰身份返回空串 */
+export function headwearLead(c: Character, w?: WorldState): string {
+  const hay = `${c.identity ?? ""} ${c.role ?? ""} ${c.name ?? ""}`;
+  const has = (...ks: string[]) => ks.some((k) => hay.includes(k));
+  if (w) {
+    const eraHay = `${w.setting?.time ?? ""} ${w.setting?.place ?? ""} ${w.genre ?? ""}`;
+    if (/(民国|近现代|现代|都市|当代|未来|星际|赛博|末世)/.test(eraHay)) return "";
+  }
+  if (has("皇帝", "帝王", "天子", "皇上", "圣上", "陛下", "太子", "亲王")) return "头戴冕冠，";
+  if (has("尚书", "侍郎", "御史", "知府", "知县", "宰相", "内阁", "官员", "巡抚", "总督", "节度使", "太守", "刺史")) return "头戴乌纱帽，";
+  if (has("将军", "武将", "统领", "校尉", "都尉", "元帅", "总兵", "副将")) return "头戴红缨盔，";
+  if (has("僧", "和尚", "方丈", "住持", "沙弥")) return "光头，";
+  return "";
+}
+
+/** 身份服饰分级（实测收敛：官服分三六九等、文武有别；主身份优先——诗人当官取「官人」着官服）：
+ * 先于 IDENTITY_DRESS_RULES 检查，保证高地位身份不被诗人/作家等前位通用条目抢占 */
+const PRIMARY_DRESS_RULES: { keys: string[]; dress: string }[] = [
+  { keys: ["宰相", "内阁", "尚书", "侍郎", "总督", "巡抚"], dress: "高官文官朝服：绯色或深蓝补子官服配玉带，气度威严" },
+  { keys: ["知府", "知县", "御史", "太守", "刺史", "官员", "节度使"], dress: "低品文官官服：靛蓝或藏青补子官服，束革带，正派干练" },
+  { keys: ["元帅", "将军", "总兵", "副将", "武将", "统领"], dress: "将军戎装：玄色战袍配山文甲，狮补，佩刀，气势威重" },
+  { keys: ["校尉", "都尉", "参将", "游击", "守备", "千户"], dress: "武官披甲服：鱼鳞甲配佩剑，英武挺拔" },
+];
 
 /** 身份服饰造型锚点（纯函数零 LLM）：按角色身份/职业返回标识性服饰/配饰；未匹配返回空串（仅用时代底衣） */
 export function identityDress(c: Character): string {
   const hay = `${c.identity ?? ""} ${c.role ?? ""} ${c.name ?? ""}`;
+  for (const r of PRIMARY_DRESS_RULES) {
+    if (r.keys.some((k) => hay.includes(k))) return r.dress;
+  }
   for (const r of IDENTITY_DRESS_RULES) {
     if (r.keys.some((k) => hay.includes(k))) return r.dress;
   }
@@ -724,8 +798,8 @@ export async function generateCharacterPortrait(storyTitle: string, w: WorldStat
   // 默认：短改变 prompt（弱模型 i2i 保持参考图的关键）；改词：回退全量描述（不叠加容貌标识，避免与用户描述冲突）
   const baseAttrs = `性别 ${c.gender || "未知"}，年龄 ${c.age || "未知"}，身份 ${c.identity || "—"}`;
   const base = desc
-    ? `《${w.title}》角色「${c.name}」（${c.role}）的全身立绘：${baseAttrs}；外貌特征 ${desc}${genderPhrase(c) ? `；此人是${genderPhrase(c)}，必须画出鲜明的${genderPhrase(c)}相貌与体态，严禁画成异性` : ""}；时代背景 ${w.setting.time || "—"}、地点 ${w.setting.place || "—"}，时代服饰：${eraDress(w)}，无现代元素${idDress ? `；身份服饰：${idDress}${c}` : ""}；${NO_HAT_CLAUSE}；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）；单人全身像，正面面向观者，神情姿态符合其身份与当前状态${poseExpr}，竖版全身构图`
-    : `《${w.title}》角色「${c.name}」（${c.role}）的全身立绘：与参考头像完全同一人，性别与参考头像一致，容貌、发型、服饰全部保持参考图原样不变；仅将头像特写改为竖版单人全身像：正面站立面向观者，全身完整入画，神情姿态符合其身份${poseExpr}；${NO_HAT_CLAUSE}；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）`;
+    ? `《${w.title}》角色「${c.name}」（${c.role}）的全身立绘：${baseAttrs}；外貌特征 ${desc}${genderPhrase(c) ? `；此人是${genderPhrase(c)}，必须画出鲜明的${genderPhrase(c)}相貌与体态，严禁画成异性` : ""}；时代背景 ${w.setting.time || "—"}、地点 ${w.setting.place || "—"}，时代服饰：${eraDress(w)}，无现代元素${idDress ? `；身份服饰：${idDress}${c}` : ""}；${headwearOf(c, w)}；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）；单人全身像，正面面向观者，神情姿态符合其身份与当前状态${poseExpr}，竖版全身构图`
+    : `《${w.title}》角色「${c.name}」（${c.role}）的全身立绘：与参考头像完全同一人，性别与参考头像一致，容貌、发型、服饰全部保持参考图原样不变；仅将头像特写改为竖版单人全身像：正面站立面向观者，全身完整入画，人物比例自然协调、面部不得拉伸变形，神情姿态符合其身份${poseExpr}；${headwearOf(c, w)}；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）`;
   const looks = desc || c.traits.slice(0, 4).join("、");
   const t2iPrompt = ensureStyleSuffix(base, styleAnchor(w));
   // i2i 形态（参考头像作容貌基准，保持人物形象）：官方 i2i 结构 [保持]+[改变]，避免弱模型换人/变样貌
@@ -736,15 +810,16 @@ export async function generateCharacterPortrait(storyTitle: string, w: WorldStat
   if (!ref) throw new Error(`角色「${c.name}」还没有头像，立绘必须以头像为参考：请先生成头像`);
   let buf: Uint8Array;
   try {
-    buf = await generateImage(i2iPrompt, "736x1312", { images: [ref] });
+    // 竖版比例定死 2:3（768x1152）：旧 9:16 过窄长，i2i 从方形头像转绘时面部垂直拉伸感明显（实测用户反馈）
+    buf = await generateImage(i2iPrompt, "768x1152", { images: [ref] });
   } catch (e) {
     console.warn("[media] 立绘参考图生图失败，抛错不降级（保证立绘渠道单一）:", (e as Error).message);
     throw e;
   }
-  // 压缩为 JPEG：立绘体积尽可能小巧（定死 736x1312 竖版 9:16），失败时保留原图
+  // 压缩为 JPEG：立绘体积尽可能小巧（定死 768x1152 竖版 2:3），失败时保留原图
   let compressed = buf;
   try {
-    compressed = await compressToJpeg(buf, 736, 1312);
+    compressed = await compressToJpeg(buf, 768, 1152);
   } catch (e) {
     console.warn("[media] 立绘压缩失败，保留原图:", (e as Error).message);
   }
@@ -767,7 +842,7 @@ export async function generateCharacterAvatar(storyTitle: string, w: WorldState,
   const gFace = genderFaceHint(c);
   const gClause = gp ? `；此人是${gp}，${gFace ? `${gFace}，` : ""}必须画出鲜明的${gp}相貌与体态，严禁画成异性` : "";
   const exprSlot = opts.expression ? `；表情${opts.expression}` : "";
-  const t2iPrompt = `${gLead}${c.name}（${c.role}）的方形头像：${baseAttrs}；外貌特征 ${looks || "结合角色姓名与身份推演"}；${distinctLookForRoster(c, w.characters)}${gClause}${exprSlot}；时代背景 ${w.setting.time || "—"}，时代服饰：${eraDress(w)}，无现代元素${idDress ? `；身份服饰：${idDress}${c}` : ""}；${NO_HAT_CLAUSE}；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）；正面头像特写，面向观者，神情姿态符合其身份，${styleAnchor(w)}，画面中不要出现文字，无水印`;
+  const t2iPrompt = `${headwearLead(c, w)}${gLead}${c.name}（${c.role}）的方形头像：${baseAttrs}；外貌特征 ${looks || "结合角色姓名与身份推演"}；${distinctLookForRoster(c, w.characters)}${gClause}${exprSlot}；时代背景 ${w.setting.time || "—"}，时代服饰：${eraDress(w)}，无现代元素${idDress ? `；身份服饰：${idDress}${c}` : ""}；${headwearOf(c, w)}；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）；正面头像特写，面向观者，神情姿态符合其身份，${styleAnchor(w)}，画面中不要出现文字，无水印`;
   const buf = await generateImage(t2iPrompt, "768x768");
   let compressed = buf;
   try {
