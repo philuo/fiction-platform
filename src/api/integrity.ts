@@ -1,6 +1,9 @@
 // 一致性治理：章节变更（编辑/重写/回滚/删除）后的确定性审计与安全修复。
-// 原则：① 审计零 LLM、可重复幂等；② autoRepair 只做确定性可逆修复（孤儿条目/悬空键/登场重算），
+// 原则：① 审计零 LLM、可重复幂等；② autoRepair 只做确定性可逆修复（孤儿条目/悬空键），
 //       任何删除正文/媒体/伏笔的动作一律不做，升级为 finding 交用户决策；③ 删章允许空洞、绝不重排 index。
+// 注：登场记录重算（recomputeAppearedIn）不在 autoRepair 内——正文变更路径（settle/编辑/回滚/重写/改名/删章）
+//     均已显式重算，读时自愈（/api/novel/state）兜底历史脏数据；避免每次伏笔/蓝图/设定写点
+//     的 alignWorld 都做 O(全书正文) 全量扫描。
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { recomputeAppearedIn } from "./chronicler";
@@ -183,6 +186,11 @@ export function auditWorld(w: WorldState): ConsistencyFinding[] {
     }
   }
   for (const f of w.foreshadowing) {
+    // 非法伏笔：文本为空或状态不在枚举（脏数据直接可见，不静默）
+    const validStatus = f.status === "planted" || f.status === "active" || f.status === "resolved";
+    if (!f.text || !f.text.trim() || !validStatus) {
+      findings.push({ id: fid("foreshadow-invalid", f.id), level: "warning", kind: "foreshadow-invalid", chapterIndex: f.plantedAt, issue: `伏笔「${(f.text ?? "").slice(0, 30)}」数据非法（${!validStatus ? `状态「${f.status}」不在已埋设/推进中/已回收` : "内容为空"}）`, suggestion: "请在伏笔账本中修正或删除该条目" });
+    }
     if (!has(f.plantedAt) && f.status !== "resolved") {
       // 待埋设（plantedAt 指向尚未创作的未来章节，如抽卡预登记）= 正常过渡态，不报异常
       if (isPendingForeshadow(w, f)) continue;
@@ -235,15 +243,15 @@ export function autoRepair(w: WorldState): string[] {
     if (n) fixed.push(`清除 ${n} 个悬空章节级参数覆盖`);
   }
 
-  if (recomputeAppearedIn(w)) fixed.push("重算角色登场记录");
   if (fixed.length) {
     logChange(w, { chapter: w.nextChapter, actor: "ai", kind: "integrity-repair", detail: fixed.join("；") });
   }
   return fixed;
 }
 
-/** 全局账本确定性对齐（零 LLM、幂等）：复用 autoRepair（孤儿摘要/时间线/本章计划/债务/章节覆盖 + 登场重算）。
- * 供角色/伏笔/大纲/设定/世界书等全局变更后自动调用，保持引用与索引一致。 */
+/** 全局账本确定性对齐（零 LLM、幂等）：复用 autoRepair（孤儿摘要/时间线/本章计划/债务/章节覆盖）。
+ * 供角色/伏笔/大纲/设定/世界书等全局变更后自动调用，保持引用与索引一致。
+ * 登场记录重算由正文变更路径显式触发（settle/编辑/回滚/重写/改名/删章 + 读时自愈）。 */
 export function alignWorld(w: WorldState): string[] {
   return autoRepair(w);
 }

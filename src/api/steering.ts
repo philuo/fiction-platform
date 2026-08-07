@@ -121,7 +121,7 @@ export async function impactReport(w: WorldState, change: { kind: string; detail
         { role: "system", content: "你是小说连续性顾问。给定一项即将应用到已写小说的变更，判断它与哪些既成事实冲突（每条一句话，含章节号），若是人物关系变更再给出反向关系建议。输出合法 JSON：{\"conflicts\":[\"…\"],\"reverseRelationHint\":\"…或空\"}。字符串值内部一律使用中文引号「」/『』，禁止英文双引号。" },
         { role: "user", content: `[拟变更] ${change.kind}：${change.detail}\n\n[既成事实]\n${facts}` },
       ],
-      { temperature: 0.2, maxTokens: 60000 },
+      { temperature: 0.2, maxTokens: 60000, schema: { type: "object", required: ["conflicts"], properties: { conflicts: { type: "array", items: { type: "string" } }, reverseRelationHint: { type: "string" } } } },
     );
     conflicts = (Array.isArray(out.conflicts) ? out.conflicts : []).map(String).filter(Boolean).slice(0, 6);
     reverseRelationHint = typeof out.reverseRelationHint === "string" && out.reverseRelationHint.trim() ? out.reverseRelationHint.trim() : undefined;

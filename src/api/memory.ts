@@ -35,7 +35,7 @@ export async function summarizeChapter(w: WorldState, ch: Chapter): Promise<Chap
         { role: "system", content: SUMMARY_SYSTEM },
         { role: "user", content: `已知角色：${w.characters.map((c) => c.name).join("、")}\n\n第${ch.index}章《${ch.title}》全文：\n${ch.text}` },
       ],
-      { temperature: 0.3, maxTokens: 60000 },
+      { temperature: 0.3, maxTokens: 60000, schema: { type: "object", required: ["summary"], properties: { summary: { type: "string" }, events: { type: "array", items: { type: "string" } }, appeared: { type: "array", items: { type: "string" } }, stateChanges: { type: "array", items: { type: "string" } }, hook: { type: "string" } } } },
     );
     const strArr = (v: unknown) => (Array.isArray(v) ? v.map(String).filter((s) => s.trim()).slice(0, 12) : []);
     return {
@@ -72,7 +72,7 @@ export async function summarizeRange(w: WorldState, from: number, to: number): P
         { role: "system", content: "你是小说档案员。把多个章节摘要归并为一段 200-400 字的阶段摘要：保留主线推进、关键转折、角色变化与未决线索。只输出 JSON：{\"summary\":\"…\"}。字符串值内部一律使用中文引号「」/『』，禁止英文双引号。" },
         { role: "user", content: ss.map((s) => `第${s.index}章：${s.summary}`).join("\n") },
       ],
-      { temperature: 0.3, maxTokens: 60000 },
+      { temperature: 0.3, maxTokens: 60000, schema: { type: "object", required: ["summary"], properties: { summary: { type: "string" } } } },
     );
     return String(out.summary ?? "").trim();
   } catch {

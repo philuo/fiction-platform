@@ -29,7 +29,28 @@ export async function generateCardPool(world: WorldState, opts: { count?: number
       { role: "system", content: GACHA_SYSTEM },
       { role: "user", content: userMsg },
     ],
-    { temperature: 1.0, maxTokens: 60000 },
+    {
+      temperature: 1.0,
+      maxTokens: 60000,
+      schema: {
+        type: "object",
+        required: ["cards"],
+        properties: {
+          cards: {
+            type: "array",
+            items: {
+              type: "object", required: ["type", "rarity", "title"],
+              properties: {
+                type: { type: "string", enum: ["角色", "发展方向", "伏笔", "章节", "道具", "场景"] },
+                rarity: { type: "string", enum: ["N", "R", "SR", "SSR"] },
+                title: { type: "string" }, description: { type: "string" }, effect: { type: "string" }, dueHint: { type: "string" },
+                character: { type: "object", required: ["name"], properties: { name: { type: "string" }, role: { type: "string" }, traits: { type: "array", items: { type: "string" } }, motivation: { type: "string" }, voice: { type: "string" } } },
+              },
+            },
+          },
+        },
+      },
+    },
   );
   const rarities: Rarity[] = ["N", "R", "SR", "SSR"];
   return (Array.isArray(out.cards) ? out.cards : [])

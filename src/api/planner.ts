@@ -2,6 +2,7 @@
 // 参考 ainovel-cli：初始只规划 2 卷骨架 + 第 1 弧详章；弧/卷边界触发摘要归并 + 展开下一弧
 import { chatJson } from "./jsonutil";
 import { saveWorld } from "./storage";
+import { logCommandChange } from "./steering";
 import { summarizeRange } from "./memory";
 import type { Blueprint, ChapterPlan, StoryArc, Volume, WorldState } from "./world";
 
@@ -51,7 +52,37 @@ export async function buildBlueprint(w: WorldState, hint?: string): Promise<Blue
       { role: "system", content: BLUEPRINT_SYSTEM },
       { role: "user", content: userMsg },
     ],
-    { temperature: 0.9, maxTokens: 60000 },
+    {
+      temperature: 0.9,
+      maxTokens: 60000,
+      schema: {
+        type: "object",
+        required: ["options"],
+        properties: {
+          options: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["theme", "mainPlot", "ending", "compass", "progressContract", "volumes"],
+              properties: {
+                theme: { type: "string" }, mainPlot: { type: "string" }, ending: { type: "string" },
+                compass: { type: "string" }, progressContract: { type: "string" },
+                volumes: {
+                  type: "array",
+                  items: {
+                    type: "object", required: ["title", "goal"],
+                    properties: {
+                      title: { type: "string" }, goal: { type: "string" },
+                      arcs: { type: "array", items: { type: "object", required: ["title", "goal", "arcType", "estChapters"], properties: { title: { type: "string" }, goal: { type: "string" }, arcType: { type: "string" }, estChapters: { type: "integer" } } } },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
   );
 
   const options: BlueprintOption[] = [];
@@ -103,8 +134,12 @@ export async function confirmBlueprint(w: WorldState, opt: BlueprintOption): Pro
   // 展开第一个骨架弧
   const first = arcs.find((a) => a.status === "skeleton");
   if (first) await expandArc(w, first.id);
+  logCommandChange(w, { chapter: w.nextChapter, actor: "user", kind: "blueprint-confirm", detail: `确认蓝图《${w.blueprint.theme?.slice(0, 30)}》（${volumesCount(w)} 卷 / ${arcs.length} 弧骨架，已展开首弧详纲）`, commandId: "CMD-W03" });
   saveWorld(w);
   return w;
+}
+function volumesCount(w: WorldState): number {
+  return (w.blueprint?.volumes ?? []).length;
 }
 
 // —— 弧展开（滚动规划：只详展当前弧，3-6 章章节计划） ——
@@ -147,7 +182,20 @@ export async function expandArc(w: WorldState, arcId: string): Promise<ChapterPl
       { role: "system", content: EXPAND_SYSTEM },
       { role: "user", content: userMsg },
     ],
-    { temperature: 0.8, maxTokens: 60000 },
+    {
+      temperature: 0.8,
+      maxTokens: 60000,
+      schema: {
+        type: "object",
+        required: ["chapters"],
+        properties: {
+          chapters: {
+            type: "array",
+            items: { type: "object", required: ["goal"], properties: { goal: { type: "string" }, beats: { type: "array", items: { type: "string" } }, hookType: { type: "string" } } },
+          },
+        },
+      },
+    },
   );
 
   const plans: ChapterPlan[] = [];
@@ -170,6 +218,7 @@ export async function expandArc(w: WorldState, arcId: string): Promise<ChapterPl
   }
   w.chapterPlans = [...(w.chapterPlans ?? []), ...plans];
   arc.status = "expanded";
+  logCommandChange(w, { chapter: safeStart, actor: "ai", kind: "arc-expand", detail: `展开弧「${arc.title}」章节计划 ${plans.length} 章（第 ${safeStart} 章起）`, commandId: "CMD-W05" });
   saveWorld(w);
   return plans;
 }
@@ -233,6 +282,7 @@ export async function handleArcBoundary(w: WorldState, arcId: string): Promise<v
   // 展开下一个骨架弧（滚动规划）
   const nextSkeleton = arcs.find((a) => a.status === "skeleton");
   if (nextSkeleton) await expandArc(w, nextSkeleton.id);
+  logCommandChange(w, { chapter: to, actor: "ai", kind: "arc-boundary", detail: `弧「${arc.title}」完成（第 ${from}-${to} 章）${vol && volArcs.every((a) => a.status === "done") ? `；卷《${vol.title}》收束${w.blueprint?.compass ? "，指南针已更新" : ""}` : ""}`, commandId: "CMD-W09" });
   saveWorld(w);
 }
 
@@ -259,9 +309,15 @@ export async function updateCompass(w: WorldState): Promise<void> {
           ].join("\n"),
         },
       ],
-      { temperature: 0.5, maxTokens: 60000 },
+      { temperature: 0.5, maxTokens: 60000, schema: { type: "object", required: ["compass"], properties: { compass: { type: "string" }, note: { type: "string" } } } },
     );
-    if (out.compass?.trim()) w.blueprint.compass = String(out.compass).trim().slice(0, 200);
+    if (out.compass?.trim()) {
+      const old = w.blueprint.compass;
+      w.blueprint.compass = String(out.compass).trim().slice(0, 200);
+      if (old !== w.blueprint.compass) {
+        logCommandChange(w, { chapter: w.nextChapter, actor: "ai", kind: "compass-update", detail: `指南针校准：${old?.slice(0, 30) ?? "（无）"} → ${w.blueprint.compass.slice(0, 30)}`, commandId: "CMD-W10" });
+      }
+    }
   } catch {
     /* compass 更新失败不阻塞 */
   }
@@ -323,6 +379,7 @@ export async function healLegacyStory(w: WorldState): Promise<boolean> {
   }));
   w.chapterPlans = plans;
   await expandArc(w, arc.id);
+  logCommandChange(w, { chapter: w.nextChapter, actor: "ai", kind: "story-heal", detail: `旧故事自愈：补最小蓝图 + 回填 ${plans.length} 条已写章计划 + 展开首弧`, commandId: "CMD-W11" });
   saveWorld(w);
   return true;
 }

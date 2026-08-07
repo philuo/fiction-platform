@@ -15,6 +15,7 @@ import { planScenes, generateSceneImage, createSceneVideo, styleAnchor, findChar
 import { auditWorld, autoRepair, alignWorld, collectOrphanMediaFiles } from "./integrity";
 import { resetChapterLedger, settleChapter } from "./chronicler";
 import { applyStateChange, finalizeStateChange } from "./statechange";
+import { withTitleLock } from "./titlelock";
 import { migrateChapterMedia, touchChapter, genOf, type WorldState, type ChapterMedia, type ConsistencyFinding, type PendingChapter } from "./world";
 import type { CardType } from "./cards";
 import { renameSync, existsSync, readFileSync, readdirSync } from "node:fs";
@@ -70,24 +71,10 @@ function sseStream(produce: (send: (obj: unknown) => void) => Promise<void>): Re
 /** 业务错误：消息可安全回显给前端（区别于内部异常） */
 export class AppError extends Error {}
 
-// per-title 互斥锁：串行化 load→修改→save 的回合/抽卡操作，防止并发覆盖
-const titleLocks = new Map<string, Promise<unknown>>();
 // 自动连载活跃运行注册表：同一书名同时只允许一个 runAuto 循环（防双跑重复写章/停止信号串扰）
 const activeAuto = new Set<string>();
 // 媒体重生成并发防护：同一 mediaId 同时只允许一个重生成（单进程部署，进程内集合即可）
 const regenBusy = new Set<string>();
-function withTitleLock<T>(title: string, fn: () => Promise<T>): Promise<T> {
-  const prev = titleLocks.get(title) ?? Promise.resolve();
-  const run = prev.then(fn, fn);
-  const guard = run.then(
-    () => undefined,
-    () => undefined,
-  );
-  titleLocks.set(title, guard);
-  return run.finally(() => {
-    if (titleLocks.get(title) === guard) titleLocks.delete(title);
-  });
-}
 
 async function readBody(req: Request): Promise<Record<string, unknown>> {
   try {
@@ -131,7 +118,11 @@ function schedulePortraitFor(title: string, w0: WorldState, anchor: string): voi
       await withTitleLock(slug(title), async () => {
         const w = loadWorld(title);
         const cc = w?.characters.find((x) => x.id === c.id);
-        if (w && cc) { cc.portrait = p; saveWorld(w); }
+        if (w && cc) {
+          cc.portrait = p;
+          steering.logChange(w, { chapter: w.nextChapter, actor: "system", kind: "portrait-auto", detail: `后台自动补全立绘：${cc.name}`, commandId: "CMD-M11" });
+          saveWorld(w);
+        }
       });
       console.log(`[media] 角色立绘后台生成完成: ${c.name}（${((Date.now() - t0) / 1000).toFixed(1)}s）`);
     } catch (e) {
@@ -253,16 +244,21 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
 
     case "/api/novel/state": {
       const title = String(body.title ?? "").trim();
-      const w = title ? loadWorld(title) : null;
-      if (!w) return json({ error: "故事不存在: " + title }, 404);
-      // 自愈：出场角色重算 + 旧媒体迁移 + 一致性自动修复（幂等，旧书打开即治理），有变更则持久化
-      let dirty = director.recomputeAppearedIn(w);
-      if (migrateChapterMedia(w)) dirty = true;
-      if (autoRepair(w).length) dirty = true;
-      if (dirty) {
-        applyStateChange(w, { actor: "system", commandId: "CMD-S08", field: "appearedIn", reason: "读时自愈：重算登场记录/媒体迁移/一致性修复", chapter: w.nextChapter });
-        saveWorld(w);
-      }
+      if (!title) return json({ error: "缺少 title" }, 400);
+      // 锁内 load→自愈→save：与并发写章互斥，防读时自愈基于旧快照覆盖（可靠性）
+      const w = await withTitleLock(slug(title), async () => {
+        const w = loadWorld(title);
+        if (!w) throw new AppError("故事不存在: " + title);
+        // 自愈：出场角色重算 + 旧媒体迁移 + 一致性自动修复（幂等，旧书打开即治理），有变更则持久化
+        let dirty = director.recomputeAppearedIn(w);
+        if (migrateChapterMedia(w)) dirty = true;
+        if (autoRepair(w).length) dirty = true;
+        if (dirty) {
+          applyStateChange(w, { actor: "system", commandId: "CMD-S08", field: "appearedIn", reason: "读时自愈：重算登场记录/媒体迁移/一致性修复", chapter: w.nextChapter });
+          saveWorld(w);
+        }
+        return w;
+      });
       return json({ world: sanitize(w) });
     }
 

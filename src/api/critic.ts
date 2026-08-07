@@ -103,7 +103,36 @@ export async function reviewChapter(
       { role: "system", content: CRITIC_SYSTEM },
       { role: "user", content: userMsg },
     ],
-    { temperature: 0.4, maxTokens: 60000 },
+    {
+      temperature: 0.4,
+      maxTokens: 60000,
+      // jsonschema 结构化约束：verdict 枚举、scores 数值、findings/criteria 数组（缺项/类型错触发修复重试）
+      schema: {
+        type: "object",
+        required: ["verdict", "scores", "findings"],
+        properties: {
+          verdict: { type: "string", enum: ["pass", "revise"] },
+          scores: {
+            type: "object",
+            required: ["coherence", "tension", "prose", "pacing", "dialogue"],
+            properties: {
+              coherence: { type: "integer" }, tension: { type: "integer" },
+              prose: { type: "integer" }, pacing: { type: "integer" }, dialogue: { type: "integer" },
+            },
+          },
+          findings: {
+            type: "array",
+            items: { type: "object", required: ["severity", "lens", "issue"], properties: {
+              severity: { type: "string", enum: ["major", "minor"] },
+              lens: { type: "string" }, issue: { type: "string" }, evidence: { type: "string" },
+              fixScope: { type: "string", enum: ["paragraph", "chapter"] }, suggestion: { type: "string" },
+            } },
+          },
+          criteria: { type: "array", items: { type: "object", required: ["name"], properties: { name: { type: "string" }, rubric: { type: "string" } } } },
+          foreshadow_notes: { type: "string" },
+        },
+      },
+    },
   );
 
   const scores = {

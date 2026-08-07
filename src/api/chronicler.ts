@@ -230,8 +230,8 @@ function applySettle(w: WorldState, out: Partial<SettleOutput>, chapterIndex: nu
     }
   }
 
-  // 时间线：覆盖式写入本章条目（修 B4：重写/回滚后重算不失配）
-  const tl = String(out.timeline_summary ?? "").trim();
+  // 时间线：覆盖式写入本章条目（修 B4：重写/回滚后重算不失配）；仅接受 string（number/对象等脏数据丢弃）
+  const tl = typeof out.timeline_summary === "string" ? out.timeline_summary.trim() : "";
   if (tl) {
     w.timeline = w.timeline.filter((t) => t.chapter !== chapterIndex);
     w.timeline.push({ chapter: chapterIndex, summary: tl });
@@ -288,11 +288,12 @@ function applySettle(w: WorldState, out: Partial<SettleOutput>, chapterIndex: nu
   // 章摘要回写（L2 记忆）
   const summary: ChapterSummary = {
     index: chapterIndex,
-    summary: String(out.summary ?? "").trim() || `第${chapterIndex}章`,
+    // 仅接受 string；number/对象等脏数据丢弃回退章号（summary: 12345 不得写入 "12345"）
+    summary: typeof out.summary === "string" && out.summary.trim() ? out.summary.trim() : `第${chapterIndex}章`,
     events: strArr(out.events),
     appeared: strArr(out.appeared),
     stateChanges: strArr(out.stateChanges),
-    hook: String(out.hook ?? "").trim() || undefined,
+    hook: typeof out.hook === "string" && out.hook.trim() ? out.hook.trim() : undefined,
   };
   upsertSummary(w, summary);
 
@@ -331,7 +332,31 @@ export async function settleChapter(w: WorldState, ch: Chapter, plan?: ChapterPl
         { role: "system", content: SETTLE_SYSTEM },
         { role: "user", content: userMsg },
       ],
-      { temperature: 0.2, maxTokens: 60000 },
+      {
+        temperature: 0.2,
+        maxTokens: 60000,
+        // jsonschema：关键字段类型约束（summary 必须 string、各数组项结构），字段级守卫兜底丢弃
+        schema: {
+          type: "object",
+          required: ["summary"],
+          properties: {
+            summary: { type: "string" },
+            events: { type: "array", items: { type: "string" } },
+            appeared: { type: "array", items: { type: "string" } },
+            stateChanges: { type: "array", items: { type: "string" } },
+            hook: { type: "string" },
+            new_foreshadowing: { type: "array", items: { type: "object", required: ["text"], properties: { text: { type: "string" }, note: { type: "string" }, dueHint: { type: "string" } } } },
+            resolved_foreshadowing: { type: "array", items: { type: "object", required: ["id"], properties: { id: { type: "string" }, how: { type: "string" } } } },
+            character_updates: { type: "array", items: { type: "object", required: ["name", "status"], properties: { name: { type: "string" }, status: { type: "string" }, look: { type: "string" } } } },
+            character_exits: { type: "array", items: { type: "object", required: ["name"], properties: { name: { type: "string" }, reason: { type: "string" } } } },
+            timeline_summary: { type: "string" },
+            world_current: { type: "string" },
+            new_characters: { type: "array", items: { type: "object", required: ["name"], properties: { name: { type: "string" }, role: { type: "string" }, gender: { type: "string" }, age: { type: "string" }, identity: { type: "string" }, traits: { type: "array", items: { type: "string" } }, motivation: { type: "string" } } } },
+            plot_threads: { type: "array", items: { type: "object", required: ["id", "status"], properties: { id: { type: "string" }, status: { type: "string" }, note: { type: "string" } } } },
+            setting_rules: { type: "array", items: { type: "string" } },
+          },
+        },
+      },
     );
   } catch {
     /* 记账失败不阻塞：降级为纯文本摘要，状态不更新 */

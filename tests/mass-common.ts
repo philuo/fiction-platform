@@ -33,7 +33,6 @@ export const BOOK_SPECS: BookSpec[] = [
 const EVAL_NAMES = ["剧情逻辑", "人物塑造", "节奏张力", "文笔风格", "爽点钩子", "伏笔管理", "设定一致", "主题立意"];
 
 let active: BookSpec | null = null;
-let installed = false;
 let _writeCalls = 0; // 每本书重置（setSpec）
 let _settleCalls = 0;
 
@@ -44,11 +43,11 @@ export function setSpec(spec: BookSpec): void {
   _settleCalls = 0;
 }
 
-/** 安装全链路 mock（幂等：只装一次）；spec 缺省时用当前 active */
+/** 安装全链路 mock：每个测试文件都必须调用一次（bun 的 mock.module 按测试文件独立生效，
+ * 跨文件共享 installed 标志会导致后执行的文件未注册 mock 而直连真实 API）。
+ * 同文件内重复调用为幂等覆盖。 */
 export function installFullMock(spec?: BookSpec): void {
   if (spec) active = spec;
-  if (installed) return;
-  installed = true;
   mock.module("../src/api/agnes", () => {
     class LLMError extends Error {}
     const responder = (messages: { role: string; content: string }[]) => {

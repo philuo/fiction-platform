@@ -96,7 +96,7 @@ export async function brainReviewAfterCommit(
         { role: "system", content: BRAIN_REVIEW_SYSTEM },
         { role: "user", content: facts },
       ],
-      taskOpts("brainReview"),
+      { ...taskOpts("brainReview"), schema: { type: "object", required: ["verdict"], properties: { verdict: { type: "string", enum: ["approve", "revise", "reject"] }, reason: { type: "string" }, suggestions: { type: "array", items: { type: "string" } } } } },
     );
     const verdict = out.verdict === "revise" || out.verdict === "reject" ? out.verdict : "approve";
     const suggestions = Array.isArray(out.suggestions) ? out.suggestions.map(String).filter(Boolean).slice(0, 3) : undefined;
@@ -166,7 +166,7 @@ export async function gateChange(
         },
         { role: "user", content: facts },
       ],
-      taskOpts("brainGate"),
+      { ...taskOpts("brainGate"), schema: { type: "object", required: ["verdict"], properties: { verdict: { type: "string", enum: ["allow", "reject"] }, reason: { type: "string" } } } },
     );
     if (out.verdict === "reject") return { allow: false, reason: out.reason?.trim() };
     return { allow: true };

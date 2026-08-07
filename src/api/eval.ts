@@ -71,7 +71,18 @@ export async function evaluateBook(w: WorldState, range?: [number, number]): Pro
       { role: "system", content: EVAL_SYSTEM },
       { role: "user", content: userMsg },
     ],
-    { temperature: 0.3, maxTokens: 60000 },
+    {
+      temperature: 0.3,
+      maxTokens: 60000,
+      schema: {
+        type: "object",
+        required: ["dimensions"],
+        properties: {
+          dimensions: { type: "array", items: { type: "object", required: ["name", "score"], properties: { name: { type: "string" }, score: { type: "integer" }, evidence: { type: "string" } } } },
+          suggestions: { type: "array", items: { type: "string" } },
+        },
+      },
+    },
   );
 
   const dims: EvalDimensionResult[] = [];

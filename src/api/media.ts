@@ -883,7 +883,29 @@ async function planScenesOnce(w: WorldState, ch: Chapter, kind: "image" | "video
         // 思考型模型预算：若文本模型为思考型（如 agnes-2.5-flash），reasoning 与正文共享 max_tokens（默认思考实测 1000~8000+，波动大），
         // 预算不足会空输出（finish_reason=length, text=0）或 JSON 截断；60000 给思考与多场景正文留足余量；
         // 实测成功 13~50s，超时 150s（内部 1 次重试预算）
-        { temperature: 0.5, maxTokens: 60000, timeoutMs: 150_000, retries: 2 },
+        {
+          temperature: 0.5,
+          maxTokens: 60000,
+          timeoutMs: 150_000,
+          retries: 2,
+          schema: {
+            type: "object",
+            required: ["scenes"],
+            properties: {
+              scenes: {
+                type: "array",
+                items: {
+                  type: "object", required: ["anchor", "scene"],
+                  properties: {
+                    anchor: { type: "string" }, scene: { type: "string" },
+                    caption: { type: "string" }, type: { type: "string", enum: ["人物", "场景", "事件"] },
+                    subject: { type: "string" }, extraChars: { type: "array", items: { type: "string" } },
+                  },
+                },
+              },
+            },
+          },
+        },
       );
     } catch (e) {
       if (scenes.length) break; // 已有部分场景：停止补充，返回已收集的 LLM 场景

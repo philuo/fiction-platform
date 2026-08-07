@@ -98,7 +98,40 @@ export async function newStory(idea: string, genre?: string): Promise<WorldState
       { role: "system", content: INIT_SYSTEM },
       { role: "user", content: `灵感：${idea}${genre ? `\n题材方向：${genre}` : ""}` },
     ],
-    { temperature: 0.9, maxTokens: 60000 },
+    {
+      temperature: 0.9,
+      maxTokens: 60000,
+      // jsonschema：立项输出结构化约束（角色性别强制 男/女 枚举）
+      schema: {
+        type: "object",
+        required: ["title", "genre", "premise", "setting", "characters"],
+        properties: {
+          title: { type: "string" },
+          genre: { type: "string" },
+          premise: { type: "string" },
+          setting: { type: "object", required: ["time", "place"], properties: { time: { type: "string" }, place: { type: "string" }, rules: { type: "array", items: { type: "string" } }, tone: { type: "string" } } },
+          characters: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["name", "gender", "role", "traits", "motivation"],
+              properties: {
+                name: { type: "string" },
+                gender: { type: "string", enum: ["男", "女"] },
+                age: { type: "string" },
+                identity: { type: "string" },
+                role: { type: "string", enum: ["主角", "反派", "配角", "关键人物"] },
+                traits: { type: "array", items: { type: "string" } },
+                motivation: { type: "string" },
+                secret: { type: "string" },
+                status: { type: "string" },
+                voice: { type: "string" },
+              },
+            },
+          },
+        },
+      },
+    },
   );
 
   const w = emptyWorld();
@@ -159,6 +192,7 @@ async function ensureResearch(world: WorldState): Promise<void> {
       ...(world.lore ?? []),
       { id: `lore-r${Date.now().toString(36)}`, keywords: ["考据"], content: `历史考据（${q}）：${content}`, enabled: true, auto: true },
     ];
+    logChange(world, { chapter: world.nextChapter, actor: "ai", kind: "lore-research", detail: `历史考据：${q} → 世界书「考据」条目（${content.slice(0, 40)}…）`, commandId: "CMD-W15" });
     saveWorld(world);
   } catch {
     /* 考据失败不阻塞写作 */
@@ -407,6 +441,8 @@ export async function commitChapter(
     instructions?: string[];
     appliedCards?: Card[];
     checkpointStep?: string;
+    /** 审计：提交触发方（user=人工确认/连载，ai=自动管线，system=重试） */
+    actor?: "user" | "ai" | "system";
   },
   onEvent?: (e: StepEvent) => void,
 ): Promise<Chapter> {
@@ -461,6 +497,15 @@ export async function commitChapter(
     }
   }
   onEvent?.({ phase: "saving" });
+  // 审计：每章提交本体落一条审计条目（谁触发、第几章、账本影响），与 brain-disposition 旁路记录互补
+  logChange(world, {
+    chapter: index,
+    actor: args.actor ?? "ai",
+    kind: "chapter-commit",
+    detail: `第 ${index} 章《${title}》提交入册（审查 ${verdict.action}，记账：新伏笔 ${report.newForeshadows}/回收 ${report.resolvedForeshadows}/新角色提案 ${report.newProposals}/角色状态更新 ${report.characterUpdates}）`,
+    commandId: "CMD-N02",
+    level: "L2",
+  });
   saveWorld(world);
   appendCheckpoint(world.title, args.checkpointStep ?? "commit", index);
   onEvent?.({
@@ -584,6 +629,7 @@ export async function gachaGenerate(
 ): Promise<{ pool: Card[] }> {
   const pool = await generateCardPool(world, { count: opts.count ?? 4, types: opts.types });
   world.pendingCards = pool;
+  logChange(world, { chapter: world.nextChapter, actor: "user", kind: "gacha-generate", detail: `生成卡池 ${pool.length} 张：${pool.map((c) => `「${c.title}」(${c.rarity}/${c.type})`).join("、").slice(0, 200)}`, commandId: "CMD-W17" });
   saveWorld(world);
   return { pool };
 }
@@ -627,10 +673,11 @@ export async function generateOutline(world: WorldState, userHint?: string): Pro
       { role: "system", content: OUTLINE_SYSTEM },
       { role: "user", content: userMsg },
     ],
-    { temperature: 0.8, maxTokens: 60000 },
+    { temperature: 0.8, maxTokens: 60000, schema: { type: "object", required: ["outline"], properties: { outline: { type: "array", items: { type: "string" } } } } },
   );
   const list = (Array.isArray(out.outline) ? out.outline : []).map(String).filter((s) => s.trim()).slice(0, 6);
   world.outline = list;
+  logChange(world, { chapter: world.nextChapter, actor: "user", kind: "outline-generate", detail: `生成大纲 ${list.length} 条：${list.map((s) => s.slice(0, 30)).join("；").slice(0, 200)}`, commandId: "CMD-W01" });
   saveWorld(world);
   return list;
 }
@@ -849,7 +896,8 @@ export function editWorld(world: WorldState, patch: {
     const manual = sanitizeLore(patch.lore).filter((e) => !e.auto);
     world.lore = [...buildAutoLore(world), ...manual];
   }
-  saveWorld(world);
+  // 注：不在此落盘——由调用方（/api/novel/world 路由）在锁内统一 saveWorld，
+  // 避免 editWorld 内落盘 + 路由 L2 策略 applyStrategy 落盘 + 路由最终落盘三重全量序列化（路径缩短）
   return world;
 }
 
@@ -943,14 +991,13 @@ export async function editChapter(world: WorldState, index: number, text: string
   recomputeAppearedIn(world); // 正文变更后同步出场角色
   markOrphanMedia(ch); // 媒体锚定失配检测（落盘前，orphan 标记随存档持久化）
   logChange(world, { chapter: index, actor: "user", kind: "chapter-edit", detail: `手动编辑第 ${index} 章《${ch.title}》正文（自动留版本快照）`, commandId: "CMD-N06" });
-  saveWorld(world);
+  saveWorld(world); // ① 编辑保底：编辑本身立即落盘，后续审查/记账失败不丢失
   // 人工编辑后自动审查，但不自动重写
   let review: ReviewResult | null = null;
   try {
     const v = await reviewChapter(world, ch.text, ch.title, index, null);
     review = toReviewResult(v);
-    ch.review = review;
-    saveWorld(world);
+    ch.review = review; // 不立即落盘，随记账后最终落盘（合并 saveWorld，路径缩短）
   } catch {
     /* 审查失败不阻塞保存 */
   }
@@ -958,7 +1005,6 @@ export async function editChapter(world: WorldState, index: number, text: string
   try {
     const settleReport = await settleChapter(world, ch, (world.chapterPlans ?? []).find((p) => p.index === index) ?? null);
     world.chapterDeltas = { ...(world.chapterDeltas ?? {}), [index]: settleReport.delta };
-    saveWorld(world);
   } catch {
     // 记账失败不阻塞编辑保存：降级该章摘要为正文开头并清空出场名单，
     // 前端「脉络/人物」回退实时正文匹配，避免展示旧章节的梗概与角色——修「内容变更后脉络未更新」
@@ -969,8 +1015,8 @@ export async function editChapter(world: WorldState, index: number, text: string
       s.stateChanges = [];
       s.appeared = [];
     }
-    saveWorld(world);
   }
+  saveWorld(world); // ② 最终落盘：审查结果 + 记账 delta（或降级摘要）一次写入
   return { world, review, report: chapterChangeReport(world, ch) };
 }
 
@@ -1004,13 +1050,12 @@ export async function rollbackChapter(world: WorldState, index: number, versionI
   try {
     const settleReport = await settleChapter(world, ch, (world.chapterPlans ?? []).find((p) => p.index === index) ?? null);
     world.chapterDeltas = { ...(world.chapterDeltas ?? {}), [index]: settleReport.delta };
-    saveWorld(world);
   } catch {
-    /* 记账失败不阻塞回滚 */
+    /* 记账失败不阻塞回滚（降级摘要已在上面写入） */
   }
   const report = chapterChangeReport(world, ch);
   logChange(world, { chapter: index, actor: "user", kind: "chapter-rollback", detail: `回滚第 ${index} 章《${ch.title}》到版本 ${versionIndex + 1}（账本已重算）`, commandId: "CMD-N07" });
-  saveWorld(world);
+  saveWorld(world); // 单次最终落盘：文本/审查/摘要/delta/日志一次写入（路径缩短）
   return { world, report };
 }
 
@@ -1133,6 +1178,7 @@ export async function reReviewChapter(
   const v = await reviewChapter(world, ch.text, ch.title, index, null);
   const review = toReviewResult(v);
   ch.review = review;
+  logChange(world, { chapter: index, actor: "user", kind: "chapter-rereview", detail: `单章重审第 ${index} 章《${ch.title}》：${v.action === "pass" ? "通过" : `需修改（${v.action}）`}`, commandId: "CMD-N09" });
   saveWorld(world);
   return { chapter: ch, review, world };
 }

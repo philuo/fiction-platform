@@ -3,7 +3,9 @@
 // 断点恢复：每章 commit 即存档 + checkpoint.jsonl；会话状态 autorun-session.json（前端刷新 / 服务重启恢复）
 import { InterruptedError, registerReviewDebt, ReviewFailedError, type StepEvent, type StepResult } from "./director";
 import { isBookComplete } from "./planner";
-import { evaluateBook, type EvalReport } from "./eval";
+import { evaluateBookCached, type EvalReport } from "./eval";
+import { logChange } from "./steering";
+import { withTitleLock } from "./titlelock";
 import { genOf, type PendingChapter, type ReviewFinding, type WorldState } from "./world";
 import {
   clearPendingChapter, loadAutoSession, loadPendingChapter, saveAutoSession, savePendingChapter, saveWorld,
@@ -151,15 +153,16 @@ export async function runAuto(
       if (lowStreak >= 2 || (opts.stopAvgScore !== undefined && avg < opts.stopAvgScore)) {
         return finish(title, { written, reason: "score", avgScore: scoreSum / scoreCount });
       }
-      // 定期整书评估（可关）
+      // 定期整书评估（可关）：走持久化缓存（内容指纹未变直接返回，避免每 10 章必烧一次 8 维 LLM 评估）
       const every = opts.runEvalEvery ?? 10;
       if (every > 0 && written % every === 0) {
         try {
           const fresh = load();
           if (fresh) {
-            lastEval = await evaluateBook(fresh);
+            const { report, cached } = await evaluateBookCached(fresh);
+            lastEval = report;
             touchSession(title, { lastEval });
-            onEvent({ auto: true, phase: "auto-status", written, reason: "eval", eval: lastEval });
+            onEvent({ auto: true, phase: "auto-status", written, reason: cached ? "eval-cached" : "eval", eval: lastEval });
           }
         } catch {
           /* 评估失败不阻塞连载 */
@@ -178,13 +181,16 @@ export async function runAuto(
           review: e.review,
           savedAt: new Date().toISOString(),
         });
-        // 记账联动：major findings 登记质量债务（独立事务落盘，等待人工处置）
+        // 记账联动：major findings 登记质量债务（锁内独立事务落盘，防与并发写章基于旧快照覆盖）
         try {
-          const wd = load();
-          if (wd) {
-            registerReviewDebt(wd, e.chapterIndex, e.review, true);
-            saveWorld(wd);
-          }
+          await withTitleLock(title, async () => {
+            const wd = load();
+            if (wd) {
+              registerReviewDebt(wd, e.chapterIndex, e.review, true);
+              logChange(wd, { chapter: e.chapterIndex, actor: "system", kind: "debt-auto", detail: `连载审查未过记账联动：第 ${e.chapterIndex} 章 major 问题登记质量债务（${(wd.qualityDebt ?? []).filter((d) => d.status === "open").length} 条未处置）`, commandId: "CMD-L12" });
+              saveWorld(wd);
+            }
+          });
         } catch {
           /* 债务登记失败不阻塞暂停流程 */
         }
