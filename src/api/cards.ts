@@ -8,7 +8,7 @@ const CARD_TYPES: CardType[] = ["角色", "发展方向", "伏笔", "章节", "�
 
 const GACHA_SYSTEM = `你是小说创作的"抽卡系统"。基于当前世界状态生成一组风格契合的卡牌，供玩家抽取后注入剧情。
 卡牌类型（按指定类型生成）：
-- 角色：新角色登场契机（必须同时给出 character 结构化人物：姓名/定位/特质/动机/说话风格）
+- 角色：新角色登场契机（必须同时给出 character 结构化人物：姓名/定位/性别（只能是男或女）/年龄/社会身份/特质/动机/说话风格）
 - 发展方向：剧情走向（转折/危机/支线/高潮/结局推进）
 - 伏笔：悬念埋设（内容 + 建议回收时机 dueHint）
 - 章节：本节推进要点（场景/节拍/视角切换/关键对话）
@@ -16,15 +16,15 @@ const GACHA_SYSTEM = `你是小说创作的"抽卡系统"。基于当前世界�
 - 场景：新地点（氛围/秘密/与主线关联）
 稀有度：N 普通 / R 稀有 / SR 史诗 / SSR 传说（SSR 少而精）。
 每张卡的 effect 必须是可直接注入写作指令的一句话。
-输出必须是合法 JSON（不要 markdown 围栏）：{"cards":[{"type":"角色","rarity":"SR","title":"…","description":"…","effect":"…","character":{"name":"姓名","role":"定位","traits":["特质"],"motivation":"动机","voice":"说话风格"},"dueHint":"伏笔卡专用：建议回收时机"}]}
-要求：卡牌与世界观契合、有戏剧性、避免陈词滥调；最多 5 张；至少包含 1 张伏笔卡或角色卡。
+输出必须是合法 JSON（不要 markdown 围栏）：{"cards":[{"type":"角色","rarity":"SR","title":"…","description":"…","effect":"…","character":{"name":"姓名","role":"定位","gender":"男或女","age":"年龄","identity":"社会身份/职业","traits":["特质"],"motivation":"动机","voice":"说话风格"},"dueHint":"伏笔卡专用：建议回收时机"}]}
+要求：卡牌与世界观契合、有戏剧性、避免陈词滥调；最多 5 张；至少包含 1 张伏笔卡或角色卡；角色卡的 gender/age/identity 必须具体明确（头像/立绘生成依赖这三项）。
 字符串值内部一律使用中文引号「」/『』，禁止英文双引号。`;
 
 export async function generateCardPool(world: WorldState, opts: { count?: number; types?: CardType[] } = {}): Promise<Card[]> {
   const count = Math.max(1, Math.min(opts.count ?? 4, 6));
   const types = opts.types?.length ? opts.types : CARD_TYPES;
   const userMsg = [worldSummary(world), `\n请为下一章生成 ${count} 张候选卡，类型限定为：${types.join("/")}（只输出 JSON）。`].join("\n");
-  const out = await chatJson<{ cards?: { type?: string; rarity?: string; title?: string; description?: string; effect?: string; dueHint?: string; character?: { name?: string; role?: string; traits?: string[]; motivation?: string; voice?: string } }[] }>(
+  const out = await chatJson<{ cards?: { type?: string; rarity?: string; title?: string; description?: string; effect?: string; dueHint?: string; character?: { name?: string; role?: string; gender?: string; age?: string; identity?: string; traits?: string[]; motivation?: string; voice?: string } }[] }>(
     [
       { role: "system", content: GACHA_SYSTEM },
       { role: "user", content: userMsg },
@@ -44,7 +44,7 @@ export async function generateCardPool(world: WorldState, opts: { count?: number
                 type: { type: "string", enum: ["角色", "发展方向", "伏笔", "章节", "道具", "场景"] },
                 rarity: { type: "string", enum: ["N", "R", "SR", "SSR"] },
                 title: { type: "string" }, description: { type: "string" }, effect: { type: "string" }, dueHint: { type: "string" },
-                character: { type: "object", required: ["name"], properties: { name: { type: "string" }, role: { type: "string" }, traits: { type: "array", items: { type: "string" } }, motivation: { type: "string" }, voice: { type: "string" } } },
+                character: { type: "object", required: ["name"], properties: { name: { type: "string" }, role: { type: "string" }, gender: { type: "string", enum: ["男", "女"] }, age: { type: "string" }, identity: { type: "string" }, traits: { type: "array", items: { type: "string" } }, motivation: { type: "string" }, voice: { type: "string" } } },
               },
             },
           },
@@ -69,6 +69,10 @@ export async function generateCardPool(world: WorldState, opts: { count?: number
           ? {
               name: String(c.character.name).trim().slice(0, 12),
               role: String(c.character.role ?? "配角").trim().slice(0, 20),
+              // 性别只接受「男/女」（与立项/提案一致）；年龄/身份供头像/立绘生成使用
+              gender: c.character.gender === "男" || c.character.gender === "女" ? c.character.gender : undefined,
+              age: c.character.age ? String(c.character.age).trim().slice(0, 20) : undefined,
+              identity: c.character.identity ? String(c.character.identity).trim().slice(0, 40) : undefined,
               traits: (Array.isArray(c.character.traits) ? c.character.traits : []).map(String).slice(0, 5),
               motivation: String(c.character.motivation ?? "").trim().slice(0, 120),
               voice: c.character.voice ? String(c.character.voice).trim().slice(0, 80) : undefined,
@@ -115,6 +119,9 @@ export function applyCards(world: WorldState, picked: Card[]): { instructions: s
           id: `cp${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
           name,
           role: c.character?.role ?? "配角",
+          gender: c.character?.gender,
+          age: c.character?.age,
+          identity: c.character?.identity,
           traits: c.character?.traits ?? [],
           motivation: c.character?.motivation ?? c.description.slice(0, 60),
           voice: c.character?.voice,

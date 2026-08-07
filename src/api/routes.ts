@@ -1583,6 +1583,22 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         }
         return json({ ok: true, status: media.status ?? "failed", error: "无视频任务" });
       }
+      // 视频超时回收：pending 超过 30 分钟（视频正常 5-15s）→ 标记 failed，避免永久 pending
+      if (media.status === "pending" && media.createdAt && Date.now() - media.createdAt > 30 * 60_000) {
+        await withTitleLock(slug(title), async () => {
+          const w = loadWorld(title);
+          const ch = w?.chapters.find((x) => x.index === idx);
+          const m = (ch?.media ?? []).find((x) => x.id === mediaId);
+          if (w && m && m.status === "pending") {
+            m.status = "failed";
+            m.error = "视频生成超时（超过 30 分钟），请删除后重新生成";
+            touchChapter(w, idx);
+            applyStateChange(w, { actor: "system", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章视频超时标记 failed（${mediaId}）`, chapter: idx });
+            saveWorld(w);
+          }
+        });
+        return json({ ok: true, status: "failed", error: "视频生成超时（超过 30 分钟），请删除后重新生成" });
+      }
       try {
         const st = await pollVideoTask(media.videoId);
         if (st.status === "rate_limited") return json({ ok: true, status: "pending", progress: -1, rateLimited: true });

@@ -35,8 +35,7 @@ export function requeueInterrupt(title: string, item: SteeringItem): void {
 export function logChange(w: WorldState, entry: Omit<ChangeLogEntry, "at">): void {
   const list = w.changeLog ?? [];
   list.push({ at: new Date().toISOString(), ...entry });
-  // 上限 500 条，防无限增长
-  w.changeLog = list.slice(-500);
+  w.changeLog = list;
 }
 
 /** 带 HARNESS 指令元数据的日志（中枢架构：所有写操作落 commandId/level，实现「所有操作可追溯」） */
@@ -45,6 +44,9 @@ export function logCommandChange(
   entry: Omit<ChangeLogEntry, "at" | "commandId" | "level"> & { commandId?: string; level?: ChangeLogEntry["level"] },
 ): void {
   const cmd = entry.commandId ? getCommand(entry.commandId) : undefined;
+  if (entry.commandId && !cmd) {
+    console.warn(`[harness] 未知指令 ID：${entry.commandId}（请检查 commandId 拼写，未登记指令降级 L0）`);
+  }
   logChange(w, {
     ...entry,
     commandId: entry.commandId ?? cmd?.id,

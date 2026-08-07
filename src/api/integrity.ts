@@ -352,7 +352,16 @@ export function deleteChapterCascade(w: WorldState, index: number): DeleteCascad
   // 账本条目清理
   w.chapterSummaries = (w.chapterSummaries ?? []).filter((s) => s.index !== index);
   w.timeline = w.timeline.filter((t) => t.chapter !== index);
+  const deletedPlan = (w.chapterPlans ?? []).find((p) => p.index === index);
   w.chapterPlans = (w.chapterPlans ?? []).filter((p) => p.index !== index);
+  // 删章后弧状态检查：被删章所属弧若已 done，回退为 writing（摘要可能不准，下回合可重新触发边界处理）
+  if (deletedPlan) {
+    const arc = (w.storyArcs ?? []).find((a) => a.id === deletedPlan.arcId);
+    if (arc && arc.status === "done") {
+      arc.status = "writing";
+      findings.push({ id: fid("arc-status-revert", deletedPlan.arcId), level: "warning", kind: "arc-status-revert", chapterIndex: index, issue: `弧「${arc.title}」因第 ${index} 章删除被回退为写作中（原状态 done，摘要可能需复核）`, suggestion: "弧内剩余章节写完后会重新触发边界处理生成新摘要" });
+    }
+  }
   w.qualityDebt = (w.qualityDebt ?? []).filter((d) => d.chapterIndex !== index);
   if (w.chapterGen) delete w.chapterGen[index];
 

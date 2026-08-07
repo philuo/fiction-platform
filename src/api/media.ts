@@ -85,13 +85,13 @@ const STYLE_FALLBACK = "电影级动漫插画，统一画风，戏剧性光影�
 // —— 时代服饰映射：按 setting.time 关键词转成具体服饰/造型指令（硬性转换，杜绝“现代人混进古代”类年代错乱）——
 // 头部统一束发/挽髻、明确禁帽子（避免模型自行画出官帽/乌纱帽等易混淆头饰）；男女装束分写，供模型区分性别形象
 const ERA_DRESS_RULES: { keys: string[]; dress: string }[] = [
-  { keys: ["明", "崇祯", "万历", "永乐"], dress: "明朝装束：男子圆领袍或直身长衫，束发用布巾系扎，不戴任何帽子；女子交领袄裙配褙子，长发挽髻插簪" },
+  { keys: ["明", "崇祯", "万历", "永乐"], dress: "明朝装束：男子圆领袍或直身长衫，头发半束成小发髻插簪、发髻裸露不包裹、余发垂肩，头上无任何巾帽；女子交领袄裙配褙子，长发挽髻插簪" },
   { keys: ["唐", "贞观", "开元", "天宝"], dress: "唐朝装束：男子圆领袍，束发，不戴帽子；女子齐胸襦裙配披帛，高髻插花钿" },
   { keys: ["宋", "北宋", "南宋", "靖康"], dress: "宋朝装束：男子直裰长衫，束发，不戴帽子；女子褙子配百褶裙，梳发髻" },
   { keys: ["秦", "汉", "两汉", "西汉", "东汉"], dress: "秦汉装束：男子深衣或曲裾袍，束发，不戴帽子；女子曲裾深衣，垂髫发式" },
-  { keys: ["民国", "近现代"], dress: "民国装束：男子长衫或中山装，短发；女子旗袍或学生装，民国发型" },
-  { keys: ["现代", "都市", "当代"], dress: "现代日常服饰，当代发型" },
-  { keys: ["未来", "星际", "赛博", "末世"], dress: "未来科技感服饰，赛博朋克风造型" },
+  { keys: ["民国", "近现代"], dress: "民国装束：利落短发或民国发型，头顶无发髻无发簪；男子长衫或中山装；女子旗袍或学生装" },
+  { keys: ["现代", "都市", "当代"], dress: "现代日常服饰，当代短发或披发，头顶无发髻无发簪" },
+  { keys: ["未来", "星际", "赛博", "末世"], dress: "未来科技感服饰，赛博朋克风造型，利落短发，头顶无发髻无发簪" },
 ];
 const ERA_DRESS_FALLBACK = "古代东方服饰，束发盘髻，不戴帽子，无任何现代元素";
 
@@ -109,7 +109,7 @@ export const IDENTITY_DRESS_RULES: { keys: string[]; dress: string }[] = [
   { keys: ["符修", "符箓师", "画符"], dress: "符箓道袍：袍上隐现符纹，腰系朱砂笔与符纸袋" },
   { keys: ["阵修", "阵法师"], dress: "阵师法袍：绣星阵纹的长袍，手持阵盘或阵旗" },
   { keys: ["器修", "炼器师", "铸器师"], dress: "炼器短褐：打铁短褐束袖，系皮质围裙，臂膀结实" },
-  { keys: ["体修", "炼体士"], dress: "体修劲装：束袖劲装半露臂膀，肌肉线条分明" },
+  { keys: ["体修", "炼体士"], dress: "体修劲装：挽袖露臂的束袖劲装，臂膀粗壮，腰缠布带" },
   { keys: ["魔修", "邪修", "魔尊"], dress: "魔修玄袍：玄黑长袍带魔纹暗绣，周身煞气" },
   { keys: ["鬼修", "魂修"], dress: "鬼修灰袍：灰白旧袍，面色苍白阴冷" },
   { keys: ["妖修", "狐妖", "精怪", "化形"], dress: "妖修华服：妖异华丽的锦袍或裙衫，眉眼带魅" },
@@ -142,7 +142,7 @@ export const IDENTITY_DRESS_RULES: { keys: string[]; dress: string }[] = [
   { keys: ["猎魔"], dress: "猎魔人装束：黑色皮甲配银质兵刃，斗篷猎猎" },
   { keys: ["驱魔"], dress: "驱魔师装束：长款风衣配圣水瓶与十字架" },
   { keys: ["灵媒"], dress: "灵媒装束：复古长裙配水晶挂饰，气质神秘" },
-  { keys: ["海盗", "海贼"], dress: "海盗装束：船长外套配三角帽与眼罩，腰挎弯刀" },
+  { keys: ["海盗", "海贼"], dress: "海盗装束：船长外套配眼罩，腰挎弯刀，束发露顶不戴帽" },
   { keys: ["舰长"], dress: "星际舰服：银白舰服配徽章肩章，英气逼人" },
   { keys: ["机甲"], dress: "机甲驾驶服：紧身连体驾驶服配飞行头盔" },
   { keys: ["星际商人", "星际走私"], dress: "星际商人装束：华丽星际斗篷，手持全息账本" },
@@ -155,7 +155,7 @@ export const IDENTITY_DRESS_RULES: { keys: string[]; dress: string }[] = [
   { keys: ["总裁", "CEO", "董事长", "总经理", "副总裁", "企业高管"], dress: "企业高管装束：高级定制西装，领带袖扣，气度不凡" },
   { keys: ["国企", "央企"], dress: "国企干部装束：深蓝夹克配白衬衫，沉稳朴素" },
   { keys: ["公务员", "机关干部", "科长", "处长", "乡长", "镇长", "县长", "市长", "省委", "市委", "政府"], dress: "机关干部装束：藏青夹克或白衬衫，正派干练" },
-  { keys: ["施工员", "监理", "建筑工程师", "造价师", "预算员", "工程管理"], dress: "工程人员装束：白衬衫或工装，戴安全帽，夹着图纸" },
+  { keys: ["施工员", "监理", "建筑工程师", "造价师", "预算员", "工程管理"], dress: "工程人员装束：白衬衫或工装，安全帽挂腰侧，夹着图纸" },
   { keys: ["律师", "法务", "诉讼"], dress: "律师正装：深色西装领带，手提公文包，气质严谨" },
   { keys: ["会计", "财务", "出纳", "审计"], dress: "财务正装：职业套装，干练整洁" },
   { keys: ["人事", "HR", "人力资源"], dress: "HR职业装：商务套装，亲和专业" },
@@ -219,10 +219,10 @@ export const IDENTITY_DRESS_RULES: { keys: string[]; dress: string }[] = [
   { keys: ["饿了么"], dress: "饿了么骑手服：蓝色工服配骑行头盔，胸前保温箱，反光条" },
   { keys: ["淘宝外卖", "闪购"], dress: "淘宝闪购骑手服：橙色工服配骑行头盔，胸前保温箱，反光条" },
   { keys: ["京东外卖", "达达"], dress: "京东秒送骑手服：红色工服配骑行头盔，胸前保温箱，反光条" },
-  { keys: ["外卖", "骑手"], dress: "外卖骑手服：平台工装（黄蓝橙红），骑行头盔，胸前保温箱" },
+  { keys: ["外卖", "骑手"], dress: "外卖骑手服：平台工装（黄蓝橙红），头盔挂腰侧，胸前保温箱" },
   { keys: ["快递", "跑腿", "闪送", "配送"], dress: "快递员工服：快递工装马甲配帽子，手持扫码枪" },
   { keys: ["服务员", "侍应生", "传菜员", "服务生"], dress: "服务员制服：餐厅制服配围裙，托盘服务" },
-  { keys: ["厨师", "大厨", "主厨", "后厨", "烹饪"], dress: "厨师服：白色厨师服，头戴厨师帽" },
+  { keys: ["厨师", "大厨", "主厨", "后厨", "烹饪"], dress: "厨师服：白色厨师服，手持炒勺（不戴帽）" },
   { keys: ["面点师", "烘焙师", "糕点师", "甜品师", "面包师"], dress: "面点师装束：围裙配袖套，双手沾面粉" },
   { keys: ["咖啡师", "奶茶店员", "奶茶", "咖啡"], dress: "咖啡师装束：工装围裙，别工作牌" },
   { keys: ["收银员", "营业员", "导购", "售货员", "店员", "店长"], dress: "门店工服：商场或门店统一工服" },
@@ -331,7 +331,7 @@ export const IDENTITY_DRESS_RULES: { keys: string[]; dress: string }[] = [
   { keys: ["赛车"], dress: "赛车手装束：赛车服配头盔，英姿飒爽" },
   { keys: ["高尔夫"], dress: "高尔夫球手装束：Polo衫配球帽，潇洒从容" },
   { keys: ["马拉松", "长跑"], dress: "跑者装束：速干运动服配跑鞋，活力满满" },
-  { keys: ["骑行"], dress: "骑行者装束：骑行服配头盔，风尘仆仆" },
+  { keys: ["骑行"], dress: "骑行者装束：骑行服配护目镜，头盔挂腰侧，风尘仆仆" },
   { keys: ["钓鱼", "钓手"], dress: "钓手装束：钓鱼背心配遮阳帽，悠然自得" },
   { keys: ["潜水"], dress: "潜水员装束：潜水服配氧气瓶与脚蹼" },
   { keys: ["登山", "攀岩"], dress: "登山者装束：冲锋衣配登山包与登山杖" },
@@ -343,7 +343,7 @@ export const IDENTITY_DRESS_RULES: { keys: string[]; dress: string }[] = [
   { keys: ["经纪人"], dress: "经纪人装束：时尚正装，干练利落" },
   { keys: ["星探"], dress: "星探装束：时尚休闲装，目光敏锐" },
   { keys: ["策展", "画廊"], dress: "策展人装束：简约艺术风穿搭，品味独特" },
-  { keys: ["拍卖"], dress: "拍卖师装束：深色正装配小木槌" },
+  { keys: ["拍卖"], dress: "拍卖师装束：深色正装，手持小木槌" },
 
   // —— 八、传统手艺与古代行业补充 ——
   { keys: ["铁匠", "打铁", "锻工", "铸剑"], dress: "铁匠装束：皮围裙配粗布短褐，肌肉结实" },
@@ -357,7 +357,7 @@ export const IDENTITY_DRESS_RULES: { keys: string[]; dress: string }[] = [
   { keys: ["乞丐", "流民", "难民", "流浪汉", "拾荒"], dress: "乞丐衣衫：破旧衣衫，蓬头垢面" },
   { keys: ["强盗", "山贼", "土匪", "马贼", "绑匪", "劫匪"], dress: "强盗短打：绑腿短打，腰插朴刀" },
   { keys: ["伙夫", "厨娘", "灶头"], dress: "伙夫装束：粗布围裙，烟火气十足" },
-  { keys: ["账房", "管家", "管账"], dress: "账房先生装束：长衫配算盘，精明干练" },
+  { keys: ["账房", "管家", "管账"], dress: "账房先生装束：长衫，手持算盘拨珠，精明干练" },
   { keys: ["师爷", "幕僚", "谋士", "军师"], dress: "师爷文士衫：青灰长衫，手持折扇" },
   { keys: ["画师", "画工", "丹青"], dress: "画师装束：素色长衫，指间墨迹" },
   { keys: ["金银匠", "首饰匠", "打银"], dress: "金银匠装束：粗布围裙配小锤，手艺精巧" },
@@ -387,7 +387,7 @@ export const IDENTITY_DRESS_RULES: { keys: string[]; dress: string }[] = [
   { keys: ["将军", "武将", "统领", "校尉", "都尉", "元帅", "总兵", "副将"], dress: "武将戎装：玄色战袍配轻甲或山文甲，束甲带，佩兵刃" },
   { keys: ["皇帝", "帝王", "太子", "亲王", "国主", "天子", "皇上", "圣上", "陛下"], dress: "帝王衮服：明黄龙袍或衮冕" },
   { keys: ["皇后", "太后", "皇贵妃", "贵妃", "嫔妃", "妃子", "娘娘", "皇妃"], dress: "后妃宫装：凤冠霞帔或华贵宫装，仪态雍容" },
-  { keys: ["尚书", "侍郎", "御史", "知府", "知县", "宰相", "内阁", "官员", "巡抚", "总督", "节度使", "太守", "刺史"], dress: "官员朝服：靛蓝或藏青补子官服，束发戴乌纱帽" },
+  { keys: ["尚书", "侍郎", "御史", "知府", "知县", "宰相", "内阁", "官员", "巡抚", "总督", "节度使", "太守", "刺史"], dress: "官员朝服：靛蓝或藏青补子官服，束发露顶不戴帽" },
   { keys: ["书生", "学子", "秀才", "举人", "文人", "才子", "进士", "儒生", "童生"], dress: "书生青衫：青布长衫，束发，手持书卷或折扇" },
   { keys: ["侠", "剑客", "镖", "杀手", "刺客", "江湖", "游侠", "刀客"], dress: "江湖劲装：玄色劲装短打，束腰带，佩刀剑" },
   { keys: ["僧", "和尚", "道士", "尼姑", "禅", "方丈", "住持", "僧人", "师太", "行者", "沙弥"], dress: "僧道衣袍：灰褐僧袍或青灰道袍，手持拂尘或念珠" },
@@ -428,6 +428,93 @@ export const IDENTITY_DRESS_RULES: { keys: string[]; dress: string }[] = [
   { keys: ["传令兵", "斥候", "探子"], dress: "传令兵装束：轻装快马，腰挎令旗" },
 ];
 const IDENTITY_DRESS_FALLBACK = ""; // 未匹配到身份服饰：仅用时代底衣
+
+// —— 容貌区分（区分度修复）：弱生图模型（Agnes 参数量小）读不懂「与其他角色区分」类抽象指令，
+// 也不会在缺外貌描述时自行分化——只会回退到「默认脸」导致全书撞脸。
+// 对策：按角色名 hash 确定性分配具体容貌特征（脸型/眉眼/肤色/身形），prompt 给的是具体视觉词，
+// 弱模型照着画即天然互斥；同名复现一致（头像重生成不变脸，立绘与头像同源同词经 i2i 继承）。
+// 不碰发型（eraDress 时代发型约束优先，避免「束发」与发型池冲突）；性别/年龄不参与，池子时代中立。
+export function nameSeed(name: string): number {
+  let h = 2166136261;
+  for (const ch of name) { h ^= ch.codePointAt(0) ?? 0; h = Math.imul(h, 16777619); }
+  return Math.abs(h);
+}
+// 脸型/眉眼只保留实测遵循的词（docs/VISUAL-VOCAB.md：圆脸/方圆脸/菱形脸/平眉深眼窝被弱模型忽略，已删）
+const FACE_SHAPES = ["鹅蛋脸", "瓜子脸", "长脸", "方脸"];
+const EYE_BROWS = ["剑眉星目", "浓眉大眼", "细长眉眼", "柳叶眉杏眼", "挑眉凤眼"];
+// 肤色只保留实测稳定的小枚举（稳定优先）：「古铜/偏深」画成脏深色脸、「红润」被弱模型字面画成红脸，均已移除；
+// 实测「白皙/小麦色」渲染自然稳定
+const SKIN_TONES = ["肤色白皙", "小麦色肤色"];
+const BODY_BUILDS = ["身形高挑清瘦", "身形壮硕高大", "身形娇小", "身形中等匀称", "身形宽肩魁梧", "身形修长挺拔"];
+
+/** 确定性容貌标识（纯函数，可单测）：按角色名 hash 分配脸型/眉眼/肤色/身形具体特征，同书角色互斥、同名复现一致；
+ * 少年/少女的身形不取 hash 池（避免「十五岁书童」配「壮硕高大」类年龄错配），固定「身形纤细瘦小」；
+ * salt 用于同书「脸型+眉眼」撞车避让（池子收缩后碰撞率上升，generateCharacterAvatar 按名册避让） */
+function lookParts(c: Character, salt = 0) {
+  const h = nameSeed(salt ? `${c.name}#${salt}` : c.name);
+  const young = /少年|少女/.test(genderPhrase(c));
+  // 身形池按性别过滤（实测修复：老周配「娇小」/秦夫人配「宽肩魁梧」类性别错配）
+  const builds = young
+    ? ["身形纤细瘦小"]
+    : c.gender === "男"
+      ? ["身形高挑清瘦", "身形壮硕高大", "身形中等匀称", "身形宽肩魁梧", "身形修长挺拔"]
+      : c.gender === "女"
+        ? ["身形高挑清瘦", "身形娇小", "身形中等匀称", "身形修长挺拔"]
+        : BODY_BUILDS;
+  return {
+    face: FACE_SHAPES[h % FACE_SHAPES.length],
+    eyes: EYE_BROWS[Math.floor(h / 4) % EYE_BROWS.length],
+    skin: SKIN_TONES[Math.floor(h / 20) % SKIN_TONES.length],
+    build: builds[Math.floor(h / 40) % builds.length],
+  };
+}
+export function distinctiveLook(c: Character, salt = 0): string {
+  const p = lookParts(c, salt);
+  return `容貌必须严格照此刻画：${p.face}，${p.eyes}，${p.skin}，${p.build}`;
+}
+
+/** 同书「脸型+眉眼」撞车避让（纯函数，可单测）：与名册内其他角色 salt0 的脸型+眉眼相同则递增 salt，
+ * 确定性（同名册同结果）；避免池子收缩后两角色脸型眉眼全同的「兄弟姐妹脸」 */
+export function distinctLookForRoster(c: Character, roster: Character[]): string {
+  const key = (ch: Character, s: number) => { const p = lookParts(ch, s); return `${p.face}|${p.eyes}`; };
+  const others = roster.filter((o) => o.id !== c.id);
+  let salt = 0;
+  while (salt < 16 && others.some((o) => key(o, 0) === key(c, salt))) salt++;
+  return distinctiveLook(c, salt);
+}
+
+/** 性别强化词（弱模型修复：性别不符）：「性别 男」埋在长 prompt 里弱模型会忽略，画出女相；
+ * 转为强具体词（年轻男性→青年男子/成年女性→成年女子），并在 prompt 多处重复强化；未知返回空串 */
+export function genderPhrase(c: Character): string {
+  if (c.gender === "男") {
+    const hay = `${c.age ?? ""}${c.identity ?? ""}`;
+    if (/少年|十五|十六|十七|少年轻/.test(hay)) return "少年男子";
+    if (/中年|四十|五十|老年|六十|老妪|老丈/.test(hay)) return "成年男子";
+    return "青年男子";
+  }
+  if (c.gender === "女") {
+    const hay = `${c.age ?? ""}${c.identity ?? ""}`;
+    if (/少年|十五|十六|十七/.test(hay)) return "少女";
+    if (/中年|四十|五十|老年|六十/.test(hay)) return "成年女子";
+    return "年轻女子";
+  }
+  return "";
+}
+
+/** 性别面部特征强化（实测修复：少年被画成女相）：男→五官英气硬朗；女→五官柔和女性化；少年额外加浓眉棱角 */
+export function genderFaceHint(c: Character): string {
+  if (c.gender === "男") {
+    return /少年|十五|十六|十七/.test(`${c.age ?? ""}${c.identity ?? ""}`)
+      ? "浓眉黑亮，脸部轮廓棱角分明，少年英气，严禁女相"
+      : "五官英气硬朗，男性特征鲜明，严禁女相";
+  }
+  if (c.gender === "女") return "五官柔和，女性特征鲜明，严禁男相";
+  return "";
+}
+
+/** 禁帽条款（实测修复：弱模型对古代人物有「发髻+帽」强先验，纯禁止压不住）：
+ * 给正面具体画法（只画发髻+发簪、发髻裸露）+ 反面禁止，双管齐下 */
+export const NO_HAT_CLAUSE = "头顶只画束起的发髻与发簪，发髻裸露，发髻外不包裹任何布料，不戴任何帽子（包括小帽、布冠、头巾类帽饰）";
 
 /** 身份服饰造型锚点（纯函数零 LLM）：按角色身份/职业返回标识性服饰/配饰；未匹配返回空串（仅用时代底衣） */
 export function identityDress(c: Character): string {
@@ -621,17 +708,25 @@ export function mediaDataUri(storyTitle: string, m: ChapterMedia): string | unde
   return `data:${mime};base64,${Buffer.from(buf).toString("base64")}`;
 }
 
-/** 生成角色全局立绘：中文提示词 = 角色自身字段属性（性别/年龄/身份/外貌特征 traits）+ 时代服饰（eraDress）+ 全书画风锚点；
- * 必须参考头像（c.image 或 opts.refImage，均为角色自身头像）作 i2i 容貌基准——立绘与头像容貌一致，渠道单一；
- * 无头像时抛错（不降级纯文生/不参考正文插画/旧立绘，保证立绘来源只有头像+角色字段）。
- * 硬约束：尺寸定死 1K 档 736x1312（ratio 9:16 竖版全身像）；背景统一纯色；禁帽子；性别特征鲜明。
+/** 生成角色全局立绘：头像即容貌/服饰/时代的唯一基准（渠道单一），立绘只改「构图」不改「人」。
+ * 弱模型策略（Agnes 参数量小）：i2i 改变部分写得越短越能保持参考图；旧版把性别/年龄/身份/traits/时代服饰
+ * 全部重述一遍（~400 字），弱模型记不住「保持容貌」长约束，自行重绘导致立绘与头像差异过大。
+ * 故默认 prompt 只写「同一人 + 保容貌发型服饰 + 竖版全身正面 + 纯色背景 + 禁帽子」；
+ * 用户改词重生成（opts.description）时才回退全量描述（尊重用户意图，不叠加容貌标识避免冲突）。
+ * 必须参考头像（c.image 或 opts.refImage，均为角色自身头像）作 i2i 容貌基准；无头像时抛错（不降级）。
+ * 硬约束：尺寸定死 1K 档 736x1312（ratio 9:16 竖版全身像）；背景统一纯色；朝向定死正面。
  * 返回 { mediaId, path, prompt, looks }，由调用方落盘到 character.portrait；落盘为 JPEG（体积小巧）；looks 供前端重生成时预填 */
-export async function generateCharacterPortrait(storyTitle: string, w: WorldState, c: Character, opts: { description?: string; refImage?: string } = {}): Promise<{ mediaId: string; path: string; prompt: string; looks: string }> {
+export async function generateCharacterPortrait(storyTitle: string, w: WorldState, c: Character, opts: { description?: string; refImage?: string; pose?: string; expression?: string } = {}): Promise<{ mediaId: string; path: string; prompt: string; looks: string }> {
   const desc = opts.description?.trim();
-  const looks = desc || c.traits.slice(0, 4).join("、");
-  const baseAttrs = `性别 ${c.gender || "未知"}，年龄 ${c.age || "未知"}，身份 ${c.identity || "—"}`;
   const idDress = identityDress(c);
-  const base = `《${w.title}》角色「${c.name}」（${c.role}）的全身立绘：${baseAttrs}；外貌特征 ${looks || "结合角色姓名与身份推演"}，面容气质需呈现明确的性别特征（男女形象区分鲜明）；时代背景 ${w.setting.time || "—"}、地点 ${w.setting.place || "—"}，时代服饰：${eraDress(w)}，无现代元素${idDress ? `；身份服饰：${idDress}${c}` : ""}；不戴任何帽子；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）；单人全身像，正面或略侧身，面向观者，神情姿态符合其身份与当前状态，竖版全身构图`;
+  // 可选槽位（VISUAL-VOCAB 实测遵循率达标后开放）：姿态/表情由调用方显式传入，默认不传保持生产行为
+  const poseExpr = `${opts.pose ? `，${opts.pose}` : ""}${opts.expression ? `，表情${opts.expression}` : ""}`;
+  // 默认：短改变 prompt（弱模型 i2i 保持参考图的关键）；改词：回退全量描述（不叠加容貌标识，避免与用户描述冲突）
+  const baseAttrs = `性别 ${c.gender || "未知"}，年龄 ${c.age || "未知"}，身份 ${c.identity || "—"}`;
+  const base = desc
+    ? `《${w.title}》角色「${c.name}」（${c.role}）的全身立绘：${baseAttrs}；外貌特征 ${desc}${genderPhrase(c) ? `；此人是${genderPhrase(c)}，必须画出鲜明的${genderPhrase(c)}相貌与体态，严禁画成异性` : ""}；时代背景 ${w.setting.time || "—"}、地点 ${w.setting.place || "—"}，时代服饰：${eraDress(w)}，无现代元素${idDress ? `；身份服饰：${idDress}${c}` : ""}；${NO_HAT_CLAUSE}；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）；单人全身像，正面面向观者，神情姿态符合其身份与当前状态${poseExpr}，竖版全身构图`
+    : `《${w.title}》角色「${c.name}」（${c.role}）的全身立绘：与参考头像完全同一人，性别与参考头像一致，容貌、发型、服饰全部保持参考图原样不变；仅将头像特写改为竖版单人全身像：正面站立面向观者，全身完整入画，神情姿态符合其身份${poseExpr}；${NO_HAT_CLAUSE}；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）`;
+  const looks = desc || c.traits.slice(0, 4).join("、");
   const t2iPrompt = ensureStyleSuffix(base, styleAnchor(w));
   // i2i 形态（参考头像作容貌基准，保持人物形象）：官方 i2i 结构 [保持]+[改变]，避免弱模型换人/变样貌
   const i2iPrompt = i2iPreservePrefix("portrait", c.name) + t2iPrompt;
@@ -659,13 +754,20 @@ export async function generateCharacterPortrait(storyTitle: string, w: WorldStat
 }
 
 /** 生成角色头像（仅供用户查看）：渠道单一——仅来源于角色自身字段属性（性别/年龄/身份/外貌特征 traits/姓名/身份服饰 identityDress）
+ * + 确定性容貌标识（distinctiveLook，弱模型缺外貌描述时会画「默认脸」撞脸，具体特征词强制分化）
  * + 时代服饰（eraDress）+ 全书画风锚点，纯文生方形 1:1，不参考任何其他图像（不参考立绘/正文插画/外部图），压缩为小体积 JPEG；
  * 头像先于立绘生成（是立绘的容貌基准，立绘以头像为参考图）；失败抛错（由调用方记录 visual-fail） */
-export async function generateCharacterAvatar(storyTitle: string, w: WorldState, c: Character): Promise<{ path: string; prompt: string }> {
+export async function generateCharacterAvatar(storyTitle: string, w: WorldState, c: Character, opts: { expression?: string } = {}): Promise<{ path: string; prompt: string }> {
   const looks = c.traits.slice(0, 4).join("、");
   const baseAttrs = `性别 ${c.gender || "未知"}，年龄 ${c.age || "未知"}，身份 ${c.identity || "—"}`;
   const idDress = identityDress(c);
-  const t2iPrompt = `${c.name}（${c.role}）的方形头像：${baseAttrs}；外貌特征 ${looks || "结合角色姓名与身份推演"}，面容气质需呈现明确的性别特征（男女形象区分鲜明）；时代背景 ${w.setting.time || "—"}，时代服饰：${eraDress(w)}，无现代元素${idDress ? `；身份服饰：${idDress}${c}` : ""}；不戴任何帽子；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）；正面头像特写，面向观者，神情姿态符合其身份，${styleAnchor(w)}，画面中不要出现文字，无水印`;
+  // 性别强化（弱模型修复）：具体性别词前置并多次重复——「性别 男」埋在长句里会被忽略画出女相
+  const gp = genderPhrase(c);
+  const gLead = gp ? `${gp}，` : "";
+  const gFace = genderFaceHint(c);
+  const gClause = gp ? `；此人是${gp}，${gFace ? `${gFace}，` : ""}必须画出鲜明的${gp}相貌与体态，严禁画成异性` : "";
+  const exprSlot = opts.expression ? `；表情${opts.expression}` : "";
+  const t2iPrompt = `${gLead}${c.name}（${c.role}）的方形头像：${baseAttrs}；外貌特征 ${looks || "结合角色姓名与身份推演"}；${distinctLookForRoster(c, w.characters)}${gClause}${exprSlot}；时代背景 ${w.setting.time || "—"}，时代服饰：${eraDress(w)}，无现代元素${idDress ? `；身份服饰：${idDress}${c}` : ""}；${NO_HAT_CLAUSE}；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）；正面头像特写，面向观者，神情姿态符合其身份，${styleAnchor(w)}，画面中不要出现文字，无水印`;
   const buf = await generateImage(t2iPrompt, "768x768");
   let compressed = buf;
   try {
@@ -997,5 +1099,5 @@ export async function createSceneVideo(scene: string, anchor: string, opts: Scen
   const fullPrompt = (opts.charHint ? `${opts.charHint}${prompt}` : prompt) + guard;
   const durationSec = opts.durationSec ?? VIDEO_MIN_SECONDS + Math.floor(Math.random() * (VIDEO_MAX_SECONDS - VIDEO_MIN_SECONDS + 1));
   const task = await createVideoTask(fullPrompt, { image: opts.image, numFrames: durationToNumFrames(durationSec) });
-  return { id: mediaId(), kind: "video", anchor, prompt, caption: opts.caption, sceneType: opts.sceneType, videoId: task.videoId, status: "pending" };
+  return { id: mediaId(), kind: "video", anchor, prompt, caption: opts.caption, sceneType: opts.sceneType, videoId: task.videoId, status: "pending", createdAt: Date.now() };
 }

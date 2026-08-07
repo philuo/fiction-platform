@@ -123,7 +123,8 @@ export async function pollVideoTask(videoId: string): Promise<VideoStatus> {
     error?: { message?: string } | null;
   } | null;
   if (!res.ok || !data) {
-    return { status: "rate_limited", progress: -1 };
+    // 非 429 的 HTTP 错误（500/404 等）或响应解析失败 → 视为失败（而非 rate_limited，避免前端无限轮询）
+    return { status: "failed", progress: 0, error: `视频状态查询失败：HTTP ${res.status}` };
   }
   const status = (data.status ?? "in_progress") as VideoStatus["status"];
   return {

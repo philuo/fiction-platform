@@ -83,7 +83,7 @@ export function toReviewResult(v: CriticVerdict): ReviewResult {
 const INIT_SYSTEM = `你是小说立项导演。根据用户的一句话灵感，生成世界设定与核心人物。
 输出必须是合法 JSON（不要 markdown 围栏）：
 {"title":"书名","genre":"题材","premise":"一句话梗概","setting":{"time":"时代","place":"主要地点","rules":["世界规则/约束 2-4条"],"tone":"文风基调"},"characters":[{"name":"名字","gender":"男或女","age":"年龄（如：二十出头）","identity":"社会身份/职业","role":"主角/反派/配角","traits":["特质"],"motivation":"动机","secret":"秘密或没有","status":"初始状态","relations":{},"voice":"说话风格（如：简短冷峻，爱用反问句；或：温婉绵长，常用比喻）"}]}
-要求：人物 2-4 个，性格鲜明有冲突；性别必须且只能是「男」或「女」，不得留空、不得写「未知」；设定规则具体（能力体系/社会规则/禁忌）。
+要求：人物 2-4 个，性格鲜明有冲突；性别必须且只能是「男」或「女」，不得留空、不得写「未知」；age（年龄）与 identity（社会身份/职业）必须具体明确、不得省略（后续头像/立绘生成依赖这三项）；设定规则具体（能力体系/社会规则/禁忌）。
 字符串值内部一律使用中文引号「」/『』，禁止英文双引号。`;
 
 export async function newStory(idea: string, genre?: string): Promise<WorldState> {
@@ -114,7 +114,7 @@ export async function newStory(idea: string, genre?: string): Promise<WorldState
             type: "array",
             items: {
               type: "object",
-              required: ["name", "gender", "role", "traits", "motivation"],
+              required: ["name", "gender", "age", "identity", "role", "traits", "motivation"],
               properties: {
                 name: { type: "string" },
                 gender: { type: "string", enum: ["男", "女"] },
@@ -162,6 +162,8 @@ export async function newStory(idea: string, genre?: string): Promise<WorldState
     introducedAt: 0,
   }));
   logChange(w, { chapter: w.nextChapter, actor: "user", kind: "newStory", detail: `立项建世界《${w.title}》（${w.genre}）：${w.premise.slice(0, 60)}${w.premise.length > 60 ? "…" : ""}，初始角色 ${w.characters.length} 名（头像/立绘自动生成中）`, commandId: "CMD-N01" });
+  // 性别/年龄/身份缺失兜底推断（弱模型 schema required 仍可能漏字段；缺失会导致头像 prompt 写「性别未知」画出默认脸）——失败不阻塞立项
+  try { await fillMissingCharacterFields(w); } catch (e) { console.warn("[director] 角色字段兜底推断失败（不阻塞）:", (e as Error).message); }
   saveWorld(w);
   // 立项即自动导演（P3）：生成蓝图候选并默认确认第一套（失败不阻塞，写作时自愈）
   try {
@@ -174,6 +176,59 @@ export async function newStory(idea: string, genre?: string): Promise<WorldState
     /* 蓝图生成失败：保留基础世界，后续可由 /api/novel/blueprint 手动重试 */
   }
   return w;
+}
+
+/** 角色性别/年龄/身份缺失兜底推断（导出供存量迁移脚本复用）：
+ * 缺任一项的角色按「书名/梗概/时代地点 + 角色已知信息 + 正文提及片段（如有）」让 LLM 补齐；
+ * 性别只接受「男/女」，非法值丢弃；仅写空字段，不覆盖已有值；返回补全的角色数（无缺失返 0）。 */
+export async function fillMissingCharacterFields(w: WorldState): Promise<number> {
+  const needy = w.characters.filter((c) => !(c.gender === "男" || c.gender === "女") || !c.age || !c.identity);
+  if (!needy.length) return 0;
+  // 正文证据：每个缺字段角色取其名字首次出现的段落片段（≤200 字，最多 2 段），帮助推断性别/年龄/身份
+  const evidence = needy.map((c) => {
+    const hits: string[] = [];
+    for (const ch of w.chapters) {
+      const idx = ch.text.indexOf(c.name);
+      if (idx >= 0) hits.push(ch.text.slice(Math.max(0, idx - 60), idx + 140).replace(/\s+/g, ""));
+      if (hits.length >= 2) break;
+    }
+    return `- ${c.name}（定位 ${c.role}，特质 ${c.traits.slice(0, 3).join("、") || "—"}，动机 ${c.motivation.slice(0, 40) || "—"}）${hits.length ? `；正文片段：${hits.join(" / ")}` : ""}`;
+  }).join("\n");
+  const out = await chatJson<{ characters?: { name?: string; gender?: string; age?: string; identity?: string }[] }>(
+    [
+      { role: "system", content: "你是小说角色档案补全助手。根据故事背景与正文线索，为缺失字段的角色推断性别/年龄/社会身份。性别只能是「男」或「女」；年龄用简短词（如：三十许人）；身份用具体职业/社会地位（如：刑房书吏）。推断须与故事背景一致、角色之间不得雷同。只输出 JSON。" },
+      { role: "user", content: `《${w.title}》（${w.genre}）：${w.premise.slice(0, 120)}；时代 ${w.setting.time || "—"}，地点 ${w.setting.place || "—"}。\n请为以下角色补齐缺失字段：\n${evidence}\n输出：{"characters":[{"name":"角色名","gender":"男或女","age":"年龄","identity":"社会身份/职业"}]}` },
+    ],
+    {
+      temperature: 0.3,
+      maxTokens: 2000,
+      schema: {
+        type: "object",
+        required: ["characters"],
+        properties: {
+          characters: {
+            type: "array",
+            items: {
+              type: "object", required: ["name"],
+              properties: { name: { type: "string" }, gender: { type: "string", enum: ["男", "女"] }, age: { type: "string" }, identity: { type: "string" } },
+            },
+          },
+        },
+      },
+    },
+  );
+  let filled = 0;
+  for (const c of needy) {
+    const f = (out.characters ?? []).find((x) => x?.name === c.name);
+    if (!f) continue;
+    let touched = false;
+    if (!(c.gender === "男" || c.gender === "女") && (f.gender === "男" || f.gender === "女")) { c.gender = f.gender; touched = true; }
+    if (!c.age && f.age) { c.age = String(f.age).trim().slice(0, 20); touched = true; }
+    if (!c.identity && f.identity) { c.identity = String(f.identity).trim().slice(0, 40); touched = true; }
+    if (touched) filled++;
+  }
+  if (filled) console.log(`[director] 角色字段兜底补全：《${w.title}》${filled} 个角色（${needy.map((c) => c.name).join("、")}）`);
+  return filled;
 }
 
 function clampNum(n: unknown, lo: number, hi: number): number {

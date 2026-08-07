@@ -91,7 +91,7 @@ describe("P3 连续自动化流程自动恢复", () => {
     const { newStory } = await import("../src/api/director");
     const { writeOneChapter } = await import("../src/api/director");
     const { runAuto, stopAuto } = await import("../src/api/autorun");
-    const { loadWorld } = await import("../src/api/storage");
+    const { loadWorld, loadAutoSession } = await import("../src/api/storage");
 
     await newStory("停止测试", specB.genre);
     const exec = (_w: unknown, onEvent: (e: unknown) => void) => writeOneChapter(loadWorld(specB.title)!, "", (e) => onEvent(e), null);
@@ -104,5 +104,7 @@ describe("P3 连续自动化流程自动恢复", () => {
     // 停止后世界无半章（每章 commit 原子）
     const w = loadWorld(specB.title)!;
     expect(w.chapters.every((c) => c.text.length > 0)).toBe(true);
+    // stopAuto 持久化停止意图：session.json status=stopped（重启后 resumeAutoSessions 不续跑）
+    expect(loadAutoSession(specB.title)?.status).toBe("stopped");
   }, 120_000);
 });

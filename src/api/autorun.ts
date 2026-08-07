@@ -39,6 +39,8 @@ const stopFlags = new Map<string, boolean>();
 const pauseFlags = new Map<string, boolean>(); // 用户主动暂停（章边界停下，保持 paused 会话可恢复）
 export function stopAuto(title: string): void {
   stopFlags.set(title, true);
+  // 立即持久化停止意图：防止服务在 runAuto 检测到 stopFlags 前重启 → resumeAutoSessions 误续跑
+  touchSession(title, { status: "stopped", phase: "用户手动停止", pauseReason: "用户手动停止" });
 }
 export function pauseAuto(title: string): void {
   pauseFlags.set(title, true);

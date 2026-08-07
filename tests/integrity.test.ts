@@ -98,6 +98,18 @@ describe("integrity.deleteChapterCascade（删章级联）", () => {
     expect(r2.findings.some((f) => f.kind === "planted-foreshadow-lost" && f.level === "danger")).toBe(true);
     expect(r.mediaPaths.length).toBe(0);
   });
+  test("删章弧状态回退：done 弧删最后一章 → 回退 writing + finding", () => {
+    const w = mkWorld();
+    w.storyArcs = [{ id: "a1", title: "追凶", volumeId: "v1", goal: "追查真凶", estChapters: 2, status: "done", summary: "追凶完成" }];
+    w.chapterPlans = [
+      { index: 1, arcId: "a1", goal: "起", beats: [], hookType: "悬念", status: "done" },
+      { index: 2, arcId: "a1", goal: "承", beats: [], hookType: "转折", status: "done" },
+    ];
+    const r = deleteChapterCascade(w, 2);
+    // 弧状态回退为 writing（摘要可能不准，需复核）
+    expect(w.storyArcs![0].status).toBe("writing");
+    expect(r.findings.some((f) => f.kind === "arc-status-revert")).toBe(true);
+  });
 });
 
 describe("integrity.auditWorld / autoRepair（审计与幂等修复）", () => {

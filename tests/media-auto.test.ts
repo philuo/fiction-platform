@@ -109,7 +109,7 @@ async function waitVisual(title: string, cid: string, timeoutMs = 5000): Promise
 }
 
 describe("P5 角色媒体自动生成", () => {
-  test("generateCharacterPortrait：立绘必须参考头像（无头像抛错；有头像时 prompt 含性别/外貌/时代服饰/禁帽子，文件落盘）", async () => {
+  test("generateCharacterPortrait：立绘必须参考头像（无头像抛错；默认短改变 prompt 保参考图原样，改词回退全量描述，文件落盘）", async () => {
     const { generateCharacterPortrait } = await import("../src/api/media");
     const { saveWorld } = await import("../src/api/storage");
     const { world } = await makeChar();
@@ -121,19 +121,42 @@ describe("P5 角色媒体自动生成", () => {
 
     genPrompts = [];
     const p = await generateCharacterPortrait(world.title, world, world.characters[0]);
-    // prompt 内容验证（生成式媒体硬约束）
-    expect(p.prompt).toContain("性别 女");
+    // 默认短改变 prompt（弱模型 i2i 保持参考图的关键）：同一人 + 性别一致 + 保容貌发型服饰 + 竖版全身正面 + 禁帽子
     expect(p.prompt).toContain("柳青霜");
-    expect(p.prompt).toContain("二十出头");
-    expect(p.prompt).toContain("女捕快");
-    expect(p.prompt).toContain("清冷");
-    expect(p.prompt).toContain("明朝");
+    expect(p.prompt).toContain("与参考头像完全同一人");
+    expect(p.prompt).toContain("性别与参考头像一致");
+    expect(p.prompt).toContain("容貌、发型、服饰全部保持参考图原样");
     expect(p.prompt).toContain("不戴任何帽子");
+    expect(p.prompt).toContain("面向观者");
+    expect(p.prompt).not.toContain("或略侧身");
+    // 短 prompt 不再重述性别/年龄/身份/时代服饰（头像已承载，重述会干扰弱模型保持参考图）
+    expect(p.prompt).not.toContain("性别 女");
+    expect(p.prompt).not.toContain("容貌必须严格照此刻画");
+    // 用户改词重生成：回退全量描述，尊重用户描述
+    const p2 = await generateCharacterPortrait(world.title, world, world.characters[0], { description: "白发红眼，左眼有疤" });
+    expect(p2.prompt).toContain("白发红眼");
+    expect(p2.prompt).toContain("性别 女");
+    expect(p2.prompt).not.toContain("容貌必须严格照此刻画");
     // 文件真实落盘
     expect(existsSync(join(imgBase(world.title), p.path))).toBe(true);
     // 返回结构
     expect(p.mediaId).toBeTruthy();
     expect(p.looks).toContain("清冷");
+  });
+
+  test("可选槽位：pose/expression 透传进立绘 prompt，expression 透传进头像 prompt（VISUAL-VOCAB 达标后开放）", async () => {
+    const { generateCharacterPortrait, generateCharacterAvatar } = await import("../src/api/media");
+    const { world } = await makeChar();
+    await makeAvatar(world);
+    const p = await generateCharacterPortrait(world.title, world, world.characters[0], { pose: "手持长剑", expression: "冷峻" });
+    expect(p.prompt).toContain("手持长剑");
+    expect(p.prompt).toContain("表情冷峻");
+    const a = await generateCharacterAvatar(world.title, world, world.characters[0], { expression: "微笑" });
+    expect(a.prompt).toContain("表情微笑");
+    // 默认不传：生产行为不变（无姿态/表情槽词）
+    const p0 = await generateCharacterPortrait(world.title, world, world.characters[0]);
+    expect(p0.prompt).not.toContain("手持长剑");
+    expect(p0.prompt).not.toContain("表情");
   });
 
   test("generateCharacterAvatar：纯文生（仅角色自身字段属性），不参考任何图像，头像落盘", async () => {
@@ -148,6 +171,14 @@ describe("P5 角色媒体自动生成", () => {
     // 头像 prompt 含方形头像与性别（角色自身字段）
     expect(avatar.prompt).toContain("方形头像");
     expect(avatar.prompt).toContain("性别 女");
+    // 区分度修复：确定性容貌标识（同名复现一致，重生成不变脸）
+    expect(avatar.prompt).toContain("容貌必须严格照此刻画");
+    // 性别强化（弱模型修复）：具体性别词前置并重复强化，防画出异性
+    expect(avatar.prompt).toContain("年轻女子");
+    expect(avatar.prompt).toContain("严禁画成异性");
+    expect(avatar.prompt).toContain("五官柔和"); // 性别面部特征强化（实测修复女相/男相错画）
+    expect(avatar.prompt).toContain("不戴任何帽子");
+    expect(avatar.prompt.startsWith("年轻女子，")).toBe(true);
     // 渠道单一：纯文生——无 i2i 保持前缀（不参考立绘/任何图像）
     expect(avatar.prompt).not.toContain("容貌基准");
     expect(genPrompts.length).toBe(1); // 只调了一次 generateImage（无参考图分支）

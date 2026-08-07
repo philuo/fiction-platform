@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { deleteChapter, gachaApply } from "../src/api/director";
-import { logChange } from "../src/api/steering";
+import { logChange, logCommandChange } from "../src/api/steering";
 import { emptyWorld, type Card, type WorldState } from "../src/api/world";
 
 // 隔离 data/：切到临时目录（saveWorld 落盘到临时区，不污染真实存档）
@@ -54,14 +54,15 @@ describe("changeLog 覆盖", () => {
     expect(entry!.detail).toContain("雨夜追踪");
   });
 
-  test("logChange 上限 500 条（防无限增长）", () => {
+  test("logChange 不截断（完整保留审计记录）", () => {
     const w = mkWorld();
     for (let i = 0; i < 510; i++) {
       logChange(w, { chapter: 1, actor: "ai", kind: "stress", detail: `第${i}条` });
     }
-    expect((w.changeLog ?? []).length).toBe(500);
-    // 保留的是最近 500 条（最早的 10 条被裁掉）
-    expect((w.changeLog ?? [])[0].detail).toBe("第10条");
+    expect((w.changeLog ?? []).length).toBe(510);
+    // 最早的记录仍保留
+    expect((w.changeLog ?? [])[0].detail).toBe("第0条");
+    expect((w.changeLog ?? []).at(-1)?.detail).toBe("第509条");
   });
 
   test("日志条目含完整字段（at/chapter/actor/kind/detail）", () => {
@@ -74,5 +75,19 @@ describe("changeLog 覆盖", () => {
     expect(e.actor).toBe("user");
     expect(e.kind).toBe("unit-test");
     expect(e.detail).toBe("校验字段完整性");
+  });
+
+  test("logCommandChange 未知 commandId 不崩溃且降级（有效 ID 正常记 level）", () => {
+    const w = mkWorld();
+    // 有效 commandId：level 从指令表取
+    logCommandChange(w, { chapter: 1, actor: "user", kind: "test", detail: "有效 ID", commandId: "CMD-L07" });
+    const valid = (w.changeLog ?? []).at(-1)!;
+    expect(valid.commandId).toBe("CMD-L07");
+    expect(valid.level).toBe("L1"); // L07 伏笔 CRUD = L1
+    // 未知 commandId：不崩溃，commandId 原样记录，level 降级 undefined
+    logCommandChange(w, { chapter: 1, actor: "user", kind: "test", detail: "未知 ID", commandId: "CMD-TYPO" });
+    const invalid = (w.changeLog ?? []).at(-1)!;
+    expect(invalid.commandId).toBe("CMD-TYPO");
+    expect(invalid.level).toBeUndefined(); // getCommand 返回 undefined → level 不填
   });
 });

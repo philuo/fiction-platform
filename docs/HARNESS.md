@@ -138,7 +138,7 @@ type HarnessCommand = {
 | CMD-G02 | 应用干预策略 `applyStrategy` | user/ai | steering.ts:127 | abort/merge(mergeTasks)/rewrite(rewriteQueue) | chapterPlans[].mergeTasks/outline/rewriteQueue/changeLog | none | L2 | — | gate+audit |
 | CMD-G03 | 字段锁 `setFieldLock` | user | `/api/novel/lock`(:696) → steering.ts:66 | 角色字段锁增删 | lockedFields | none | L1 | — | audit |
 | CMD-G04 | 世界补丁分级 `classifyWorldPatch` | ai | steering.ts:61 | L0/L2 分级判定 | 只读 | none | L0 | — | none |
-| CMD-G05 | 写变更日志 `logChange` | ai/system | steering.ts:34 | 审计日志追加（上限 500） | changeLog | none | L0 | — | audit（本身） |
+| CMD-G05 | 写变更日志 `logChange` | ai/system | steering.ts:34 | 审计日志追加（不截断，完整保留） | changeLog | none | L0 | — | audit（本身） |
 | CMD-G06 | 回溯重写队列消费 `rewrite start` | user | `/api/novel/rewrite`(:985) | 按序 regenerateChapter 消费队列 | chapters/rewriteQueue/账本 | exec | L2 | 单章失败即停剩余保留 | gate+schedule |
 | CMD-G07 | 清空重写队列 `rewrite clear` | user | `/api/novel/rewrite`(clear)(:1000) | 清空队列 | rewriteQueue | none | L1 | — | audit |
 | CMD-G08 | 请求打断 `requestInterrupt` | user | steering.ts:11（N16 同源） | 内存打断信号 | 内存 Map | none | L0 | — | control |
@@ -183,7 +183,7 @@ type HarnessCommand = {
 | 治理点 | 指令集合 | 现状承担者 | 中枢接入（未来） |
 |---|---|---|---|
 | **gate**（写前审查） | 所有 L2/L3 写指令：N01-08、W03/04/09/12/13/18、L01-07/11/13、G02/06、S02/03/04 | `withTitleLock` 串行 + chronicler 字段守卫 | `applyStateChange` 闸门（AGNES_BRAIN_GATE=on 时 L2+ 审查） |
-| **audit**（审计） | 全部写指令 + G05 | `changeLog`（上限 500，actor/strategy） | 扩展 `reason` 字段（中枢审查结论） |
+| **audit**（审计） | 全部写指令 + G05 | `changeLog`（不截断，actor/strategy） | 扩展 `reason` 字段（中枢审查结论） |
 | **schedule**（调度） | N02/03/04/05、W09、M02/03/12、G06、S07/10 | 限流池（text/image/video）+ 异步任务表 | 任务优先级/跨章分布协调（分镜候选池全局共享） |
 | **control**（控制） | N03/13/14/15/16、G08、S07 | interrupt/stop 信号、内存 Map | 中枢下发"暂停/中止/重试"修正指令 |
 | **none**（免治理） | 纯只读/草稿/媒体生成/锁 | — | 无需中枢介入 |
@@ -226,7 +226,7 @@ type HarnessCommand = {
 
 **负向确认**（排除项）：`progressGuard`/`isBookComplete`/`evalFingerprint`/`cardKey`/`normCharName` 等为纯只读函数不登记；`autoGacha` 为 `GenProfile` 布尔开关（非函数），触发链为 W17→autoPick→W18；限流排队不产生业务副作用（S10 登记为调度机制）。
 
-**统计**：指令共 **87 条**（N16 + W18 + L13 + M12 + G08 + S10 + Q10）。其中写指令（L1-L3）约 60 条、纯只读/无状态 27 条；L3 不可逆 2 条（N08 删章、S03 级联删章）。
+**统计**：指令共 **88 条**（N16 + W18 + L13 + M12 + G08 + S11 + Q10）。其中写指令（L1-L3）48 条、纯只读/无状态 40 条；L3 不可逆 2 条（N08 删章、S03 级联删章）。
 
 ---
 

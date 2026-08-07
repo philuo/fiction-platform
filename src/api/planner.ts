@@ -265,12 +265,12 @@ export async function handleArcBoundary(w: WorldState, arcId: string): Promise<v
   const from = Math.min(...arcPlans.map((p) => p.index));
   const to = Math.max(...arcPlans.map((p) => p.index));
   arc.summary = await summarizeRange(w, from, to);
-  arc.status = "done";
+  // arc.status 延迟到卷边界处理完成后置位（失败可重入：未 done 的弧下回合 markChapterDone 仍触发边界处理）
 
-  // 卷边界检查：该卷所有弧完成 → 卷摘要 + compass 更新
+  // 卷边界检查：该卷所有弧完成（当前弧尚未置 done，排除自身判定）
   const vol = (w.blueprint?.volumes ?? []).find((v) => v.id === arc.volumeId);
   const volArcs = arcs.filter((a) => a.volumeId === arc.volumeId);
-  if (vol && volArcs.every((a) => a.status === "done")) {
+  if (vol && volArcs.every((a) => a.id === arcId || a.status === "done")) {
     vol.summary = await summarizeRange(w, from, Math.max(to, 1));
     vol.status = "done";
     await updateCompass(w);
@@ -279,10 +279,13 @@ export async function handleArcBoundary(w: WorldState, arcId: string): Promise<v
     if (nextVol) nextVol.status = "writing";
   }
 
+  // 全部卷边界工作完成 → 置 arc done（延迟置位确保卷摘要失败可重入）
+  arc.status = "done";
+
   // 展开下一个骨架弧（滚动规划）
   const nextSkeleton = arcs.find((a) => a.status === "skeleton");
   if (nextSkeleton) await expandArc(w, nextSkeleton.id);
-  logCommandChange(w, { chapter: to, actor: "ai", kind: "arc-boundary", detail: `弧「${arc.title}」完成（第 ${from}-${to} 章）${vol && volArcs.every((a) => a.status === "done") ? `；卷《${vol.title}》收束${w.blueprint?.compass ? "，指南针已更新" : ""}` : ""}`, commandId: "CMD-W09" });
+  logCommandChange(w, { chapter: to, actor: "ai", kind: "arc-boundary", detail: `弧「${arc.title}」完成（第 ${from}-${to} 章）${vol && volArcs.every((a) => a.id === arcId || a.status === "done") ? `；卷《${vol.title}》收束${w.blueprint?.compass ? "，指南针已更新" : ""}` : ""}`, commandId: "CMD-W09" });
   saveWorld(w);
 }
 

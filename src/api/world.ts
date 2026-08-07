@@ -80,7 +80,7 @@ export type Card = {
   description: string;
   effect: string; // 注入写作指令的文本
   dueHint?: string; // 伏笔卡专用：建议回收时机
-  character?: { name: string; role: string; traits: string[]; motivation: string; voice?: string }; // 角色卡结构化人物（提案化，修正则猜名）
+  character?: { name: string; role: string; gender?: string; age?: string; identity?: string; traits: string[]; motivation: string; voice?: string }; // 角色卡结构化人物（提案化，修正则猜名；性别/年龄/身份供头像/立绘生成使用）
 };
 
 // M1 生成参数（用户可调，存 WorldState.gen）
@@ -156,6 +156,7 @@ export type ChapterMedia = {
   videoId?: string; // video 异步任务 id
   status?: "pending" | "ready" | "failed";
   error?: string; // 生成失败原因（异步生成时供轮询展示）
+  createdAt?: number; // 创建时间戳（视频异步任务超时回收用，毫秒）
   orphan?: boolean; // anchor 失配标记：正文变更后锚定段落已不存在（可逆，重新命中即清除）
 };
 

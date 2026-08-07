@@ -904,7 +904,7 @@ const CharacterEditor: React.FC<{ world: WorldState; onSave: Props["onSave"]; on
             <input
               list="char-role-options"
               value={role}
-              placeholder="如：主角 / 反派 / 配角，或自定义（死者、案件起点…）"
+              placeholder="如：主角 / 反派 / 配角"
               onChange={(e) => setRole(e.target.value)}
             />
             <datalist id="char-role-options">
@@ -912,8 +912,6 @@ const CharacterEditor: React.FC<{ world: WorldState; onSave: Props["onSave"]; on
               <option value="反派" />
               <option value="配角" />
               <option value="关键人物" />
-              <option value="待登场" />
-              <option value="其他" />
             </datalist>
           </div>
           <div style={{ display: "flex", gap: "0.6rem" }}>

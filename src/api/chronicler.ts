@@ -4,6 +4,7 @@
 import { chatJson } from "./jsonutil";
 import { activeForeshadows, genOf, type Chapter, type ChapterDelta, type ChapterPlan, type ChapterSummary, type CharacterFieldDelta, type WorldState } from "./world";
 import { upsertSummary } from "./memory";
+import { logChange } from "./steering";
 
 export type SettleOutput = {
   summary: string;
@@ -299,6 +300,7 @@ function applySettle(w: WorldState, out: Partial<SettleOutput>, chapterIndex: nu
 
   recomputeAppearedIn(w);
 
+  logChange(w, { chapter: chapterIndex, actor: "ai", kind: "ledger-apply", detail: `应用第${chapterIndex}章账本 delta（新伏笔 ${added}/回收 ${resolved}/角色 ${updates}/关系 ${relUpdates}/规则 ${addedRules}）`, commandId: "CMD-L02" });
   return {
     summary,
     newForeshadows: added,
@@ -362,7 +364,9 @@ export async function settleChapter(w: WorldState, ch: Chapter, plan?: ChapterPl
     /* 记账失败不阻塞：降级为纯文本摘要，状态不更新 */
     out = { summary: `第${ch.index}章《${ch.title}》：${ch.text.slice(0, 300)}`, timeline_summary: ch.title };
   }
-  return applySettle(w, out, ch.index);
+  const report = applySettle(w, out, ch.index);
+  logChange(w, { chapter: ch.index, actor: "ai", kind: "ledger-settle", detail: `第${ch.index}章记账结算（新伏笔 ${report.newForeshadows}/回收 ${report.resolvedForeshadows}/角色 ${report.characterUpdates}/丢弃 ${report.droppedFields}）`, commandId: "CMD-L01" });
+  return report;
 }
 
 /**
@@ -384,4 +388,5 @@ export function resetChapterLedger(w: WorldState, chapterIndex: number): void {
   for (const c of w.characters) {
     if (c.exit?.chapter === chapterIndex) delete c.exit;
   }
+  logChange(w, { chapter: chapterIndex, actor: "ai", kind: "ledger-reset", detail: `撤销第${chapterIndex}章记账（伏笔/时间线/离场清理）`, commandId: "CMD-L05" });
 }
