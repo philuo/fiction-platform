@@ -2,7 +2,7 @@
 // 数据源：world（SSR/拉取）+ /api/novel/changelog（操作日志端点）
 import { useEffect, useMemo, useState } from "react";
 import type { ChangeLogEntry, WorldState } from "../api/world";
-import { getCommand } from "../api/harness";
+import { getCommand, commandTooltip } from "../api/harness";
 import { lensCn, severityCn } from "../terms";
 import { X } from "./icons";
 
@@ -228,7 +228,7 @@ export const MemoryAuditModal: React.FC<{ world: WorldState; onClose: () => void
                     <div key={`${e.at}-${i}`} className="mem-log-item">
                       <span className="mem-log-time">{e.at ? new Date(e.at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) : "—"}</span>
                       <span className={`mem-badge ${e.actor === "user" ? "" : "mem-badge-off"}`}>{ACTOR_TEXT[e.actor] ?? e.actor}</span>
-                      {cmd && <span className="mem-badge mem-badge-cmd" title={cmd.name}>{e.commandId}</span>}
+                      {cmd && <span className="mem-badge mem-badge-cmd" title={commandTooltip(cmd)}>{e.commandId}</span>}
                       {e.level && <span className={`mem-badge ${e.level === "L3" ? "mem-badge-warn" : e.level === "L2" ? "" : "mem-badge-off"}`} title="对已完成叙事/账本的破坏级别">{LEVEL_TEXT[e.level] ?? e.level}</span>}
                       <span className="mem-log-kind">{e.kind}</span>
                       {e.strategy && <span className="mem-badge mem-badge-warn">{e.strategy}</span>}

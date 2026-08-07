@@ -156,6 +156,21 @@ export function getCommand(id: string): HarnessCommand | undefined {
   return COMMANDS.find((c) => c.id === id);
 }
 
+// —— 指令标签悬浮中文解释（全局统一：UI 渲染 CMD 标签处悬浮即用此文案，见 docs/HARNESS.md §1）——
+const GOV_CN: Record<GovPoint, string> = { gate: "写前审查", audit: "审计留痕", schedule: "排队调度", control: "可打断/停止", none: "免治理" };
+const LEVEL_CN: Record<ChangeLevel, string> = { L0: "只读/不破坏已落定状态", L1: "改变未来计划", L2: "改变已落定内容（可回滚）", L3: "全局不可逆" };
+const TRIGGER_CN: Record<CommandTrigger, string> = { user: "用户触发", ai: "管线内部触发", system: "系统自动触发", brain: "中枢治理指令" };
+
+/** 指令标签悬浮中文解释（多行）：指令名 / 动作 / 级别含义 / 触发源 / 治理点 */
+export function commandTooltip(cmd: HarnessCommand): string {
+  const gov = cmd.governance.filter((g) => g !== "none").map((g) => GOV_CN[g]).join(" + ") || GOV_CN.none;
+  return [
+    `${cmd.id} · ${cmd.name}`,
+    cmd.action,
+    `级别：${cmd.level}（${LEVEL_CN[cmd.level]}）｜触发：${TRIGGER_CN[cmd.trigger]}｜治理：${gov}`,
+  ].join("\n");
+}
+
 /** 按入口端点反查指令（路由层落日志用；未知入口返回 undefined） */
 export function commandByEntry(entry: string): HarnessCommand | undefined {
   return COMMANDS.find((c) => c.entry === entry);

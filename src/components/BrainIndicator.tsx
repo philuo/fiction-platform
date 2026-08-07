@@ -48,12 +48,16 @@ export const BrainIndicator: React.FC<{
     <button
       className={running ? "brain-indicator busy" : "brain-indicator"}
       onClick={p.onClick}
-      title="中枢：点击查看分层记忆 · 台账 · 操作日志"
+      title={running
+        ? `中枢运行中：${p.action}（点击查看分层记忆 · 台账 · 操作日志）`
+        : "中枢待命（点击查看分层记忆 · 台账 · 操作日志）"}
     >
       <span className="brain-dot" />
       <span className="brain-label">中枢</span>
-      {/* 动作名：有动作就显示（含连载暂停态）；计时仅在 busy（真正运行中）时展示 */}
-      <span className="brain-action">{p.action || "待命"}</span>
+      {/* 状态徽章：待命/运行中两档，与圆点脉冲联动，一眼可辨 */}
+      <span className="brain-state">{running ? "运行中" : "待命"}</span>
+      {/* 动作名：有动作才显示（含连载暂停态）；截断时悬浮可见全文；计时仅在 busy（真正运行中）时展示 */}
+      {p.action && <span className="brain-action" title={p.action}>{p.action}</span>}
       {running && <span className="brain-timer">{formatElapsed(elapsed)}</span>}
     </button>
   );

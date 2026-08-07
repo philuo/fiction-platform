@@ -1,7 +1,7 @@
 // 角色全局立绘大图预览：展示立绘（缺失时占位），可生成/重新生成立绘。
 // 全局立绘是插画图生图参考图与视频 i2v 首帧的样貌唯一基准，保证同一人物跨章跨媒介形象一致。
 // 立绘硬约束：1K 档 736x1312（9:16 竖版全身像），展示区域锁死同比例。
-// 布局（三段，编辑状态底部留足空间）：头部固定 + 图片区自适应（剩余高度内等比缩放，超高可滚动）+ 底部操作区固定（textarea/说明/按钮始终可见，不被图片挤压）。
+// 布局（三段，编辑状态底部留足空间）：头部固定 + 图片区自适应（弹窗定高，立绘等比缩放完整显示，不滚动）+ 底部操作区固定（textarea/说明/按钮始终可见）。
 import { useState } from "react";
 import { X } from "./icons";
 import type { Character } from "../api/world";
@@ -21,7 +21,7 @@ export const PortraitModal: React.FC<{
   const [desc, setDesc] = useState(() => c.portrait?.looks ?? "");
   return (
     <div className="modal-mask" onClick={p.onClose}>
-      <div className="modal modal-stable portrait-modal" onClick={(e) => e.stopPropagation()}>
+      <div className={"modal modal-stable portrait-modal" + (p.readOnly ? " readonly" : "")} onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
           <b style={{ fontFamily: "var(--sans)", letterSpacing: "0.25em" }}>{c.name} · 全局立绘</b>
           <button className="modal-close" onClick={p.onClose}><X size={16} /></button>
