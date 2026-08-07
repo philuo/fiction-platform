@@ -4,14 +4,14 @@ import { describe, expect, test } from "bun:test";
 import { COMMANDS, COMMAND_COUNTS, getCommand, commandsByGovernance, levelOf } from "../src/api/harness";
 
 describe("HARNESS 指令注册表", () => {
-  test("总数 87 条（N16+W18+L13+M12+G08+S10+Q10）", () => {
-    expect(COMMANDS.length).toBe(87);
-    expect(COMMAND_COUNTS.total).toBe(87);
+  test("总数 88 条（N16+W18+L13+M12+G08+S11+Q10）", () => {
+    expect(COMMANDS.length).toBe(88);
+    expect(COMMAND_COUNTS.total).toBe(88);
   });
 
   test("ID 唯一且格式为 CMD-{类别}-{序号}", () => {
     const ids = COMMANDS.map((c) => c.id);
-    expect(new Set(ids).size).toBe(87);
+    expect(new Set(ids).size).toBe(88);
     for (const id of ids) {
       expect(id).toMatch(/^CMD-(N|W|L|M|G|S|Q)\d+$/);
     }
@@ -23,7 +23,7 @@ describe("HARNESS 指令注册表", () => {
     expect(COMMAND_COUNTS.byCategory.Ledger).toBe(13);
     expect(COMMAND_COUNTS.byCategory.Media).toBe(12);
     expect(COMMAND_COUNTS.byCategory.Governance).toBe(8);
-    expect(COMMAND_COUNTS.byCategory.System).toBe(10);
+    expect(COMMAND_COUNTS.byCategory.System).toBe(11);
     expect(COMMAND_COUNTS.byCategory.Query).toBe(10);
   });
 

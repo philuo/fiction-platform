@@ -531,7 +531,7 @@ export const RelationshipModal: React.FC<{
                 {showAddChar && (
                   <div style={{ border: "1px dashed var(--line-strong)", padding: "0.7rem", marginBottom: "0.7rem", background: "var(--paper-dark)" }}>
                     <div style={{ fontSize: "0.78rem", color: "var(--ink-soft)", marginBottom: "0.4rem" }}>
-                      手动新增角色（保存后可在设置面板继续编辑；头像/立绘按需手动生成）
+                      手动新增角色（保存后可在设置面板继续编辑；保存后自动生成头像与立绘）
                     </div>
                     <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
                       <input className="rp-add-input" placeholder="姓名（必填）" value={acName} onChange={(e) => setAcName(e.target.value)} style={{ width: "8rem" }} />

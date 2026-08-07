@@ -87,11 +87,36 @@ async function makeChar(): Promise<{ world: import("../src/api/world").WorldStat
   return { world: w, cid };
 }
 
+/** 给角色造一个假头像文件并落到 world.characters[0].image（立绘必须参考头像，先备好头像） */
+async function makeAvatar(world: import("../src/api/world").WorldState): Promise<string> {
+  const { generateCharacterAvatar } = await import("../src/api/media");
+  const avatar = await generateCharacterAvatar(world.title, world, world.characters[0]);
+  world.characters[0].image = avatar.path;
+  return avatar.path;
+}
+
+/** 轮询等待角色视觉自动生成完成（fire-and-forget 任务收尾），返回最终世界状态 */
+async function waitVisual(title: string, cid: string, timeoutMs = 5000): Promise<import("../src/api/world").WorldState> {
+  const { loadWorld } = await import("../src/api/storage");
+  const t0 = Date.now();
+  for (;;) {
+    const w = loadWorld(title);
+    const c = w?.characters.find((x) => x.id === cid);
+    if (w && c?.portrait?.path && c.image) return w;
+    if (Date.now() - t0 > timeoutMs) throw new Error(`等待角色视觉自动生成超时: ${title} ${cid}`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
 describe("P5 角色媒体自动生成", () => {
-  test("generateCharacterPortrait：prompt 含性别/外貌/时代服饰/禁帽子，文件落盘", async () => {
+  test("generateCharacterPortrait：立绘必须参考头像（无头像抛错；有头像时 prompt 含性别/外貌/时代服饰/禁帽子，文件落盘）", async () => {
     const { generateCharacterPortrait } = await import("../src/api/media");
     const { saveWorld } = await import("../src/api/storage");
     const { world } = await makeChar();
+    // 立绘必须参考头像：无头像 → 抛错（不降级纯文生）
+    await expect(generateCharacterPortrait(world.title, world, world.characters[0])).rejects.toThrow("还没有头像");
+    // 备好头像后立绘正常生成
+    await makeAvatar(world);
     saveWorld(world);
 
     genPrompts = [];
@@ -111,31 +136,32 @@ describe("P5 角色媒体自动生成", () => {
     expect(p.looks).toContain("清冷");
   });
 
-  test("generateCharacterAvatar：有立绘时 i2i 参考图生图（prompt 含保持容貌前缀），头像落盘", async () => {
-    const { generateCharacterPortrait, generateCharacterAvatar, mediaDataUri } = await import("../src/api/media");
+  test("generateCharacterAvatar：纯文生（仅角色自身字段属性），不参考任何图像，头像落盘", async () => {
+    const { generateCharacterAvatar } = await import("../src/api/media");
     const { saveWorld } = await import("../src/api/storage");
     const { world } = await makeChar();
     saveWorld(world);
     genPrompts = [];
-    const portrait = await generateCharacterPortrait(world.title, world, world.characters[0]);
-    const ref = mediaDataUri(world.title, { id: portrait.mediaId, kind: "image", anchor: "柳青霜", path: portrait.path, status: "ready" });
-    const avatar = await generateCharacterAvatar(world.title, world, world.characters[0], { refImage: ref });
+    const avatar = await generateCharacterAvatar(world.title, world, world.characters[0]);
     expect(avatar.path).toContain("images/avatar-");
     expect(existsSync(join(imgBase(world.title), avatar.path))).toBe(true);
-    // 头像 prompt 含方形头像与性别
+    // 头像 prompt 含方形头像与性别（角色自身字段）
     expect(avatar.prompt).toContain("方形头像");
     expect(avatar.prompt).toContain("性别 女");
+    // 渠道单一：纯文生——无 i2i 保持前缀（不参考立绘/任何图像）
+    expect(avatar.prompt).not.toContain("容貌基准");
+    expect(genPrompts.length).toBe(1); // 只调了一次 generateImage（无参考图分支）
   });
 
-  test("proposal 确认入册：角色入册（当前设计：媒体手动生成）；随后手动生成立绘+头像可落盘", async () => {
+  test("proposal 确认入册：角色入册后自动生成立绘+头像（fire-and-forget），操作日志留痕 CMD-M07/M08", async () => {
     const { handleApi } = await import("../src/api/routes");
-    const { generateCharacterPortrait, generateCharacterAvatar } = await import("../src/api/media");
     const { saveWorld, loadWorld } = await import("../src/api/storage");
     const { emptyWorld } = await import("../src/api/world");
     const w = emptyWorld();
     w.title = "提案媒体书";
     w.setting = { time: "架空", place: "边城", rules: [], tone: "" };
-    w.characters.push({ id: "c1", name: "主角", role: "主角", traits: [], motivation: "", status: "", relations: {}, introducedAt: 0 });
+    w.characters.push({ id: "c1", name: "主角", role: "主角", traits: [], motivation: "", status: "", relations: {}, introducedAt: 0,
+      portrait: { mediaId: "m1", kind: "image", anchor: "主角", path: "images/portrait-c1.jpg", status: "ready" }, image: "images/avatar-c1.jpg" }); // 已有完整视觉，读时自愈不触发
     w.characterProposals = [{ id: "cp1", name: "新角色乙", role: "配角", gender: "男", age: "三十", identity: "镖师", traits: ["沉稳"], motivation: "护送", source: "gacha", status: "pending" }];
     saveWorld(w);
 
@@ -151,24 +177,31 @@ describe("P5 角色媒体自动生成", () => {
     const nc = after.characters.find((c) => c.name === "新角色乙");
     expect(nc).toBeDefined();
     expect(nc?.gender).toBe("男");
-    // 当前设计：确认入册不自动生成媒体（视觉手动生成），字段为空
-    expect(nc?.image).toBeFalsy();
-    expect(nc?.portrait?.path).toBeFalsy();
 
-    // 手动生成路径：立绘 → 头像（以立绘为参考图），落盘后可读
-    const portrait = await generateCharacterPortrait(w.title, after, nc!);
-    nc!.portrait = portrait;
-    const avatar = await generateCharacterAvatar(w.title, after, nc!, { refImage: undefined });
-    nc!.image = avatar.path;
-    saveWorld(after);
-    const saved = loadWorld(w.title)!.characters.find((c) => c.name === "新角色乙")!;
-    expect(saved.portrait?.path).toBeTruthy();
-    expect(saved.image).toBeTruthy();
-    expect(existsSync(join(imgBase(w.title), saved.image!))).toBe(true);
-    expect(existsSync(join(imgBase(w.title), saved.portrait!.path))).toBe(true);
+    // 等待后台自动生成完成：头像 + 立绘（立绘以头像为参考图）落盘
+    const finished = await waitVisual(w.title, nc!.id);
+    const done = finished.characters.find((c) => c.id === nc!.id)!;
+    expect(done.portrait?.path).toBeTruthy();
+    expect(done.image).toBeTruthy();
+    expect(existsSync(join(imgBase(w.title), done.image!))).toBe(true);
+    expect(existsSync(join(imgBase(w.title), done.portrait!.path))).toBe(true);
+    expect(done.visualTriedAt).toBeGreaterThan(0);
+    // 操作日志留痕（actor=system 的自动指令）
+    const autoLogs = finished.changeLog.filter((e) => ["portrait-auto", "avatar-auto"].includes(e.kind) && e.actor === "system");
+    expect(autoLogs.some((e) => e.kind === "portrait-auto" && e.detail.includes("新角色乙"))).toBe(true);
+    expect(autoLogs.some((e) => e.kind === "avatar-auto" && e.detail.includes("新角色乙"))).toBe(true);
+
+    // 幂等：视觉已完整，再次确认/读时自愈不再触发自动生成
+    const res2 = await handleApi("/api/novel/state", new Request("http://localhost/api/novel/state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: w.title }),
+    }));
+    const st2 = (await res2!.json()) as { visualPending?: boolean };
+    expect(st2.visualPending).toBe(false);
   });
 
-  test("生成失败：不阻塞角色入册（媒体字段保持空，可稍后手动补）", async () => {
+  test("生成失败：不阻塞角色入册，操作日志留痕 visual-fail（失败可见，可稍后手动补）", async () => {
     const { handleApi } = await import("../src/api/routes");
     const { saveWorld, loadWorld } = await import("../src/api/storage");
     const { emptyWorld } = await import("../src/api/world");
@@ -185,12 +218,116 @@ describe("P5 角色媒体自动生成", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title: w.title, proposalId: "cp1", action: "confirm" }),
     }));
-    failImage = false;
     const data = (await res!.json()) as { ok?: boolean; world?: import("../src/api/world").WorldState };
     expect(data.ok).toBe(true); // 入册不阻塞
-    const nc = loadWorld(w.title)!.characters.find((c) => c.name === "失败角色");
-    expect(nc).toBeDefined();
-    expect(nc?.image).toBeFalsy();
-    expect(nc?.portrait?.path).toBeFalsy();
+    // 等待后台任务失败收尾（visual-fail 日志落盘）后再恢复图像层，避免 fire-and-forget 时序竞态
+    const { loadWorld: lw } = await import("../src/api/storage");
+    const t0 = Date.now();
+    for (;;) {
+      const ww = lw(w.title);
+      if (ww?.changeLog.some((e) => e.kind === "visual-fail" && e.detail.includes("失败角色"))) break;
+      if (Date.now() - t0 > 5000) throw new Error("等待视觉失败收尾超时");
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    failImage = false;
+    const after = loadWorld(w.title)!;
+    const nc2 = after.characters.find((c) => c.name === "失败角色")!;
+    expect(nc2).toBeDefined();
+    expect(nc2.image).toBeFalsy();
+    expect(nc2.portrait?.path).toBeFalsy();
+    expect(nc2.visualTriedAt).toBeGreaterThan(0); // 已尝试标记（防反复烧配额）
+    // 失败写操作日志（而非静默）：失败可见
+    expect(after.changeLog.some((e) => e.kind === "visual-fail" && e.actor === "system" && e.detail.includes("失败角色"))).toBe(true);
+    // 状态链路：轮询 /api/novel/visual/status 必须能拿到 failed + reason（前端据此提示失败，而非假成功）
+    const t1 = Date.now();
+    let statusRes: { pending?: unknown[]; failed?: { id: string; name: string; reason?: string }[] };
+    for (;;) {
+      const rs = await handleApi("/api/novel/visual/status", new Request("http://localhost/api/novel/visual/status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: w.title }),
+      }));
+      statusRes = (await rs!.json()) as typeof statusRes;
+      if (!statusRes.pending?.length || (statusRes.failed ?? []).some((f) => f.name === "失败角色")) break;
+      if (Date.now() - t1 > 5000) throw new Error("等待 status 返回 failed 超时");
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const failedEntry = (statusRes.failed ?? []).find((f) => f.name === "失败角色");
+    expect(failedEntry).toBeDefined();
+    expect(failedEntry?.reason).toContain("模拟图像生成失败");
+  });
+
+  test("读时自愈：打开已有故事，视觉缺失且未尝试（或过冷却期）的角色自动补立绘+头像", async () => {
+    const { handleApi } = await import("../src/api/routes");
+    const { saveWorld, loadWorld } = await import("../src/api/storage");
+    const { emptyWorld } = await import("../src/api/world");
+    const w = emptyWorld();
+    w.title = "自愈书";
+    w.setting = { time: "架空", place: "边城", rules: [], tone: "" };
+    w.characters.push(
+      { id: "c1", name: "主角", role: "主角", traits: ["清冷"], motivation: "", status: "", relations: {}, introducedAt: 0 },
+      { id: "c2", name: "配角甲", role: "配角", traits: [], motivation: "", status: "", relations: {}, introducedAt: 0 }, // 视觉缺失
+    );
+    saveWorld(w);
+
+    failImage = false;
+    const res = await handleApi("/api/novel/state", new Request("http://localhost/api/novel/state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: w.title }),
+    }));
+    const st = (await res!.json()) as { visualPending?: boolean };
+    expect(st.visualPending).toBe(true); // 触发后台补视觉
+
+    const finished = await waitVisual(w.title, "c2");
+    const c2 = finished.characters.find((c) => c.id === "c2")!;
+    expect(c2.portrait?.path).toBeTruthy();
+    expect(c2.image).toBeTruthy();
+    expect(finished.changeLog.some((e) => e.kind === "portrait-auto" && e.actor === "system" && e.detail.includes("配角甲"))).toBe(true);
+
+    // 幂等：视觉已完整 → 再次打开不触发
+    const res2 = await handleApi("/api/novel/state", new Request("http://localhost/api/novel/state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: w.title }),
+    }));
+    const st2 = (await res2!.json()) as { visualPending?: boolean };
+    expect(st2.visualPending).toBe(false);
+  });
+
+  test("中枢巡检 sweepVisualGaps：扫描所有故事，视觉缺失角色自动补头像+立绘；冷却期内不重复触发", async () => {
+    const { sweepVisualGaps } = await import("../src/api/routes");
+    const { saveWorld, loadWorld } = await import("../src/api/storage");
+    const { emptyWorld } = await import("../src/api/world");
+    const w = emptyWorld();
+    w.title = "巡检书";
+    w.setting = { time: "架空", place: "边城", rules: [], tone: "" };
+    // c1 视觉完全缺失（未尝试过）→ 巡检应触发；c2 刚失败过（visualTriedAt 新鲜，1 分钟冷却内）→ 巡检应跳过
+    w.characters.push(
+      { id: "c1", name: "巡检主角", role: "主角", traits: ["沉稳"], motivation: "", status: "", relations: {}, introducedAt: 0 },
+      { id: "c2", name: "冷却配角", role: "配角", traits: [], motivation: "", status: "", relations: {}, introducedAt: 0, visualTriedAt: Date.now() },
+    );
+    saveWorld(w);
+
+    failImage = false;
+    sweepVisualGaps(); // 中枢巡检：服务启动每 60s 调一次（此处直接单次调用）
+
+    // c1：视觉缺失且未尝试 → 自动补全头像+立绘
+    const finished = await waitVisual(w.title, "c1");
+    const c1 = finished.characters.find((c) => c.id === "c1")!;
+    expect(c1.portrait?.path).toBeTruthy();
+    expect(c1.image).toBeTruthy();
+    expect(finished.changeLog.some((e) => e.kind === "avatar-auto" && e.actor === "system" && e.detail.includes("巡检主角"))).toBe(true);
+    expect(finished.changeLog.some((e) => e.kind === "portrait-auto" && e.actor === "system" && e.detail.includes("巡检主角"))).toBe(true);
+    // c2：冷却期内（visualTriedAt 新鲜）→ 巡检不触发，视觉保持缺失
+    const c2 = finished.characters.find((c) => c.id === "c2")!;
+    expect(c2.image).toBeFalsy();
+    expect(c2.portrait?.path).toBeFalsy();
+    // 冷却期内再次巡检仍不触发（幂等 + 冷却双重保护）
+    sweepVisualGaps();
+    await new Promise((r) => setTimeout(r, 100));
+    const after2 = loadWorld(w.title)!;
+    const c2b = after2.characters.find((c) => c.id === "c2")!;
+    expect(c2b.image).toBeFalsy();
   });
 });

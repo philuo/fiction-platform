@@ -217,11 +217,13 @@ const Home: React.FC<HomeProps> = (props) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ idea: idea.trim(), genre: genre.trim() || undefined }),
       });
-      const data = (await res.json()) as { world?: WorldState; error?: string };
+      const data = (await res.json()) as { world?: WorldState; visualPending?: boolean; error?: string };
       if (data.error || !data.world) throw new Error(data.error ?? "立项失败");
       setWorld(data.world);
       setPhase("playing");
       setStoryUrl(data.world.title);
+      // 初始角色头像/立绘后台自动生成：立项期间中枢显示「自动生成角色头像/立绘中…」，完成后刷新世界并恢复待命
+      if (data.visualPending) startVisualPolling(data.world.title);
       showToast(`《${data.world.title}》立项完成，导演与审查者已就位。`);
     } catch (e) {
       showToast("立项失败: " + (e as Error).message);
@@ -238,8 +240,11 @@ const Home: React.FC<HomeProps> = (props) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title: world.title }),
     });
-    const data = (await res.json()) as { world?: WorldState };
-    if (data.world) setWorld(data.world);
+    const data = (await res.json()) as { world?: WorldState; visualPending?: boolean };
+    const dw = data.world;
+    if (dw) setWorld(dw);
+    // 读时自愈/新增角色触发的视觉自动生成：启动轮询（中枢显示「自动生成角色头像/立绘中…」，完成后恢复待命）
+    if (dw && data.visualPending) startVisualPolling(dw.title);
   }
 
   async function advance() {
@@ -460,7 +465,7 @@ const Home: React.FC<HomeProps> = (props) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, ...patch, ...(strategy ? { strategy } : {}) }),
       });
-      const data = (await res.json()) as { ok?: boolean; world?: WorldState; error?: string; needIntervention?: boolean; report?: ImpactReportView; change?: { detail?: string }; aborted?: boolean };
+      const data = (await res.json()) as { ok?: boolean; world?: WorldState; visualPending?: boolean; error?: string; needIntervention?: boolean; report?: ImpactReportView; change?: { detail?: string }; aborted?: boolean };
       if (data.needIntervention && data.report) {
         // L2：弹出干预面板，暂存 patch 等待三选一
         setIntervene({ patch, report: data.report, changeDesc: data.change?.detail ?? "角色/设定修改" });
@@ -475,6 +480,8 @@ const Home: React.FC<HomeProps> = (props) => {
       if (!data.ok || !data.world) throw new Error(data.error ?? "保存失败");
       setWorld(data.world);
       setIntervene(null);
+      // 手动新增角色：头像/立绘后台自动生成（轮询期间中枢显示「自动生成角色头像/立绘中…」，完成后刷新并恢复待命）
+      if (data.visualPending) startVisualPolling(data.world.title);
       showToast(strategy === "merge" ? "设定已保存，弥合任务已注入后续章节计划。" : strategy === "rewrite" ? "设定已保存，受影响章节已入重写队列。" : "设定已保存，将影响后续写作。");
       return true;
     } catch (e) {
@@ -506,9 +513,11 @@ const Home: React.FC<HomeProps> = (props) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, proposalId, action }),
       });
-      const data = (await res.json()) as { ok?: boolean; world?: WorldState; error?: string };
+      const data = (await res.json()) as { ok?: boolean; world?: WorldState; visualPending?: boolean; error?: string };
       if (!data.ok || !data.world) throw new Error(data.error ?? "操作失败");
       setWorld(data.world);
+      // 入册新角色：头像/立绘后台自动生成（轮询期间中枢显示「自动生成角色头像/立绘中…」，完成后刷新并恢复待命）
+      if (data.visualPending) startVisualPolling(data.world.title);
       showToast(action === "confirm" ? "新角色已入册，可在后续章节登场。" : "提案已拒绝。");
     } catch (e) {
       showToast("提案处理失败: " + (e as Error).message);
@@ -726,6 +735,9 @@ const Home: React.FC<HomeProps> = (props) => {
   const [mediaGen, setMediaGen] = useState<MediaGen | null>(null);
   // 改词重生成：编辑弹窗状态（预填 prompt，风格后缀服务端自动保留）
   const [regenMedia, setRegenMedia] = useState<{ chapterIndex: number; media: ChapterMedia; prompt: string } | null>(null);
+  // 角色视觉后台自动生成中（立项 / 确认入册 / 手动新增角色后轮询 /api/novel/visual/status；期间中枢显示「自动生成角色头像/立绘中…」）
+  const [visualGen, setVisualGen] = useState(false);
+  const visualTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   // 角色全局立绘：大图预览 + 生成/重新生成（点击角色列表中的立绘或角色项触发）
   const [portraitView, setPortraitView] = useState<Character | null>(null);
   const [portraitBusy, setPortraitBusy] = useState(false);
@@ -742,7 +754,7 @@ const Home: React.FC<HomeProps> = (props) => {
   function stopMediaPolling() {
     if (mediaTimer.current) { clearInterval(mediaTimer.current); mediaTimer.current = undefined; }
   }
-  useEffect(() => () => stopMediaPolling(), []);
+  useEffect(() => () => { stopMediaPolling(); stopVisualPolling(); }, []);
 
   // 刷新/重新进入恢复轮询：world 中存在 pending 媒体（插画/视频异步任务）且当前无轮询时自动续接，保证刷新页面不影响生成结果
   useEffect(() => {
@@ -829,6 +841,65 @@ const Home: React.FC<HomeProps> = (props) => {
       }
     }, 5000);
   }
+
+  /** 角色视觉后台自动生成轮询（立项 / 确认入册 / 手动新增角色后触发）：每 5s 查 /api/novel/visual/status，
+   * pending 为空 = 全部生成完毕 → 停止轮询、刷新世界、中枢恢复待命；
+   * 期间不锁全局 busy（不阻塞写作/媒体操作，与媒体异步任务一致），仅中枢指示器显示「自动生成角色头像/立绘中…」 */
+  function startVisualPolling(storyTitle: string) {
+    stopVisualPolling();
+    setVisualGen(true);
+    visualTimer.current = setInterval(async () => {
+      try {
+        const r = await fetch("/api/novel/visual/status", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: storyTitle }),
+        });
+        const st = (await r.json()) as {
+          ok?: boolean;
+          pending?: { id: string; name: string }[];
+          failed?: { id: string; name: string; reason?: string }[];
+          error?: string;
+        };
+        if (!st.ok) throw new Error(st.error ?? "查询角色视觉状态失败");
+        if (!st.pending?.length) {
+          stopVisualPolling();
+          setVisualGen(false);
+          await refreshWorld();
+          // 区分成功/失败提示（失败原因同时落在操作日志 visual-fail 与角色面板手动生成兜底）
+          const failed = st.failed ?? [];
+          if (failed.length) {
+            showToast(`${failed.length} 个角色头像/立绘自动生成失败（${failed.map((f) => f.name).join("、")}），可在角色面板手动生成（详见操作日志）`);
+          } else {
+            showToast("角色头像/立绘已自动生成");
+          }
+        }
+      } catch (e) {
+        // 网络抖动/任务短暂中断：保留轮询重试
+        console.warn("[visual] 轮询失败，稍后重试:", (e as Error).message);
+      }
+    }, 5000);
+  }
+  function stopVisualPolling() {
+    if (visualTimer.current) { clearInterval(visualTimer.current); visualTimer.current = undefined; }
+  }
+  // 角色视觉生成中恢复轮询：刷新/重新进入页面时任务表仍有 running（服务未重启）→ 自动续接，保证刷新不丢进度/不丢中枢忙碌态
+  useEffect(() => {
+    if (!world || visualTimer.current) return;
+    let cancelled = false;
+    fetch("/api/novel/visual/status", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: world.title }),
+    })
+      .then((r) => r.json())
+      .then((st: { ok?: boolean; pending?: unknown[] }) => {
+        if (!cancelled && st.ok && st.pending?.length) startVisualPolling(world.title);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [world]);
 
   /** 分镜：LLM 挑选关键场景 → 弹出确认窗（不直接生成）；240s 超时保护（服务端单次最长 90s，内部重试 + 外层重试共 3 次预算） */
   async function planMedia(kind: "image" | "video", count: number) {
@@ -1703,8 +1774,8 @@ const Home: React.FC<HomeProps> = (props) => {
             onOpenSettings={() => { setShowSettings(true); void refreshWorld(); }}
             brain={(
               <BrainIndicator
-                action={busyPhase || ((autoSession?.status === "running" || autoSession?.status === "paused") && autoSession.phase ? `连载·${autoSession.phase}` : "")}
-                busy={Boolean(busyPhase) || autoSession?.status === "running"}
+                action={busyPhase || (visualGen ? "自动生成角色头像/立绘中…" : "") || ((autoSession?.status === "running" || autoSession?.status === "paused") && autoSession.phase ? `连载·${autoSession.phase}` : "")}
+                busy={Boolean(busyPhase) || visualGen || autoSession?.status === "running"}
                 onClick={() => setShowMemoryAudit(true)}
               />
             )}

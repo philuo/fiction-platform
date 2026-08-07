@@ -60,7 +60,7 @@ bun test tests/  # 单测 + mock 管线测试（不消耗真实 API 额度）
 | `eval.ts` | 整书 8 维评估（WebNovelBench 式 LLM-as-Judge） |
 | `cards.ts` | 抽卡：六类卡池；**角色卡提案化**（结构化人物→待确认）；伏笔卡带回收时机；去重 title+description |
 | `lore.ts` | 世界书：**关键词匹配注入**（命中优先，上限 8）+ 自动生成/手动保留 |
-| `images.ts` | 图像生成（Agnes，失败回退 mflux）、saveImage、readImage（防穿越） |
+| `images.ts` | 图像生成（Agnes 云端生图）、saveImage、readImage（防穿越） |
 | `storage.ts` | 持久化：**原子写 tmp+rename**、同名书防覆盖（allocateTitle）、versions 外置、meta.json 列表快读、checkpoint.jsonl、EPUB（含卷题） |
 | `jsonutil.ts` | 鲁棒 JSON 提取（围栏剥离 + 平衡括号）+ chatJson（不合法时回填修复重试） |
 | `routes.ts` | 全部 /api/* 路由，per-title 并发锁，AppError 业务错误，SSE 心跳 15s |
@@ -111,7 +111,7 @@ minWords/maxWords（滑杆 100-20000）、settingMode（历史真实/架空/混�
 ### M6 章节编辑
 - ✎ 手动编辑（自动留版本快照，审查重置）
 - ✨ AI 重写本节（保持剧情方向，重新对抗审查，留版本）
-- 🎨 章节插画（mflux 生成，正文下方展示）
+- 🎨 章节插画（Agnes 生成，正文下方展示）
 - 📚 版本历史：编辑/重写/回滚前自动快照（≤10 版/章，含标题/文本/审查/时间/原因）；弹层回滚
 - **回滚语义**：仅还原文本/标题/审查；角色登场/离场、时间线不随回滚还原
 
@@ -132,7 +132,9 @@ minWords/maxWords（滑杆 100-20000）、settingMode（历史真实/架空/混�
 
 ### M8 增强
 - **流派模板**：启动页 5 预置模板一键填充（古风悬疑/科幻/武侠/都市怪谈/奇幻）
-- **图像生成**：本地 mflux（z-image-turbo），书籍封面（AI 生成/上传）/角色头像/章节插画；防穿越 + 魔数校验 + 10MB 上限
+- **图像生成**：Agnes 云端生图（agnes-image-2.1-flash，1K 档），书籍封面（AI 生成/上传）/角色头像/章节插画；防穿越 + 魔数校验 + 10MB 上限
+- **角色视觉自动生成**：立项初始角色 / 抽卡·记账新角色「确定入册」/ 手动新增角色 / 打开已有故事（读时自愈）后，**自动生成头像 + 立绘**（先头像 → 再以头像为参考图生成立绘，容貌一致；fire-and-forget 不阻塞返回）；**中枢巡检兜底**：服务启动后每 60s 扫描所有故事角色，头像/立绘缺失自动补全（任何路径进入世界的角色都不会漏）；中枢指示器显示「自动生成角色头像/立绘中…」，完成后恢复待命；操作日志留痕（头像 CMD-M08 / 立绘 CMD-M07，actor=system）；失败不静默——操作日志记录 visual-fail 带原因、前端提示可在角色面板手动生成，自动重试有 **1 分钟冷却**（visualTriedAt）防烧配额
+- **角色视觉渠道单一**：头像仅来源于角色自身字段属性（性别/年龄/身份/外貌 traits/身份服饰）+ 时代服饰 + 全书画风锚点，纯文生不参考任何其他图像；立绘必须以头像为参考图（无头像时提示先生成头像，不降级纯文生）——头像与立绘容貌一致、来源可预期
 - **导出**：Markdown / EPUB（标准结构，中文文件名 RFC5987 编码）
 
 ---
@@ -166,6 +168,7 @@ minWords/maxWords（滑杆 100-20000）、settingMode（历史真实/架空/混�
 | `POST /api/novel/chapter/regenerate` | AI 重写本节（留版本） |
 | `POST /api/novel/chapter/rollback` | 版本回滚 |
 | `POST /api/novel/image` | 图像生成（kind=cover/character/chapter） |
+| `POST /api/novel/visual/status` | 角色视觉自动生成任务状态（pending=生成中 / failed 带原因 / done；前端轮询，完成后中枢恢复待命） |
 | `POST /api/novel/cover/upload` | 封面上传（dataUrl，魔数校验） |
 | `GET /api/novel/asset?title=&path=` | 图片读取（防穿越） |
 | `GET /api/novel/export?title=&format=md\|epub` | 导出 |
@@ -180,7 +183,7 @@ minWords/maxWords（滑杆 100-20000）、settingMode（历史真实/架空/混�
 WorldState {
   title, genre, premise,
   setting: { time, place, rules[], tone },
-  characters: [{ id, name, role, traits[], motivation, secret?, status, relations{}, voice?, appearedIn?: number[], exit?, image?, introducedAt }],
+  characters: [{ id, name, role, traits[], motivation, secret?, status, relations{}, voice?, appearedIn?: number[], exit?, image?, portrait?, visualTriedAt?（自动视觉最近尝试时间戳，读时自愈冷却用）, introducedAt }],
   foreshadowing: [{ id, text, plantedAt, status: planted|active|resolved, resolvedAt?, note?, dueHint? }],
   timeline: [{ chapter, summary }],
   chapters: [{ index, title, text, review, media?, versions?(运行时)/versionFiles?(落盘) }],
@@ -206,8 +209,7 @@ TEXT_BASE_URL / TEXT_API_KEY / TEXT_MODEL（当前：https://tokenrhythm.studio/
 # 未配置 TEXT_* 时回落：
 AGNES_API_KEY / AGNES_BASE_URL(https://api.agnes-ai.cn/v1) / AGNES_MODEL(agnes-2.5-flash)
 ANYSEARCH_API_KEY / ANYSEARCH_ENDPOINT
-AGNES_IMAGE_MODEL(agnes-image-2.1-flash) / IMAGE_PROVIDER(agnes，失败回退 mflux)
-IMAGE_STEPS(8) / IMAGE_QUANT(8)          # 仅 mflux 回退时生效
+AGNES_IMAGE_MODEL(agnes-image-2.1-flash)
 PORT(dev 3000 / prod 3000)
 ```
 
@@ -230,10 +232,9 @@ PORT(dev 3000 / prod 3000)
 
 ### 限制
 1. Agnes 免费额度 30 RPM：主动节流 + 退避重试；自动连载遇配额耗尽自动停下留痕
-2. mflux 图像生成单张 1-3 分钟（本地 MLX），spawnSync 同步阻塞（单用户可接受）
-3. 无浏览器端自动化测试（hydrate 依赖人工验证）
-4. 本地单用户：无账号（可用 `?title=` 直达）
-5. 回溯重写队列（rewriteQueue）目前仅入队，逐章执行需手动触发 regenerate（后续可做自动消费）
+2. 无浏览器端自动化测试（hydrate 依赖人工验证）
+3. 本地单用户：无账号（可用 `?title=` 直达）
+4. 回溯重写队列（rewriteQueue）目前仅入队，逐章执行需手动触发 regenerate（后续可做自动消费）
 
 ### 迭代建议（优先级排序）
 1. **rewriteQueue 自动消费**（干预选回溯重写后自动逐章 regenerate）

@@ -5,7 +5,7 @@
 // - 客户端 bundle：进程启动时 Bun.build 输出到 dist/dev/（无缓存头，刷新即最新）
 import { render } from "./entry-server";
 import { buildHtml } from "./render";
-import { handleApi, resumeAutoSessions } from "../src/api/routes";
+import { handleApi, resumeAutoSessions, startVisualSweep } from "../src/api/routes";
 import { loadWorld } from "../src/api/storage";
 // 仅注册到 --hot 监听图（客户端代码 / CSS 变化触发重建）；SSR 环境下无副作用（内部有 window 保护）
 import "../src/entry-client";
@@ -110,5 +110,11 @@ setTimeout(() => {
     resumeAutoSessions();
   } catch (e) {
     console.error("[dev] 连载会话恢复失败:", e);
+  }
+  // 中枢视觉巡检：周期扫描所有故事角色，头像/立绘缺失自动补全（1 分钟冷却兜底防烧配额）
+  try {
+    startVisualSweep();
+  } catch (e) {
+    console.error("[dev] 中枢视觉巡检启动失败:", e);
   }
 }, 0);

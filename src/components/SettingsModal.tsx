@@ -278,7 +278,7 @@ const GlobalSettings: React.FC<{ world: WorldState; onSave: Props["onSave"]; onI
               setMsg("封面生成中…");
               try {
                 const r = await p.onImage("cover");
-                setMsg(r?.path ? "封面已生成" : "封面生成失败（请检查本地 z-image-turbo 服务）");
+                setMsg(r?.path ? "封面已生成" : "封面生成失败（请检查 Agnes 生图服务）");
               } finally {
                 setImgBusy(false);
               }

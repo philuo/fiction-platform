@@ -488,17 +488,17 @@ export function sceneGuardClause(scene: string, roster: string[]): string {
  * 模型会换人/变样貌/照搬参考图场景。前缀置顶（弱模型对句首注意力最强，保持人物身份是首要约束），
  * 后接原 T2I 提示词作为"按此重绘/生成"的 Change 部分。
  *
- * - portrait：旧立绘作容貌基准，保持面部/发型/身形/整体形象，背景改纯色，不照搬参考图背景
- * - avatar：立绘作容貌基准，保持面部/发型/神态，裁切为正面头像
+ * - portrait：头像作容貌基准（立绘必须参考头像，渠道单一），保持面部/发型/身形/整体形象，背景改纯色，不照搬参考图背景
+ * - avatar：已弃用——头像纯文生（仅角色自身字段属性），不再 i2i 参考立绘；保留分支仅为兼容旧调用
  * - scene：参考图作画面主体样貌基准，保持人物形象，不照搬参考图场景与构图
  */
 export function i2iPreservePrefix(target: "portrait" | "avatar" | "scene", name?: string): string {
   const nm = name ? `「${name}」` : "";
   if (target === "portrait") {
-    return `以参考立绘为角色${nm}的容貌基准，严格保持面部五官、发型、身形与整体人物形象与参考图一致（容貌延续，不得改变样貌或换人）；参考图仅作人物样貌依据，背景须改为干净的纯色背景，不照搬参考图背景。按以下要求重绘全身立绘：\n`;
+    return `以参考头像为角色${nm}的容貌基准，严格保持面部五官、发型、身形与整体人物形象与参考图一致（容貌延续，不得改变样貌或换人）；参考图仅作人物样貌依据，背景须改为干净的纯色背景，不照搬参考图背景。按以下要求重绘全身立绘：\n`;
   }
   if (target === "avatar") {
-    return `以参考立绘为容貌基准，严格保持面部五官、发型、神态与参考立绘一致（容貌延续，不得改变样貌或换人）；参考立绘仅作人物样貌依据，背景须改为干净的纯色背景。按以下要求呈现正面头像特写：\n`;
+    return `（已弃用：头像纯文生，不再 i2i 参考立绘）以参考图为容貌基准，严格保持面部五官、发型、神态与参考图一致（容貌延续，不得改变样貌或换人）；参考图仅作人物样貌依据，背景须改为干净的纯色背景。按以下要求呈现正面头像特写：\n`;
   }
   return `参考图仅作为画面主体的样貌参考（面部五官、发型、服饰、身形），画面中该角色须与参考图保持一致，不得改变样貌或换人；若画面描述出现多个角色，参考图人物在画面中只能出现一次，其余角色须按文字描述另行绘制，严禁复制或复用参考图人物形象（禁止分身）；每个角色只能出现一次；不得照搬参考图的场景与构图，按以下描述生成新画面：\n`;
 }
@@ -621,38 +621,30 @@ export function mediaDataUri(storyTitle: string, m: ChapterMedia): string | unde
   return `data:${mime};base64,${Buffer.from(buf).toString("base64")}`;
 }
 
-/** 生成角色全局立绘：中文提示词 = 外貌特征（traits/可选 description）+ 时代服饰（eraDress）+ 全书画风锚点；
- * 参考图优先级：旧立绘自身（重生成容貌延续，noOldRef 时跳过）> 该角色章节插画。头像（c.image）仅供用户查看，AI 不读（头像会反向参考立绘）。
+/** 生成角色全局立绘：中文提示词 = 角色自身字段属性（性别/年龄/身份/外貌特征 traits）+ 时代服饰（eraDress）+ 全书画风锚点；
+ * 必须参考头像（c.image 或 opts.refImage，均为角色自身头像）作 i2i 容貌基准——立绘与头像容貌一致，渠道单一；
+ * 无头像时抛错（不降级纯文生/不参考正文插画/旧立绘，保证立绘来源只有头像+角色字段）。
  * 硬约束：尺寸定死 1K 档 736x1312（ratio 9:16 竖版全身像）；背景统一纯色；禁帽子；性别特征鲜明。
  * 返回 { mediaId, path, prompt, looks }，由调用方落盘到 character.portrait；落盘为 JPEG（体积小巧）；looks 供前端重生成时预填 */
-export async function generateCharacterPortrait(storyTitle: string, w: WorldState, c: Character, opts: { description?: string; noOldRef?: boolean } = {}): Promise<{ mediaId: string; path: string; prompt: string; looks: string }> {
+export async function generateCharacterPortrait(storyTitle: string, w: WorldState, c: Character, opts: { description?: string; refImage?: string } = {}): Promise<{ mediaId: string; path: string; prompt: string; looks: string }> {
   const desc = opts.description?.trim();
   const looks = desc || c.traits.slice(0, 4).join("、");
   const baseAttrs = `性别 ${c.gender || "未知"}，年龄 ${c.age || "未知"}，身份 ${c.identity || "—"}`;
   const idDress = identityDress(c);
   const base = `《${w.title}》角色「${c.name}」（${c.role}）的全身立绘：${baseAttrs}；外貌特征 ${looks || "结合角色姓名与身份推演"}，面容气质需呈现明确的性别特征（男女形象区分鲜明）；时代背景 ${w.setting.time || "—"}、地点 ${w.setting.place || "—"}，时代服饰：${eraDress(w)}，无现代元素${idDress ? `；身份服饰：${idDress}${c}` : ""}；不戴任何帽子；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）；单人全身像，正面或略侧身，面向观者，神情姿态符合其身份与当前状态，竖版全身构图`;
   const t2iPrompt = ensureStyleSuffix(base, styleAnchor(w));
-  // i2i 形态（参考图作容貌基准，保持人物形象）：官方 i2i 结构 [保持]+[改变]，避免弱模型换人/变样貌
+  // i2i 形态（参考头像作容貌基准，保持人物形象）：官方 i2i 结构 [保持]+[改变]，避免弱模型换人/变样貌
   const i2iPrompt = i2iPreservePrefix("portrait", c.name) + t2iPrompt;
-  // 参考图：默认旧立绘自身（容貌延续）；noOldRef 时跳过全部参考图按新提示词纯文生重画；不读头像（头像仅作展示）
-  let ref: string | undefined;
-  if (!opts.noOldRef && c.portrait?.path) ref = mediaDataUri(storyTitle, { id: c.portrait.mediaId, kind: "image", anchor: c.name, path: c.portrait.path, status: "ready" });
-  if (!opts.noOldRef && !ref) {
-    for (const ch of w.chapters) {
-      const m = (ch.media ?? []).find((x) => x.kind === "image" && x.status === "ready" && x.path && `${x.anchor} ${x.caption ?? ""}`.includes(c.name));
-      if (m) { ref = mediaDataUri(storyTitle, m); break; }
-    }
-  }
+  // 参考图（容貌基准）：仅角色自身头像——opts.refImage（调用方显式传入，如自动补全传刚生成的头像）> c.image（已落盘头像）；
+  // 两者皆无 = 该角色还没有头像 → 抛错（立绘必须参考头像，渠道单一可靠，不降级纯文生）
+  const ref = opts.refImage ?? (c.image ? mediaDataUri(storyTitle, { id: "", kind: "image", anchor: c.name, path: c.image, status: "ready" }) : undefined);
+  if (!ref) throw new Error(`角色「${c.name}」还没有头像，立绘必须以头像为参考：请先生成头像`);
   let buf: Uint8Array;
-  if (ref) {
-    try {
-      buf = await generateImage(i2iPrompt, "736x1312", { images: [ref] });
-    } catch (e) {
-      console.warn("[media] 立绘参考图生图失败，降级纯文生图:", (e as Error).message);
-      buf = await generateImage(t2iPrompt, "736x1312");
-    }
-  } else {
-    buf = await generateImage(t2iPrompt, "736x1312");
+  try {
+    buf = await generateImage(i2iPrompt, "736x1312", { images: [ref] });
+  } catch (e) {
+    console.warn("[media] 立绘参考图生图失败，抛错不降级（保证立绘渠道单一）:", (e as Error).message);
+    throw e;
   }
   // 压缩为 JPEG：立绘体积尽可能小巧（定死 736x1312 竖版 9:16），失败时保留原图
   let compressed = buf;
@@ -666,25 +658,15 @@ export async function generateCharacterPortrait(storyTitle: string, w: WorldStat
   return { mediaId: mediaId(), path, prompt: t2iPrompt, looks: looks || "" };
 }
 
-/** 生成角色头像（仅供用户查看，AI 不读）：中文提示词 = 外貌特征 + 时代服饰（eraDress）+ 全书画风锚点 + 方形 1:1，压缩为小体积 JPEG；
- * refImage 非空时图生图（传立绘作参考，保证头像与立绘容貌一致），失败降级纯文生 */
-export async function generateCharacterAvatar(storyTitle: string, w: WorldState, c: Character, opts: { refImage?: string } = {}): Promise<{ path: string; prompt: string }> {
+/** 生成角色头像（仅供用户查看）：渠道单一——仅来源于角色自身字段属性（性别/年龄/身份/外貌特征 traits/姓名/身份服饰 identityDress）
+ * + 时代服饰（eraDress）+ 全书画风锚点，纯文生方形 1:1，不参考任何其他图像（不参考立绘/正文插画/外部图），压缩为小体积 JPEG；
+ * 头像先于立绘生成（是立绘的容貌基准，立绘以头像为参考图）；失败抛错（由调用方记录 visual-fail） */
+export async function generateCharacterAvatar(storyTitle: string, w: WorldState, c: Character): Promise<{ path: string; prompt: string }> {
   const looks = c.traits.slice(0, 4).join("、");
   const baseAttrs = `性别 ${c.gender || "未知"}，年龄 ${c.age || "未知"}，身份 ${c.identity || "—"}`;
   const idDress = identityDress(c);
   const t2iPrompt = `${c.name}（${c.role}）的方形头像：${baseAttrs}；外貌特征 ${looks || "结合角色姓名与身份推演"}，面容气质需呈现明确的性别特征（男女形象区分鲜明）；时代背景 ${w.setting.time || "—"}，时代服饰：${eraDress(w)}，无现代元素${idDress ? `；身份服饰：${idDress}${c}` : ""}；不戴任何帽子；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）；正面头像特写，面向观者，神情姿态符合其身份，${styleAnchor(w)}，画面中不要出现文字，无水印`;
-  const i2iPrompt = i2iPreservePrefix("avatar") + t2iPrompt;
-  let buf: Uint8Array;
-  if (opts.refImage) {
-    try {
-      buf = await generateImage(i2iPrompt, "768x768", { images: [opts.refImage] });
-    } catch (e) {
-      console.warn("[media] 头像参考图生图失败，降级纯文生:", (e as Error).message);
-      buf = await generateImage(t2iPrompt, "768x768");
-    }
-  } else {
-    buf = await generateImage(t2iPrompt, "768x768");
-  }
+  const buf = await generateImage(t2iPrompt, "768x768");
   let compressed = buf;
   try {
     compressed = await compressToJpeg(buf, 384, 384, 80);

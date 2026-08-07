@@ -1,6 +1,6 @@
 // 生产服务器：bun run start（先 bun run build 生成 dist/）
 // 纯 Bun.serve：静态资源（dist/client）+ API + SSR（bun build 的 server bundle）
-import { handleApi, resumeAutoSessions } from "../src/api/routes";
+import { handleApi, resumeAutoSessions, startVisualSweep } from "../src/api/routes";
 import { loadWorld } from "../src/api/storage";
 import { buildHtml } from "./render";
 
@@ -88,5 +88,11 @@ setTimeout(() => {
     resumeAutoSessions();
   } catch (e) {
     console.error("[prod] 连载会话恢复失败:", e);
+  }
+  // 中枢视觉巡检：周期扫描所有故事角色，头像/立绘缺失自动补全（1 分钟冷却兜底防烧配额）
+  try {
+    startVisualSweep();
+  } catch (e) {
+    console.error("[prod] 中枢视觉巡检启动失败:", e);
   }
 }, 0);

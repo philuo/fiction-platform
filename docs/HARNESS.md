@@ -123,11 +123,11 @@ type HarnessCommand = {
 | CMD-M04 | 媒体状态回写 `media/status` | user | `/api/novel/media/status`(:1338) | 轮询视频任务结果回写 | chapters[].media[].status/error/path | none | L0（条件写） | 429 返 rate_limited | audit |
 | CMD-M05 | 改词重生成 `media/regenerate` | user | `/api/novel/media/regenerate`(:1409) | 改 prompt 重生成 | media[].prompt/path/status | image/video | L0 | — | audit |
 | CMD-M06 | 删除媒体 `media/delete` | user | `/api/novel/media/delete`(:1505) | 删除媒体条目+磁盘文件 | chapters[].media | none | L0 | — | audit |
-| CMD-M07 | 生成角色立绘 `generateCharacterPortrait` | user | `/api/novel/character/portrait`(:1126) → media.ts:628 | 模板拼接+i2i 参考→竖版立绘 | characters[].portrait | image | L0 | — | audit |
-| CMD-M08 | 生成角色头像 `generateCharacterAvatar` | user | `/api/novel/image`(character)(:1076) → media.ts:671 | 模板→方形头像 | characters[].image | image | L0 | — | audit |
+| CMD-M07 | 生成角色立绘 `generateCharacterPortrait` | user | `/api/novel/character/portrait`(:1126) → media.ts:628 | i2i 参考（必须参考头像）→竖版立绘 | characters[].portrait | image | L0 | — | audit |
+| CMD-M08 | 生成角色头像 `generateCharacterAvatar` | user | `/api/novel/image`(character)(:1076) → media.ts:671 | 纯文生（仅角色自身字段属性）→方形头像 | characters[].image | image | L0 | — | audit |
 | CMD-M09 | 生成封面 `image cover` | user | `/api/novel/image`(cover)(:1076) | 生成封面 | cover | image | L0 | — | audit |
 | CMD-M10 | 上传封面 `cover/upload` | user | `/api/novel/cover/upload`(:1553) | 上传本地封面 | cover | none | L0 | — | audit |
-| CMD-M11 | 后台补立绘 `schedulePortraitFor` | system | routes.ts:120 | 媒体生成后 fire-and-forget 补立绘 | characters[].portrait | image | L0 | — | none |
+| CMD-M11 | 后台补角色视觉 `schedulePortraitFor` | system | routes.ts:120 | 媒体生成后 fire-and-forget 补头像+立绘（委托 ensureCharacterVisuals） | characters[].portrait/image | image | L0 | — | none |
 | CMD-M12 | 异步批量生图 `imageGenTasks` | system | routes.ts:1270 | 插画异步批量生成锁内回写 | chapters[].media | image | L0 | — | schedule |
 
 ### 2.5 干预治理类（Governance）— 用户干预/审计
@@ -157,6 +157,7 @@ type HarnessCommand = {
 | CMD-S08 | 读时自愈钩子 `state 钩子` | system | `/api/novel/state`(:247-257) | 每次打开重算登场+媒体迁移+autoRepair | appearedIn/ch.media（dirty 时 saveWorld） | none | L1（条件写） | — | audit |
 | CMD-S09 | 整书评估 `evaluateBook` | user | `/api/novel/eval`(:1021) → eval.ts:49 | 8 维 LLM 评估（缓存指纹） | 只读（写 eval.json） | exec/brain(未来) | L0 | 缓存兜底 | none |
 | CMD-S10 | 限流排队 `limiter` | system | limiter.ts | text 5/40、image 5/40、video 1/2 并发限流 | 影响所有 LLM/媒体行为 | none | L0 | 排队不 429 | schedule |
+| CMD-S11 | 中枢视觉巡检 `sweepVisualGaps` | system | routes.ts:236（dev.ts/prod.ts 启动触发，每 60s） | 扫描所有故事角色，头像/立绘缺失自动补全（1 分钟冷却） | characters[].portrait/image | image | L1 | 冷却兜底防烧配额 | schedule+audit |
 
 ### 2.7 查询只读类（Query）
 

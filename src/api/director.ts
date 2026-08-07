@@ -161,6 +161,7 @@ export async function newStory(idea: string, genre?: string): Promise<WorldState
     voice: c.voice ? String(c.voice).trim().slice(0, 80) : undefined,
     introducedAt: 0,
   }));
+  logChange(w, { chapter: w.nextChapter, actor: "user", kind: "newStory", detail: `立项建世界《${w.title}》（${w.genre}）：${w.premise.slice(0, 60)}${w.premise.length > 60 ? "…" : ""}，初始角色 ${w.characters.length} 名（头像/立绘自动生成中）`, commandId: "CMD-N01" });
   saveWorld(w);
   // 立项即自动导演（P3）：生成蓝图候选并默认确认第一套（失败不阻塞，写作时自愈）
   try {

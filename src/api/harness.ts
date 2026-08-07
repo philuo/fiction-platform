@@ -97,7 +97,7 @@ export const COMMANDS: HarnessCommand[] = [
   C("CMD-L08", "生成章摘要 summarizeChapter", "Ledger", "ai", "memory.ts:23", "LLM 章摘要", "不写（返回）", "exec", "L0", "—", ["none"], []),
   C("CMD-L09", "归并阶段摘要 summarizeRange", "Ledger", "ai", "memory.ts:66", "LLM 阶段摘要归并", "不写（返回，写入方在弧边界）", "exec", "L0", "—", ["none"], []),
   C("CMD-L10", "落盘摘要 upsertSummary", "Ledger", "ai", "memory.ts:55", "按 index 覆盖/追加摘要", "chapterSummaries", "none", "L1", "—", ["audit"], ["U08"]),
-  C("CMD-L11", "提案确认/拒绝 proposal confirm/reject", "Ledger", "user", "/api/novel/proposal", "新角色入册（头像/立绘按需手动生成）", "characterProposals[].status/characters", "image", "L2", "—", ["gate", "audit"], ["U09", "U13"]),
+  C("CMD-L11", "提案确认/拒绝 proposal confirm/reject", "Ledger", "user", "/api/novel/proposal", "新角色入册（自动生成头像/立绘，后台 CMD-M07/CMD-M08）", "characterProposals[].status/characters", "image", "L2", "—", ["gate", "audit"], ["U09", "U13"]),
   C("CMD-L12", "质量债登记 registerDebt", "Ledger", "ai", "director.ts:163", "登记质量债", "qualityDebt", "none", "L1", "—", ["audit"], ["U15"]),
   C("CMD-L13", "质量债修复/忽略 debt fix/ignore", "Ledger", "user", "/api/novel/debt", "fix 注入 mergeTasks/ignore 置状态", "qualityDebt[].status/chapterPlans[].mergeTasks/outline", "none", "L1", "—", ["gate", "audit"], ["U04", "U15"]),
 
@@ -108,11 +108,11 @@ export const COMMANDS: HarnessCommand[] = [
   C("CMD-M04", "媒体状态回写 media/status", "Media", "user", "/api/novel/media/status", "轮询视频任务结果回写", "chapters[].media[].status/error/path", "none", "L0", "429 返 rate_limited", ["audit"], ["U06", "U07"]),
   C("CMD-M05", "改词重生成 media/regenerate", "Media", "user", "/api/novel/media/regenerate", "改 prompt 重生成", "media[].prompt/path/status", "image", "L0", "—", ["audit"], ["U06", "U07"]),
   C("CMD-M06", "删除媒体 media/delete", "Media", "user", "/api/novel/media/delete", "删除媒体条目+磁盘文件", "chapters[].media", "none", "L0", "—", ["audit"], ["U06"]),
-  C("CMD-M07", "生成角色立绘 generateCharacterPortrait", "Media", "user", "/api/novel/character/portrait → media.ts:628", "模板拼接+i2i 参考→竖版立绘", "characters[].portrait", "image", "L0", "—", ["audit"], ["U13", "U19"]),
-  C("CMD-M08", "生成角色头像 generateCharacterAvatar", "Media", "user", "/api/novel/image(character) → media.ts:671", "模板→方形头像", "characters[].image", "image", "L0", "—", ["audit"], ["U13"]),
+  C("CMD-M07", "生成角色立绘 generateCharacterPortrait", "Media", "user", "/api/novel/character/portrait → media.ts:628", "i2i 参考（必须参考头像）→竖版立绘（角色创建后自动触发，actor=system）", "characters[].portrait", "image", "L0", "—", ["audit"], ["U13", "U19"]),
+  C("CMD-M08", "生成角色头像 generateCharacterAvatar", "Media", "user", "/api/novel/image(character) → media.ts:671", "纯文生（仅角色自身字段属性）→方形头像（角色创建后自动触发，actor=system）", "characters[].image", "image", "L0", "—", ["audit"], ["U13"]),
   C("CMD-M09", "生成封面 image cover", "Media", "user", "/api/novel/image(cover)", "生成封面", "cover", "image", "L0", "—", ["audit"], ["U01", "U13"]),
   C("CMD-M10", "上传封面 cover/upload", "Media", "user", "/api/novel/cover/upload", "上传本地封面", "cover", "none", "L0", "—", ["audit"], ["U01", "U13"]),
-  C("CMD-M11", "后台补立绘 schedulePortraitFor", "Media", "system", "routes.ts:120", "媒体生成后 fire-and-forget 补立绘", "characters[].portrait", "image", "L0", "—", ["none"], ["U13"]),
+  C("CMD-M11", "后台补角色视觉 schedulePortraitFor", "Media", "system", "routes.ts:120", "媒体生成后 fire-and-forget 补头像+立绘（委托 ensureCharacterVisuals）", "characters[].portrait/image", "image", "L0", "—", ["none"], ["U13"]),
   C("CMD-M12", "异步批量生图 imageGenTasks", "Media", "system", "routes.ts:1270", "插画异步批量生成锁内回写", "chapters[].media", "image", "L0", "—", ["schedule"], ["U06", "U07"]),
 
   // ===== 2.5 干预治理类（Governance）=====
@@ -136,6 +136,7 @@ export const COMMANDS: HarnessCommand[] = [
   C("CMD-S08", "读时自愈钩子 state 钩子", "System", "system", "/api/novel/state", "每次打开重算登场+媒体迁移+autoRepair", "appearedIn/ch.media（dirty 时 saveWorld）", "none", "L1", "—", ["audit"], ["U03", "U05", "U08"]),
   C("CMD-S09", "整书评估 evaluateBook", "System", "user", "/api/novel/eval → eval.ts:49", "8 维 LLM 评估（缓存指纹）", "只读（写 eval.json）", "brain", "L0", "缓存兜底", ["none"], ["U15"]),
   C("CMD-S10", "限流排队 limiter", "System", "system", "limiter.ts", "text 5/40、image 5/40、video 1/2 并发限流", "影响所有 LLM/媒体行为", "none", "L0", "排队不 429", ["schedule"], []),
+  C("CMD-S11", "中枢视觉巡检 sweepVisualGaps", "System", "system", "routes.ts:236（dev.ts/prod.ts 启动触发，每 60s）", "扫描所有故事角色，头像/立绘缺失自动补全（1 分钟冷却）", "characters[].portrait/image", "image", "L1", "冷却兜底防烧配额", ["schedule", "audit"], ["U13"]),
 
   // ===== 2.7 查询只读类（Query）=====
   C("CMD-Q01", "读世界状态", "Query", "user", "/api/novel/state", "读世界+自愈钩子", "只读（条件写见 S08）", "none", "L0", "—", ["none"], ["U03", "U06", "U08"]),
