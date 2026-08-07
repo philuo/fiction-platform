@@ -13,7 +13,7 @@
 
 ```bash
 bun install          # 安装依赖（缓存已配置到 .bun-cache，避开 ~/.bun TCC 限制）
-bun run dev          # 开发服务器 http://localhost:5173（bun --hot 热重启）
+bun run dev          # 开发服务器 http://localhost:3000（bun --hot 热重启）
 bun run build        # 生产构建（dist/client + dist/server）
 bun run start        # 生产服务器 http://localhost:3000（Bun.serve）
 ```
@@ -68,7 +68,7 @@ bun 会自动加载项目根 `.env`。密钥不进入代码 / git。
 
 日式报纸风格（纸色/衬线/报头双线/朱印/竖排标签）+ 游戏 HUD（左目录/中正文/右状态面板/底部控制条）。
 人在界面上的操作极小：立项一句话 → [推进剧情] → 抽卡筛选 → 看审查报告；其余全部由 AI 完成。
-恢复已存故事：`http://localhost:5173/?title=断梦录`
+恢复已存故事：`http://localhost:3000/?title=断梦录`
 
 ## 目录结构
 

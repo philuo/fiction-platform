@@ -31,7 +31,7 @@ const MIME: Record<string, string> = {
 };
 
 Bun.serve({
-  hostname: "127.0.0.1", // 仅本机访问：避免 API 无认证暴露到局域网（安全审查 HIGH）
+  hostname: "0.0.0.0", // 监听所有网卡（局域网/容器可访问）
   port,
   async fetch(req) {
     const url = new URL(req.url);

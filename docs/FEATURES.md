@@ -17,9 +17,9 @@
 | 密钥 | `.env`（bun 自动加载，gitignore） |
 
 ```bash
-bun run dev      # http://localhost:5173（开发，bun --hot 热重启）
+bun run dev      # http://localhost:3000（开发，bun --hot 热重启）
 bun run build    # dist/（client + SSR bundle）
-bun run start    # http://localhost:3000（生产，绑定 127.0.0.1）
+bun run start    # http://localhost:3000（生产，监听 0.0.0.0）
 bun run typecheck
 bun test tests/  # 单测 + mock 管线测试（不消耗真实 API 额度）
 ```
@@ -208,7 +208,7 @@ AGNES_API_KEY / AGNES_BASE_URL(https://api.agnes-ai.cn/v1) / AGNES_MODEL(agnes-2
 ANYSEARCH_API_KEY / ANYSEARCH_ENDPOINT
 AGNES_IMAGE_MODEL(agnes-image-2.1-flash) / IMAGE_PROVIDER(agnes，失败回退 mflux)
 IMAGE_STEPS(8) / IMAGE_QUANT(8)          # 仅 mflux 回退时生效
-PORT(dev 5173 / prod 3000)
+PORT(dev 3000 / prod 3000)
 ```
 
 > 插画/视频固定读 `AGNES_BASE_URL/AGNES_API_KEY`（images.ts/videos.ts），不受 TEXT_* 影响；冲烟脚本 `bun scripts/smoke-model.ts` 可验证当前文本端点。
@@ -221,7 +221,7 @@ PORT(dev 5173 / prod 3000)
 - `tests/engine-test.ts`：引擎端到端（立项→回合→审查→伏笔，需真实 API key）
 - `tests/restore-chapter.ts`：章节恢复工具
 - 每次功能变更：typecheck + SSR curl 冒烟 + review + security_review（无 git 仓库，审查以读文件为准）
-- 已知安全终态：HIGH×1/MEDIUM×2/LOW×10 全部闭环（服务器绑 127.0.0.1、错误 fail-closed、参数钳制、路径防穿越、图片魔数+大小）
+- 已知安全终态：HIGH×1/MEDIUM×2/LOW×10 全部闭环（错误 fail-closed、参数钳制、路径防穿越、图片魔数+大小；绑定已改为 0.0.0.0 供局域网访问——若需仅本机，改回 `hostname: "127.0.0.1"` 即可）
 - **双轨门禁**：`bun test`（代码正确性）+ `docs/QUALITY-BASELINE.md`（结果质量——基线作品复测对比），缺一不可；中枢重构（ARCHITECTURE P0-P3）未建基线前不得启动
 
 ---

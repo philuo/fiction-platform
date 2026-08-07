@@ -10,7 +10,7 @@ import { loadWorld } from "../src/api/storage";
 // 仅注册到 --hot 监听图（客户端代码 / CSS 变化触发重建）；SSR 环境下无副作用（内部有 window 保护）
 import "../src/entry-client";
 
-const port = Number(process.env.PORT) || 5173;
+const port = Number(process.env.PORT) || 3000;
 const isProd = process.env.NODE_ENV === "production";
 
 if (isProd) {
@@ -50,7 +50,7 @@ const MIME: Record<string, string> = {
 };
 
 Bun.serve({
-  hostname: "127.0.0.1", // 仅本机访问：避免 API 无认证暴露到局域网
+  hostname: "0.0.0.0", // 监听所有网卡（局域网/容器可访问）
   port,
   async fetch(req) {
     const url = new URL(req.url);
