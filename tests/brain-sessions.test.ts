@@ -130,22 +130,22 @@ describe("会话级任务注册表（连接解耦）", () => {
     sessionIds.push(s.id);
     const events: unknown[] = [];
     const emitter = (o: unknown) => events.push(o);
-    const task = registerSessionTask(s.id, emitter);
+    const task = registerSessionTask(TITLE, s.id, emitter);
     task.running = true;
 
     // 第二个连接 attach
     const events2: unknown[] = [];
-    const attached = attachSessionTask(s.id, (o) => events2.push(o));
+    const attached = attachSessionTask(TITLE, s.id, (o) => events2.push(o));
     expect(attached).not.toBeNull();
 
-    broadcastToSession(s.id, { phase: "delta", text: "x" });
+    broadcastToSession(TITLE, s.id, { phase: "delta", text: "x" });
     expect(events).toHaveLength(1);
     expect(events2).toHaveLength(1);
 
-    finishSessionTask(s.id);
-    broadcastToSession(s.id, { phase: "delta", text: "y" });
+    finishSessionTask(TITLE, s.id);
+    broadcastToSession(TITLE, s.id, { phase: "delta", text: "y" });
     expect(events).toHaveLength(1); // 不再广播
-    expect(attachSessionTask(s.id, () => {})).toBeNull(); // 无运行中任务
+    expect(attachSessionTask(TITLE, s.id, () => {})).toBeNull(); // 无运行中任务
   });
 
   test("register 同名会话复用任务；detach 后空集停表", () => {
@@ -153,8 +153,8 @@ describe("会话级任务注册表（连接解耦）", () => {
     sessionIds.push(s.id);
     const e1 = () => {};
     const e2 = () => {};
-    const t1 = registerSessionTask(s.id, e1);
-    const t2 = registerSessionTask(s.id, e2);
+    const t1 = registerSessionTask(TITLE, s.id, e1);
+    const t2 = registerSessionTask(TITLE, s.id, e2);
     expect(t1).toBe(t2);
     expect(t2.emitters.size).toBe(2);
   });

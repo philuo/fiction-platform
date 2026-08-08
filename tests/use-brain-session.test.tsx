@@ -14,13 +14,17 @@ import { useBrainSession } from "../src/components/useBrainSession";
 
 let win: Window;
 const origFetch = globalThis.fetch;
-const created = new Map<string, { id: string; role: string; text?: string }[]>();
+const created = new Map<string, { id: string; role: string; text?: string; pending?: boolean; interrupted?: boolean; at?: number }[]>();
 /** 手动释放 SSE（模拟生成完成） */
 let releaseChat: (() => void) | null = null;
 /** 记录对 /api/brain/sessions 的调用（验证无 id 列表 / 有 id 创建分派与挂载无空壳） */
 const listCalls: Array<{ hasId: boolean; id?: string }> = [];
 /** 记录对 /api/brain/sessions/detail 的调用（验证 newSession id 被复用） */
 const detailCalls: string[] = [];
+/** 记录对 /api/brain/chat 的请求体（验证 ctx 透传 / resume 标记） */
+const chatBodies: Array<{ prompt?: string; sessionId?: string; resume?: boolean; ctx?: { chapterIndex?: number | null } }> = [];
+/** SSE 事件队列（由测试预置，逐条发射后关闭） */
+let chatEvents: Array<Record<string, unknown>> | null = null;
 
 beforeAll(() => {
   win = new Window({ url: "http://localhost/?title=brain-session-hook-test" });
@@ -60,8 +64,21 @@ beforeAll(() => {
       return new Response(JSON.stringify({ sessions }), { status: 200, headers: { "Content-Type": "application/json" } }) as unknown as Response;
     }
     if (u.includes("/api/brain/chat")) {
-      // SSE 延迟完成：先只发 intent（不做 delta），由测试手动 release 完成
+      // 记录请求体（ctx 透传 / resume 标记断言）
+      chatBodies.push(JSON.parse(String(init?.body ?? "{}")) as (typeof chatBodies)[number]);
+      // SSE：默认先发 intent，由测试手动 release 完成；chatEvents 预置时逐条发射后关闭
       const enc = new TextEncoder();
+      if (chatEvents) {
+        const events = chatEvents;
+        chatEvents = null;
+        const stream = new ReadableStream<Uint8Array>({
+          start(c) {
+            for (const ev of events) c.enqueue(enc.encode("data: " + JSON.stringify(ev) + "\n\n"));
+            c.close();
+          },
+        });
+        return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } }) as unknown as Response;
+      }
       const body = "data: " + JSON.stringify({ type: "intent" }) + "\n\n";
       const stream = new ReadableStream<Uint8Array>({
         start(c) {
@@ -87,17 +104,18 @@ const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 
 /** 复刻 BrainCabin.doSend 的发送入口（无 activeId → newSession → send） */
 function Harness() {
-  const { messages, activeId, newSession, send } = useBrainSession("brain-session-hook-test");
+  const { messages, activeId, newSession, openSession, send } = useBrainSession("brain-session-hook-test");
   const msgRef = React.useRef(messages);
   msgRef.current = messages;
   React.useEffect(() => {
     (win as unknown as { __harness?: unknown }).__harness = {
-      doSend: async (prompt: string) => {
+      doSend: async (prompt: string, ctx?: { chapterIndex?: number | null }) => {
         let sid = activeId;
         if (!sid) sid = await newSession(prompt);
-        await send({ prompt, sessionId: sid });
+        await send({ prompt, sessionId: sid, ctx });
       },
       startNew: () => newSession(),
+      openSession: (id: string) => openSession(id),
       getMessages: () => msgRef.current,
       getActiveId: () => activeId,
     };
@@ -110,6 +128,8 @@ async function mountHarness() {
   releaseChat = null;
   listCalls.length = 0;
   detailCalls.length = 0;
+  chatBodies.length = 0;
+  chatEvents = null;
   const mount = document.createElement("div");
   document.body.appendChild(mount);
   const root: Root = createRoot(mount);
@@ -117,7 +137,7 @@ async function mountHarness() {
   return { mount, root };
 }
 
-const harness = () => (win as unknown as { __harness: { doSend: (p: string) => Promise<void>; getMessages: () => { role: string; text?: string }[]; getActiveId: () => string } }).__harness;
+  const harness = () => (win as unknown as { __harness: { doSend: (p: string, ctx?: { chapterIndex?: number | null }) => Promise<void>; startNew: () => Promise<string>; getMessages: () => { role: string; text?: string; pending?: boolean }[]; getActiveId: () => string; openSession: (id: string) => Promise<void> } }).__harness;
 
 describe("useBrainSession 首次对话发送", () => {
   test("无 activeId 时发送：SSE 完成前用户消息已出现在对话列表（立即展示，不依赖流式完成）", async () => {
@@ -190,6 +210,70 @@ describe("useBrainSession 首次对话发送", () => {
     // 协议：两轮对话只创建一次会话（hasId=true 仅 1 次），第二轮复用同一会话不重复创建
     const creates = listCalls.filter((c) => c.hasId);
     expect(creates).toHaveLength(1);
+    await act(() => root.unmount());
+  });
+
+  test("打开被中断的会话：不自动发起 resume（修复每次打开弹窗默认发起聊天）", async () => {
+    const { root } = await mountHarness();
+    await tick();
+    // 手工构造：会话含 user 消息 + 被中断的 assistant 消息（interrupted=true）
+    const sid = "interrupted-session";
+    created.set(sid, [
+      { id: "u1", role: "user", text: "你好", at: 1786182000000 },
+      { id: "b1", role: "assistant", text: "部分生成", interrupted: true, at: 1786182000000 },
+    ]);
+    // 记录 chat 请求次数（需重置 mock 的 chatCalls——直接用 fetch 内嵌计数）
+    let chatCalls = 0;
+    const origFetch2 = globalThis.fetch;
+    globalThis.fetch = async (url: unknown, init?: RequestInit) => {
+      if (String(url).includes("/api/brain/chat")) chatCalls++;
+      return origFetch2(url, init);
+    };
+    // 打开该会话（detail 未命中缓存 → 拉取 → 不应触发 resume）
+    await act(() => harness().openSession(sid));
+    await tick();
+    await tick();
+    expect(chatCalls).toBe(0); // interrupted 不自动 resume
+    // 会话已展示（消息可读；role 转换为 brain）
+    const shown = harness().getMessages();
+    expect(shown.some((m) => m.role === "brain" && m.text === "部分生成" && m.interrupted)).toBe(true);
+    globalThis.fetch = origFetch2;
+    await act(() => root.unmount());
+  });
+
+  test("send 透传 ctx（选中章节上下文）到 /api/brain/chat 请求体（需求 1/2）", async () => {
+    const { root } = await mountHarness();
+    await tick();
+    const p = harness().doSend("给第三章配张插画", { chapterIndex: 2 });
+    await tick();
+    await tick();
+    // 请求体携带 ctx.chapterIndex = 2（前端选中章）
+    expect(chatBodies.length).toBeGreaterThan(0);
+    expect(chatBodies[chatBodies.length - 1].ctx).toEqual({ chapterIndex: 2 });
+    expect(chatBodies[chatBodies.length - 1].resume).toBe(false);
+    releaseChat?.();
+    await p;
+    await act(() => root.unmount());
+  });
+
+  test("onReset 保留服务端重放文本（attach 恢复不闪没已生成内容，需求 3）", async () => {
+    const { root } = await mountHarness();
+    await tick();
+    // 预置 SSE：先 reset（带服务端已生成文本）→ 追加 delta → done
+    chatEvents = [
+      { type: "reset", messageId: "brain-1", text: "已生成一半" },
+      { type: "delta", messageId: "brain-1", text: "已生成一半，继续" },
+      { type: "done", messageId: "brain-1" },
+    ];
+    const p = harness().doSend("继续生成");
+    await tick();
+    await tick();
+    const msgs = harness().getMessages();
+    const brain = [...msgs].reverse().find((m) => m.role === "brain");
+    // reset 后 delta 从重放文本续写，最终完整文本不被清空
+    expect(brain?.text).toBe("已生成一半，继续");
+    expect(brain?.pending).toBe(false);
+    await p;
     await act(() => root.unmount());
   });
 });

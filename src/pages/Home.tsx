@@ -2223,6 +2223,7 @@ const Home: React.FC<HomeProps> = (props) => {
           brainState={brainState}
           onWorldUpdate={() => { void refreshWorld(); }}
           onProposalTalk={() => savePropClosed(false)}
+          currentChapter={shownChapter ? { index: shownChapter.index } : null}
         />
       )}
 

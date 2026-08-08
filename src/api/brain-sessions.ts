@@ -248,22 +248,23 @@ export type SessionTask = {
 
 const tasks = new Map<string, SessionTask>();
 
-/** 任务表 key：前缀当前用户——sessionId 可由调用方指定（brain-chat 传请求 body 的 id），不同账号不可互串 */
-function taskKey(sessionId: string): string {
-  return `${currentUser() ?? ""}::${sessionId}`;
+/** 任务表 key：用户 + 书名 + sessionId——sessionId 可由调用方指定（brain-chat 传请求 body 的 id），
+ * 不同账号 / 不同书 / 同 sessionId 均不可互串（否则同用户跨书同 id 会 attach 到错误任务收错 delta） */
+function taskKey(title: string, sessionId: string): string {
+  return `${currentUser() ?? ""}::${slugify(title)}::${sessionId}`;
 }
 
 /** 若会话已有进行中任务则注册 emitter 并返回任务；没有返回 null（调用方自行开新回合） */
-export function attachSessionTask(sessionId: string, emitter: (obj: unknown) => void): SessionTask | null {
-  const t = tasks.get(taskKey(sessionId));
+export function attachSessionTask(title: string, sessionId: string, emitter: (obj: unknown) => void): SessionTask | null {
+  const t = tasks.get(taskKey(title, sessionId));
   if (!t || !t.running) return null;
   t.emitters.add(emitter);
   return t;
 }
 
 /** 创建（或复用已结束的）任务并注册 emitter；abortSignal 取消时自动 abort 任务 */
-export function registerSessionTask(sessionId: string, emitter: (obj: unknown) => void, signal?: AbortSignal): SessionTask {
-  const key = taskKey(sessionId);
+export function registerSessionTask(title: string, sessionId: string, emitter: (obj: unknown) => void, signal?: AbortSignal): SessionTask {
+  const key = taskKey(title, sessionId);
   let t = tasks.get(key);
   if (!t) {
     t = { running: false, emitters: new Set(), abort: new AbortController() };
@@ -279,8 +280,8 @@ export function registerSessionTask(sessionId: string, emitter: (obj: unknown) =
 }
 
 /** 向会话所有附加连接广播（连接断开吞掉 enqueue 异常） */
-export function broadcastToSession(sessionId: string, obj: unknown): void {
-  const t = tasks.get(taskKey(sessionId));
+export function broadcastToSession(title: string, sessionId: string, obj: unknown): void {
+  const t = tasks.get(taskKey(title, sessionId));
   if (!t) return;
   for (const e of [...t.emitters]) {
     try {
@@ -292,8 +293,8 @@ export function broadcastToSession(sessionId: string, obj: unknown): void {
 }
 
 /** 移除一个 emitter；空集时任务停表（内存泄漏防护） */
-export function detachSessionTask(sessionId: string, emitter: (obj: unknown) => void): void {
-  const key = taskKey(sessionId);
+export function detachSessionTask(title: string, sessionId: string, emitter: (obj: unknown) => void): void {
+  const key = taskKey(title, sessionId);
   const t = tasks.get(key);
   if (!t) return;
   t.emitters.delete(emitter);
@@ -301,8 +302,8 @@ export function detachSessionTask(sessionId: string, emitter: (obj: unknown) => 
 }
 
 /** 回合结束：running=false，清空 emitter（任务停表） */
-export function finishSessionTask(sessionId: string): void {
-  const key = taskKey(sessionId);
+export function finishSessionTask(title: string, sessionId: string): void {
+  const key = taskKey(title, sessionId);
   const t = tasks.get(key);
   if (!t) return;
   t.running = false;
@@ -310,7 +311,7 @@ export function finishSessionTask(sessionId: string): void {
   tasks.delete(key);
 }
 
-export function isSessionRunning(sessionId: string): boolean {
-  const t = tasks.get(taskKey(sessionId));
+export function isSessionRunning(title: string, sessionId: string): boolean {
+  const t = tasks.get(taskKey(title, sessionId));
   return !!t && t.running;
 }

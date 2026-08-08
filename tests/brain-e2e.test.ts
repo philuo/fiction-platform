@@ -1,0 +1,391 @@
+// 中枢聊天端到端测试（真实 HTTP 层）：通过 handleApi 走完整链路
+// （认证 → 路由分发 → SSE 流），mock 仅注入 brainChatDeps 依赖点 + 临时数据目录。
+// 覆盖核心闭环与极端场景：
+// 1. 会话全生命周期：创建(id 透传) → chat SSE(intent→delta→done) → 列表 → detail → truncate → delete
+// 2. 极端场景：空 prompt 400、缺 title/sessionId 400、resume 会话不存在 error、无待续流消息 error、
+//    超长 prompt、会话删除后 send 重建、未登录 401、GET 405、双用户隔离、并发幂等创建
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { emptyWorld, type WorldState } from "../src/api/world";
+import type { ChatMessage } from "../src/api/agnes";
+import { brainChatDeps } from "../src/api/brain-chat";
+
+// —— 依赖注入（与 brain-chat.test 同款模式，避免 mock.module 污染） ——
+let nextChatContent = "";
+let nextReplyText = "你好，我是墨枢。这是流式回复。";
+const originalDeps = { ...brainChatDeps };
+
+brainChatDeps.chatJson = (async (_msgs: ChatMessage[], _opts?: unknown) =>
+  JSON.parse(nextChatContent)) as typeof brainChatDeps.chatJson;
+brainChatDeps.chatStream = (async (_msgs: ChatMessage[], onChunk: (d: string) => void, opts?: { signal?: AbortSignal }) => {
+  const text = nextReplyText;
+  let acc = "";
+  for (const ch of text) {
+    if (opts?.signal?.aborted) throw new DOMException("aborted", "AbortError");
+    acc += ch;
+    onChunk(ch);
+  }
+  return acc;
+}) as typeof brainChatDeps.chatStream;
+brainChatDeps.gachaGenerate = (async () => ({ pool: [] })) as typeof brainChatDeps.gachaGenerate;
+
+let mockWorld: WorldState | null = null;
+brainChatDeps.loadWorld = (() => mockWorld) as typeof brainChatDeps.loadWorld;
+
+let sessDataDir = "";
+let dbDir = "";
+
+beforeAll(async () => {
+  // 会话存储 + 账号库均隔离到临时目录，不污染真实 data/
+  sessDataDir = mkdtempSync(join(tmpdir(), "e2e-brainsess-"));
+  dbDir = mkdtempSync(join(tmpdir(), "e2e-appdb-"));
+  process.env.BRAIN_SESSIONS_DATA_DIR = sessDataDir;
+  process.env.APP_DB_PATH = join(dbDir, "test.db");
+  mockWorld = emptyWorld();
+  mockWorld.title = "e2e-book";
+  mockWorld.nextChapter = 1;
+  nextChatContent = '{"intent":"chat","params":{},"reply":"你好，我是墨枢。"}';
+});
+
+afterAll(() => {
+  // 恢复 deps（防跨文件污染）
+  Object.assign(brainChatDeps, originalDeps);
+  // 关闭 sqlite 释放句柄，再删临时目录（Windows EBUSY）
+  try {
+    const { getDb } = require("../src/api/db") as typeof import("../src/api/db");
+    getDb().close();
+  } catch { /* 未初始化则跳过 */ }
+  delete process.env.APP_DB_PATH;
+  delete process.env.BRAIN_SESSIONS_DATA_DIR;
+  rmSync(sessDataDir, { recursive: true, force: true });
+  rmSync(dbDir, { recursive: true, force: true });
+});
+
+// —— 工具：注册用户拿 token、发请求、读 SSE ——
+let cookieA = "";
+let cookieB = "";
+
+async function register(username: string): Promise<string> {
+  const { handleApi } = await import("../src/api/routes");
+  const res = await handleApi(
+    "/api/auth/register",
+    new Request("http://x/api/auth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password: "secret123" }),
+    }),
+  );
+  const setCookie = res!.headers.get("Set-Cookie") ?? "";
+  return setCookie.split(";")[0];
+}
+
+async function api(path: string, method: string, body: unknown, cookie: string): Promise<{ status: number; json: () => Promise<Record<string, unknown>>; text: () => Promise<string>; headers: Headers; body: ReadableStream<Uint8Array> | null }> {
+  const { handleApi } = await import("../src/api/routes");
+  const res = await handleApi(
+    path,
+    new Request(`http://x${path}`, {
+      method,
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }),
+  )!;
+  return { status: res.status, json: () => res.json(), text: () => res.text(), headers: res.headers, body: res.body };
+}
+
+/** 读 SSE 响应 body 全部事件（行缓冲，正确处理分块边界） */
+async function readSSE(body: ReadableStream<Uint8Array> | null): Promise<Record<string, unknown>[]> {
+  if (!body) return [];
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  const events: Record<string, unknown>[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    // 按行切分：SSE 事件以 \n\n 分隔，逐行解析更稳（事件 JSON 可能跨 chunk）
+    let idx: number;
+    while ((idx = buf.indexOf("\n\n")) >= 0) {
+      const block = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      const line = block.trim();
+      if (line.startsWith("data: ")) {
+        try { events.push(JSON.parse(line.slice(6))); } catch { /* ping 或非 JSON 忽略 */ }
+      }
+    }
+  }
+  // 尾部残留
+  const tail = buf.trim();
+  if (tail.startsWith("data: ")) {
+    try { events.push(JSON.parse(tail.slice(6))); } catch { /* ignore */ }
+  }
+  return events;
+}
+
+describe("中枢聊天 e2e：会话生命周期", () => {
+  test("创建 → chat SSE(intent→delta→done) → 列表 → detail → truncate → delete 全链路", async () => {
+    cookieA = await register("e2e_user_" + Math.random().toString(36).slice(2, 8));
+    const sid = "e2e-session-1";
+
+    // 1) 创建（id 透传）
+    const create = await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "你好" }, cookieA);
+    expect(create.status).toBe(201);
+    expect(((await create.json()) as { session: { id: string } }).session.id).toBe(sid);
+
+    // 2) chat SSE：intent → delta → done
+    const chat = await api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "你好", sessionId: sid, resume: false }, cookieA);
+    expect(chat.status).toBe(200);
+    expect(chat.headers.get("content-type")).toContain("text/event-stream");
+    const events = await readSSE(chat.body as unknown as ReadableStream<Uint8Array>);
+    const types = events.map((e) => e.type);
+    expect(types).toContain("intent");
+    expect(types).toContain("delta");
+    expect(types).toContain("done");
+    // delta 应携带回复文本（真流式：每条 delta 是累计全文，最后一条含完整回复）
+    const deltas = events.filter((e) => e.type === "delta") as { text?: string }[];
+    expect(deltas.length).toBeGreaterThan(0);
+    expect(deltas[deltas.length - 1]?.text).toContain("墨枢");
+
+    // 3) 列表含该会话（有消息）
+    const list = await api("/api/brain/sessions", "POST", { title: "e2e-book" }, cookieA);
+    const listData = (await list.json()) as { sessions: { id: string }[] };
+    expect(listData.sessions.map((s) => s.id)).toContain(sid);
+
+    // 4) detail 命中且消息已落盘
+    const detail = await api("/api/brain/sessions/detail", "POST", { title: "e2e-book", id: sid }, cookieA);
+    const detailData = (await detail.json()) as { session: { messages: unknown[] } };
+    expect(detailData.session.messages.length).toBeGreaterThanOrEqual(2); // user + assistant
+
+    // 5) truncate 到首条 user 消息之后（编辑重发语义）
+    const trunc = await api("/api/brain/sessions/truncate", "POST", { title: "e2e-book", id: sid, messageId: "non-existent" }, cookieA);
+    expect(trunc.status).toBe(200); // 不存在的消息 id：返回 200 {ok:false}，不破坏
+
+    // 6) 删除
+    const del = await api("/api/brain/sessions/delete", "POST", { title: "e2e-book", id: sid }, cookieA);
+    expect(del.status).toBe(200);
+    const list2 = await api("/api/brain/sessions", "POST", { title: "e2e-book" }, cookieA);
+    expect(((await list2.json()) as { sessions: unknown[] }).sessions).not.toContain(sid);
+  });
+});
+
+describe("中枢聊天 e2e：极端场景", () => {
+  test("空 prompt → 400", async () => {
+    const r = await api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "", sessionId: "s-empty", resume: false }, cookieA);
+    expect(r.status).toBe(400);
+  });
+
+  test("缺 title → 400", async () => {
+    const r = await api("/api/brain/sessions", "POST", {}, cookieA);
+    expect(r.status).toBe(400);
+  });
+
+  test("缺 sessionId → 400", async () => {
+    const r = await api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "你好" }, cookieA);
+    expect(r.status).toBe(400);
+  });
+
+  test("resume 不存在的会话 → SSE error 事件（非崩溃）", async () => {
+    const r = await api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "继续", sessionId: "no-such-session", resume: true }, cookieA);
+    expect(r.status).toBe(200); // SSE 仍 200
+    const events = await readSSE(r.body as unknown as ReadableStream<Uint8Array>);
+    expect(events.some((e) => e.error)).toBe(true);
+  });
+
+  test("resume 无待续流消息 → SSE error 事件", async () => {
+    const sid = "e2e-finished";
+    await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "你好" }, cookieA);
+    // 正常完成一轮（消息已 done，无 pending）
+    await api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "你好", sessionId: sid, resume: false }, cookieA);
+    const r = await api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "继续", sessionId: sid, resume: true }, cookieA);
+    const events = await readSSE(r.body as unknown as ReadableStream<Uint8Array>);
+    // 已完成会话无 pending 消息 → 服务端发 error 事件
+    expect(events.some((e) => e.error)).toBe(true);
+  });
+
+  test("未登录访问 → 401", async () => {
+    const r = await api("/api/brain/sessions", "POST", { title: "e2e-book" }, "");
+    expect(r.status).toBe(401);
+  });
+
+  test("GET 方法 → 405", async () => {
+    const r = await api("/api/brain/sessions", "GET", undefined, cookieA);
+    expect(r.status).toBe(405);
+  });
+
+  test("超长 prompt（10k 字符）不崩溃且正常处理", async () => {
+    const sid = "e2e-long";
+    await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "长输入" }, cookieA);
+    const long = "写一章".repeat(5000); // 1.5 万字符
+    const r = await api("/api/brain/chat", "POST", { title: "e2e-book", prompt: long, sessionId: sid, resume: false }, cookieA);
+    expect(r.status).toBe(200);
+    const events = await readSSE(r.body as unknown as ReadableStream<Uint8Array>);
+    expect(events.some((e) => e.type === "done")).toBe(true);
+  });
+
+  test("会话删除后再次 send → 服务端自动重建同 id（不崩）", async () => {
+    const sid = "e2e-recreate";
+    await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "你好" }, cookieA);
+    await api("/api/brain/sessions/delete", "POST", { title: "e2e-book", id: sid }, cookieA);
+    // 删除后立即 chat：非 resume → 自动 createSession 重建
+    const r = await api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "你好", sessionId: sid, resume: false }, cookieA);
+    expect(r.status).toBe(200);
+    const events = await readSSE(r.body as unknown as ReadableStream<Uint8Array>);
+    expect(events.some((e) => e.type === "done")).toBe(true);
+  });
+
+  test("双用户同名书会话隔离", async () => {
+    cookieB = await register("e2e_user_b_" + Math.random().toString(36).slice(2, 8));
+    const sidA = "e2e-isol-a";
+    const sidB = "e2e-isol-b";
+    await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sidA, prompt: "A 的会话" }, cookieA);
+    await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sidB, prompt: "B 的会话" }, cookieB);
+    // 各发一轮消息（否则空壳被列表过滤）
+    await api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "你好 A", sessionId: sidA, resume: false }, cookieA);
+    await api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "你好 B", sessionId: sidB, resume: false }, cookieB);
+    // A 看不到 B 的会话，B 看不到 A 的
+    const listA = (await (await api("/api/brain/sessions", "POST", { title: "e2e-book" }, cookieA)).json()) as { sessions: { id: string }[] };
+    const listB = (await (await api("/api/brain/sessions", "POST", { title: "e2e-book" }, cookieB)).json()) as { sessions: { id: string }[] };
+    expect(listA.sessions.map((s) => s.id)).toContain(sidA);
+    expect(listA.sessions.map((s) => s.id)).not.toContain(sidB);
+    expect(listB.sessions.map((s) => s.id)).toContain(sidB);
+    expect(listB.sessions.map((s) => s.id)).not.toContain(sidA);
+  });
+
+  test("并发同 id 幂等创建：重复请求不产生重复会话", async () => {
+    const sid = "e2e-race";
+    const [r1, r2] = await Promise.all([
+      api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "并发" }, cookieA),
+      api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "并发" }, cookieA),
+    ]);
+    expect([200, 201]).toContain(r1.status);
+    expect([200, 201]).toContain(r2.status);
+    // 发消息后列表只应有 1 个该 id
+    await api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "测试消息", sessionId: sid, resume: false }, cookieA);
+    const list = (await (await api("/api/brain/sessions", "POST", { title: "e2e-book" }, cookieA)).json()) as { sessions: { id: string }[] };
+    expect(list.sessions.filter((s) => s.id === sid)).toHaveLength(1);
+  });
+
+  test("detail 不存在的会话 → 404（前端静默处理，不崩溃）", async () => {
+    const r = await api("/api/brain/sessions/detail", "POST", { title: "e2e-book", id: "no-such-detail" }, cookieA);
+    expect(r.status).toBe(404); // 前端 openSession 对 !res.ok 静默 return
+  });
+
+  test("会话被截断（truncate 到某消息）后仅保留该消息之前内容", async () => {
+    const sid = "e2e-trunc";
+    await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "你好" }, cookieA);
+    await api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "你好", sessionId: sid, resume: false }, cookieA);
+    // 取第一条 user 消息 id，truncate 到它（删除其后的全部）
+    const detail = (await (await api("/api/brain/sessions/detail", "POST", { title: "e2e-book", id: sid }, cookieA)).json()) as { session: { messages: { id: string; role: string }[] } };
+    const firstUser = detail.session.messages.find((m) => m.role === "user");
+    expect(firstUser).toBeTruthy();
+    const trunc = await api("/api/brain/sessions/truncate", "POST", { title: "e2e-book", id: sid, messageId: firstUser!.id }, cookieA);
+    expect(trunc.status).toBe(200);
+    const after = (await (await api("/api/brain/sessions/detail", "POST", { title: "e2e-book", id: sid }, cookieA)).json()) as { session: { messages: { id: string }[] } };
+    // 截断到 firstUser 及其后删除 → 剩余 0 条（该消息也被删）
+    expect(after.session.messages.length).toBe(0);
+  });
+
+  test("delete 后 detail → 空响应；重新 create 同 id 可恢复", async () => {
+    const sid = "e2e-del-det";
+    await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "你好" }, cookieA);
+    await api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "你好", sessionId: sid, resume: false }, cookieA);
+    await api("/api/brain/sessions/delete", "POST", { title: "e2e-book", id: sid }, cookieA);
+    const d = (await (await api("/api/brain/sessions/detail", "POST", { title: "e2e-book", id: sid }, cookieA)).json()) as { session?: unknown };
+    expect(d.session ?? null).toBeFalsy();
+    // 重新创建同 id
+    const re = await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "再次" }, cookieA);
+    expect([200, 201]).toContain(re.status);
+  });
+
+  test("中断后 resume：复用同一消息续流（不新增消息，user 不重复）", async () => {
+    const sid = "e2e-resume";
+    await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "写一段" }, cookieA);
+    // 第一轮：慢流式 + 中途 abort → interrupted
+    const origStream = brainChatDeps.chatStream;
+    brainChatDeps.chatStream = (async (_m: unknown, onChunk: (d: string) => void, opts?: { signal?: AbortSignal }) => {
+      let acc = "";
+      for (const ch of "写了一半的内容") {
+        if (opts?.signal?.aborted) throw new DOMException("aborted", "AbortError");
+        acc += ch;
+        onChunk(ch);
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      return acc;
+    }) as typeof brainChatDeps.chatStream;
+    // 发起并等待首块后 abort（用 AbortController）
+    const ac = new AbortController();
+    const reqPromise = (async () => {
+      const { handleApi } = await import("../src/api/routes");
+      return handleApi(
+        "/api/brain/chat",
+        new Request("http://x/api/brain/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: cookieA },
+          body: JSON.stringify({ title: "e2e-book", prompt: "写一段", sessionId: sid, resume: false }),
+          signal: ac.signal,
+        }),
+      );
+    })();
+    // 稍等让任务开始流式，然后 abort
+    await new Promise((r) => setTimeout(r, 50));
+    ac.abort();
+    const res = await reqPromise;
+    const events = await readSSE(res!.body as unknown as ReadableStream<Uint8Array>);
+    expect(events.some((e) => e.type === "interrupted")).toBe(true);
+    // 恢复原 chatStream
+    brainChatDeps.chatStream = origStream;
+
+    // resume 续流：应复用最后 pending 消息（interrupted），不新增 user 消息
+    nextChatContent = '{"intent":"chat","params":{},"reply":"续流回复"}';
+    const r2 = await api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "写一段", sessionId: sid, resume: true }, cookieA);
+    const ev2 = await readSSE(r2.body as unknown as ReadableStream<Uint8Array>);
+    // resume 先 reset 再 delta
+    expect(ev2.some((e) => e.type === "reset")).toBe(true);
+    expect(ev2.some((e) => e.type === "delta")).toBe(true);
+    expect(ev2.some((e) => e.type === "done")).toBe(true);
+    // user 消息只有 1 条（resume 不重复写 user）
+    const detail = (await (await api("/api/brain/sessions/detail", "POST", { title: "e2e-book", id: sid }, cookieA)).json()) as { session: { messages: { role: string }[] } };
+    expect(detail.session.messages.filter((m) => m.role === "user")).toHaveLength(1);
+  });
+
+  test("attach 补发最终状态：任务结束后新连接收到 done（需求 3：不再永久 loading）", async () => {
+    const sid = "e2e-attach";
+    await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "慢速生成" }, cookieA);
+    // 慢速流式：每字符 30ms，测试期间任务保持 running
+    const origStream = brainChatDeps.chatStream;
+    brainChatDeps.chatStream = (async (_m: unknown, onChunk: (d: string) => void, _opts?: unknown) => {
+      let acc = "";
+      for (const ch of "慢速回复内容") {
+        acc += ch;
+        onChunk(ch);
+        await new Promise((r) => setTimeout(r, 30));
+      }
+      return acc;
+    }) as typeof brainChatDeps.chatStream;
+
+    try {
+      // 第一个连接：发起生成（挂起，任务 running）
+      const first = api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "慢速生成", sessionId: sid, resume: false }, cookieA);
+      // 等待任务开始（注册 running）后再 attach
+      await new Promise((r) => setTimeout(r, 80));
+      // 第二个连接：attach 到同一任务（refetch 需要新请求）
+      const second = api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "慢速生成", sessionId: sid, resume: false }, cookieA);
+      const res2 = await second;
+      const events2 = await readSSE(res2.body as unknown as ReadableStream<Uint8Array>);
+      // attach 连接：先重放（reset）或直接等到任务结束，最终必须收到 done（补发）——不永久挂起
+      expect(events2.some((e) => e.type === "done")).toBe(true);
+      // 第一个连接正常完成
+      const res1 = await first;
+      const events1 = await readSSE(res1!.body as unknown as ReadableStream<Uint8Array>);
+      expect(events1.some((e) => e.type === "done")).toBe(true);
+      // 会话最终无 pending 消息（落盘完成），且 assistant 恰 1 条（证明 second 走了 attach 而非新回合）
+      const detail = (await (await api("/api/brain/sessions/detail", "POST", { title: "e2e-book", id: sid }, cookieA)).json()) as { session: { messages: { role: string; pending?: boolean }[] } };
+      expect(detail.session.messages.some((m) => m.pending)).toBe(false);
+      expect(detail.session.messages.filter((m) => m.role === "assistant")).toHaveLength(1);
+    } finally {
+      brainChatDeps.chatStream = origStream;
+    }
+  });
+});

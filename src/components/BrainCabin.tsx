@@ -69,7 +69,6 @@ function ThinkingSkeleton() {
   return (
     <div className="bc-thinking">
       <span className="bc-dot" /><span className="bc-dot" /><span className="bc-dot" />
-      <span className="bc-thinking-label">中枢正在思考…</span>
     </div>
   );
 }
@@ -99,11 +98,16 @@ export const BrainCabin: React.FC<{
   onWorldUpdate?: () => void;
   /** 用户与中枢沟通「新角色提案」相关话题（返回提案浏览卡）→ 通知 Home 恢复底部提案区显示 */
   onProposalTalk?: () => void;
-}> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk }) => {
+  /** 左侧栏当前选中章节（未指定章的操作（如生成插画）默认用此章；null=未选中） */
+  currentChapter?: { index: number } | null;
+}> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk, currentChapter }) => {
   const {
     sessions, activeId, messages, streaming, thinking,
     openSession, newSession, removeSession, truncate, appendMsg, send, stop, isStreaming,
   } = useBrainSession(world.title);
+
+  /** 前端上下文：当前选中章（供服务端意图识别参数提取兜底，需求 1/2） */
+  const chatCtx = { chapterIndex: currentChapter?.index ?? null };
 
   const [input, setInput] = useState("");
   const [executing, setExecuting] = useState(false);
@@ -121,7 +125,7 @@ export const BrainCabin: React.FC<{
     setClosedTabs((prev) => new Set(prev).add(id));
     if (id === activeId) {
       const next = visibleSessions.find((s) => s.id !== id);
-      if (next) void openSession(next.id);
+      if (next) void openSession(next.id, chatCtx);
       else setShowHistory(false);
     }
   }
@@ -201,7 +205,7 @@ export const BrainCabin: React.FC<{
               <div key={s.id} className={`bc-tab-wrap${activeId === s.id ? " active" : ""}`}>
                 <button
                   className="bc-tab"
-                  onClick={() => { setShowHistory(false); void openSession(s.id); }}
+                  onClick={() => { setShowHistory(false); void openSession(s.id, chatCtx); }}
                   title={s.title}
                 >
                   <span className="bc-tab-title">{s.title}</span>
@@ -243,7 +247,7 @@ export const BrainCabin: React.FC<{
                 <div
                   key={s.id}
                   className={`bc-history-item${activeId === s.id ? " active" : ""}`}
-                  onClick={() => { setShowHistory(false); setClosedTabs((prev) => { const n = new Set(prev); n.delete(s.id); return n; }); void openSession(s.id); }}
+                  onClick={() => { setShowHistory(false); setClosedTabs((prev) => { const n = new Set(prev); n.delete(s.id); return n; }); void openSession(s.id, chatCtx); }}
                 >
                   <div className="bc-history-main">
                     <span className="bc-history-title">{s.title}{isStreaming(s.id) && <span className="bc-live-dot" title="生成中" />}</span>
@@ -409,7 +413,7 @@ export const BrainCabin: React.FC<{
     setInput("");
     let sid = activeId;
     if (!sid) sid = await newSession(prompt);
-    await send({ prompt, sessionId: sid });
+    await send({ prompt, sessionId: sid, ctx: chatCtx });
   }
 
   /** 重新生成：resume 当前会话最后一条未完成消息 */
@@ -418,7 +422,7 @@ export const BrainCabin: React.FC<{
     const lastBrain = [...messages].reverse().find((m) => m.role === "brain" && m.interrupted);
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
     if (!lastBrain || !lastUser) return;
-    void send({ prompt: lastUser.text ?? "", sessionId: activeId, resume: true });
+    void send({ prompt: lastUser.text ?? "", sessionId: activeId, resume: true, ctx: chatCtx });
   }
 
   /**
@@ -471,6 +475,29 @@ export const BrainCabin: React.FC<{
     if (!act) return;
     setExecuting(true);
     try {
+      // 媒体生成（插画/视频）：image 为异步任务，提交后轮询 /media/status，完成后刷新世界并回执
+      if (act.endpoint === "/api/novel/media/generate") {
+        const res = await apiFetch(act.endpoint, {
+          method: act.method ?? "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(act.body),
+        });
+        const data = (await res.json().catch(() => ({}))) as { ok?: boolean; mediaIds?: string[]; mediaId?: string; error?: string };
+        if (!res.ok || data.error) {
+          appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: String(data.error ?? `HTTP ${res.status}`) }]);
+          return;
+        }
+        const ids = data.mediaIds ?? (data.mediaId ? [data.mediaId] : []);
+        const chapterIndex = Number(act.body.chapterIndex);
+        if (ids.length) {
+          appendBrainMsg([{ kind: "result", title: card.title, success: true, detail: `生成任务已提交（${ids.length} 项），完成后自动显示` }]);
+          pollMediaGen(world.title, chapterIndex, ids, card.title);
+        } else {
+          appendBrainMsg([{ kind: "result", title: card.title, success: true, detail: "已提交生成任务" }]);
+        }
+        onWorldUpdate?.();
+        return;
+      }
       const r = await fetchAction(act.endpoint, act.method ?? "POST", act.body);
       appendBrainMsg([{ kind: "result", title: card.title, success: r.success, detail: r.detail }]);
       if (r.success) onWorldUpdate?.();
@@ -479,6 +506,32 @@ export const BrainCabin: React.FC<{
     } finally {
       setExecuting(false);
     }
+  }
+
+  /** 媒体生成进度轮询：全部 ready/failed 后刷新世界并追加结果卡（聊天内生成插画的进度闭环）。
+   *  非 2xx / 解析失败视为该项失败并结束轮询，防 setInterval 永久泄漏。 */
+  function pollMediaGen(title: string, chapterIndex: number, mediaIds: string[], label: string) {
+    const timer = window.setInterval(async () => {
+      try {
+        const sts = await Promise.all(mediaIds.map(async (id) => {
+          const r = await apiFetch("/api/novel/media/status", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ title, chapterIndex, mediaId: id }),
+          });
+          if (!r.ok) return "failed"; // 媒体不存在/参数错误：按失败收尾，不再无限轮询
+          const d = (await r.json().catch(() => ({}))) as { status?: string };
+          return d.status === "ready" || d.status === "failed" ? d.status : "pending";
+        }));
+        const done = sts.filter((s) => s === "ready").length;
+        const failed = sts.filter((s) => s === "failed").length;
+        if (done + failed === mediaIds.length) {
+          window.clearInterval(timer);
+          appendBrainMsg([{ kind: "result", title: label, success: failed === 0, detail: failed === 0 ? `已完成（${done} 项）` : `${done} 项成功，${failed} 项失败` }]);
+          onWorldUpdate?.();
+        }
+      } catch { /* 网络抖动：继续轮询 */ }
+    }, 3000);
   }
 
   /** ConfirmCard 确认（L2/L3 三选一） */
@@ -514,7 +567,7 @@ export const BrainCabin: React.FC<{
   async function submitForm(card: FormCard, values: Record<string, unknown>) {
     if (executing || streaming) return;
     const flat = flattenFormValues(card.fields ?? [], values);
-    const body = { ...(card.action.body ?? {}), ...flat, title: world.title };
+    const body: Record<string, unknown> = { ...(card.action.body ?? {}), ...flat, title: world.title };
     setExecuting(true);
     try {
       const res = await apiFetch(card.action.endpoint, {
@@ -525,6 +578,29 @@ export const BrainCabin: React.FC<{
       const data = await res.json().catch(() => ({})) as Record<string, unknown>;
       if (!res.ok || data.error) {
         appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: String(data.error ?? `HTTP ${res.status}`) }]);
+        return;
+      }
+      // 媒体生成表单（/api/novel/media/plan）：分镜 → 本地追加 preview 卡（确认场景后生成，聊天内闭环）
+      if (card.action.endpoint === "/api/novel/media/plan") {
+        const scenes = data.scenes as { anchor?: string; scene?: string; caption?: string; type?: string; subject?: string }[] | undefined;
+        if (!data.ok || !Array.isArray(scenes) || !scenes.length) {
+          appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: String(data.error ?? "场景规划失败，请重试") }]);
+          return;
+        }
+        const chapterIndex = Number(body.chapterIndex);
+        const kind = String(body.kind ?? "image");
+        // 视频后端只取第一个场景（valid[0]）生成 1 段，文案据 kind 区分
+        const preview: PreviewCard = {
+          kind: "preview",
+          title: kind === "image" ? `生成第 ${chapterIndex} 章插画（${scenes.length} 张）` : `生成第 ${chapterIndex} 章视频`,
+          commandId: card.commandId,
+          level: card.level ?? "L0",
+          summary: kind === "image"
+            ? `已从第 ${chapterIndex} 章正文挑选 ${scenes.length} 个关键场景，确认后开始生成。`
+            : `已从第 ${chapterIndex} 章正文挑选 1 个关键场景，确认后开始生成视频。`,
+          action: { endpoint: "/api/novel/media/generate", method: "POST", body: { title: world.title, chapterIndex, kind, scenes } },
+        };
+        appendBrainMsg([preview]);
         return;
       }
       if (data.needIntervention && data.report) {

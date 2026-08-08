@@ -3834,33 +3834,42 @@ html { scroll-behavior: smooth; }
 
 /* —— 会话 tab 栏（独立区域，与头部上下分区；单行横滑 + 悬浮 ✕ 关闭窗口） —— */
 .bc-tabs {
-  display: flex; align-items: center; gap: 0.3rem;
-  padding: 0.35rem 1rem; flex-shrink: 0;
-  border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+  display: flex; align-items: stretch; gap: 0; flex-shrink: 0;
+  padding: 0 0.5rem; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
   background: var(--paper-dark);
 }
-.bc-tabs-scroll { display: flex; align-items: center; gap: 0.35rem; overflow-x: auto; flex: 1; scrollbar-width: thin; padding-bottom: 2px; }
-.bc-tabs-empty { font-size: 0.72rem; color: var(--ink-dim, #666); padding: 0.2rem 0.2rem; white-space: nowrap; }
-.bc-tab-wrap { position: relative; display: inline-flex; align-items: center; flex-shrink: 0; }
+.bc-tabs-scroll { display: flex; align-items: stretch; gap: 0.15rem; overflow-x: auto; flex: 1; scrollbar-width: thin; }
+.bc-tabs-empty { font-size: 0.72rem; color: var(--ink-dim, #666); padding: 0.35rem 0.4rem; white-space: nowrap; align-self: center; }
+/* 浏览器 Tab 样式：扁平方角、上圆角、激活与下方内容区同色（仿 Chrome 标签脊形） */
+.bc-tab-wrap { position: relative; display: inline-flex; align-items: stretch; flex-shrink: 0; }
 .bc-tab {
   display: inline-flex; align-items: center; gap: 0.3rem; white-space: nowrap;
-  border: 1px solid var(--line); background: var(--paper); color: var(--ink);
-  border-radius: 0.3rem; padding: 0.22rem 0.5rem; font-size: 0.74rem; cursor: pointer; max-width: 140px;
+  border: none; background: transparent; color: var(--ink-soft);
+  border-top-left-radius: 0.45rem; border-top-right-radius: 0.45rem;
+  padding: 0.3rem 0.9rem 0.35rem 0.9rem; font-size: 0.74rem; cursor: pointer; max-width: 150px;
+  position: relative;
 }
-.bc-tab-wrap:hover .bc-tab { border-color: var(--seal); }
-.bc-tab-wrap.active .bc-tab { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+/* 未激活 tab：底部 1px 分隔线贯穿（与边框一致），hover 提亮 */
+.bc-tab-wrap:not(.active) .bc-tab { box-shadow: inset 0 -1px 0 var(--line); }
+.bc-tab-wrap:not(.active):hover .bc-tab { color: var(--ink); background: rgba(0, 0, 0, 0.04); }
+/* 激活 tab：与内容区同色，上方 2px 主色条 + 底部无分隔（融合下方内容区） */
+.bc-tab-wrap.active .bc-tab {
+  background: var(--paper); color: var(--ink);
+  box-shadow: inset 0 2px 0 var(--seal), inset 0 -1px 0 var(--paper);
+  font-weight: 600;
+}
 .bc-tab-title { overflow: hidden; text-overflow: ellipsis; }
 /* 悬浮 ✕：关闭该会话窗口（不删除会话，历史中保留可重开） */
 .bc-tab-close {
-  display: none; position: absolute; top: 50%; right: 0.1rem; transform: translateY(-50%);
+  display: none; position: absolute; top: 50%; right: 0.25rem; transform: translateY(-50%);
   background: none; border: none; color: var(--ink-soft);
   font-size: 0.6rem; line-height: 1; cursor: pointer; padding: 0.12rem 0.18rem;
   border-radius: 0.2rem;
 }
 .bc-tab-wrap:hover .bc-tab-close { display: inline-flex; }
-.bc-tab-wrap.active .bc-tab-close { color: var(--paper); }
+.bc-tab-wrap.active .bc-tab-close { color: var(--ink-soft); }
 .bc-tab-close:hover { color: var(--seal); background: rgba(176, 58, 46, 0.12); }
-.bc-tab-wrap.active .bc-tab-close:hover { color: var(--gold); background: rgba(0, 0, 0, 0.25); }
+.bc-tab-wrap.active .bc-tab-close:hover { color: var(--seal); background: rgba(0, 0, 0, 0.06); }
 
 /* 运行中会话：绿色小圆点 + 波纹闪烁 */
 .bc-live-dot {

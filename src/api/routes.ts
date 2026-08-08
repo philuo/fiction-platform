@@ -556,28 +556,39 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       const bcChatPrompt = String(bcChatBody.prompt ?? "").trim();
       const bcSessionId = String(bcChatBody.sessionId ?? "").trim();
       const bcResume = bcChatBody.resume === true;
+      // 前端上下文（左侧栏选中章等）：供意图识别参数提取兜底（需求 1/2）
+      const bcCtx = (bcChatBody.ctx ?? null) as { chapterIndex?: number | null } | null;
       if (!bcChatTitle) return json({ error: "缺少 title" }, 400);
       if (!bcResume && !bcChatPrompt) return json({ error: "缺少 prompt" }, 400);
       if (!bcSessionId) return json({ error: "缺少 sessionId" }, 400);
       return sseStream(async (send) => {
-        // 已有运行中任务（其他连接在流式）→ attach：先重放当前已生成文本，再收广播直到任务结束
-        const attached = attachSessionTask(bcSessionId, send);
+        // 已有运行中任务（其他连接在流式）→ attach：先重放当前已生成文本，再收广播直到任务结束；
+        // 结束后补发最终状态（done/interrupted）——任务收尾期 attach 的新连接可能错过已广播的 done，
+        // 否则前端消息永久 pending（一直 loading），需刷新才能看到最新状态（需求 3 修复）
+        const attached = attachSessionTask(bcChatTitle, bcSessionId, send);
         if (attached) {
           const sess = getBrainSession(bcChatTitle, bcSessionId);
           const pending = sess ? lastPendingMessage(sess) : null;
           if (pending) send({ type: "reset", messageId: pending.id, text: pending.text });
-          while (isSessionRunning(bcSessionId)) await Bun.sleep(300);
+          while (isSessionRunning(bcChatTitle, bcSessionId)) await Bun.sleep(300);
+          // 收尾窗口兜底：任务已 done 但 running 仍 true 时 attach（无 pending 消息），
+          // 或等待期结束时补发当前最后一条 assistant 消息的最终状态，防该连接错过 done 后永久 loading
+          const sess2 = getBrainSession(bcChatTitle, bcSessionId);
+          const last = sess2?.messages[sess2.messages.length - 1];
+          if (last && last.role === "assistant" && !last.pending) {
+            send(last.interrupted ? { type: "interrupted", messageId: last.id } : { type: "done", messageId: last.id });
+          }
           return;
         }
         // 新回合：注册任务（req.signal 取消时 abort 任务），回合内 send 一律广播给会话全部连接
-        const task = registerSessionTask(bcSessionId, send, req.signal);
+        const task = registerSessionTask(bcChatTitle, bcSessionId, send, req.signal);
         task.running = true;
-        const broadcast = (obj: unknown) => broadcastToSession(bcSessionId, obj);
+        const broadcast = (obj: unknown) => broadcastToSession(bcChatTitle, bcSessionId, obj);
         try {
-          await brainChatStream({ title: bcChatTitle, prompt: bcChatPrompt, sessionId: bcSessionId, send: broadcast, signal: req.signal, resume: bcResume });
+          await brainChatStream({ title: bcChatTitle, prompt: bcChatPrompt, sessionId: bcSessionId, send: broadcast, signal: req.signal, resume: bcResume, ctx: bcCtx ?? undefined });
         } finally {
           task.running = false;
-          finishSessionTask(bcSessionId);
+          finishSessionTask(bcChatTitle, bcSessionId);
         }
       });
     }

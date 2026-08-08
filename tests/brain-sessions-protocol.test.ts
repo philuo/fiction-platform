@@ -98,6 +98,21 @@ describe("/api/brain/sessions POST 协议", () => {
     expect(l.sessions.map((s) => s.id)).not.toContain(sid);
   });
 
+  test("有消息的会话出现在过滤后列表（空壳过滤语义：仅保留有对话内容的）", async () => {
+    const sid = "proto-msg-0001";
+    await post("/api/brain/sessions", { title: TITLE, id: sid, prompt: "你好" });
+    // 模拟真实聊天：在用户上下文内写入一条消息（缓存按 currentUser 隔离，需与接口同一用户上下文）
+    const { appendMessage } = await import("../src/api/brain-sessions");
+    const { runAsUser } = await import("../src/api/storage");
+    await runAsUser(USER, () => appendMessage(TITLE, sid, { id: "m1", role: "user", text: "你好", at: Date.now() }));
+    // 列表应包含该有消息会话
+    const list = await post("/api/brain/sessions", { title: TITLE });
+    const l = (await list!.json()) as { sessions: { id: string }[] };
+    expect(l.sessions.map((s) => s.id)).toContain(sid);
+    // 清理：删除该会话，避免污染后续测试
+    await post("/api/brain/sessions/delete", { title: TITLE, id: sid });
+  });
+
   test("GET 方法 → 405（死代码分支已移除）", async () => {
     const { handleApi } = await import("../src/api/routes");
     const res = await handleApi(

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { emptyWorld, type WorldState } from "../src/api/world";
 import type { Card as WorldCard } from "../src/api/world";
-import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues } from "../src/api/brain-chat";
+import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt } from "../src/api/brain-chat";
 import { getSession as sessGet, lastPendingMessage as sessLastPending } from "../src/api/brain-sessions";
 import type { ChatMessage } from "../src/api/agnes";
 
@@ -734,3 +734,83 @@ describe("brainChatStream（SSE 编排，事件协议 v2）", () => {
     expect(events[events.length - 1].type).toBe("done");
   });
 });
+
+// —— 需求 1/2：生成插画未指定章节 → 默认选中章 + 默认 1 张；LLM 自动提取章号参数 ——
+
+describe("chapterIndexFromPrompt（从用户输入提取章号）", () => {
+  test("「第 N 章」/「第N章」/「N章」识别（阿拉伯数字）", () => {
+    expect(chapterIndexFromPrompt("给第 5 章配张插画")).toBe(5);
+    expect(chapterIndexFromPrompt("给第12章配图")).toBe(12);
+    expect(chapterIndexFromPrompt("画第 3 回的插图")).toBe(3);
+  });
+  test("中文数字章号（第一/三/十二/二十/二十五章）", () => {
+    expect(chapterIndexFromPrompt("给第三章配张插画")).toBe(3);
+    expect(chapterIndexFromPrompt("画第一章的插图")).toBe(1);
+    expect(chapterIndexFromPrompt("给第十二章配图")).toBe(12);
+    expect(chapterIndexFromPrompt("第二十章的插画")).toBe(20);
+    expect(chapterIndexFromPrompt("给第二十五章配图")).toBe(25);
+  });
+  test("无章号 → null", () => {
+    expect(chapterIndexFromPrompt("生成插画")).toBeNull();
+    expect(chapterIndexFromPrompt("写一章")).toBeNull();
+  });
+});
+
+describe("buildMediaCard（生成插画/视频表单卡，需求 1）", () => {
+  test("未指定章节 → 默认前端选中章（ctx.chapterIndex），张数默认 1", () => {
+    const w = mkWorld();
+    w.chapters.push({ index: 2, title: "第二章", text: "……", review: null });
+    const card = buildMediaCard(w, "media_image", {}, "生成插画", { chapterIndex: 2 });
+    expect(card.kind).toBe("form");
+    const idxField = card.fields.find((f) => f.key === "chapterIndex")!;
+    expect(idxField.value).toBe(2); // 默认选中章
+    const countField = card.fields.find((f) => f.key === "count")!;
+    expect(countField.value).toBe(1); // 默认 1 张
+    expect(card.action.endpoint).toBe("/api/novel/media/plan");
+    expect(card.action.body.kind).toBe("image");
+  });
+
+  test("prompt 正则「第 N 章」优先于选中章；不存在的章号回退到选中章", () => {
+    const w = mkWorld();
+    w.chapters.push({ index: 2, title: "第二章", text: "……", review: null });
+    // prompt 指定第 2 章（存在）→ 2 优先于选中章 1
+    const card = buildMediaCard(w, "media_image", {}, "给第二章配张插画", { chapterIndex: 1 });
+    expect(card.fields.find((f) => f.key === "chapterIndex")!.value).toBe(2);
+    // prompt 指定第 9 章（不存在）→ 回退选中章 2
+    const card2 = buildMediaCard(w, "media_image", {}, "给第九章配张插画", { chapterIndex: 2 });
+    expect(card2.fields.find((f) => f.key === "chapterIndex")!.value).toBe(2);
+  });
+
+  test("无章号且无选中章 → 默认最后一章，count 取 params.count", () => {
+    const w = mkWorld();
+    w.chapters.push({ index: 2, title: "第二章", text: "……", review: null });
+    const card = buildMediaCard(w, "media_image", { count: 3 }, "生成插画", undefined);
+    const idxField = card.fields.find((f) => f.key === "chapterIndex")!;
+    expect(idxField.value).toBe(2); // 最后一章
+    const countField = card.fields.find((f) => f.key === "count")!;
+    expect(countField.value).toBe(3);
+  });
+
+  test("LLM 提取的 params.chapterIndex 优先于 prompt 正则", () => {
+    const w = mkWorld();
+    const card = buildMediaCard(w, "media_image", { chapterIndex: 1 }, "给第三章配张插画", undefined);
+    const idxField = card.fields.find((f) => f.key === "chapterIndex")!;
+    expect(idxField.value).toBe(1);
+  });
+
+  test("media_video → 恒 1 段，无 count 字段", () => {
+    const w = mkWorld();
+    const card = buildMediaCard(w, "media_video", {}, "给第一章生成视频", undefined);
+    expect(card.action.body.kind).toBe("video");
+    expect(card.fields.find((f) => f.key === "count")).toBeUndefined();
+    const idxField = card.fields.find((f) => f.key === "chapterIndex")!;
+    expect(idxField.value).toBe(1);
+  });
+
+  test("无章节的世界 → 不崩（chapters 空，value 取 lastIdx=null）", () => {
+    const w = emptyWorld();
+    const card = buildMediaCard(w, "media_image", {}, "生成插画", undefined);
+    expect(card.kind).toBe("form");
+  });
+});
+

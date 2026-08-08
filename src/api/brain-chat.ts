@@ -182,7 +182,12 @@ const INTENT_SYSTEM = `你是小说创作引擎「墨枢」的中枢对话编排
 ${INTENT_ENUM.map((k) => `- ${k}：${INTENT_HINT[k] ?? k}`).join("\n")}
 
 输出合法 JSON：{"intent":"动作名","params":{...},"reply":"一句话自然语言回复（中文）"}
-- params：动作参数（如 read_chapter 的 {index:3}、read_character 的 {name:"林墨"}、autostart 的 {maxChapters:10}）
+- params：从用户输入中提取动作参数（需求 2：自动提取工具参数）：
+  · read_chapter / read_review / regenerate / delete_chapter → {index: 第几章}（数字）
+  · read_character → {name:"角色名"}
+  · media_image（生成插画）→ {chapterIndex: 第几章, count: 张数}；media_video（生成视频）→ {chapterIndex: 第几章}
+  · autostart → {maxChapters: 章数}；gacha → {count: 张数}
+  · 用户未指定具体章节时，**不要填 chapterIndex**（系统会自动用其当前选中的章节兜底）
 - 用户询问「有哪些角色推荐」「新角色提案」「角色提案」等 → intent 为 "read_proposals"
 - intent 为 "chat" 时 params 为空对象，reply 直接回答用户问题
 - 无法确定具体操作时选 "chat"
@@ -190,13 +195,21 @@ ${INTENT_ENUM.map((k) => `- ${k}：${INTENT_HINT[k] ?? k}`).join("\n")}
 
 type IntentResult = { intent: string; params: Record<string, unknown>; reply: string };
 
-/** 意图识别（LLM）；失败降级为 chat */
-async function recognizeIntent(w: WorldState, prompt: string): Promise<IntentResult> {
+/** 意图识别（LLM）；失败降级为 chat。
+ *  ctx：前端上下文（选中章）——用户未指定章节时作为参数兜底（需求 1/2）；
+ *  history：最近会话文本（支持「上一章/刚说的那个」类指代）。 */
+async function recognizeIntent(w: WorldState, prompt: string, ctx?: { chapterIndex?: number | null }, history?: string[]): Promise<IntentResult> {
   try {
+    const ctxLines: string[] = [];
+    if (history?.length) ctxLines.push(`最近对话：\n${history.join("\n")}`);
+    if (typeof ctx?.chapterIndex === "number" && Number.isInteger(ctx.chapterIndex)) {
+      ctxLines.push(`用户当前选中的章节：第 ${ctx.chapterIndex} 章（用户未指定章节的操作默认作用于该章）`);
+    }
+    const ctxBlock = ctxLines.length ? `\n\n${ctxLines.join("\n\n")}` : "";
     const out = await brainChatDeps.chatJson<{ intent?: string; params?: Record<string, unknown>; reply?: string }>(
       [
         { role: "system", content: INTENT_SYSTEM },
-        { role: "user", content: `用户输入：${prompt}\n\n当前世界：\n${worldSummary(w)}` },
+        { role: "user", content: `用户输入：${prompt}${ctxBlock}\n\n当前世界：\n${worldSummary(w)}` },
       ],
       {
         ...taskOpts("brainGate"),
@@ -449,6 +462,8 @@ export type BrainChatContext = {
   signal?: AbortSignal;
   /** resume 模式：复用最后一条未完成 assistant 消息重新生成（不重复写用户消息，前端先 reset 再收 delta） */
   resume?: boolean;
+  /** 前端上下文（左侧栏选中章等）：意图识别/参数提取兜底（需求 1/2：未指定章节的操作默认用选中章） */
+  ctx?: { chapterIndex?: number | null };
 };
 
 /** 纯对话系统提示：中枢以「墨枢」身份自然回答，允许 Markdown 富文本 */
@@ -735,6 +750,85 @@ export function buildFormCard(w: WorldState, intent: string, params: Record<stri
   return null;
 }
 
+/** 从用户输入中提取章号（「第 N 章/第N章/N章」，支持阿拉伯数字与中文数字一~九十九；无则 null） */
+const CN_NUM: Record<string, number> = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+export function chapterIndexFromPrompt(prompt: string): number | null {
+  // 阿拉伯数字：「第 5 章」「第12章」「第 3 回」（0 非法）
+  const ar = prompt.match(/第\s*(\d{1,4})\s*[章回节]/);
+  if (ar) {
+    const n = Number(ar[1]);
+    return n > 0 ? n : null;
+  }
+  // 中文数字：「第一章」「第三章」「第十二章」「第二十章」「二十五章」
+  const cn = prompt.match(/第\s*([一二三四五六七八九十]{1,3})\s*[章回节]/);
+  if (!cn) return null;
+  const s = cn[1];
+  if (s === "十") return 10;
+  if (s.length === 1) return CN_NUM[s] ?? null;
+  if (s.includes("十")) {
+    const [a, b] = s.split("十");
+    const tens = a ? (CN_NUM[a] ?? 1) * 10 : 10;
+    const ones = b ? CN_NUM[b] ?? 0 : 0;
+    return tens + ones;
+  }
+  return null;
+}
+
+/**
+ * 媒体生成表单卡（需求 1/2）：
+ * - 章号解析优先级：LLM 提取的 params.chapterIndex → prompt 正则「第 N 章」→ 前端选中章（ctx）→ 最后一章
+ * - 未指定章节时默认前端选中章；张数默认 1（需求 1）
+ * - 提交后前端先调 /api/novel/media/plan 分镜 → preview 卡确认 → /api/novel/media/generate 生成（聊天内完整闭环）
+ */
+export function buildMediaCard(
+  w: WorldState,
+  intent: "media_image" | "media_video",
+  params: Record<string, unknown>,
+  prompt: string,
+  ctx?: { chapterIndex?: number | null },
+): FormCardData {
+  const kind = intent === "media_image" ? "image" : "video";
+  const chapters = [...w.chapters].sort((a, b) => a.index - b.index);
+  const lastIdx = chapters.length ? chapters[chapters.length - 1].index : null;
+  // 章号解析：LLM params → prompt 正则 → 前端选中章
+  let idx: number | null = null;
+  const raw = params.chapterIndex ?? params.chapter ?? params.index;
+  if (typeof raw === "number" && Number.isInteger(raw) && raw > 0) idx = raw;
+  else if (typeof raw === "string") {
+    const n = Number(raw.replace(/[^\d]/g, ""));
+    if (Number.isInteger(n) && n > 0) idx = n;
+  }
+  if (idx == null) idx = chapterIndexFromPrompt(prompt);
+  if (idx == null && typeof ctx?.chapterIndex === "number" && Number.isInteger(ctx.chapterIndex) && ctx.chapterIndex > 0) {
+    idx = ctx.chapterIndex;
+  }
+  const validIdx = idx != null && chapters.some((c) => c.index === idx) ? idx : null;
+  // 张数：默认 1（需求 1）；video 恒 1 段
+  const count = kind === "video" ? 1 : Math.max(1, Math.min(3, Number(params.count ?? 1) || 1));
+  const fields: FormFieldDef[] = [
+    {
+      key: "chapterIndex",
+      label: "章节",
+      type: "select",
+      value: validIdx ?? lastIdx ?? undefined,
+      options: chapters.map((c) => ({ label: `第 ${c.index} 章 · ${c.title}`, value: String(c.index) })),
+      required: true,
+    },
+  ];
+  if (kind === "image") fields.push({ key: "count", label: "张数（1-3）", type: "number", value: count });
+  const target = validIdx != null ? `第 ${validIdx} 章` : "当前章节";
+  return {
+    kind: "form",
+    title: kind === "image" ? "生成章节插画" : "生成章节视频",
+    commandId: intent === "media_image" ? "CMD-M02" : "CMD-M03",
+    level: "L0",
+    summary: `为「${target}」${kind === "image" ? `生成 ${count} 张插画` : "生成 1 段视频"}：提交后 AI 先从正文挑选关键场景，确认后开始生成（未指定章节时默认选中章节，可改）`,
+    fields,
+    action: { endpoint: "/api/novel/media/plan", method: "POST", body: { title: w.title, kind } },
+    submitLabel: "挑选场景并生成",
+  };
+}
+
 /** 卡片 JSON 扁平化提交：field.key 支持点路径（setting.time → { setting: { time } }），array 字段按行拆分 */
 export function flattenFormValues(fields: FormFieldDef[], values: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -809,8 +903,9 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
   try {
     send({ type: "intent" });
 
-    // —— 意图识别 ——
-    const { intent, params, reply } = await recognizeIntent(w, activePrompt);
+    // —— 意图识别（注入前端选中章 + 最近会话上下文，供 LLM 自动提取工具参数，需求 2） ——
+    const hist = (session?.messages ?? []).slice(-6).map((m) => `${m.role === "user" ? "用户" : "中枢"}：${(m.text ?? "").slice(0, 200)}`);
+    const { intent, params, reply } = await recognizeIntent(w, activePrompt, ctx.ctx, hist);
 
     // 纯对话 / 未知意图：真流式回复（可中断、可恢复）
     const meta = INTENTS[intent];
@@ -867,6 +962,21 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
         markMessageDone(title, sessionId, messageId, []);
         send({ error: `抽卡失败：${(e as Error).message}` });
       }
+      send({ type: "done", messageId });
+      return;
+    }
+
+    // 媒体生成（插画/视频）：form 卡收集章节+张数 → 前端分镜 → preview 确认 → 生成（需求 1/2）。
+    // 未指定章节时默认前端选中章、默认 1 张；不在此处同步调分镜（LLM 分镜耗时长，避免 SSE 长挂）
+    if (intent === "media_image" || intent === "media_video") {
+      const text = reply || meta.title;
+      if (text) {
+        updateMessageText(title, sessionId, messageId, text, true);
+        send({ type: "delta", messageId, text });
+      }
+      const card = buildMediaCard(w, intent, params, activePrompt, ctx.ctx);
+      markMessageDone(title, sessionId, messageId, [card]);
+      send({ type: "card", messageId, card });
       send({ type: "done", messageId });
       return;
     }

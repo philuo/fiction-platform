@@ -54,7 +54,8 @@ type SSEEvents = {
   onCard?: (messageId: string, card: BrainCard) => void;
   onDone?: (messageId: string) => void;
   onInterrupted?: (messageId: string) => void;
-  onReset?: (messageId: string) => void;
+  /** text：服务端重放已生成文本（attach 恢复时携带，前端保留而非清空，避免已回复内容闪没） */
+  onReset?: (messageId: string, text?: string) => void;
   onError?: (msg: string) => void;
 };
 
@@ -130,11 +131,31 @@ export function useBrainSession(title: string) {
   }
 
   /**
+   * 对齐消息 id（需求 3 根因修复）：非 resume 首发时，前端预创建的 brain 槽位 id 用前端 randomUUID，
+   * 而服务端广播的 delta/card/done 携带服务端生成的 messageId——两者不一致会导致 delta 全部不匹配、
+   * 消息永久 pending 空文本（"AI 已回复但一直 loading，刷新才可见"）。
+   * 收到带服务端 messageId 的事件时，若缓存无此 id 且存在 pending 的 brain 槽位，则将该槽位重命名为
+   * 服务端 messageId（后续 delta/done 即可命中）；resume/回看场景缓存里已有服务端 id，直接命中不重命名。
+   */
+  const alignMsgId = useCallback((sessionId: string, messageId: string): string => {
+    const arr = cacheRef.current.get(sessionId);
+    if (!arr || arr.some((m) => m.id === messageId)) return messageId;
+    const slot = [...arr].reverse().find((m) => m.role === "brain" && m.pending);
+    if (slot && !slot.interrupted) {
+      slot.id = messageId;
+      cacheRef.current.set(sessionId, arr);
+      if (sessionId === activeIdRef.current) setMessages([...arr]);
+    }
+    return messageId;
+  }, []);
+
+  /**
    * 向会话发起一轮生成（或 resume 续流）：
    * - 各会话独立连接：切换 tab 后 onDelta 仍更新缓存（后台继续跑，不打断）
    * - resume：本地不追加消息（服务端复用未完成消息，先 reset 再重新流式）
+   * - ctx：前端上下文（左侧栏选中章等），供服务端意图识别参数提取兜底（需求 1/2）
    */
-  const send = useCallback(async (opts: { prompt: string; sessionId: string; resume?: boolean }) => {
+  const send = useCallback(async (opts: { prompt: string; sessionId: string; resume?: boolean; ctx?: { chapterIndex?: number | null } }) => {
     const { prompt, sessionId, resume } = opts;
     if (!prompt.trim() || abortRef.current.has(sessionId)) return; // 该会话正在生成
     const ctrl = new AbortController();
@@ -156,19 +177,24 @@ export function useBrainSession(title: string) {
       onIntent: () => setThinkingFor(sessionId, false),
       onDelta: (messageId, text) => {
         setThinkingFor(sessionId, false);
-        patchMsg(sessionId, messageId, { text, interrupted: false });
+        patchMsg(sessionId, alignMsgId(sessionId, messageId), { text, interrupted: false });
       },
       onCard: (messageId, card) => {
         setThinkingFor(sessionId, false);
+        const mid = alignMsgId(sessionId, messageId);
         const arr = cacheRef.current.get(sessionId);
         if (!arr) return;
-        const next = arr.map((m) => (m.id === messageId ? { ...m, cards: [...(m.cards ?? []), card] } : m));
+        const next = arr.map((m) => (m.id === mid ? { ...m, cards: [...(m.cards ?? []), card] } : m));
         cacheRef.current.set(sessionId, next);
         if (sessionId === activeIdRef.current) setMessages(next);
       },
-      onDone: (messageId) => patchMsg(sessionId, messageId, { pending: false, interrupted: false }),
-      onInterrupted: (messageId) => patchMsg(sessionId, messageId, { pending: false, interrupted: true }),
-      onReset: (messageId) => patchMsg(sessionId, messageId, { text: "", cards: [], interrupted: false, pending: true }),
+      onDone: (messageId) => { setThinkingFor(sessionId, false); patchMsg(sessionId, alignMsgId(sessionId, messageId), { pending: false, interrupted: false }); },
+      onInterrupted: (messageId) => { setThinkingFor(sessionId, false); patchMsg(sessionId, alignMsgId(sessionId, messageId), { pending: false, interrupted: true }); },
+      // 保留服务端重放文本：attach 恢复/resume 重放时不闪没已生成内容，后续 delta 在其上继续累积
+      onReset: (messageId, text) => {
+        setThinkingFor(sessionId, false);
+        patchMsg(sessionId, alignMsgId(sessionId, messageId), { text: text ?? "", cards: [], interrupted: false, pending: true });
+      },
       onError: (msg) => {
         const last = lastMsgOf(sessionId);
         if (last) patchMsg(sessionId, last.id, { text: `（${msg}）`, pending: false, interrupted: true });
@@ -179,13 +205,18 @@ export function useBrainSession(title: string) {
       const res = await apiFetch("/api/brain/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, prompt, sessionId, resume: resume ?? false }),
+        body: JSON.stringify({ title, prompt, sessionId, resume: resume ?? false, ctx: opts.ctx }),
         signal: ctrl.signal,
       });
       if (!res.ok || !res.body) throw new Error("对话失败");
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buf = "";
+      // 空闲兜底：长时间（360s）无任何 SSE 事件 → 视为连接悬挂，主动中止（服务端任务经 req.signal abort 停止）
+      let lastEventAt = Date.now();
+      const idleTimer = setInterval(() => {
+        if (Date.now() - lastEventAt > 360_000) ctrl.abort();
+      }, 30_000);
       try {
         for (;;) {
           const { done, value } = await reader.read();
@@ -195,6 +226,7 @@ export function useBrainSession(title: string) {
           buf = lines.pop() ?? "";
           for (const line of lines) {
             if (!line.startsWith("data: ")) continue;
+            lastEventAt = Date.now(); // ping 等任意事件均视为连接存活
             let obj: { type?: string; messageId?: string; text?: string; card?: BrainCard; error?: string };
             try { obj = JSON.parse(line.slice(6)); } catch { continue; }
             if (obj.error) { events.onError?.(obj.error); continue; }
@@ -204,12 +236,13 @@ export function useBrainSession(title: string) {
               case "card": if (obj.messageId && obj.card) events.onCard?.(obj.messageId, obj.card); break;
               case "done": if (obj.messageId) events.onDone?.(obj.messageId); break;
               case "interrupted": if (obj.messageId) events.onInterrupted?.(obj.messageId); break;
-              case "reset": if (obj.messageId) events.onReset?.(obj.messageId); break;
+              case "reset": if (obj.messageId) events.onReset?.(obj.messageId, obj.text); break;
               default: /* ping 忽略 */
             }
           }
         }
       } finally {
+        clearInterval(idleTimer);
         reader.cancel().catch(() => {});
       }
     } catch (e) {
@@ -222,12 +255,35 @@ export function useBrainSession(title: string) {
       abortRef.current.delete(sessionId);
       patchStreaming(sessionId, false);
       setThinkingFor(sessionId, false);
+      // 兜底：流已结束但本地缓存仍 pending（done 事件在连接收尾期丢失/未送达）
+      // → 查服务端最终状态并同步，避免"AI 已回复但一直 loading，需刷新才可见"（需求 3）
+      const last = lastMsgOf(sessionId);
+      if (last && last.pending) {
+        void (async () => {
+          try {
+            const r = await apiFetch("/api/brain/sessions/detail", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ title, id: sessionId }),
+            });
+            if (!r.ok) return;
+            const d = (await r.json()) as { session?: BrainSessionDetail };
+            const serverLast = d.session?.messages[d.session.messages.length - 1];
+            if (serverLast && serverLast.id === last.id && !serverLast.pending) {
+              patchMsg(sessionId, last.id, serverLast.interrupted
+                ? { pending: false, interrupted: true }
+                : { pending: false, interrupted: false });
+            }
+          } catch { /* 网络异常：保持现状，下次打开会话会从服务端拉取最新状态 */ }
+        })();
+      }
       void refreshList(); // 更新会话列表（标题/时间/streaming 标记）
     }
-  }, [title, patchMsg, patchStreaming, setThinkingFor, refreshList]);
+  }, [title, patchMsg, patchStreaming, setThinkingFor, refreshList, alignMsgId]);
 
-  /** 展示某会话（缓存命中即时；未命中从服务端拉详情；streaming 会话自动 resume 续流） */
-  const openSession = useCallback(async (id: string) => {
+  /** 展示某会话（缓存命中即时；未命中从服务端拉详情；streaming 会话自动 resume 续流）。
+   *  ctx：resume 续流时透传前端上下文（选中章），供服务端意图识别参数提取兜底（需求 1/2）。 */
+  const openSession = useCallback(async (id: string, ctx?: { chapterIndex?: number | null }) => {
     setActive(id);
     setMessages(cacheRef.current.get(id) ?? []);
     setStreaming(abortRef.current.has(id));
@@ -246,11 +302,13 @@ export function useBrainSession(title: string) {
       setMessages(msgs);
       const running = data.session.streaming || abortRef.current.has(id);
       setStreaming(running);
-      // 刷新恢复：该会话仍在生成（或最后消息未完成）→ 自动 resume 续流至完成
+      // 刷新恢复：该会话仍在生成（最后消息 pending，刷新前未完成）→ 自动 resume 续流至完成
+      // 注意：interrupted（用户主动中断）不自动续流——重新生成应由用户点「重新生成」按钮触发，
+      // 否则每次打开弹窗/切换会话都会意外发起聊天请求。
       const last = msgs[msgs.length - 1];
       const lastUser = [...msgs].reverse().find((m) => m.role === "user");
-      if (last && last.role === "brain" && (last.pending || last.interrupted) && lastUser && !abortRef.current.has(id)) {
-        void send({ prompt: lastUser.text ?? "", sessionId: id, resume: true });
+      if (last && last.role === "brain" && last.pending && lastUser && !abortRef.current.has(id)) {
+        void send({ prompt: lastUser.text ?? "", sessionId: id, resume: true, ctx });
       }
     } catch { /* 静默 */ }
   }, [title, send]);
