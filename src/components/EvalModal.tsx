@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { X } from "./icons";
 import { lensCn } from "../terms";
+import { apiFetch } from "../api/client";
 import type { WorldState, QualityDebt } from "../api/world";
 
 type EvalReportView = {
@@ -30,8 +31,8 @@ export const EvalModal: React.FC<{
     setErr("");
     try {
       const [evalRes, debtRes] = await Promise.all([
-        fetch("/api/novel/eval", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: p.world.title, force }) }),
-        fetch("/api/novel/debt", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: p.world.title, action: "list" }) }),
+        apiFetch("/api/novel/eval", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: p.world.title, force }) }),
+        apiFetch("/api/novel/debt", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: p.world.title, action: "list" }) }),
       ]);
       const ev = (await evalRes.json()) as { ok?: boolean; report?: EvalReportView; cached?: boolean; error?: string };
       if (!ev.ok || !ev.report) throw new Error(ev.error ?? "评估失败");
@@ -54,7 +55,7 @@ export const EvalModal: React.FC<{
   async function debtAction(id: string, action: "fix" | "ignore") {
     if (p.taskActive) { p.onToast?.("任务运行中，质量债操作已禁止——请先取消任务。"); return; } // 运行锁
     try {
-      const res = await fetch("/api/novel/debt", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: p.world.title, action, id }) });
+      const res = await apiFetch("/api/novel/debt", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: p.world.title, action, id }) });
       const data = (await res.json()) as { ok?: boolean; debt?: QualityDebt[]; world?: WorldState; error?: string };
       if (!data.ok) throw new Error(data.error ?? "操作失败");
       setDebt((data.debt ?? []).filter((d) => d.status === "open"));

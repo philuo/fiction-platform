@@ -1,4 +1,5 @@
 // 世界状态：设定 / 人物 / 伏笔 / 时间线 / 章节 / 卡牌（JSON 持久化 data/<title>/）
+import { formatChapterRange } from "../shared/chapterRange";
 
 export type Rarity = "N" | "R" | "SR" | "SSR";
 
@@ -311,6 +312,8 @@ export type CharacterProposal = {
   traits: string[];
   motivation: string;
   voice?: string;
+  /** 推荐原因：为什么建议让该角色登场（一句话，来源为卡牌描述 / writer 记账） */
+  reason?: string;
   source: "gacha" | "writer";
   status: "pending" | "confirmed" | "rejected";
 };
@@ -515,7 +518,7 @@ export function worldSummary(w: WorldState): string {
   if (w.setting.rules.length) parts.push(`规则: ${w.setting.rules.join("；")}`);
   parts.push(`人物(${w.characters.length}):`);
   for (const c of w.characters) {
-    const appear = c.appearedIn?.length ? `（登场于第${c.appearedIn.join("、")}章）` : "（未登场）";
+    const appear = c.appearedIn?.length ? `（登场于第${formatChapterRange(c.appearedIn)}章）` : "（未登场）";
     const exit = c.exit ? `（已于第${c.exit.chapter}章离场：${c.exit.reason}）` : "";
     const rel = Object.entries(c.relations ?? {});
     const relText = rel.length ? ` 关系:${rel.map(([k, v]) => `${k}→${v}`).join("；")}` : "";

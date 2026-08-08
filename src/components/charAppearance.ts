@@ -1,39 +1,4 @@
 // 本章出场角色判定（左栏「脉络」与右栏「人物」共用，保证两栏一致）
-// 双轨：已结算章节用 LLM 记账语义名单 chapterSummaries[].appeared（被提及或出场，随结算/编辑/回滚自动刷新）；
-//       未结算章节 / 结算名单为空（降级兜底）→ 实时正文文本匹配。
-// 注意：名单为空（结算失败降级、回滚后旧名单被清空、LLM 判定无人出场）时不得绕过文本兜底，
-// 否则章节内容变更/版本切换后两栏会停留旧账本（修「脉络未更新」）。
-import type { Character, WorldState } from "../api/world";
-
-/** 角色名别名归一：去空白 + 去「阿/小/老」前缀（与 chronicler.normCharName 同款实现，
- * 本地内联避免把服务端模块拖进浏览器 bundle） */
-export function normCharName(name: string): string {
-  return name.replace(/\s+/g, "").replace(/^(阿|小|老)/, "");
-}
-
-/** 角色在本章正文中被提及或出场（实时全文匹配：出场有台词/行动必含名字，旁白提及也算；
- * 别名归一宽松匹配处理「小飞侠→飞侠」类前缀变体；单字归一不做宽松匹配以免误伤） */
-export function appearsInChapter(c: Character, text: string): boolean {
-  if (!c.name) return false;
-  if (text.includes(c.name)) return true;
-  const norm = normCharName(c.name);
-  return norm.length >= 2 && norm !== c.name && text.includes(norm);
-}
-
-/** 本章出场角色（双轨判定，返回名册角色数组；chapterIdx < 0 或章节不存在（已删除/悬空）返回空） */
-export function appearedChars(world: WorldState, chapterIdx: number): Character[] {
-  if (chapterIdx < 0) return [];
-  const chapter = world.chapters.find((c) => c.index === chapterIdx);
-  if (!chapter) return []; // 章节不存在（删除后残留旧账本条目）→ 无角色可展示
-  const chapterText = chapter.text ?? "";
-  const summary = (world.chapterSummaries ?? []).find((s) => s.index === chapterIdx) ?? null;
-  const llmNames = summary?.appeared ?? [];
-  // 仅当 LLM 记账成功且给出了出场名单时采信语义名单；名单为空（结算失败降级 / 回滚后清单清空 / 判定无人提及）
-  // 一律回退实时文本匹配，保证章节内容变更、版本切换、删除章节后脉络与正文一致
-  const useLlm = summary != null && llmNames.length > 0;
-  if (!useLlm) return world.characters.filter((c) => appearsInChapter(c, chapterText));
-  return world.characters.filter((c) => {
-    const normC = normCharName(c.name);
-    return llmNames.some((n) => n === c.name || (n !== c.name && normCharName(n) === normC && normCharName(n).length >= 2));
-  });
-}
+// 实现已收敛到 src/shared/appearance.ts（服务端 chronicler 的登场重算同源引用），
+// 本文件仅作为前端 re-export 入口，保持既有 import 路径不变。
+export { normCharName, appearsInChapter, appearedChars, appearedInChapter, formatChapterRange } from "../shared/appearance";

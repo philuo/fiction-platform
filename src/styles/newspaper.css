@@ -13,6 +13,9 @@
   --line-strong: #191817;
   --seal: #b03a2e;
   --gold: #a67c2e;
+  --indigo: #3b4d8f;
+  --azure: #3a6d8c;
+  --muted: #7a6f5e;
   --serif: "Hiragino Mincho ProN", "Yu Mincho", "Noto Serif CJK SC", "Songti SC", "SimSun", serif;
   --sans: "Hiragino Sans", "Yu Gothic", "Noto Sans CJK SC", "PingFang SC", sans-serif;
   /* 装饰衬线：Cormorant Garamond 数字/西文；中文自动回退到 serif */
@@ -169,6 +172,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   border-right: 1px solid var(--line);
   background: var(--paper);
   min-height: 70vh;
+  position: relative; /* 新角色提案展开抽屉（absolute 覆盖三栏）的定位上下文 */
 }
 .game-col {
   padding: 0.9rem 0.7rem;
@@ -263,9 +267,164 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
     padding: 0.5rem 0.5rem 5.5rem;
   }
 }
-.col-title {
+/* ============ 新角色提案：折叠单行 + 展开抽屉（覆盖三栏，200ms 自底部向上） ============ */
+.proposal-bar {
+  padding: 0.4rem 1rem;
+  border-top: 1px dashed var(--line-strong);
+  border-bottom: 1px dashed var(--line-strong);
+  background: var(--paper-dark);
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  flex-wrap: nowrap; /* 单行：不折行 */
+  overflow: hidden;
   font-size: 0.78rem;
-  letter-spacing: 0.25em;
+  flex-shrink: 0;
+}
+.proposal-bar-title {
+  font-family: var(--sans);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.proposal-bar-items {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ink-soft);
+}
+.proposal-bar-actions {
+  display: flex;
+  gap: 0.35rem;
+  flex-shrink: 0;
+}
+/* 提案区 icon 按钮：无 button 样式（透明、无边框），hover 轻微反馈 */
+.proposal-bar-icon {
+  background: none;
+  border: none;
+  padding: 0.15rem;
+  margin: 0;
+  color: var(--ink-soft);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius);
+  line-height: 0;
+}
+.proposal-bar-icon:hover {
+  color: var(--ink);
+  background: var(--paper);
+}
+/* 抽屉头部「收起」：箭头朝上（旋转 180°） */
+.proposal-bar-collapse svg {
+  transform: rotate(180deg);
+}
+.proposal-drawer {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 0; /* 折叠：不占视觉（动画起点） */
+  z-index: 15; /* 覆盖三栏（默认 z-index），低于底部控制条（20） */
+  background: var(--paper-dark);
+  border-top: 1px dashed var(--line-strong);
+  transition: height 200ms ease; /* 从底部缓慢向顶部展开 */
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.proposal-drawer.open {
+  height: 100%; /* 顶部不超过 game-grid 顶部 */
+}
+.proposal-drawer-head {
+  flex-shrink: 0;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.78rem;
+}
+.proposal-drawer-head b {
+  font-family: var(--sans);
+}
+.proposal-drawer-hint {
+  flex: 1;
+  color: var(--ink-soft);
+  font-size: 0.7rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.proposal-drawer-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.6rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.proposal-item {
+  border: 1px solid var(--line);
+  background: var(--paper);
+  padding: 0.5rem 0.7rem;
+  font-size: 0.78rem;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.7rem;
+}
+.proposal-item-main {
+  flex: 1;
+  min-width: 0;
+}
+.proposal-item-name {
+  font-weight: 600;
+  margin-right: 0.4rem;
+}
+.proposal-item-source {
+  font-size: 0.68rem;
+  color: var(--ink-soft);
+  border: 1px solid var(--line);
+  padding: 0 0.35em;
+  border-radius: var(--radius);
+}
+.proposal-reason {
+  color: var(--seal);
+  margin-top: 0.25rem;
+}
+.proposal-item-meta {
+  color: var(--ink-soft);
+  margin-top: 0.2rem;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.proposal-item-actions {
+  display: flex;
+  gap: 0.35rem;
+  flex-shrink: 0;
+  padding-top: 0.15rem;
+}
+/* 移动端：抽屉覆盖三栏堆叠区，内部滚动不受影响 */
+@media (max-width: 900px) {
+  .proposal-bar {
+    padding: 0.35rem 0.6rem;
+    gap: 0.5rem;
+  }
+  .proposal-drawer-head {
+    padding: 0.4rem 0.6rem;
+  }
+  .proposal-drawer-list {
+    padding: 0.5rem 0.6rem;
+  }
+}
+
+.col-title {
+  font-size: 0.78rem;letter-spacing: 0.25em;
   font-weight: 700;
   border-bottom: 1px solid var(--line-strong);
   padding-bottom: 0.3rem;
@@ -338,8 +497,9 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   margin: 0 0 0.9em 0;
 }
 .chapter-text .para:last-child { margin-bottom: 0; }
-/* 首字下沉（drop-cap）：红色大号首字（作用于首个段落；段落为 div/p 混用，按 first-child 定位首段） */
-.chapter-text .para:first-child::first-letter {
+/* 首字下沉（drop-cap）：红色大号首字（作用于首个段落；段落为 div/p 混用，按 first-child 定位首段）。
+   首段以特殊符号（引号/破折号等）开头时组件会加 no-dropcap 跳过放大，避免巨型标点 */
+.chapter-text .para:first-child:not(.no-dropcap)::first-letter {
   float: left;
   font-size: 2.8em;
   line-height: 0.82;
@@ -648,15 +808,6 @@ video.chapter-media { aspect-ratio: 896 / 560; object-fit: cover; background: #1
 }
 .btn-ghost:hover { background: rgba(246, 241, 230, 0.12); }
 .btn-ghost:active { transform: scale(0.95); }
-.status-light {
-  width: 10px; height: 10px;
-  border-radius: 50%;
-  background: #6f6f6f;
-  display: inline-block;
-}
-.status-light.busy { background: var(--gold); animation: blink 0.9s infinite; }
-.status-light.ok { background: #4d7a4d; }
-@keyframes blink { 50% { opacity: 0.25; } }
 
 /* 底部控制条：图标入口按钮 + 状态组 */
 .bar-icon-btn {
@@ -689,6 +840,30 @@ video.chapter-media { aspect-ratio: 896 / 560; object-fit: cover; background: #1
   letter-spacing: 0.08em;
   opacity: 0.85;
   white-space: nowrap;
+}
+/* 底部状态条中枢按钮（替换原状态小圆点）：迷你 BrainCore + 状态文字，忙碌时脉动+发光表达 loading */
+.bar-status-brain {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex-shrink: 0;
+  padding: 0.12rem 0.45rem;
+  border: none;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--paper);
+  cursor: pointer;
+  font-family: var(--sans);
+  transition: background 0.3s ease, filter 0.3s ease, transform 0.1s ease;
+}
+.bar-status-brain:hover { background: rgba(246, 241, 230, 0.12); filter: brightness(1.25); }
+.bar-status-brain:active { transform: scale(0.95); }
+.bar-status-brain.busy { filter: brightness(1.25) drop-shadow(0 0 4px rgba(176, 58, 46, 0.55)); }
+.bar-status-brain .brain-core { transition: filter 0.3s ease; }
+.bar-status-brain.busy .brain-core { animation: brainCoreLoading 1.1s ease-in-out infinite; }
+@keyframes brainCoreLoading {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.14); }
 }
 .control-bar .cmd-input { flex: 1; width: auto; min-width: 140px; }
 
@@ -749,11 +924,39 @@ video.chapter-media { aspect-ratio: 896 / 560; object-fit: cover; background: #1
   outline-offset: -6px;
 }
 .landing-header {
+  position: relative;
   text-align: center;
   margin-bottom: 1.8rem;
   padding-bottom: 1.2rem;
   border-bottom: 3px double var(--ink);
 }
+/* 登录用户信息 + 退出登录（landing 浅色背景专用样式） */
+.landing-user {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.7rem;
+  font-family: var(--sans);
+}
+.landing-user-name { font-size: 0.82rem; color: var(--ink-soft); letter-spacing: 0.08em; }
+.landing-user .btn-sm {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0.28rem 0.7rem;
+  font-size: 0.78rem;
+  font-family: var(--sans);
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: all var(--transition);
+}
+.landing-user .btn-sm:hover { border-color: var(--seal); color: var(--seal); }
+.landing-user .btn-sm:active { transform: scale(0.96); }
 .landing-seal {
   display: inline-flex;
   align-items: center;
@@ -1919,14 +2122,6 @@ input[type="checkbox"], input[type="radio"] {
 .modal .btn-save {
   transition: background var(--transition), transform 0.1s ease;
 }
-
-/* ============ 状态指示灯增强 ============ */
-.status-light {
-  transition: background 0.3s ease;
-  box-shadow: 0 0 4px rgba(0,0,0,0.2);
-}
-.status-light.ok { box-shadow: 0 0 6px rgba(77, 122, 77, 0.5); }
-.status-light.busy { box-shadow: 0 0 6px rgba(166, 124, 46, 0.5); }
 
 /* ============ Tab 内容切换过渡 ============ */
 .game-col.left .left-scroll > * {
@@ -3450,69 +3645,308 @@ html { scroll-behavior: smooth; }
 .mem-log-kind { font-family: var(--sans); font-size: 0.7rem; font-weight: 700; color: var(--seal); flex-shrink: 0; }
 .mem-log-detail { color: var(--ink); flex: 1; min-width: 200px; }
 
-/* ============ 中枢指示器（BrainIndicator，报头常驻） ============ */
-/* 胶囊状态条：圆点（待机灰/运行朱红脉冲）+ 「中枢」+ 状态徽章（待命/运行中）+ 动作 + 计时章 */
-.brain-indicator {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  background: var(--paper-dark);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  color: var(--ink);
-  font-family: var(--sans);
-  font-size: 0.72rem;
-  padding: 0.28rem 0.8rem;
-  cursor: pointer;
-  transition: all var(--transition);
-  max-width: 400px;
-}
-.brain-indicator:hover { border-color: var(--seal); box-shadow: var(--shadow-sm); }
-/* 忙碌态：朱红描边 + 淡朱底色，与待命态（灰纸底）拉开对比 */
-.brain-indicator.busy { border-color: var(--seal); background: rgba(176, 58, 46, 0.07); }
-.brain-dot {
-  width: 0.5rem; height: 0.5rem;
-  border-radius: 50%;
-  background: var(--ink-soft);
-  opacity: 0.5;
-  flex-shrink: 0;
-}
-.brain-indicator.busy .brain-dot {
-  background: var(--seal);
-  opacity: 1;
-  box-shadow: 0 0 0 3px rgba(176, 58, 46, 0.16);
-  animation: brainPulse 1.1s ease-in-out infinite;
-}
+/* 状态脉冲（供 .task-step.active 等复用） */
 @keyframes brainPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
-.brain-label { letter-spacing: 0.12em; flex-shrink: 0; font-weight: 700; }
-/* 状态徽章：待命灰描边 / 运行中朱红描边+淡朱底，语义与圆点联动 */
-.brain-state {
-  flex-shrink: 0;
-  font-size: 0.64rem;
-  letter-spacing: 0.08em;
-  padding: 0.06rem 0.45rem;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  color: var(--ink-soft);
+
+/* ============ 中枢大脑（BrainCore）动画 + 多档状态徽章 ============ */
+/* 外脑波环旋转脉冲：频率由 inline animationDuration 控制（activity 驱动） */
+.brain-core-wave { animation: brainWaveSpin linear infinite; }
+@keyframes brainWaveSpin { to { transform: rotate(360deg); } }
+/* 大脑 glyph 脉冲发光：模拟神经活动（drop-shadow 强度由 presence 驱动，频率由 activity 驱动） */
+.brain-core-glyph { animation: brainGlyphPulse ease-in-out infinite; }
+@keyframes brainGlyphPulse {
+  0%, 100% { opacity: 0.7; }
+  50% { opacity: 1; }
 }
-.brain-indicator.busy .brain-state { border-color: var(--seal); color: var(--seal); background: rgba(176, 58, 46, 0.09); font-weight: 700; }
-.brain-action {
-  max-width: 200px;
-  overflow: hidden;
-  text-overflow: ellipsis;
+/* 迷你中枢图标默认尺寸（底部状态条经 px prop 覆盖为 14px） */
+.brain-core-mini { width: 22px; height: 22px; }
+
+/* ============ 中枢对话舱（BrainCabin） ============ */
+.brain-cabin-mask {
+  position: fixed; inset: 0; background: rgba(25, 24, 23, 0.35);
+  z-index: 1000; display: flex; justify-content: flex-end;
+  animation: bcFadeIn 0.2s ease;
+}
+@keyframes bcFadeIn { from { opacity: 0; } to { opacity: 1; } }
+.brain-cabin {
+  width: min(440px, 100%); height: 100%; background: var(--paper);
+  border-left: 1px solid var(--line-strong);
+  box-shadow: -6px 0 24px rgba(0, 0, 0, 0.18);
+  display: flex; flex-direction: column;
+  animation: bcSlideIn 0.25s ease;
+}
+@keyframes bcSlideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
+.brain-cabin-head {
+  position: relative;
+  padding: 1.1rem 2.4rem 1rem 1.1rem; border-bottom: 1px solid var(--line);
+  background: var(--paper-dark);
+}
+/* 关闭按钮：独立于右上角角落，复用全局弹窗 modal-close 样式（圆形 + hover 旋转/朱红底），仅保留定位 */
+.bc-head-close {
+  position: absolute; top: 0.5rem; right: 0.5rem; z-index: 2;
+}
+.brain-cabin-head-row { display: flex; align-items: center; gap: 1rem; }
+.brain-cabin-head-row .brain-core { flex-shrink: 0; }
+.brain-cabin-status { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 0.4rem; }
+.brain-cabin-title { font-family: var(--serif); font-size: 1.05rem; color: var(--ink); display: flex; align-items: center; gap: 0.45rem; letter-spacing: 0.04em; }
+.bc-presence { font-weight: 700; font-size: 0.7rem; font-family: var(--sans); padding: 0.08rem 0.5rem; border-radius: 999px; border: 1px solid var(--line); letter-spacing: 0.05em; }
+.bc-presence-focused { color: var(--indigo); border-color: var(--indigo); background: rgba(59, 77, 143, 0.06); }
+.bc-presence-awake { color: var(--seal); border-color: var(--seal); background: rgba(176, 58, 46, 0.06); }
+.bc-presence-alert { color: var(--gold); border-color: var(--gold); background: rgba(166, 124, 46, 0.08); }
+.bc-presence-pondering { color: var(--azure); border-color: var(--azure); background: rgba(58, 109, 140, 0.06); }
+.bc-presence-weary { color: var(--muted); border-color: var(--muted); }
+.brain-cabin-sub { font-size: 0.74rem; color: var(--ink-soft); display: flex; gap: 0.5rem; align-items: center; }
+.bc-activity { font-weight: 600; }
+.bc-gov-tag { font-size: 0.64rem; padding: 0.04rem 0.35rem; border-radius: 999px; border: 1px solid; font-weight: 700; }
+.bc-gov-tag-revise { color: var(--gold); border-color: var(--gold); }
+.bc-gov-tag-rejected { color: var(--seal); border-color: var(--seal); }
+.bc-gov-tag-pendingIntervention { color: var(--seal); border-color: var(--seal); }
+.bc-gov-tag-degraded { color: var(--ink-soft); border-color: var(--line); }
+/* 头部右上角无边框 icon 操作组（新建/历史）：不渲染按钮边框，hover 仅变色 */
+.bc-head-icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 1.7rem; height: 1.7rem; flex-shrink: 0;
+  background: none; border: none; color: var(--ink-soft);
+  cursor: pointer; border-radius: 0.3rem; transition: all var(--transition);
+}
+.bc-head-icon-btn:hover { color: var(--seal); background: rgba(176, 58, 46, 0.07); }
+.bc-head-icon-btn.active { color: var(--seal); background: rgba(176, 58, 46, 0.1); }
+/* bc-tabs 右侧操作组（新建会话 + 查看历史）：固定不收缩，与滚动栏分隔 */
+.bc-tabs-actions {
+  display: flex; align-items: center; gap: 0.15rem; flex-shrink: 0;
+  margin-left: 0.4rem; padding-left: 0.5rem; border-left: 1px solid var(--line);
+}
+.bc-tabs-actions .bc-head-icon-btn { width: 1.5rem; height: 1.5rem; }
+
+.brain-cabin-stream { flex: 1; overflow-y: auto; padding: 0.8rem 1rem; display: flex; flex-direction: column; gap: 0.7rem; }
+.brain-cabin-empty { text-align: center; color: var(--ink-soft); font-size: 0.82rem; margin: auto; padding: 2rem 1rem; }
+.bc-hint { font-size: 0.72rem; color: var(--ink-soft); margin-top: 0.6rem; opacity: 0.8; }
+
+.bc-msg { display: flex; gap: 0.5rem; align-items: flex-start; }
+.bc-msg-user { flex-direction: row-reverse; }
+.bc-msg-content { max-width: 82%; }
+.bc-msg-user .bc-msg-content { text-align: right; }
+.bc-msg-text {
+  display: inline-block; padding: 0.5rem 0.75rem; border-radius: 0.5rem;
+  font-size: 0.82rem; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+}
+.bc-msg-brain .bc-msg-text { background: var(--paper-dark); border: 1px solid var(--line); color: var(--ink); border-top-left-radius: 0.1rem; }
+.bc-msg-user .bc-msg-text { background: var(--ink); color: var(--paper); border-top-right-radius: 0.1rem; }
+.bc-cursor { animation: bcBlink 0.8s infinite; color: var(--seal); }
+@keyframes bcBlink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+.bc-msg-brain .brain-core { flex-shrink: 0; margin-top: 0.1rem; }
+
+/* —— 中枢回复打字动画：delta 更新时内容块轻微上浮淡入（视觉反馈“正在输出”） —— */
+.bc-typing { animation: bcTypePulse 0.35s ease-out; }
+@keyframes bcTypePulse {
+  0% { opacity: 0.55; transform: translateY(1px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+/* —— 生成中 loading 骨架（intent 阶段/等待首块） —— */
+.bc-thinking { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.5rem 0.75rem; background: var(--paper-dark); border: 1px solid var(--line); border-radius: 0.5rem; margin-bottom: 0.2rem; }
+.bc-thinking .bc-dot { width: 0.35rem; height: 0.35rem; border-radius: 50%; background: var(--seal); animation: bcDotPulse 1.2s infinite; }
+.bc-thinking .bc-dot:nth-child(2) { animation-delay: 0.2s; }
+.bc-thinking .bc-dot:nth-child(3) { animation-delay: 0.4s; }
+@keyframes bcDotPulse { 0%, 100% { opacity: 0.25; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1.15); } }
+.bc-thinking-label { font-size: 0.75rem; color: var(--ink-dim, #666); }
+
+/* —— 中断条（停止生成后可重新生成） —— */
+.bc-interrupted-bar { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.4rem; }
+.bc-interrupted-tag { font-size: 0.7rem; color: var(--seal); border: 1px solid var(--seal); border-radius: 0.2rem; padding: 0.05rem 0.35rem; }
+.bc-link-btn { background: none; border: none; color: var(--seal); font-size: 0.75rem; cursor: pointer; padding: 0.1rem 0.3rem; text-decoration: underline; }
+.bc-link-btn:hover { color: var(--ink); }
+.bc-link-btn:disabled { opacity: 0.4; cursor: default; }
+.bc-user-actions { display: flex; justify-content: flex-end; margin-top: 0.2rem; }
+.bc-stop { flex-shrink: 0; }
+
+/* —— 中枢回复 Markdown 富文本（表格/图片/列表/代码块） —— */
+.bc-md { font-size: 0.82rem; line-height: 1.65; word-break: break-word; }
+.bc-md p { margin: 0.2rem 0; }
+.bc-md ul, .bc-md ol { margin: 0.2rem 0; padding-left: 1.1rem; }
+.bc-md table { border-collapse: collapse; margin: 0.4rem 0; width: 100%; font-size: 0.78rem; }
+.bc-md th, .bc-md td { border: 1px solid var(--line); padding: 0.25rem 0.45rem; text-align: left; }
+.bc-md th { background: var(--paper-dark); }
+.bc-md img.bc-md-img { max-width: 100%; border-radius: 0.3rem; margin: 0.3rem 0; }
+.bc-md code { background: var(--paper-dark); padding: 0.1rem 0.3rem; border-radius: 0.2rem; font-size: 0.75em; }
+.bc-md pre { background: var(--paper-dark); border: 1px solid var(--line); border-radius: 0.3rem; padding: 0.5rem; overflow-x: auto; }
+.bc-md pre code { background: none; padding: 0; }
+.bc-md blockquote { border-left: 3px solid var(--seal); margin: 0.3rem 0; padding-left: 0.6rem; color: var(--ink-dim, #666); }
+
+.brain-cabin-input { display: flex; gap: 0.5rem; padding: 0.7rem 1rem; border-top: 1px solid var(--line); background: var(--paper-dark); }
+.brain-cabin-input textarea {
+  flex: 1; resize: vertical; min-height: 3rem; max-height: 11rem;
+  border: 1px solid var(--line); border-radius: 0.4rem;
+  padding: 0.55rem 0.6rem; font-family: var(--serif); font-size: 0.82rem; background: var(--paper);
+  color: var(--ink);
+}
+.brain-cabin-input textarea:focus { outline: none; border-color: var(--seal); }
+.bc-send { flex-shrink: 0; }
+
+/* —— 会话 tab 栏（独立区域，与头部上下分区；单行横滑 + 悬浮 ✕ 关闭窗口） —— */
+.bc-tabs {
+  display: flex; align-items: center; gap: 0.3rem;
+  padding: 0.35rem 1rem; flex-shrink: 0;
+  border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+  background: var(--paper-dark);
+}
+.bc-tabs-scroll { display: flex; align-items: center; gap: 0.35rem; overflow-x: auto; flex: 1; scrollbar-width: thin; padding-bottom: 2px; }
+.bc-tabs-empty { font-size: 0.72rem; color: var(--ink-dim, #666); padding: 0.2rem 0.2rem; white-space: nowrap; }
+.bc-tab-wrap { position: relative; display: inline-flex; align-items: center; flex-shrink: 0; }
+.bc-tab {
+  display: inline-flex; align-items: center; gap: 0.3rem; white-space: nowrap;
+  border: 1px solid var(--line); background: var(--paper); color: var(--ink);
+  border-radius: 0.3rem; padding: 0.22rem 0.5rem; font-size: 0.74rem; cursor: pointer; max-width: 140px;
+}
+.bc-tab-wrap:hover .bc-tab { border-color: var(--seal); }
+.bc-tab-wrap.active .bc-tab { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+.bc-tab-title { overflow: hidden; text-overflow: ellipsis; }
+/* 悬浮 ✕：关闭该会话窗口（不删除会话，历史中保留可重开） */
+.bc-tab-close {
+  display: none; position: absolute; top: 50%; right: 0.1rem; transform: translateY(-50%);
+  background: none; border: none; color: var(--ink-soft);
+  font-size: 0.6rem; line-height: 1; cursor: pointer; padding: 0.12rem 0.18rem;
+  border-radius: 0.2rem;
+}
+.bc-tab-wrap:hover .bc-tab-close { display: inline-flex; }
+.bc-tab-wrap.active .bc-tab-close { color: var(--paper); }
+.bc-tab-close:hover { color: var(--seal); background: rgba(176, 58, 46, 0.12); }
+.bc-tab-wrap.active .bc-tab-close:hover { color: var(--gold); background: rgba(0, 0, 0, 0.25); }
+
+/* 运行中会话：绿色小圆点 + 波纹闪烁 */
+.bc-live-dot {
+  width: 0.45rem; height: 0.45rem; border-radius: 50%; background: #34d399;
+  position: relative; flex-shrink: 0;
+}
+.bc-live-dot::after {
+  content: ""; position: absolute; inset: 0; border-radius: 50%;
+  background: #34d399; animation: bcRipple 1.4s ease-out infinite;
+}
+@keyframes bcRipple {
+  0% { transform: scale(1); opacity: 0.9; }
+  100% { transform: scale(2.6); opacity: 0; }
+}
+
+/* —— 历史会话视图（内嵌面板：点击头部历史 icon 切换；可删除会话、点击切换） —— */
+.bc-history-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.bc-history-panel-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0.55rem 1rem; border-bottom: 1px solid var(--line);
+  font-size: 0.8rem; font-weight: 700; color: var(--ink);
+}
+.bc-history-list { flex: 1; overflow-y: auto; padding: 0.3rem 0.5rem; }
+.bc-history-empty { color: var(--ink-dim, #666); font-size: 0.78rem; padding: 1rem; text-align: center; }
+.bc-history-item { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; padding: 0.45rem 0.5rem; border-radius: 0.3rem; cursor: pointer; }
+.bc-history-item:hover { background: var(--paper-dark); }
+.bc-history-item.active { background: var(--paper-dark); outline: 1px solid var(--seal); }
+.bc-history-main { display: flex; flex-direction: column; gap: 0.15rem; min-width: 0; }
+.bc-history-title { font-size: 0.8rem; font-weight: 600; display: inline-flex; align-items: center; gap: 0.35rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bc-history-meta { font-size: 0.68rem; color: var(--ink-dim, #666); }
+.bc-history-del { border: 1px solid var(--line); background: none; color: #b00020; border-radius: 0.25rem; font-size: 0.7rem; padding: 0.15rem 0.4rem; cursor: pointer; flex-shrink: 0; }
+.bc-history-del:hover { background: #b00020; color: #fff; }
+
+/* —— 中枢对话卡片 ============ */
+.brain-card {
+  border: 1px solid var(--line); border-radius: 0.4rem; padding: 0.6rem 0.7rem;
+  margin-top: 0.4rem; background: var(--paper); font-size: 0.78rem;
+  text-align: left;
+}
+.brain-card-image-wrap { margin-top: 0.4rem; }
+.brain-card-image { display: block; max-width: 100%; max-height: 220px; object-fit: cover; border-radius: 0.3rem; border: 1px solid var(--line); }
+
+/* —— 计划/意见选项卡（plan/opinion） —— */
+.bc-choice-options { display: flex; flex-direction: column; gap: 0.35rem; margin-top: 0.4rem; }
+.bc-choice-option {
+  display: flex; align-items: center; gap: 0.5rem; text-align: left;
+  border: 1px solid var(--line); background: var(--paper); color: var(--ink);
+  border-radius: 0.35rem; padding: 0.4rem 0.55rem; cursor: pointer; font-size: 0.78rem;
+}
+.bc-choice-option:hover:not(:disabled) { border-color: var(--seal); background: var(--paper-dark); }
+.bc-choice-option:disabled { opacity: 0.5; cursor: default; }
+.bc-choice-label { font-weight: 600; white-space: nowrap; }
+.bc-choice-desc { flex: 1; color: var(--ink-dim, #666); font-size: 0.72rem; }
+.bc-choice-go { color: var(--seal); flex-shrink: 0; }
+.brain-card-head { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 0.3rem; }
+.brain-card-title { font-weight: 700; color: var(--ink); font-size: 0.8rem; }
+.brain-card-body { color: var(--ink-soft); line-height: 1.55; margin: 0; }
+.bc-cmd { font-family: var(--sans); font-size: 0.62rem; color: var(--ink-soft); background: var(--paper-dark); border: 1px solid var(--line); padding: 0.02rem 0.3rem; border-radius: 3px; }
+.bc-level { font-family: var(--sans); font-size: 0.6rem; padding: 0.02rem 0.3rem; border-radius: 3px; border: 1px solid; }
+.bc-level-L0, .bc-level-L1 { color: var(--ink-soft); border-color: var(--line); }
+.bc-level-L2 { color: var(--gold); border-color: var(--gold); }
+.bc-level-L3 { color: var(--seal); border-color: var(--seal); font-weight: 700; }
+.bc-confirm-tag { font-size: 0.6rem; color: var(--seal); border: 1px solid var(--seal); padding: 0.02rem 0.3rem; border-radius: 3px; }
+.brain-card-impact { font-size: 0.74rem; color: var(--seal); margin: 0.2rem 0; }
+.brain-card-verdict { font-size: 0.72rem; color: var(--ink-soft); margin: 0.2rem 0; }
+.brain-card-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.4rem; }
+.brain-card-result.ok { border-left: 3px solid #4d7a4d; }
+.brain-card-result.fail { border-left: 3px solid var(--seal); }
+.brain-card-browse .bc-browse-title { font-weight: 700; font-size: 0.78rem; margin-bottom: 0.2rem; }
+.brain-card-browse .bc-browse-text { font-size: 0.76rem; color: var(--ink-soft); line-height: 1.55; margin: 0; }
+.brain-card-browse .bc-browse-meta { font-size: 0.68rem; color: var(--ink-soft); display: block; margin-top: 0.2rem; }
+.bc-browse-list { display: flex; flex-direction: column; gap: 0.5rem; }
+.bc-browse-item { border-top: 1px dashed var(--line); padding-top: 0.4rem; }
+.bc-browse-item:first-child { border-top: none; padding-top: 0; }
+.bc-browse-item-id { font-size: 0.7rem; color: var(--ink); font-weight: 700; }
+/* 新角色提案（proposal）浏览卡：推荐原因 + 可交互操作 */
+.bc-proposal-item { padding: 0.45rem 0.55rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper-dark); }
+.bc-proposal-head { display: flex; align-items: baseline; gap: 0.4rem; flex-wrap: wrap; }
+.bc-proposal-name { font-weight: 700; font-size: 0.78rem; color: var(--ink); }
+.bc-proposal-reason { font-size: 0.74rem; color: var(--seal); line-height: 1.5; margin: 0.25rem 0 0; }
+.bc-browse-actions { display: flex; gap: 0.35rem; margin-top: 0.35rem; flex-wrap: wrap; }
+
+/* —— 查询可视化（Phase 1：进度条/统计网格/徽章/列表操作） —— */
+.bc-progress { display: flex; align-items: center; gap: 0.5rem; margin: 0.3rem 0 0.5rem; }
+.bc-progress-bar { flex: 1; height: 7px; background: var(--paper-dark); border: 1px solid var(--line); border-radius: 3px; overflow: hidden; }
+.bc-progress-fill { display: block; height: 100%; background: var(--seal); transition: width 0.4s ease; }
+.bc-progress-label { font-family: var(--sans); font-size: 0.66rem; color: var(--ink-soft); white-space: nowrap; }
+.bc-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(4.2rem, 1fr)); gap: 0.35rem; margin: 0.3rem 0 0.5rem; }
+.bc-stat {
+  display: flex; flex-direction: column; align-items: center; gap: 0.1rem;
+  border: 1px solid var(--line); border-radius: 0.3rem; padding: 0.3rem 0.2rem;
+  background: var(--paper-dark); font-size: 0.62rem; color: var(--ink-soft);
+}
+.bc-stat b { font-family: var(--sans); font-size: 0.85rem; color: var(--ink); }
+.bc-badge {
+  font-family: var(--sans); font-size: 0.6rem; padding: 0.02rem 0.32rem;
+  border-radius: 3px; border: 1px solid var(--line); color: var(--ink-soft);
   white-space: nowrap;
-  color: var(--ink-soft);
 }
-.brain-indicator.busy .brain-action { color: var(--ink); font-weight: 700; }
-/* 计时章：朱红实底小胶囊，运行时长醒目可读 */
-.brain-timer {
-  font-family: var(--display);
-  font-size: 0.72rem;
-  color: var(--paper);
-  background: var(--seal);
-  border-radius: 999px;
-  padding: 0.02rem 0.5rem;
-  flex-shrink: 0;
+.bc-badge-ok { color: #4d7a4d; border-color: #4d7a4d; }
+.bc-badge-warn { color: var(--gold, #a67c2e); border-color: var(--gold, #a67c2e); }
+.bc-badge-danger { color: var(--seal); border-color: var(--seal); }
+.bc-badge-info { color: var(--ink-soft); border-color: var(--line); }
+.bc-browse-item-head { display: flex; align-items: center; justify-content: space-between; gap: 0.4rem; flex-wrap: wrap; }
+.bc-browse-item-title { font-size: 0.74rem; color: var(--ink); font-weight: 700; }
+.bc-browse-item-badges { display: inline-flex; gap: 0.3rem; flex-shrink: 0; }
+.bc-browse-sec { font-family: var(--sans); font-size: 0.64rem; letter-spacing: 0.12em; color: var(--ink-soft); margin-bottom: 0.15rem; }
+.bc-browse-quote { font-size: 0.74rem; color: var(--ink); font-style: italic; border-left: 3px solid var(--seal); padding-left: 0.5rem; margin: 0.3rem 0; }
+.bc-chip-row { display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0.2rem 0; }
+.bc-chip {
+  font-family: var(--sans); font-size: 0.66rem; color: var(--ink);
+  background: var(--paper-dark); border: 1px solid var(--line);
+  border-radius: 999px; padding: 0.12rem 0.5rem;
+}
+.bc-next .bc-browse-item-title { color: var(--seal); }
+.bc-next::after { content: "← 下一章"; font-family: var(--sans); font-size: 0.6rem; color: var(--seal); margin-left: 0.4rem; }
+.bc-log-item .bc-browse-text { font-size: 0.72rem; }
+
+/* —— 表单卡（FormCard）：结构化字段表单 —— */
+.brain-card-form { border-left: 3px solid var(--seal); }
+.bc-form-confirm { border-left-color: var(--gold, #a67c2e); }
+.bc-form-fields { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.5rem; }
+.bc-form-field { display: flex; flex-direction: column; gap: 0.2rem; }
+.bc-form-label { font-family: var(--sans); font-size: 0.68rem; color: var(--ink-soft); }
+.bc-form-input {
+  font-family: var(--sans); font-size: 0.76rem;
+  background: var(--paper); border: 1px solid var(--line); color: var(--ink);
+  padding: 0.32rem 0.5rem; border-radius: 0.25rem; width: 100%;
+}
+.bc-form-input:focus { border-color: var(--seal); outline: none; }
+.bc-form-checkgroup { display: flex; flex-wrap: wrap; gap: 0.4rem 0.8rem; }
+.bc-form-check { display: inline-flex; align-items: center; gap: 0.3rem; font-size: 0.76rem; color: var(--ink); cursor: pointer; }
+
+@media (max-width: 640px) {
+  .brain-cabin { width: 100%; }
 }
 
 /* ============ 任务中心（TaskCenterModal） ============ */

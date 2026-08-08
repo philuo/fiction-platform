@@ -1,12 +1,16 @@
 // 干预治理中枢（P3.5，修 F4-F6）：变更分级 L0-L3 + 影响评估 + 三选一策略 + 打断 + 日志
 // 用户决策：L2 每次弹影响报告三选一；写作中干预立即打断；字段锁（status 手改即锁）
 import { chatJson } from "./jsonutil";
-import { saveWorld } from "./storage";
+import { saveWorld, currentUser } from "./storage";
 import { getCommand } from "./harness";
 import type { ChangeLogEntry, SteeringItem, WorldState } from "./world";
 
 // —— 立即打断（用户决策②）：内存态信号，writeOneChapter 每阶段边界轮询 ——
+// key 前缀当前用户：不同账号的同名书互不打断（多用户隔离）
 const interrupts = new Map<string, SteeringItem>();
+function intKey(title: string): string {
+  return `${currentUser() ?? ""}::${title}`;
+}
 
 /** 请求打断指定故事的当前写作（写作中提交干预时调用） */
 export function requestInterrupt(title: string, item: Omit<SteeringItem, "id" | "at">): SteeringItem {
@@ -15,20 +19,21 @@ export function requestInterrupt(title: string, item: Omit<SteeringItem, "id" | 
     at: new Date().toISOString(),
     ...item,
   };
-  interrupts.set(title, full);
+  interrupts.set(intKey(title), full);
   return full;
 }
 
 /** 管线阶段边界检查：命中则取出（消费）并返回 */
 export function checkInterrupt(title: string): SteeringItem | null {
-  const item = interrupts.get(title);
-  if (item) interrupts.delete(title);
+  const key = intKey(title);
+  const item = interrupts.get(key);
+  if (item) interrupts.delete(key);
   return item ?? null;
 }
 
 /** 打断后未消费的项可由调用方重新入队（如 commit 后阶段命中 → 章末消费） */
 export function requeueInterrupt(title: string, item: SteeringItem): void {
-  interrupts.set(title, item);
+  interrupts.set(intKey(title), item);
 }
 
 // —— 变更日志（审计：谁、第几章、改了什么、选了哪种传播策略） ——

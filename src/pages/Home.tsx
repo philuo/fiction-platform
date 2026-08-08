@@ -1,7 +1,7 @@
 // 主界面：启动页（立项）→ 创作游戏界面（日式报纸 HUD + 完整控制面板）
 // 交互：立项一句话 / 指令输入 / 抽卡筛选 / 世界观·设定·角色·大纲编辑 / 章节段落编辑 / 推进
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, BookMarked, BookOpen, ChevronDown, Dices, History, List, MoreHorizontal, PenLine, Play, RefreshCw, Search, Sparkles, Users, Video, Wand2, X } from "../components/icons";
+import { AlertTriangle, BookMarked, BookOpen, ChevronDown, Dices, History, List, LogOut, MoreHorizontal, PenLine, Play, RefreshCw, Search, Sparkles, Users, Video, Wand2, X } from "../components/icons";
 import type { Card, Chapter, ChapterMedia, Character, LoreEntry, ReviewResult, WorldPatch, WorldState } from "../api/world";
 import { Masthead } from "../components/Masthead";
 import { StatusPanel } from "../components/StatusPanel";
@@ -17,19 +17,38 @@ import { EvalModal } from "../components/EvalModal";
 import { PortraitModal } from "../components/PortraitModal";
 import { AutoRunPanel, type AutoSessionView, type PendingChapterView } from "../components/AutoRunPanel";
 import { MemoryAuditModal } from "../components/MemoryAuditModal";
-import { BrainIndicator } from "../components/BrainIndicator";
+import { BrainCore } from "../components/BrainCore";
+import { BrainCabin } from "../components/BrainCabin";
 import { TaskCenterModal } from "../components/TaskCenterModal";
 import { ForeshadowModal } from "../components/ForeshadowModal";
+import AuthPage from "./AuthPage";
+import type { AuthUser } from "../api/auth-types";
+import { apiFetch, clearToken, onAuthChange } from "../api/client";
 import { lensCn, severityCn } from "../terms";
+import { deriveBrainState } from "../api/brain-state";
 
 export type HomeProps = {
   url?: string;
-  initialData?: { world?: WorldState; serverTime?: string; ssr?: boolean; chapter?: number };
+  initialData?: {
+    world?: WorldState;
+    serverTime?: string;
+    ssr?: boolean;
+    chapter?: number;
+    /** SSR 按会话注入的当前登录用户（未登录为 undefined） */
+    user?: AuthUser;
+    /** SSR 按用户 + 书名读库注入的新角色提案区关闭状态（首帧即正确，刷新不闪现） */
+    propClosed?: boolean;
+  };
 };
 
 type Phase = "landing" | "playing";
 
 type StoryMeta = { slug: string; title: string; genre: string; chapters: number; updatedAt: string; cover?: string };
+
+// —— 新角色提案区关闭状态（服务端权威：bun:sqlite 按用户 + 书名存储）——
+// SSR 时服务端读会话 cookie → 查库 → 注入 initialData.propClosed，首帧 HTML 即正确（不渲染提案区），
+// 客户端与 SSR 快照一致、无修正 re-render —— 根治「刷新闪现后自动关」。
+// 前端操作（✕ 关闭 / 新提案到达 / 中枢话题）经 POST /api/novel/proposal-closed 写库。
 
 // 流派模板：点选一键填充灵感与题材（M8 增强）
 const GENRE_TEMPLATES: { name: string; genre: string; idea: string }[] = [
@@ -76,6 +95,8 @@ function resolveInitialChapter(w: WorldState, urlChapter?: number): number {
 
 const Home: React.FC<HomeProps> = (props) => {
   const [phase, setPhase] = useState<Phase>(props.initialData?.world ? "playing" : "landing");
+  // 当前登录用户（SSR 注入 / 登录成功后设置；null = 未登录 → 渲染登录页）
+  const [user, setUser] = useState<AuthUser | null>(props.initialData?.user ?? null);
   const [world, setWorld] = useState<WorldState | null>(props.initialData?.world ?? null);
   const [busy, setBusy] = useState(false);
   const [busyPhase, setBusyPhase] = useState("");
@@ -86,10 +107,39 @@ const Home: React.FC<HomeProps> = (props) => {
   const [showGacha, setShowGacha] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showMemoryAudit, setShowMemoryAudit] = useState(false); // 中枢弹窗一：分层记忆·台账·操作日志
+  const [showBrainCabin, setShowBrainCabin] = useState(false); // 中枢对话舱：卡片式浏览 + 智能控制
   const [showTaskCenter, setShowTaskCenter] = useState(false); // 任务中心（弹窗二）：连载/推进任务进度与控制
   const [advanceMenu, setAdvanceMenu] = useState(false); // 底部"推进剧情"下拉（本章续写/章节连载）展开态
   const [pendingCommitIdx, setPendingCommitIdx] = useState<number | null>(null); // 推进剧情待人工确认入册的章节号（commitPolicy=confirm）
   const [showForeshadow, setShowForeshadow] = useState(false); // 伏笔账编辑弹窗（底部控制条角色与关系旁）
+  const [proposalExpanded, setProposalExpanded] = useState(false); // 底部新角色提案区：抽屉展开态（覆盖三栏）
+  // 新角色提案区关闭状态（服务端按用户 + 书名存储）：
+  // - 初始值取 SSR 注入的 initialData.propClosed（刷新直达时首帧即正确）；
+  // - 打开书（openStory/startStory，无 SSR 预载时）按书名从服务端同步；
+  // - 关闭/恢复写入经 savePropClosed 持久化到服务端。
+  const [proposalClosed, setProposalClosed] = useState(props.initialData?.propClosed ?? false);
+  useEffect(() => {
+    if (!world) return;
+    let cancelled = false;
+    apiFetch(`/api/novel/proposal-closed?title=${encodeURIComponent(world.title)}`)
+      .then((r) => r.json())
+      .then((d) => { if (!cancelled && typeof d?.closed === "boolean") setProposalClosed(d.closed); })
+      .catch(() => { /* 网络失败保持当前状态 */ });
+    return () => { cancelled = true; };
+  }, [world?.title]);
+  /** 持久化新角色提案区关闭状态（乐观更新，失败回滚）；供刷新/SSR 首帧正确渲染 */
+  function savePropClosed(closed: boolean) {
+    if (!world) return;
+    setProposalClosed(closed);
+    void apiFetch("/api/novel/proposal-closed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: world.title, closed }),
+    })
+      .then((r) => r.json())
+      .then((d) => { if (!d?.ok) setProposalClosed(!closed); })
+      .catch(() => setProposalClosed(!closed));
+  }
   /** 角色与关系弹窗（底部按钮=可编辑模式；脉络/审查面板角色点击=只读模式，顶层共享同一实例渲染，避免弹窗被困在区域内部） */
   const [relModal, setRelModal] = useState<{ editable: boolean; charId: string | null } | null>(null);
   const [toast, setToast] = useState("");
@@ -137,13 +187,26 @@ const Home: React.FC<HomeProps> = (props) => {
   // 加载小说列表
   async function fetchStories() {
     try {
-      const res = await fetch("/api/novel/list");
+      const res = await apiFetch("/api/novel/list");
       const data = (await res.json()) as { stories?: StoryMeta[] };
       if (data.stories) setStories(data.stories);
     } catch { /* ignore */ }
   }
   // 初始加载列表
   useEffect(() => { fetchStories(); }, []);
+
+  // token 失效（apiFetch 401 清凭证后广播）：清用户态回登录页
+  useEffect(() => {
+    return onAuthChange(() => {
+      setUser(null);
+      setWorld(null);
+      setPhase("landing");
+      setActiveIdx(-1);
+      setEditing(false);
+      setStoryUrl();
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   /** 路由状态持久化：URL 同步 ?title=<书名>&chapter=<章节index>，刷新时 SSR 凭此直接恢复阅读位置（返回列表则清除） */
   function setStoryUrl(title?: string, chapter?: number) {
@@ -161,7 +224,7 @@ const Home: React.FC<HomeProps> = (props) => {
     setBusy(true);
     setBusyPhase("加载中…");
     try {
-      const res = await fetch("/api/novel/state", {
+      const res = await apiFetch("/api/novel/state", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title }),
@@ -170,11 +233,15 @@ const Home: React.FC<HomeProps> = (props) => {
       if (data.error || !data.world) throw new Error(data.error ?? "加载失败");
       setWorld(data.world);
       setPhase("playing");
+      // 关闭/展开态不跨书残留：关闭状态按书持久化（useSyncExternalStore 随 propCloseKey 自动读该书存储），此处仅重置展开态
+      setProposalExpanded(false);
       // 恢复上次选中章节（URL chapter）；无记录/章节缺失 → 第一章
       const initIdx = resolveInitialChapter(data.world, readUrlChapter());
       setActiveIdx(initIdx);
       setStoryUrl(data.world.title, initIdx > 0 ? initIdx : undefined);
       showToast(`《${data.world.title}》已加载`);
+      // 恢复单章推进任务状态（刷新/重进后不丢状态：后台 running 恢复显示，done/failed 提示结果）
+      void restoreAdvanceTask(title);
     } catch (e) {
       showToast("加载失败: " + (e as Error).message);
     } finally {
@@ -193,6 +260,18 @@ const Home: React.FC<HomeProps> = (props) => {
     fetchStories();
   }
 
+  // 退出登录：注销服务端会话 + 清本地 token（回登录页）
+  async function logout() {
+    await apiFetch("/api/auth/logout", { method: "POST" }).catch(() => {});
+    clearToken();
+    setUser(null);
+    setWorld(null);
+    setPhase("landing");
+    setActiveIdx(-1);
+    setEditing(false);
+    setStoryUrl();
+  }
+
   const lastChapter = useMemo(() => {
     return world && world.chapters.length ? world.chapters[world.chapters.length - 1] : null;
   }, [world]);
@@ -200,6 +279,12 @@ const Home: React.FC<HomeProps> = (props) => {
   const pendingProposals = useMemo(() => {
     return (world?.characterProposals ?? []).filter((p) => p.status === "pending");
   }, [world]);
+  // 新提案到达时自动恢复底部提案区显示（用户 ✕ 关闭后，有新增提案仍提示，避免错过）
+  const lastPropCountRef = useRef(pendingProposals.length);
+  useEffect(() => {
+    if (pendingProposals.length > lastPropCountRef.current) savePropClosed(false);
+    lastPropCountRef.current = pendingProposals.length;
+  }, [pendingProposals.length]);
   const shownChapter = useMemo(() => {
     if (!world) return null;
     if (activeIdx === -1) return lastChapter;
@@ -212,7 +297,7 @@ const Home: React.FC<HomeProps> = (props) => {
     setBusy(true);
     setBusyPhase("立项中…");
     try {
-      const res = await fetch("/api/novel/new", {
+      const res = await apiFetch("/api/novel/new", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ idea: idea.trim(), genre: genre.trim() || undefined }),
@@ -235,7 +320,7 @@ const Home: React.FC<HomeProps> = (props) => {
 
   async function refreshWorld() {
     if (!world) return;
-    const res = await fetch("/api/novel/state", {
+    const res = await apiFetch("/api/novel/state", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title: world.title }),
@@ -247,13 +332,108 @@ const Home: React.FC<HomeProps> = (props) => {
     if (dw && data.visualPending) startVisualPolling(dw.title);
   }
 
+  /** 单章推进任务恢复（刷新/重进页面后）：查询持久化任务状态——
+   * running → 恢复忙碌态 + 轮询直到完成（后台仍在执行，不重复发起）；
+   * done → 刷新世界 + 提示（pendingCommit 则打开任务中心确认）；failed → 报错提示。
+   * 读取后调 /api/novel/step/clear 清除任务文件，避免下次刷新重复提示。 */
+  const advanceRestoreTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
+  function stopAdvanceRestorePolling() {
+    if (advanceRestoreTimer.current) { clearInterval(advanceRestoreTimer.current); advanceRestoreTimer.current = undefined; }
+  }
+  useEffect(() => () => { stopAdvanceRestorePolling(); }, []);
+
+  async function clearAdvanceTaskFile(storyTitle: string) {
+    try {
+      await apiFetch("/api/novel/step/clear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: storyTitle }),
+      });
+    } catch { /* 清除失败不阻塞 */ }
+  }
+
+  async function finishRestoreAdvance(storyTitle: string, task: { status: string; chapterIndex?: number; verdict?: string; rounds?: number; pendingCommit?: boolean; error?: string }) {
+    stopAdvanceRestorePolling();
+    setBusy(false);
+    setBusyPhase("");
+    setLiveDraft("");
+    await clearAdvanceTaskFile(storyTitle);
+    if (task.status === "failed") {
+      showToast(`推进任务失败：${task.error ?? "未知错误"}`);
+      await refreshWorld();
+      return;
+    }
+    // done
+    await refreshWorld();
+    setActiveIdx(-1); // 跟随最新章节
+    if (task.pendingCommit && task.chapterIndex != null) {
+      setPendingCommitIdx(task.chapterIndex);
+      setShowTaskCenter(true);
+      showToast(`检测到第 ${task.chapterIndex} 章审查通过待确认入册（任务在页面刷新前已暂存）`);
+    } else {
+      showToast(
+        task.verdict === "pass"
+          ? `检测到后台推进完成：第 ${task.chapterIndex} 章已入册（${task.rounds ?? 1} 稿通过）`
+          : `检测到后台推进完成：第 ${task.chapterIndex} 章已入册（最终仍需修改，可查看审查报告）`,
+      );
+    }
+  }
+
+  async function restoreAdvanceTask(storyTitle: string) {
+    if (advanceRestoreTimer.current) return; // 已在恢复中
+    try {
+      const res = await apiFetch("/api/novel/step/status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: storyTitle }),
+      });
+      const data = (await res.json()) as { task?: { status: string; phase: string; chapterIndex?: number; verdict?: string; rounds?: number; pendingCommit?: boolean; error?: string } | null };
+      const task = data.task;
+      if (!task) return;
+      if (task.status === "done" || task.status === "failed") {
+        // 已结束但前端未消费（刷新发生在完成之后）：提示并清除
+        await finishRestoreAdvance(storyTitle, task);
+        return;
+      }
+      // running：恢复忙碌态展示，轮询直到完成（服务端仍在执行）
+      const phaseText: Record<string, string> = { start: "准备中…", writing: "导演写作中…", reviewing: "审查中…", patching: "修补中…", settling: "结算中…", selfcheck: "自检中…", saving: "存档中…" };
+      setBusy(true);
+      setBusyPhase(phaseText[task.phase] ?? "后台推进中…");
+      showToast("检测到后台推进任务仍在运行，已恢复进度显示（刷新不影响写作）");
+      advanceRestoreTimer.current = setInterval(async () => {
+        try {
+          const r = await apiFetch("/api/novel/step/status", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ title: storyTitle }),
+          });
+          const d = (await r.json()) as { task?: { status: string; phase: string; chapterIndex?: number; verdict?: string; rounds?: number; pendingCommit?: boolean; error?: string } | null };
+          const t = d.task;
+          if (!t) { // 任务文件被清除：异常，停止恢复
+            stopAdvanceRestorePolling();
+            setBusy(false);
+            setBusyPhase("");
+            return;
+          }
+          if (t.status === "running") {
+            setBusyPhase(phaseText[t.phase] ?? "后台推进中…");
+          } else {
+            await finishRestoreAdvance(storyTitle, t);
+          }
+        } catch (e) {
+          console.warn("[advance-restore] 轮询失败，稍后重试:", (e as Error).message);
+        }
+      }, 5000);
+    } catch { /* 查询失败静默（不阻塞打开故事） */ }
+  }
+
   async function advance() {
     if (!world || busy) return;
     setBusy(true);
     setBusyPhase("导演写作中…");
     setLiveDraft("");
     try {
-      const res = await fetch("/api/novel/step", {
+      const res = await apiFetch("/api/novel/step", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, instruction: cmd.trim() }),
@@ -336,7 +516,7 @@ const Home: React.FC<HomeProps> = (props) => {
   async function pauseAutoRun() {
     if (!world) return;
     try {
-      await fetch("/api/novel/auto/pause", {
+      await apiFetch("/api/novel/auto/pause", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title }),
@@ -351,7 +531,7 @@ const Home: React.FC<HomeProps> = (props) => {
   async function resumeAutoRun() {
     if (!world) return;
     try {
-      const res = await fetch("/api/novel/auto/start", {
+      const res = await apiFetch("/api/novel/auto/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title }),
@@ -371,19 +551,19 @@ const Home: React.FC<HomeProps> = (props) => {
     if (!world) return;
     try {
       // ① 立即打断当前章（阶段边界丢弃草稿，零污染）
-      await fetch("/api/novel/intervene", {
+      await apiFetch("/api/novel/intervene", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, action: "interrupt", kind: "user-stop", detail: "用户取消连载任务" }),
       });
       // ② 停止连载（章边界停下）
-      await fetch("/api/novel/auto/stop", {
+      await apiFetch("/api/novel/auto/stop", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title }),
       });
       // ③ 清理会话与暂存区，回空闲
-      await fetch("/api/novel/auto/clear-session", {
+      await apiFetch("/api/novel/auto/clear-session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title }),
@@ -404,7 +584,7 @@ const Home: React.FC<HomeProps> = (props) => {
   async function confirmPendingCommit() {
     if (!world) return;
     try {
-      const res = await fetch("/api/novel/chapter/confirm", {
+      const res = await apiFetch("/api/novel/chapter/confirm", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title }),
@@ -425,7 +605,7 @@ const Home: React.FC<HomeProps> = (props) => {
   async function rejectPendingCommit() {
     if (!world) return;
     try {
-      const res = await fetch("/api/novel/chapter/reject", {
+      const res = await apiFetch("/api/novel/chapter/reject", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title }),
@@ -444,7 +624,7 @@ const Home: React.FC<HomeProps> = (props) => {
   async function cancelAdvance() {
     if (!world) return;
     try {
-      await fetch("/api/novel/intervene", {
+      await apiFetch("/api/novel/intervene", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, action: "interrupt", kind: "user-stop", detail: "用户取消推进" }),
@@ -460,7 +640,7 @@ const Home: React.FC<HomeProps> = (props) => {
     if (!world) return false;
     if (!requireIdle()) return false; // 运行锁：任务运行中禁止一切设定/角色/大纲编辑（含干预策略）
     try {
-      const res = await fetch("/api/novel/world", {
+      const res = await apiFetch("/api/novel/world", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, ...patch, ...(strategy ? { strategy } : {}) }),
@@ -508,7 +688,7 @@ const Home: React.FC<HomeProps> = (props) => {
     if (!world) return;
     if (!requireIdle()) return; // 运行锁：角色入册属编辑类操作
     try {
-      const res = await fetch("/api/novel/proposal", {
+      const res = await apiFetch("/api/novel/proposal", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, proposalId, action }),
@@ -528,7 +708,7 @@ const Home: React.FC<HomeProps> = (props) => {
     if (!world || outlineBusy) return null;
     setOutlineBusy(true);
     try {
-      const res = await fetch("/api/novel/outline", {
+      const res = await apiFetch("/api/novel/outline", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, hint }),
@@ -564,7 +744,7 @@ const Home: React.FC<HomeProps> = (props) => {
     setBusy(true);
     setBusyPhase("保存并审查中…");
     try {
-      const res = await fetch("/api/novel/chapter/edit", {
+      const res = await apiFetch("/api/novel/chapter/edit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, index: c.index, text: draft }),
@@ -594,7 +774,7 @@ const Home: React.FC<HomeProps> = (props) => {
     setBusy(true);
     setBusyPhase("重算本章账本中…");
     try {
-      const res = await fetch("/api/novel/chapter/resettle", {
+      const res = await apiFetch("/api/novel/chapter/resettle", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, index: c.index }),
@@ -633,7 +813,7 @@ const Home: React.FC<HomeProps> = (props) => {
         .map((f) => `[${lensCn(f.lens)}/${severityCn(f.severity)}] ${f.issue}（原文：${f.evidence}）建议：${f.suggestion}`)
         .join("\n");
       const autoFix = c.review?.verdict === "revise" && findingsText ? `按以下审查意见修复本章：\n${findingsText}` : undefined;
-      const res = await fetch("/api/novel/chapter/regenerate", {
+      const res = await apiFetch("/api/novel/chapter/regenerate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, index: c.index, instruction: cmd.trim() || autoFix || undefined }),
@@ -669,7 +849,7 @@ const Home: React.FC<HomeProps> = (props) => {
     setBusy(true);
     setBusyPhase("审查中…");
     try {
-      const res = await fetch("/api/novel/chapter/review", {
+      const res = await apiFetch("/api/novel/chapter/review", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, index: c.index }),
@@ -704,7 +884,7 @@ const Home: React.FC<HomeProps> = (props) => {
     );
     try {
       const isUpload = kind === "cover" && typeof args?.dataUrl === "string";
-      const res = await fetch(isUpload ? "/api/novel/cover/upload" : "/api/novel/image", {
+      const res = await apiFetch(isUpload ? "/api/novel/cover/upload" : "/api/novel/image", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(isUpload ? { title: world.title, dataUrl: args!.dataUrl } : { title: world.title, kind, ...args }),
@@ -738,6 +918,25 @@ const Home: React.FC<HomeProps> = (props) => {
   // 角色视觉后台自动生成中（立项 / 确认入册 / 手动新增角色后轮询 /api/novel/visual/status；期间中枢显示「自动生成角色头像/立绘中…」）
   const [visualGen, setVisualGen] = useState(false);
   const visualTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
+  // 中枢四维状态派生（零 LLM，前端从 world + 运行时信号确定性派生；驱动底部状态条中枢图标的神态与脉冲）
+  // busy 口径：单章推进 busyPhase / 角色视觉后台生成 / 连载运行 任一即视为中枢忙碌（图标脉动表达 loading）
+  const brainBusy = Boolean(busyPhase) || visualGen || autoSession?.status === "running";
+  // 活动描述（busy title 展示中枢正在做什么；paused 为 busy 口径扩展预留，非忙碌时 title 显示「待命」）
+  const brainAction =
+    busyPhase ||
+    (visualGen ? "自动生成角色头像/立绘中…" : "") ||
+    ((autoSession?.status === "running" || autoSession?.status === "paused")
+      ? (autoSession?.phase ? `连载·${autoSession.phase}` : "连载中")
+      : "");
+  const brainState = useMemo(
+    () => deriveBrainState(world, {
+      busy: brainBusy,
+      phase: busyPhase || (visualGen ? "自动生成角色头像/立绘中…" : "") || (autoSession?.status === "running" ? autoSession.phase : ""),
+      visualGen,
+      autoRunning: autoSession?.status === "running",
+    }),
+    [world, brainBusy, busyPhase, visualGen, autoSession],
+  );
   // 角色全局立绘：大图预览 + 生成/重新生成（点击角色列表中的立绘或角色项触发）
   const [portraitView, setPortraitView] = useState<Character | null>(null);
   const [portraitBusy, setPortraitBusy] = useState(false);
@@ -774,7 +973,7 @@ const Home: React.FC<HomeProps> = (props) => {
     if (!world || !portraitView || portraitBusy) return;
     setPortraitBusy(true);
     try {
-      const res = await fetch("/api/novel/character/portrait", {
+      const res = await apiFetch("/api/novel/character/portrait", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, characterId: portraitView.id, description }),
@@ -805,7 +1004,7 @@ const Home: React.FC<HomeProps> = (props) => {
         const pending: string[] = [];
         for (const id of ids) {
           if (finished.has(id)) continue;
-          const r = await fetch("/api/novel/media/status", {
+          const r = await apiFetch("/api/novel/media/status", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ title: storyTitle, chapterIndex, mediaId: id }),
@@ -850,7 +1049,7 @@ const Home: React.FC<HomeProps> = (props) => {
     setVisualGen(true);
     visualTimer.current = setInterval(async () => {
       try {
-        const r = await fetch("/api/novel/visual/status", {
+        const r = await apiFetch("/api/novel/visual/status", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ title: storyTitle }),
@@ -887,7 +1086,7 @@ const Home: React.FC<HomeProps> = (props) => {
   useEffect(() => {
     if (!world || visualTimer.current) return;
     let cancelled = false;
-    fetch("/api/novel/visual/status", {
+    apiFetch("/api/novel/visual/status", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title: world.title }),
@@ -901,6 +1100,13 @@ const Home: React.FC<HomeProps> = (props) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [world]);
 
+  // SSR 预载路径恢复（initialData 直接进 playing，不走 openStory）：挂载后恢复单章推进任务状态
+  useEffect(() => {
+    if (!props.initialData?.world) return;
+    void restoreAdvanceTask(props.initialData.world.title);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   /** 分镜：LLM 挑选关键场景 → 弹出确认窗（不直接生成）；240s 超时保护（服务端单次最长 90s，内部重试 + 外层重试共 3 次预算） */
   async function planMedia(kind: "image" | "video", count: number) {
     if (!world || !shownChapter || busy || mediaGen) return;
@@ -910,7 +1116,7 @@ const Home: React.FC<HomeProps> = (props) => {
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 240_000); // 服务端单次分镜最长约 90s，失败自动重试（预留重试预算）
-      const res = await fetch("/api/novel/media/plan", {
+      const res = await apiFetch("/api/novel/media/plan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, chapterIndex, kind, count }),
@@ -939,7 +1145,7 @@ const Home: React.FC<HomeProps> = (props) => {
     const plan = mediaPlan;
     setMediaPlan(null);
     try {
-      const res = await fetch("/api/novel/media/generate", {
+      const res = await apiFetch("/api/novel/media/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, chapterIndex: plan.chapterIndex, kind: plan.kind, scenes: plan.scenes }),
@@ -971,7 +1177,7 @@ const Home: React.FC<HomeProps> = (props) => {
       if (media.kind === "image") {
         setBusy(true);
         setBusyPhase("AI 重新生成插画中…");
-        const res = await fetch("/api/novel/media/regenerate", {
+        const res = await apiFetch("/api/novel/media/regenerate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ title: world.title, chapterIndex, mediaId: media.id, prompt }),
@@ -981,7 +1187,7 @@ const Home: React.FC<HomeProps> = (props) => {
         await refreshWorld();
         showToast("插画已重新生成");
       } else {
-        const res = await fetch("/api/novel/media/regenerate", {
+        const res = await apiFetch("/api/novel/media/regenerate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ title: world.title, chapterIndex, mediaId: media.id, prompt }),
@@ -1006,7 +1212,7 @@ const Home: React.FC<HomeProps> = (props) => {
     const label = m.kind === "video" ? "视频" : "插画";
     askConfirm(`确定删除该${label}？对应文件将被移除，删除后不可恢复。`, async () => {
       try {
-        const res = await fetch("/api/novel/media/delete", {
+        const res = await apiFetch("/api/novel/media/delete", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ title: world.title, chapterIndex, mediaId: m.id }),
@@ -1040,7 +1246,7 @@ const Home: React.FC<HomeProps> = (props) => {
     setBusy(true);
     setBusyPhase("评估删章影响…");
     try {
-      const res = await fetch("/api/novel/chapter/delete", {
+      const res = await apiFetch("/api/novel/chapter/delete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, chapterIndex: c.index }),
@@ -1064,7 +1270,7 @@ const Home: React.FC<HomeProps> = (props) => {
     setBusy(true);
     setBusyPhase(`删除第 ${index} 章中…`);
     try {
-      const res = await fetch("/api/novel/chapter/delete", {
+      const res = await apiFetch("/api/novel/chapter/delete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, chapterIndex: index, strategy: "merge" }),
@@ -1096,7 +1302,7 @@ const Home: React.FC<HomeProps> = (props) => {
         const last = data.world.chapters[data.world.chapters.length - 1];
         if (last) {
           try {
-            const rr = await fetch("/api/novel/chapter/resettle", {
+            const rr = await apiFetch("/api/novel/chapter/resettle", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ title: world.title, index: last.index }),
@@ -1129,7 +1335,7 @@ const Home: React.FC<HomeProps> = (props) => {
     setBusy(true);
     setBusyPhase("一致性巡检中…");
     try {
-      const res = await fetch("/api/novel/integrity", {
+      const res = await apiFetch("/api/novel/integrity", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, action: "scan" }),
@@ -1151,7 +1357,7 @@ const Home: React.FC<HomeProps> = (props) => {
     setBusy(true);
     setBusyPhase("修复一致性问题…");
     try {
-      const res = await fetch("/api/novel/integrity", {
+      const res = await apiFetch("/api/novel/integrity", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, action: "repair" }),
@@ -1175,7 +1381,7 @@ const Home: React.FC<HomeProps> = (props) => {
   async function fetchAutoStatus() {
     if (!world) return null;
     try {
-      const res = await fetch(`/api/novel/auto/status?title=${encodeURIComponent(world.title)}`);
+      const res = await apiFetch(`/api/novel/auto/status?title=${encodeURIComponent(world.title)}`);
       const d = (await res.json()) as { session?: AutoSessionView | null; pending?: PendingChapterView | null; error?: string };
       if (d.error) return null;
       setAutoSession(d.session ?? null);
@@ -1239,7 +1445,7 @@ const Home: React.FC<HomeProps> = (props) => {
     void fetchAutoStatus(); // 运行前同步会话基础数据（控制台可用）
     let interrupted = false;
     try {
-      const res = await fetch("/api/novel/auto/start", {
+      const res = await apiFetch("/api/novel/auto/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, maxChapters: chapters }),
@@ -1317,7 +1523,7 @@ const Home: React.FC<HomeProps> = (props) => {
   async function skipAutoChapter() {
     if (!world || !autoSession) return;
     try {
-      const res = await fetch("/api/novel/auto/skip", {
+      const res = await apiFetch("/api/novel/auto/skip", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title }),
@@ -1336,7 +1542,7 @@ const Home: React.FC<HomeProps> = (props) => {
   async function discardAutoSession() {
     if (!world) return;
     try {
-      await fetch("/api/novel/auto/clear-session", {
+      await apiFetch("/api/novel/auto/clear-session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title }),
@@ -1352,7 +1558,7 @@ const Home: React.FC<HomeProps> = (props) => {
   async function stopAutoRun() {
     if (!world) return;
     try {
-      await fetch("/api/novel/auto/stop", {
+      await apiFetch("/api/novel/auto/stop", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title }),
@@ -1367,7 +1573,7 @@ const Home: React.FC<HomeProps> = (props) => {
   async function interruptAutoRun() {
     if (!world) return;
     try {
-      const res = await fetch("/api/novel/intervene", {
+      const res = await apiFetch("/api/novel/intervene", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, action: "interrupt", kind: "user-stop", detail: "用户手动打断" }),
@@ -1387,7 +1593,7 @@ const Home: React.FC<HomeProps> = (props) => {
     setBusy(true);
     setBusyPhase("回溯重写中…");
     try {
-      const res = await fetch("/api/novel/rewrite", {
+      const res = await apiFetch("/api/novel/rewrite", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, action: "start" }),
@@ -1408,7 +1614,7 @@ const Home: React.FC<HomeProps> = (props) => {
     if (!world) return;
     if (!requireIdle()) return; // 运行锁：队列清理属编辑类
     try {
-      await fetch("/api/novel/rewrite", {
+      await apiFetch("/api/novel/rewrite", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, action: "clear" }),
@@ -1498,7 +1704,7 @@ const Home: React.FC<HomeProps> = (props) => {
     if (!world || !c) return;
     if (!requireIdle()) return; // 运行锁：版本切换禁止
     try {
-      const res = await fetch("/api/novel/chapter/rollback", {
+      const res = await apiFetch("/api/novel/chapter/rollback", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, index: c.index, versionIndex }),
@@ -1520,7 +1726,7 @@ const Home: React.FC<HomeProps> = (props) => {
     if (!world) return null;
     if (!requireIdle()) return null; // 运行锁：世界书/设定编辑禁止
     try {
-      const res = await fetch("/api/novel/lore", {
+      const res = await apiFetch("/api/novel/lore", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, action, entries }),
@@ -1540,7 +1746,7 @@ const Home: React.FC<HomeProps> = (props) => {
   async function toggleLock(characterId: string, field: string, locked: boolean): Promise<boolean> {
     if (!world) return false;
     try {
-      const res = await fetch("/api/novel/lock", {
+      const res = await apiFetch("/api/novel/lock", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title, characterId, field, locked }),
@@ -1662,11 +1868,20 @@ const Home: React.FC<HomeProps> = (props) => {
     syncActive(); // 弹窗打开 / 题材变化时同步高亮（客户端 only）
   }, [genre, showNewStory]);
 
+  // 未登录：整页展示登录 / 注册（动效登录页）；登录成功后进入首页
+  if (!user) {
+    return <AuthPage onAuthed={(u) => setUser(u)} />;
+  }
+
   return (
     <>
       {phase === "landing" && (
         <div className="landing landing-list">
           <header className="landing-header">
+            <div className="landing-user">
+              <span className="landing-user-name">{user.displayName || user.username}</span>
+              <button className="btn btn-ghost btn-sm" onClick={logout} title="退出登录"><LogOut size={14} /> 退出</button>
+            </div>
             <span className="landing-seal" aria-hidden="true">墨 枢</span>
           </header>
 
@@ -1771,14 +1986,8 @@ const Home: React.FC<HomeProps> = (props) => {
             status={statusText}
             chapter={shownChapter}
             onBackToList={backToList}
+            onOpenMemoryAudit={() => setShowMemoryAudit(true)}
             onOpenSettings={() => { setShowSettings(true); void refreshWorld(); }}
-            brain={(
-              <BrainIndicator
-                action={busyPhase || (visualGen ? "自动生成角色头像/立绘中…" : "") || ((autoSession?.status === "running" || autoSession?.status === "paused") && autoSession.phase ? `连载·${autoSession.phase}` : "")}
-                busy={Boolean(busyPhase) || visualGen || autoSession?.status === "running"}
-                onClick={() => setShowMemoryAudit(true)}
-              />
-            )}
           />
 
           <div className="game-grid">
@@ -1815,14 +2024,14 @@ const Home: React.FC<HomeProps> = (props) => {
                         <button className="btn-save" onClick={openReviewPanel}><Search size={13} /> 审查报告</button>
                       )
                     )}
-                    <button className="btn-save" onClick={startEdit}><PenLine size={13} /> 编辑</button>
+                    <button className="btn-save" onClick={startEdit} disabled={taskActive} title={taskActive ? "任务运行中已禁止编辑——可浏览正文，写操作请先取消任务" : undefined}><PenLine size={13} /> 编辑</button>
                     <button className="btn-save" data-menu-trigger onClick={toggleChapterMenu}><MoreHorizontal size={13} /> 更多 <ChevronDown size={11} className="chevron" /></button>
                   </div>
                 )}
                 {editing && (
                   <div className="editor-tools">
                     <button className="btn" onClick={() => setEditing(false)}>取消</button>
-                    <button className="btn btn-primary" onClick={saveEdit} disabled={busy} title={busy ? "任务运行中已禁止内容修订——请先取消任务" : undefined}>
+                    <button className="btn btn-primary" onClick={saveEdit} disabled={taskActive} title={taskActive ? "任务运行中已禁止内容修订——请先取消任务" : undefined}>
                       {busy ? "保存中…" : "保存修改"}
                     </button>
                   </div>
@@ -1870,19 +2079,52 @@ const Home: React.FC<HomeProps> = (props) => {
             <StatusPanel world={world} busyPhase={busyPhase} currentChapter={shownChapter?.index ?? null} onViewPortrait={(c) => openPortrait(c, true)} />
           </div>
 
-          {/* P3.5 新角色提案横幅：确认前不入册、不写入正文 */}
-          {pendingProposals.length > 0 && (
-            <div style={{ padding: "0.5rem 1rem", borderTop: "1px dashed var(--line-strong)", background: "var(--paper-dark)", display: "flex", alignItems: "center", gap: "0.7rem", flexWrap: "wrap", fontSize: "0.78rem" }}>
-              <b style={{ fontFamily: "var(--sans)" }}>新角色提案（{pendingProposals.length}）：</b>
-              {pendingProposals.slice(0, 3).map((p) => (
-                <span key={p.id} style={{ display: "inline-flex", alignItems: "center", gap: "0.35rem", border: "1px solid var(--line)", padding: "0.15rem 0.5rem", background: "var(--paper)" }}>
-                  「{p.name}」{p.role}（{p.source === "gacha" ? "抽卡" : "剧情"}）
-                  <button className="btn-save" disabled={busy} onClick={() => proposalAction(p.id, "confirm")}>确认入册</button>
-                  <button className="btn-save btn-danger-sm" disabled={busy} onClick={() => proposalAction(p.id, "reject")}>拒绝</button>
-                </span>
-              ))}
-              {pendingProposals.length > 3 && <span style={{ color: "var(--ink-soft)" }}>…等 {pendingProposals.length} 项</span>}
-            </div>
+          {/* P3.5 新角色提案横幅：确认前不入册、不写入正文；折叠单行 + 可关闭 + 展开抽屉（200ms 自底部向上覆盖三栏） */}
+          {pendingProposals.length > 0 && !proposalClosed && (
+            <>
+              {/* 折叠态：单行（不折行），超长省略，操作入口在展开抽屉 */}
+              {!proposalExpanded && (
+                <div className="proposal-bar">
+                  <b className="proposal-bar-title">新角色提案（{pendingProposals.length}）：</b>
+                  <span
+                    className="proposal-bar-items"
+                    title={pendingProposals.map((p) => `「${p.name}」${p.role}${p.reason ? "：推荐原因 " + p.reason : ""}`).join("\n")}
+                  >
+                    {pendingProposals.slice(0, 3).map((p) => `「${p.name}」${p.role}（${p.source === "gacha" ? "抽卡" : "剧情"}）`).join(" · ")}
+                    {pendingProposals.length > 3 ? ` …等 ${pendingProposals.length} 项` : ""}
+                  </span>
+                  <span className="proposal-bar-actions">
+                    <button className="proposal-bar-icon" onClick={() => setProposalExpanded(true)} title="展开查看推荐原因与动机，可确认/拒绝"><ChevronDown size={15} /></button>
+                    <button className="proposal-bar-icon" onClick={() => savePropClosed(true)} title="关闭新角色提案提示"><X size={15} /></button>
+                  </span>
+                </div>
+              )}
+              {/* 展开态：绝对定位于 game-grid 区域，height 0→100% 200ms 从底部向顶部覆盖三栏（顶部不超过 game-grid 顶） */}
+              <div className={`proposal-drawer${proposalExpanded ? " open" : ""}`}>
+                <div className="proposal-drawer-head">
+                  <b>新角色提案（{pendingProposals.length}）</b>
+                  <span className="proposal-drawer-hint">确认入册后角色可登场；拒绝则移除提案</span>
+                  <button className="proposal-bar-icon proposal-bar-collapse" onClick={() => setProposalExpanded(false)} title="收起"><ChevronDown size={15} /></button>
+                  <button className="proposal-bar-icon" onClick={() => { setProposalExpanded(false); savePropClosed(true); }} title="关闭新角色提案"><X size={15} /></button>
+                </div>
+                <div className="proposal-drawer-list">
+                  {pendingProposals.map((p) => (
+                    <div key={p.id} className="proposal-item">
+                      <div className="proposal-item-main">
+                        <span className="proposal-item-name">「{p.name}」{p.role}</span>
+                        <span className="proposal-item-source">{p.source === "gacha" ? "抽卡" : "剧情"}</span>
+                        {p.reason && <p className="proposal-reason">推荐原因：{p.reason}</p>}
+                        {p.motivation && <p className="proposal-item-meta">动机：{p.motivation}</p>}
+                      </div>
+                      <div className="proposal-item-actions">
+                        <button className="btn-save btn-xs" disabled={taskActive} onClick={() => proposalAction(p.id, "confirm")}>确认入册</button>
+                        <button className="btn-save btn-xs btn-danger-sm" disabled={taskActive} onClick={() => proposalAction(p.id, "reject")}>拒绝</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>
           )}
 
           {toast && (
@@ -1891,28 +2133,34 @@ const Home: React.FC<HomeProps> = (props) => {
 
           {/* 底部控制条：角色入口（最左）+ 状态 + 指令输入 + 抽卡 + 推进 */}
           <nav className="control-bar">
-            {/* 手工处理类入口：运行锁统一由 requireIdle/taskActive 管控（任务运行中全面禁止） */}
-            <button className="bar-icon-btn" title={taskActive ? "任务运行中已禁止角色编辑——请先取消任务" : "角色与关系"} onClick={() => { if (requireIdle()) setRelModal({ editable: true, charId: null }); }}>
+            {/* 手工处理类入口：任务运行中允许打开浏览（只读模式），空闲时可编辑 */}
+            <button className="bar-icon-btn" title={taskActive ? "角色与关系（任务运行中，只读）" : "角色与关系"} onClick={() => setRelModal({ editable: !taskActive, charId: null })}>
               <Users size={17} />
             </button>
-            <button className="bar-icon-btn" title={taskActive ? "任务运行中已禁止伏笔编辑——请先取消任务" : "伏笔账（增删改）"} onClick={() => { if (requireIdle()) setShowForeshadow(true); }}>
+            <button className="bar-icon-btn" title={taskActive ? "伏笔账（任务运行中，只读）" : "伏笔账（增删改）"} onClick={() => setShowForeshadow(true)}>
               <BookMarked size={16} />
             </button>
             <span className="bar-status">
-              <span className={`status-light ${busy ? "busy" : "ok"}`} />
-              <span className="bar-status-text">{statusText}</span>
+              <button
+                className={`bar-status-brain${brainBusy ? " busy" : ""}`}
+                title={brainBusy ? `中枢运行中：${brainAction}（点击打开中枢）` : "中枢待命（点击打开中枢）"}
+                onClick={() => setShowBrainCabin(true)}
+              >
+                <BrainCore presence={brainState?.presence ?? "standby"} activity={brainState?.activity ?? "idle"} size="mini" px={17} />
+                <span className="bar-status-text">{statusText}</span>
+              </button>
             </span>
             <input
               className="cmd-input"
               placeholder="指令：让主角…（Enter 推进）"
               value={cmd}
               onChange={(e) => setCmd(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter" && !busy) advance(); }}
+              onKeyDown={(e) => { if (e.key === "Enter" && !taskActive) advance(); }}
             />
-            <button className="btn btn-ghost" onClick={() => setShowGacha(true)} disabled={busy || autoRunning} title={busy || autoRunning ? "任务运行中已禁用（抽卡属 AI 类操作）" : undefined}>
+            <button className="btn btn-ghost" onClick={() => setShowGacha(true)} disabled={taskActive} title={taskActive ? "任务运行中已禁用（抽卡属 AI 类操作）" : undefined}>
               <Dices size={15} /> 抽卡
             </button>
-            <button className="btn btn-ghost" onClick={() => setShowEval(true)} disabled={busy || autoRunning || !world.chapters.length} title={busy || autoRunning ? "任务运行中已禁用（评估属 AI 类操作）" : "整书 8 维评估 + 质量债务"}>
+            <button className="btn btn-ghost" onClick={() => setShowEval(true)} disabled={taskActive || !world.chapters.length} title={taskActive ? "任务运行中已禁用（评估属 AI 类操作）" : "整书 8 维评估 + 质量债务"}>
               <Search size={15} /> 评估
             </button>
             {autoRunning ? (
@@ -1935,10 +2183,10 @@ const Home: React.FC<HomeProps> = (props) => {
             </button>
             {!autoRunning && (
               <div className="advance-wrap">
-                <button className="btn btn-primary" onClick={() => { if (!busy) setAdvanceMenu((m) => !m); }} disabled={busy} title="推进剧情：写下一章（点击展开更多选项）">
-                  {busy ? "进行中…" : (<><Play size={15} /> 推进剧情 <ChevronDown size={13} /></>)}
+                <button className="btn btn-primary" onClick={() => { if (!taskActive) setAdvanceMenu((m) => !m); }} disabled={taskActive} title="推进剧情：写下一章（点击展开更多选项）">
+                  {taskActive ? "进行中…" : (<><Play size={15} /> 推进剧情 <ChevronDown size={13} /></>)}
                 </button>
-                {advanceMenu && !busy && (
+                {advanceMenu && !taskActive && (
                   <div className="advance-menu">
                     <button className="advance-menu-item" onClick={() => { setAdvanceMenu(false); advance(); }} title="写一章：AI 导演按本章计划写下一章并自动审查提交">
                       <Play size={13} /> 本章续写
@@ -1954,16 +2202,28 @@ const Home: React.FC<HomeProps> = (props) => {
           {(world.rewriteQueue ?? []).length > 0 && (
             <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", marginTop: "0.5rem", fontSize: "0.78rem", padding: "0.4rem 0.7rem", background: "var(--paper-dark)", border: "1px dashed var(--line)" }}>
               <span>{(world.rewriteQueue ?? []).length} 章待回溯重写（受 L2 变更影响）</span>
-              <button className="btn-save btn-xs" onClick={runRewrite} disabled={busy || autoRunning} title={busy || autoRunning ? "任务运行中已禁用（AI 重写）" : undefined}><PenLine size={11} /> 开始重写</button>
-              <button className="btn-save btn-xs" onClick={clearRewriteQueue} disabled={busy}>清空队列</button>
+              <button className="btn-save btn-xs" onClick={runRewrite} disabled={taskActive} title={taskActive ? "任务运行中已禁用（AI 重写）" : undefined}><PenLine size={11} /> 开始重写</button>
+              <button className="btn-save btn-xs" onClick={clearRewriteQueue} disabled={taskActive}>清空队列</button>
             </div>
           )}
         </div>
       )}
 
-      {/* 中枢弹窗一：分层记忆 · 台账 · 操作日志（点击报头中枢指示器打开） */}
+      {/* 中枢弹窗一：分层记忆 · 台账 · 操作日志（对话舱「记忆·台账」按钮打开） */}
       {showMemoryAudit && world && (
         <MemoryAuditModal world={world} onClose={() => setShowMemoryAudit(false)} />
+      )}
+
+      {/* 中枢对话舱：卡片式浏览 + 智能控制（报头中枢指示器点击打开） */}
+      {showBrainCabin && world && (
+        <BrainCabin
+          open={showBrainCabin}
+          onClose={() => setShowBrainCabin(false)}
+          world={world}
+          brainState={brainState}
+          onWorldUpdate={() => { void refreshWorld(); }}
+          onProposalTalk={() => savePropClosed(false)}
+        />
       )}
 
       {/* 任务中心（弹窗二）：连载/推进任务进度步骤可视化 + 暂停/恢复/移除/取消 + 确认入册 */}
@@ -2157,6 +2417,7 @@ const Home: React.FC<HomeProps> = (props) => {
                   realIdx={realIdx}
                   isCurrent={sameAsCurrent}
                   world={world}
+                  taskActive={taskActive}
                   onRollback={(vi) => askConfirm(`确定回滚到版本 ${vi + 1}？当前内容将被替换。`, () => rollback(vi))}
                   onOpenChar={(id) => setRelModal({ editable: false, charId: id })}
                   activeCharId={relModal && !relModal.editable ? relModal.charId : null}
@@ -2347,13 +2608,7 @@ const Home: React.FC<HomeProps> = (props) => {
         />
       )}
 
-      {/* 全局 Loading 遮罩 */}
-      {busy && (
-        <div className="loading-overlay">
-          <div className="loading-spinner" />
-          <div className="loading-text">{busyPhase || "处理中…"}</div>
-        </div>
-      )}
+      {/* 全局 Loading 已移除：推进剧情/连载时不再全屏阻塞——进度通过报头中枢指示器（busyPhase）+ 任务中心面板 + 实时写作预览（liveDraft）展示，用户可自由浏览正文/版本/审查 */}
 
       {/* 浮动下拉菜单（body 层级，不受父容器 overflow/z-index 影响） */}
       {chapterMenu && (
@@ -2378,22 +2633,22 @@ const Home: React.FC<HomeProps> = (props) => {
                 const imgCount = (shownChapter?.media ?? []).filter((x) => x.kind === "image").length;
                 const overLimit = imgCount + n > 3;
                 return (
-                  <button key={n} className="menu-imgen-num" disabled={busy || !!mediaGen || overLimit} title={overLimit ? `本章已有 ${imgCount} 张插画（上限 3 张），请先删除部分插画` : undefined} onClick={() => { setChapterMenu(null); void planMedia("image", n); }}>{n}张</button>
+                  <button key={n} className="menu-imgen-num" disabled={taskActive || !!mediaGen || overLimit} title={overLimit ? `本章已有 ${imgCount} 张插画（上限 3 张），请先删除部分插画` : taskActive ? "任务运行中已禁用" : undefined} onClick={() => { setChapterMenu(null); void planMedia("image", n); }}>{n}张</button>
                 );
               })}
             </span>
           </div>
-          <button onClick={() => { void planMedia("video", 1); setChapterMenu(null); }} disabled={busy || !!mediaGen}><Video size={14} /> 生成视频</button>
-          <button onClick={() => { reReview(); setChapterMenu(null); }} disabled={busy}><Search size={14} /> 重新审查</button>
+          <button onClick={() => { void planMedia("video", 1); setChapterMenu(null); }} disabled={taskActive || !!mediaGen}><Video size={14} /> 生成视频</button>
+          <button onClick={() => { reReview(); setChapterMenu(null); }} disabled={taskActive}><Search size={14} /> 重新审查</button>
           {shownChapter?.review?.verdict === "revise" ? (
-            <button onClick={() => { setChapterMenu(null); askConfirm("确定要按审查意见 AI 修复本章？当前内容将被覆盖（可在版本历史中回滚）。", regenerate); }} disabled={busy || autoRunning} title={busy || autoRunning ? "任务运行中已禁用（AI 修复）" : undefined}><Sparkles size={14} /> AI 修复本章</button>
+            <button onClick={() => { setChapterMenu(null); askConfirm("确定要按审查意见 AI 修复本章？当前内容将被覆盖（可在版本历史中回滚）。", regenerate); }} disabled={taskActive} title={taskActive ? "任务运行中已禁用（AI 修复）" : undefined}><Sparkles size={14} /> AI 修复本章</button>
           ) : (
-            <button onClick={() => { setChapterMenu(null); askConfirm("确定要 AI 重写本章？当前内容将被覆盖（可在版本历史中回滚）。", regenerate); }} disabled={busy}><Sparkles size={14} /> AI 重写本章</button>
+            <button onClick={() => { setChapterMenu(null); askConfirm("确定要 AI 重写本章？当前内容将被覆盖（可在版本历史中回滚）。", regenerate); }} disabled={taskActive}><Sparkles size={14} /> AI 重写本章</button>
           )}
-          <button onClick={() => { setChapterMenu(null); askConfirm("以当前正文重新结算本章账本（角色状态/伏笔/时间线）？正文与审查不变；删除该章时恢复将更精确。", resettleChapter); }} disabled={busy || autoRunning} title={busy || autoRunning ? "任务运行中已禁用（重算账本）" : undefined}><RefreshCw size={14} /> 重算本章账本</button>
-          <button onClick={() => { void runIntegrityScan(); }} disabled={busy}><Search size={14} /> 一致性巡检</button>
+          <button onClick={() => { setChapterMenu(null); askConfirm("以当前正文重新结算本章账本（角色状态/伏笔/时间线）？正文与审查不变；删除该章时恢复将更精确。", resettleChapter); }} disabled={taskActive} title={taskActive ? "任务运行中已禁用（重算账本）" : undefined}><RefreshCw size={14} /> 重算本章账本</button>
+          <button onClick={() => { void runIntegrityScan(); }} disabled={taskActive} title={taskActive ? "任务运行中已禁用（一致性巡检）" : undefined}><Search size={14} /> 一致性巡检</button>
           {/* 删章属编辑类：运行锁统一禁止（函数内 requireIdle 兜底） */}
-          <button onClick={() => { void requestDeleteChapter(); }} disabled={busy || !!mediaGen}><AlertTriangle size={14} /> 删除本章</button>
+          <button onClick={() => { void requestDeleteChapter(); }} disabled={taskActive || !!mediaGen}><AlertTriangle size={14} /> 删除本章</button>
         </div>
       )}
     </>
@@ -2407,6 +2662,8 @@ const VersionItem: React.FC<{
   /** 该版本内容与章节当前内容完全一致（标题/正文/审查）→ 无回滚意义，禁用按钮 */
   isCurrent?: boolean;
   world: WorldState;
+  /** 任务运行中（软阻塞：禁用回滚等写操作，但可展开/查看审查） */
+  taskActive?: boolean;
   onRollback: (versionIndex: number) => void;
   /** 版本内审查面板的角色弹窗接线（顶层共享实例） */
   onOpenChar?: (charId: string) => void;
@@ -2440,8 +2697,8 @@ const VersionItem: React.FC<{
         )}
         <button
           className="btn-save btn-danger-sm"
-          disabled={p.isCurrent}
-          title={p.isCurrent ? "当前内容已与该版本一致，无需回滚" : undefined}
+          disabled={p.isCurrent || p.taskActive}
+          title={p.isCurrent ? "当前内容已与该版本一致，无需回滚" : p.taskActive ? "任务运行中已禁止回滚——请先取消任务" : undefined}
           onClick={() => p.onRollback(p.realIdx)}
         >
           {p.isCurrent ? "= 当前内容" : "回滚到此版本"}

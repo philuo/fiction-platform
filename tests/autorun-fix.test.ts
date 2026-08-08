@@ -76,6 +76,13 @@ beforeAll(() => {
 });
 afterAll(() => {
   process.chdir(oldCwd);
+  // resumeAutoSessions 会经 listUsernames 初始化 db（临时库）：先关闭释放句柄再删目录（Windows 文件锁）
+  const { getDb } = require("../src/api/db") as typeof import("../src/api/db");
+  try {
+    getDb().close();
+  } catch {
+    /* 未初始化则忽略 */
+  }
   rmSync(tmp, { recursive: true, force: true });
 });
 

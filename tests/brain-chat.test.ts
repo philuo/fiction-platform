@@ -1,0 +1,666 @@
+// 中枢对话编排（brain-chat）测试：意图映射完整性 + L0 查询执行 + 事件协议 v2（intent/delta/card/done/interrupted）
+// 隔离策略：不用 mock.module（Bun 进程级注册会污染同进程其他测试文件），
+// 而是替换 brain-chat 的依赖注入点 brainChatDeps + BRAIN_SESSIONS_DATA_DIR 临时目录。
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { emptyWorld, type WorldState } from "../src/api/world";
+import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues } from "../src/api/brain-chat";
+import { getSession as sessGet, lastPendingMessage as sessLastPending } from "../src/api/brain-sessions";
+import type { ChatMessage } from "../src/api/agnes";
+
+// —— 注入替身（替代 mock.module）：chatJson 返回 nextChatContent（JSON 字符串）；chatStream 逐字符真流式 + abort 检查 ——
+let nextChatContent = "";
+let chatJsonQueue: string[] = [];
+const originalDeps = { ...brainChatDeps };
+
+brainChatDeps.chatJson = (async (_msgs: ChatMessage[], _opts?: unknown) => {
+  if (chatJsonQueue.length) return JSON.parse(chatJsonQueue.shift() ?? "{}");
+  return JSON.parse(nextChatContent);
+}) as typeof brainChatDeps.chatJson;
+brainChatDeps.chatStream = (async (_msgs: ChatMessage[], onChunk: (d: string) => void, opts?: { signal?: AbortSignal }) => {
+  const text = nextChatContent;
+  let acc = "";
+  for (const ch of text) {
+    if (opts?.signal?.aborted) throw new DOMException("aborted", "AbortError");
+    acc += ch;
+    onChunk(ch);
+  }
+  return acc;
+}) as typeof brainChatDeps.chatStream;
+
+// loadWorld 注入：返回内存 mockWorld（不触碰真实磁盘）
+let mockWorld: WorldState | null = null;
+brainChatDeps.loadWorld = (() => mockWorld) as typeof brainChatDeps.loadWorld;
+
+// 会话持久化隔离：BRAIN_SESSIONS_DATA_DIR 指向临时目录，不污染真实 data/
+let sessDataDir = "";
+beforeAll(() => {
+  sessDataDir = mkdtempSync(join(tmpdir(), "brain-chat-sess-"));
+  process.env.BRAIN_SESSIONS_DATA_DIR = sessDataDir;
+});
+afterAll(() => {
+  rmSync(sessDataDir, { recursive: true, force: true });
+  delete process.env.BRAIN_SESSIONS_DATA_DIR;
+  // 还原真实依赖（同进程内后续文件不受影响）
+  brainChatDeps.chatJson = originalDeps.chatJson;
+  brainChatDeps.chatStream = originalDeps.chatStream;
+  brainChatDeps.loadWorld = originalDeps.loadWorld;
+});
+
+/** 收集一次回合的全部事件 */
+async function runTurn(prompt: string, opts: { sessionId?: string; resume?: boolean; signal?: AbortSignal } = {}): Promise<Record<string, unknown>[]> {
+  const events: Record<string, unknown>[] = [];
+  await brainChatStream({
+    title: "brain-chat-test",
+    prompt,
+    sessionId: opts.sessionId ?? "test-session",
+    send: (o) => events.push(o as Record<string, unknown>),
+    signal: opts.signal,
+    resume: opts.resume,
+  });
+  return events;
+}
+
+function mkWorld(): WorldState {
+  const w = emptyWorld();
+  w.title = "brain-chat-test";
+  w.nextChapter = 3;
+  w.chapters.push({ index: 1, title: "第一章", text: "林墨走入夜色中…", review: null });
+  w.characters.push({ id: "c1", name: "林墨", role: "主角", traits: ["冷静"], motivation: "查明真相", status: "调查中", introducedAt: 1 });
+  w.foreshadowing.push({ id: "f1", text: "神秘玉佩", plantedAt: 1, status: "planted" });
+  return w;
+}
+
+describe("INTENTS 意图映射", () => {
+  test("覆盖 16 类手动入口的核心操作", () => {
+    const keys = Object.keys(INTENTS);
+    // 推进/连载/抽卡/查询/评估/编辑/删章/重写/重算/媒体/巡检/导出/伏笔/对话
+    expect(keys).toContain("advance");
+    expect(keys).toContain("autostart");
+    expect(keys).toContain("autostop");
+    expect(keys).toContain("gacha");
+    expect(keys).toContain("read_chapter");
+    expect(keys).toContain("read_character");
+    expect(keys).toContain("read_foreshadow");
+    expect(keys).toContain("eval");
+    expect(keys).toContain("edit_world");
+    expect(keys).toContain("delete_chapter");
+    expect(keys).toContain("regenerate");
+    expect(keys).toContain("media_image");
+    expect(keys).toContain("integrity");
+    expect(keys).toContain("export");
+    expect(keys).toContain("chat");
+  });
+
+  test("每个意图有 commandId + level + title", () => {
+    for (const [k, v] of Object.entries(INTENTS)) {
+      expect(v.commandId).toMatch(/^CMD-/);
+      expect(["L0", "L1", "L2", "L3"]).toContain(v.level);
+      expect(v.title.length).toBeGreaterThan(0);
+    }
+  });
+
+  test("read_proposals：L0 只读意图（无 action，查询直接执行）", () => {
+    expect(INTENTS.read_proposals.level).toBe("L0");
+    expect(INTENTS.read_proposals.action).toBeUndefined();
+    expect(INTENTS.read_proposals.title).toContain("提案");
+  });
+
+  test("L2/L3 写操作有 action 端点", () => {
+    expect(INTENTS.advance.level).toBe("L2");
+    expect(INTENTS.advance.action?.endpoint).toBe("/api/novel/step");
+    expect(INTENTS.delete_chapter.level).toBe("L3");
+    expect(INTENTS.delete_chapter.action?.endpoint).toBe("/api/novel/chapter/delete");
+  });
+});
+
+describe("executeQuery（L0 查询直接执行）", () => {
+  test("read_chapter：找到章节 → BrowseCard", () => {
+    const w = mkWorld();
+    const card = executeQuery(w, "read_chapter", { index: 1 });
+    expect(card?.kind).toBe("browse");
+    expect(card?.browseType).toBe("chapter");
+  });
+
+  test("read_chapter：未找到 → ResultCard fail", () => {
+    const w = mkWorld();
+    const card = executeQuery(w, "read_chapter", { index: 99 });
+    expect(card?.kind).toBe("result");
+    expect(card?.success).toBe(false);
+  });
+
+  test("read_character：按名匹配 → BrowseCard", () => {
+    const w = mkWorld();
+    const card = executeQuery(w, "read_character", { name: "林墨" });
+    expect(card?.kind).toBe("browse");
+    expect(card?.browseType).toBe("character");
+  });
+
+  test("read_character：未找到 → ResultCard fail", () => {
+    const w = mkWorld();
+    const card = executeQuery(w, "read_character", { name: "不存在" });
+    expect(card?.kind).toBe("result");
+    expect(card?.success).toBe(false);
+  });
+
+  test("read_foreshadow → BrowseCard 含伏笔列表", () => {
+    const w = mkWorld();
+    const card = executeQuery(w, "read_foreshadow", {});
+    expect(card?.kind).toBe("browse");
+    expect(card?.browseType).toBe("foreshadow");
+  });
+
+  test("read_proposals：有 pending 提案 → BrowseCard(proposal) 含推荐原因与可交互操作", () => {
+    const w = mkWorld();
+    w.characterProposals = [
+      { id: "cp1", name: "小翠", role: "掌柜", traits: ["机灵"], motivation: "查清身世", reason: "与主角身世成谜呼应", source: "writer", status: "pending" },
+      { id: "cp2", name: "铁捕", role: "捕快", traits: [], motivation: "追凶", source: "gacha", status: "confirmed" }, // 非 pending 不出现
+    ];
+    const card = executeQuery(w, "read_proposals", {});
+    expect(card?.kind).toBe("browse");
+    expect(card?.browseType).toBe("proposal");
+    const list = (card!.data as { list: Record<string, unknown>[] }).list;
+    expect(list.length).toBe(1);
+    expect(list[0].name).toBe("小翠");
+    expect(list[0].reason).toBe("与主角身世成谜呼应");
+    const actions = list[0].actions as { label: string; danger?: boolean; action: { endpoint: string; body: Record<string, unknown> } }[];
+    expect(actions.length).toBe(2); // 确认入册 + 拒绝
+    expect(actions[0].label).toBe("确认入册");
+    expect(actions[0].action.endpoint).toBe("/api/novel/proposal");
+    // 端点字段完整：/api/novel/proposal 要求 title + proposalId + action（缺 title 会 400）
+    expect(actions[0].action.body).toEqual({ title: "brain-chat-test", proposalId: "cp1", action: "confirm" });
+    expect(actions[1].action.body).toEqual({ title: "brain-chat-test", proposalId: "cp1", action: "reject" });
+  });
+
+  test("read_proposals：无 pending 提案 → ResultCard 提示", () => {
+    const w = mkWorld();
+    const card = executeQuery(w, "read_proposals", {});
+    expect(card?.kind).toBe("result");
+    expect(card?.success).toBe(false);
+  });
+
+  test("eval：无落盘评估 → ResultCard 提示", () => {
+    const w = mkWorld();
+    const card = executeQuery(w, "eval", {});
+    expect(card?.kind).toBe("result");
+    expect(card?.success).toBe(false);
+  });
+
+  test("未知查询意图 → null", () => {
+    const w = mkWorld();
+    expect(executeQuery(w, "unknown", {})).toBeNull();
+  });
+
+  // —— Phase 1 查询扩展：read_chapters/read_characters/read_plans/read_tasks/read_logs/read_worldbook/read_media/read_review ——
+
+  test("read_chapters → BrowseCard(chapters) 含章进度 done/target 与列表", () => {
+    const w = mkWorld();
+    w.goal = { structure: { targetChapters: 10 } };
+    w.chapters[0].review = { verdict: "pass", scores: { coherence: 8, tension: 7, prose: 6, pacing: 7, dialogue: 7 }, findings: [], round: 1 };
+    const card = executeQuery(w, "read_chapters", {});
+    expect(card?.kind).toBe("browse");
+    expect(card?.browseType).toBe("chapters");
+    const d = card!.data as { done: number; target: number; list: Record<string, unknown>[] };
+    expect(d.done).toBe(1);
+    expect(d.target).toBe(10);
+    expect(d.list.length).toBe(1);
+    expect(d.list[0].index).toBe(1);
+    expect(d.list[0].score).toBe(8);
+    expect(d.list[0].status).toBe("已入册");
+  });
+
+  test("read_characters → BrowseCard(characters) 含统计网格与列表", () => {
+    const w = mkWorld();
+    const card = executeQuery(w, "read_characters", {});
+    expect(card?.kind).toBe("browse");
+    expect(card?.browseType).toBe("characters");
+    const d = card!.data as { stats: Record<string, unknown>; list: Record<string, unknown>[] };
+    expect(d.stats.total).toBe(1);
+    expect(d.list[0].name).toBe("林墨");
+    expect(d.list[0].appeared).toBe(0);
+    expect(d.list[0].portrait).toBe(false);
+  });
+
+  test("read_plans → BrowseCard(plans) 含卷/弧/章纲进度与 next", () => {
+    const w = mkWorld();
+    w.blueprint = { theme: "复仇", mainPlot: "", ending: "", compass: "终局对决", progressContract: "前十章铺垫", volumes: [{ id: "v1", title: "第一卷", goal: "觉醒", status: "writing" }] };
+    w.storyArcs = [{ id: "a1", volumeId: "v1", title: "身世之谜", goal: "揭开玉佩来历", arcType: "探索发现", status: "expanded", estChapters: 5 }];
+    w.chapterPlans = [
+      { index: 3, arcId: "a1", goal: "主角进入迷局", beats: [], hookType: "悬念", status: "planned" },
+      { index: 4, arcId: "a1", goal: "揭开一角", beats: [], hookType: "反转", status: "planned" },
+    ];
+    const card = executeQuery(w, "read_plans", {});
+    expect(card?.kind).toBe("browse");
+    expect(card?.browseType).toBe("plans");
+    const d = card!.data as { done: number; total: number; volumes: unknown[]; arcs: unknown[]; plans: Record<string, unknown>[]; next: Record<string, unknown> | null; compass: string };
+    expect(d.compass).toBe("终局对决");
+    expect(d.volumes.length).toBe(1);
+    expect(d.arcs.length).toBe(1);
+    expect(d.total).toBe(2);
+    expect(d.done).toBe(0);
+    expect(d.next?.index).toBe(3);
+    expect(d.plans[0].hookType).toBe("悬念");
+  });
+
+  test("read_tasks → BrowseCard(tasks) 质量债含 fix/ignore 操作 + 重写队列", () => {
+    const w = mkWorld();
+    w.qualityDebt = [{ id: "d1", chapterIndex: 2, lens: "continuity", issue: "角色状态前后矛盾", severity: "major", status: "open" }];
+    w.rewriteQueue = [2, 3];
+    const card = executeQuery(w, "read_tasks", {});
+    expect(card?.kind).toBe("browse");
+    expect(card?.browseType).toBe("tasks");
+    const d = card!.data as { debt: Record<string, unknown>[]; major: number; rewriteQueue: number[]; mergeTasks: string[]; goal: { disposition: string; chapterCount: number } };
+    expect(d.debt.length).toBe(1);
+    expect(d.major).toBe(1);
+    expect(d.rewriteQueue).toEqual([2, 3]);
+    const actions = d.debt[0].actions as { label: string; danger?: boolean; action: { endpoint: string; body: Record<string, unknown> } }[];
+    expect(actions.length).toBe(2);
+    expect(actions[0].action.endpoint).toBe("/api/novel/debt");
+    expect(actions[0].action.body).toEqual({ title: "brain-chat-test", id: "d1", action: "fix" });
+    expect(actions[1].action.body).toEqual({ title: "brain-chat-test", id: "d1", action: "ignore" });
+    expect(d.goal.disposition).toBe("continue");
+    expect(d.goal.chapterCount).toBe(1);
+  });
+
+  test("read_logs → BrowseCard(logs) 倒序含 commandId/level", () => {
+    const w = mkWorld();
+    w.changeLog = [
+      { at: "2025-01-01T00:00:00Z", chapter: 1, actor: "user", kind: "gacha-apply", detail: "抽卡应用 1 张", commandId: "CMD-W18", level: "L0" },
+      { at: "2025-01-01T00:01:00Z", chapter: 2, actor: "brain", kind: "brain-review", detail: "认可", commandId: "CMD-N06", level: "L2" },
+    ];
+    const card = executeQuery(w, "read_logs", {});
+    expect(card?.kind).toBe("browse");
+    expect(card?.browseType).toBe("logs");
+    const d = card!.data as { list: Record<string, unknown>[] };
+    expect(d.list.length).toBe(2);
+    expect(d.list[0].commandId).toBe("CMD-N06"); // 倒序：最近在前
+    expect(d.list[0].level).toBe("L2");
+  });
+
+  test("read_worldbook → BrowseCard(worldbook) 含设定与 lore", () => {
+    const w = mkWorld();
+    w.setting = { time: "明末", place: "江南", rules: ["江湖不出朝廷"], tone: "冷峻" };
+    w.lore = [{ id: "l1", keywords: ["玉佩"], content: "主角身世信物", enabled: true, auto: true }];
+    const card = executeQuery(w, "read_worldbook", {});
+    expect(card?.kind).toBe("browse");
+    expect(card?.browseType).toBe("worldbook");
+    const d = card!.data as { setting: { rules: string[] }; lore: Record<string, unknown>[] };
+    expect(d.setting.rules).toEqual(["江湖不出朝廷"]);
+    expect(d.lore.length).toBe(1);
+    expect(d.lore[0].keywords).toEqual(["玉佩"]);
+  });
+
+  test("read_media → BrowseCard(media) 统计插画/视频/角色立绘", () => {
+    const w = mkWorld();
+    w.chapters[0].media = [
+      { id: "m1", kind: "image", anchor: "夜色", status: "ready" },
+      { id: "m2", kind: "video", anchor: "走入", status: "pending" },
+    ];
+    w.characters[0].image = "portraits/linmo.png";
+    const card = executeQuery(w, "read_media", {});
+    expect(card?.kind).toBe("browse");
+    expect(card?.browseType).toBe("media");
+    const d = card!.data as { stats: { images: number; videos: number; characters: number }; list: Record<string, unknown>[] };
+    expect(d.stats.images).toBe(1);
+    expect(d.stats.videos).toBe(1);
+    expect(d.stats.characters).toBe(1);
+    expect(d.list.length).toBe(2);
+    expect(d.list[0].kind).toBe("image");
+  });
+
+  test("read_review：有审查报告 → BrowseCard(review) 含 5 维分数", () => {
+    const w = mkWorld();
+    w.chapters[0].review = { verdict: "pass", scores: { coherence: 8, tension: 7, prose: 6, pacing: 7, dialogue: 7 }, findings: [{ severity: "minor", lens: "pacing", issue: "中段略拖", evidence: "…", suggestion: "删减" }], round: 2 };
+    const card = executeQuery(w, "read_review", {});
+    expect(card?.kind).toBe("browse");
+    expect(card?.browseType).toBe("review");
+    const d = card!.data as { verdict: string; scores: Record<string, number>; findings: unknown[]; round: number };
+    expect(d.verdict).toBe("pass");
+    expect(d.scores.coherence).toBe(8);
+    expect(d.findings.length).toBe(1);
+    expect(d.round).toBe(2);
+  });
+
+  test("read_review：无审查记录 → ResultCard 提示", () => {
+    const w = mkWorld();
+    const card = executeQuery(w, "read_review", {});
+    expect(card?.kind).toBe("result");
+    expect(card?.success).toBe(false);
+  });
+});
+
+// —— Phase 2：FormCard 协议（buildFormCard / flattenFormValues）+ 新意图映射 ——
+
+describe("INTENTS 意图映射（Phase 2 表单/执行类）", () => {
+  test("表单类意图已注册（edit_world/foreshadow_edit/task_ops/draft_confirm/expand_arc/settings）", () => {
+    for (const k of ["edit_world", "foreshadow_edit", "task_ops", "draft_confirm", "expand_arc", "settings"]) {
+      expect(INTENTS[k]).toBeTruthy();
+      expect(INTENTS[k].commandId).toMatch(/^CMD-/);
+    }
+    expect(INTENTS.task_ops.level).toBe("L2");
+    expect(INTENTS.settings.level).toBe("L0");
+  });
+});
+
+describe("buildFormCard（表单卡构建）", () => {
+  test("edit_world 带角色名 → 角色表单（L2、含 id、confirmRequired）", () => {
+    const w = mkWorld();
+    const card = buildFormCard(w, "edit_world", { name: "林墨" }, "修改林墨");
+    expect(card?.kind).toBe("form");
+    expect(card?.level).toBe("L2");
+    expect(card?.confirmRequired).toBe(true);
+    const fields = card!.fields as { key: string }[];
+    expect(fields.map((f) => f.key)).toContain("status");
+    expect(fields.map((f) => f.key)).toContain("motivation");
+    expect((card!.action.body.characters as { id: string }[])[0].id).toBe("c1");
+    expect(card?.action.endpoint).toBe("/api/novel/world");
+  });
+
+  test("edit_world 无角色名 → 设定表单（含点路径字段 setting.rules array）", () => {
+    const w = mkWorld();
+    const card = buildFormCard(w, "edit_world", {});
+    expect(card?.kind).toBe("form");
+    expect(card?.level).toBe("L0");
+    const fields = card!.fields as { key: string; array?: boolean }[];
+    expect(fields.find((f) => f.key === "setting.rules")?.array).toBe(true);
+    expect(fields.map((f) => f.key)).toContain("setting.time");
+  });
+
+  test("foreshadow_edit add → 新增表单（required text + plantedAt）", () => {
+    const w = mkWorld();
+    const card = buildFormCard(w, "foreshadow_edit", {});
+    expect(card?.kind).toBe("form");
+    expect(card?.action.body).toEqual({ action: "add" });
+    expect((card!.fields as { key: string; required?: boolean }[]).find((f) => f.key === "text")?.required).toBe(true);
+  });
+
+  test("foreshadow_edit update（带 id）→ 修改表单（select status + body 带 id）", () => {
+    const w = mkWorld();
+    w.foreshadowing.push({ id: "f9", text: "旧伏笔", plantedAt: 1, status: "planted" });
+    const card = buildFormCard(w, "foreshadow_edit", { action: "update", id: "f9" });
+    expect(card?.kind).toBe("form");
+    expect(card?.action.body).toEqual({ action: "update", id: "f9" });
+    expect((card!.fields as { key: string }[]).map((f) => f.key)).toContain("status");
+  });
+
+  test("foreshadow_edit delete（带 id）→ 确认删除表单（confirmRequired）", () => {
+    const w = mkWorld();
+    const card = buildFormCard(w, "foreshadow_edit", { action: "delete", id: "f9" });
+    expect(card?.kind).toBe("form");
+    expect(card?.confirmRequired).toBe(true);
+    expect(card?.action.body).toEqual({ action: "delete", id: "f9" });
+  });
+
+  test("foreshadow_edit update 无 id → 提示表单（不崩）", () => {
+    const w = mkWorld();
+    const card = buildFormCard(w, "foreshadow_edit", { action: "update" });
+    expect(card?.kind).toBe("form");
+    expect(card!.fields).toEqual([]);
+  });
+
+  test("task_ops rewrite → 消费重写队列（confirmRequired，按队列非空）", () => {
+    const w = mkWorld();
+    w.rewriteQueue = [2, 3];
+    const card = buildFormCard(w, "task_ops", { action: "rewrite" });
+    expect(card?.kind).toBe("form");
+    expect(card?.action.body).toEqual({ action: "start" });
+    expect(card?.confirmRequired).toBe(true);
+    expect(card?.summary).toContain("2");
+  });
+
+  test("task_ops 带质量债 id → 处理表单（select fix/ignore + body 带 id）", () => {
+    const w = mkWorld();
+    w.qualityDebt = [{ id: "d1", chapterIndex: 2, lens: "continuity", issue: "矛盾", severity: "major", status: "open" }];
+    const card = buildFormCard(w, "task_ops", { id: "d1" });
+    expect(card?.kind).toBe("form");
+    expect(card?.action.endpoint).toBe("/api/novel/debt");
+    expect(card?.action.body).toEqual({ id: "d1" });
+    expect(card?.summary).toContain("continuity");
+  });
+
+  test("draft_confirm confirm/reject → 对应端点", () => {
+    const w = mkWorld();
+    const c = buildFormCard(w, "draft_confirm", {});
+    expect(c?.action.endpoint).toBe("/api/novel/chapter/confirm");
+    const r = buildFormCard(w, "draft_confirm", { action: "reject" });
+    expect(r?.action.endpoint).toBe("/api/novel/chapter/reject");
+  });
+
+  test("expand_arc → 定位 skeleton 弧，无则提示", () => {
+    const w = mkWorld();
+    w.storyArcs = [{ id: "a1", volumeId: "v1", title: "身世之谜", goal: "g", arcType: "探索发现", status: "skeleton", estChapters: 5 }];
+    const card = buildFormCard(w, "expand_arc", {});
+    expect(card?.kind).toBe("form");
+    expect(card?.action.body).toEqual({ action: "expand", arcId: "a1" });
+    const w2 = mkWorld();
+    const card2 = buildFormCard(w2, "expand_arc", {});
+    expect(card2?.summary).toContain("没有可展开的弧");
+  });
+
+  test("settings → 生成参数表单（含 bool 转换字段 autoGacha）", () => {
+    const w = mkWorld();
+    const card = buildFormCard(w, "settings", {});
+    expect(card?.kind).toBe("form");
+    const fields = card!.fields as { key: string; transform?: string }[];
+    expect(fields.find((f) => f.key === "gen.autoGacha")?.transform).toBe("bool");
+    expect(fields.map((f) => f.key)).toContain("gen.temperature");
+  });
+
+  test("非表单意图 → null", () => {
+    const w = mkWorld();
+    expect(buildFormCard(w, "advance", {})).toBeNull();
+    expect(buildFormCard(w, "chat", {})).toBeNull();
+  });
+});
+
+describe("flattenFormValues（表单值扁平化）", () => {
+  const fields = [
+    { key: "setting.rules", label: "规则", type: "textarea", array: true, value: [] as string[] },
+    { key: "gen.minWords", label: "最少字数", type: "number", value: 800 },
+    { key: "gen.autoGacha", label: "自动抽卡", type: "select", value: "关", transform: "bool" as const },
+    { key: "premise", label: "梗概", type: "textarea", value: "" },
+  ];
+
+  test("点路径嵌套 + array 按行拆分 + number/bool 转换", () => {
+    const out = flattenFormValues(fields, {
+      "setting.rules": "规则一\n规则二",
+      "gen.minWords": "1000",
+      "gen.autoGacha": "开",
+      premise: "新梗概",
+    });
+    expect(out.setting).toEqual({ rules: ["规则一", "规则二"] });
+    expect(out.gen).toEqual({ minWords: 1000, autoGacha: true });
+    expect(out.premise).toBe("新梗概");
+  });
+
+  test("空值跳过 + 未修改字段不进入 body", () => {
+    const out = flattenFormValues(fields, { "gen.minWords": "", premise: "" });
+    expect(out.gen).toBeUndefined();
+    expect(out.premise).toBe("");
+  });
+});
+
+describe("brainChatStream（SSE 编排，事件协议 v2）", () => {
+  test("故事不存在 → error 事件", async () => {
+    mockWorld = null;
+    const events = await runTurn("测试");
+    expect((events[0] as Record<string, unknown>).error).toBeTruthy();
+  });
+
+  test("LLM 识别失败 → 降级 chat：intent → delta* → done", async () => {
+    mockWorld = mkWorld();
+    nextChatContent = "非法输出!!!"; // 识别失败降级 chat，回复走真流式
+    const events = await runTurn("你好");
+    expect(events[0].type).toBe("intent");
+    const deltas = events.filter((e) => e.type === "delta");
+    expect(deltas.length).toBeGreaterThan(0);
+    // 最后一个 delta 是完整文本
+    expect((deltas[deltas.length - 1].text as string).endsWith("!!!")).toBe(true);
+    expect(events[events.length - 1].type).toBe("done");
+  });
+
+  test("chat 意图 → 真流式 delta 累积 + done；消息落盘可恢复", async () => {
+    mockWorld = mkWorld();
+    nextChatContent = "中枢收到！";
+    const events = await runTurn("你好", { sessionId: "chat-stream-session" });
+    const deltas = events.filter((e) => e.type === "delta").map((e) => e.text as string);
+    expect(deltas.length).toBeGreaterThan(1);
+    // 累积语义：text 是消息累计全文，最后一个即完整回复
+    expect(deltas[deltas.length - 1]).toBe("中枢收到！");
+    expect(deltas[0]).toBe("中");
+    const done = events.find((e) => e.type === "done") as { messageId?: string } | undefined;
+    expect(done?.messageId).toBeTruthy();
+    // 会话持久化：消息已落盘（pending 清除、streaming 复位、文本完整）
+    const sess = sessGet("brain-chat-test", "chat-stream-session");
+    expect(sess).toBeTruthy();
+    expect(sess!.streaming).toBe(false);
+    expect(sessLastPending(sess!)).toBeNull();
+    const lastMsg = sess!.messages[sess!.messages.length - 1];
+    expect(lastMsg.role).toBe("assistant");
+    expect(lastMsg.text).toBe("中枢收到！");
+    expect(lastMsg.cards).toBeUndefined();
+  });
+
+  test("意图 read_chapter → delta(reply) + card(browse) + done", async () => {
+    mockWorld = mkWorld();
+    nextChatContent = JSON.stringify({ intent: "read_chapter", params: { index: 1 }, reply: "为你打开第一章" });
+    const events = await runTurn("读第一章");
+    const delta = events.find((e) => e.type === "delta") as { text?: string } | undefined;
+    expect(delta?.text).toBe("为你打开第一章");
+    const card = events.find((e) => e.type === "card") as { card?: Record<string, unknown> } | undefined;
+    expect(card).toBeTruthy();
+    expect(card!.card!.kind).toBe("browse");
+    expect(events[events.length - 1].type).toBe("done");
+  });
+
+  test("意图 read_proposals → delta + card(browse/proposal)（L0 查询直接执行）", async () => {
+    mockWorld = mkWorld();
+    mockWorld.characterProposals = [{ id: "cp1", name: "小翠", role: "掌柜", traits: [], motivation: "查清身世", reason: "呼应身世线", source: "writer", status: "pending" }];
+    nextChatContent = JSON.stringify({ intent: "read_proposals", params: {}, reply: "当前有 1 项新角色提案" });
+    const events = await runTurn("有哪些角色推荐？");
+    const delta = events.find((e) => e.type === "delta") as { text?: string } | undefined;
+    expect(delta?.text).toBe("当前有 1 项新角色提案");
+    const card = events.find((e) => e.type === "card") as { card?: Record<string, unknown> } | undefined;
+    expect(card!.card!.kind).toBe("browse");
+    expect(card!.card!.browseType).toBe("proposal");
+  });
+
+  test("意图 advance（L2）→ delta + card(preview/confirmRequired) + card(confirm)", async () => {
+    mockWorld = mkWorld();
+    nextChatContent = JSON.stringify({ intent: "advance", params: {}, reply: "好的，推进剧情" });
+    const events = await runTurn("再写一章");
+    const cards = events.filter((e) => e.type === "card").map((e) => e.card as Record<string, unknown>);
+    expect(cards.length).toBe(2);
+    expect(cards[0].kind).toBe("preview");
+    expect(cards[0].confirmRequired).toBe(true);
+    expect(cards[1].kind).toBe("confirm");
+    expect(Array.isArray(cards[1].options)).toBe(true);
+  });
+
+  test("意图 delete_chapter（L3）→ confirm 仅 abort 选项", async () => {
+    mockWorld = mkWorld();
+    nextChatContent = JSON.stringify({ intent: "delete_chapter", params: { index: 1 }, reply: "删除第一章" });
+    const events = await runTurn("删掉第一章");
+    const confirmCard = events.filter((e) => e.type === "card").map((e) => e.card as Record<string, unknown>).find((c) => c?.kind === "confirm");
+    expect(confirmCard).toBeTruthy();
+    expect(confirmCard!.options).toEqual(["abort"]);
+  });
+
+  test("意图 plan → delta + card(plan 选项) + done", async () => {
+    mockWorld = mkWorld();
+    chatJsonQueue = [
+      JSON.stringify({ intent: "plan", params: {}, reply: "给你三个方向" }),
+      JSON.stringify({ options: [
+        { label: "推进一章", description: "写下一章", intent: "advance" },
+        { label: "查看现状", description: "看进度", intent: "read_chapter" },
+      ] }),
+    ];
+    const events = await runTurn("接下来怎么写？");
+    const delta = events.find((e) => e.type === "delta") as { text?: string } | undefined;
+    expect(delta?.text).toBe("给你三个方向");
+    const card = (events.find((e) => e.type === "card") as { card?: Record<string, unknown> } | undefined)?.card;
+    expect(card?.kind).toBe("plan");
+    const options = card!.options as { label: string; action?: { endpoint: string } }[];
+    expect(options.length).toBe(2);
+    expect(options[0].label).toBe("推进一章");
+    expect(options[0].action?.endpoint).toBe("/api/novel/step");
+    expect(options[1].action).toBeUndefined(); // 只读意图无 action
+    expect(events[events.length - 1].type).toBe("done");
+  });
+
+  test("意图 opinion → delta + card(opinion 选项)；LLM 选项失败降级兜底", async () => {
+    mockWorld = mkWorld();
+    chatJsonQueue = [
+      JSON.stringify({ intent: "opinion", params: {}, reply: "我觉得可以继续" }),
+      "not-json", // 选项生成失败 → 兜底
+    ];
+    const events = await runTurn("要不要继续写？");
+    const delta = events.find((e) => e.type === "delta") as { text?: string } | undefined;
+    expect(delta?.text).toBe("我觉得可以继续");
+    const card = (events.find((e) => e.type === "card") as { card?: Record<string, unknown> } | undefined)?.card;
+    expect(card?.kind).toBe("opinion");
+    const options = card!.options as { label: string }[];
+    expect(options.length).toBeGreaterThanOrEqual(2);
+    expect(options[0].label).toBe("保持现状"); // 兜底选项
+    expect(events[events.length - 1].type).toBe("done");
+  });
+
+  test("中途取消 → interrupted 事件，消息保留已生成文本", async () => {
+    mockWorld = mkWorld();
+    nextChatContent = "很长很长的回复内容";
+    const ac = new AbortController();
+    const events: Record<string, unknown>[] = [];
+    // 首块发出后立即 abort（模拟用户点“停止生成”）
+    const turn = brainChatStream({
+      title: "brain-chat-test",
+      prompt: "写点东西",
+      sessionId: "abort-session",
+      send: (o) => {
+        const ev = o as Record<string, unknown>;
+        events.push(ev);
+        if (ev.type === "delta") ac.abort();
+      },
+      signal: ac.signal,
+    });
+    await turn;
+    expect(events.some((e) => e.type === "interrupted")).toBe(true);
+    // 消息标记 interrupted 且已生成文本保留（含卡片不写）
+    const sess = sessGet("brain-chat-test", "abort-session")!;
+    const last = sess.messages[sess.messages.length - 1];
+    expect(last.interrupted).toBe(true);
+    expect(last.pending).toBeFalsy();
+    expect(last.text.length).toBeGreaterThan(0);
+    expect(sess.streaming).toBe(false);
+  });
+
+  test("resume：复用最后一条 pending 消息，先 reset 再重新 delta", async () => {
+    mockWorld = mkWorld();
+    // 第一回合：中断（留下 pending 消息）
+    nextChatContent = "半截回复";
+    const ac1 = new AbortController();
+    await brainChatStream({
+      title: "brain-chat-test",
+      prompt: "续写这个",
+      sessionId: "resume-session",
+      send: (o) => {
+        if ((o as Record<string, unknown>).type === "delta") ac1.abort();
+      },
+      signal: ac1.signal,
+    });
+    // 第二回合：resume 复用同一 assistant 消息
+    nextChatContent = "重新生成的完整回复";
+    const events = await runTurn("续写这个", { sessionId: "resume-session", resume: true });
+    const reset = events.find((e) => e.type === "reset") as { messageId?: string } | undefined;
+    expect(reset?.messageId).toBeTruthy();
+    const sess = sessGet("brain-chat-test", "resume-session")!;
+    const last = sess.messages[sess.messages.length - 1];
+    expect(last.id).toBe(reset!.messageId);
+    expect(last.pending).toBeFalsy();
+    // 未重复追加用户消息（消息数：1 user + 1 assistant）
+    expect(sess.messages.filter((m) => m.role === "user").length).toBe(1);
+    expect(sess.messages.length).toBe(2);
+    expect(events[events.length - 1].type).toBe("done");
+  });
+});

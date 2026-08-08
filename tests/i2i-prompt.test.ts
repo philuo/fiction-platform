@@ -2,7 +2,7 @@
 // 覆盖：i2iPreservePrefix 按 portrait/avatar/scene 产出官方 i2i [保持]+[改变] 结构，含明确保持子句；
 // distinctiveLook 确定性容貌标识（弱模型区分度修复：同名复现一致、不同角色互斥）
 import { test, expect } from "bun:test";
-import { i2iPreservePrefix, ensureStyleSuffix, sceneGuardClause, distinctiveLook, nameSeed, genderPhrase, distinctLookForRoster } from "../src/api/media";
+import { i2iPreservePrefix, ensureStyleSuffix, sceneGuardClause, distinctiveLook, nameSeed, genderPhrase, distinctLookForRoster, headwearOf, headwearLead, identityDress } from "../src/api/media";
 
 test("portrait：前缀含容貌基准 + 保持五官发型身形 + 不照搬背景 + 重绘引导", () => {
   const p = i2iPreservePrefix("portrait", "沈夜");
@@ -142,6 +142,41 @@ test("distinctLookForRoster：同书脸型+眉眼撞车避让（池子收缩后�
 test("distinctiveLook：少年/少女身形不取 hash 池（防「十五岁书童」配「壮硕高大」年龄错配）", () => {
   expect(distinctiveLook({ ...mkChar("阿衡"), gender: "男", age: "十五岁" })).toContain("身形纤细瘦小");
   expect(distinctiveLook({ ...mkChar("阿阮"), gender: "女", age: "十六岁" })).toContain("身形纤细瘦小");
+});
+
+test("headwearOf：身份/性别/年龄差异化头饰（官帽/布带/散发/僧光/女髻多样）", () => {
+  const w = undefined;
+  expect(headwearOf({ ...mkChar("甲"), identity: "知县" }, w)).toContain("乌纱帽");
+  expect(headwearOf({ ...mkChar("乙"), identity: "将军" }, w)).toContain("红缨盔");
+  expect(headwearOf({ ...mkChar("丙"), identity: "书生" }, w)).toContain("布带束发");
+  expect(headwearOf({ ...mkChar("丁"), identity: "和尚" }, w)).toContain("光头");
+  expect(headwearOf({ ...mkChar("戊"), identity: "乞丐" }, w)).toContain("蓬松散乱");
+  expect(headwearOf({ ...mkChar("己"), gender: "女", age: "十五岁" }, w)).toContain("双丫髻");
+  expect(headwearOf({ ...mkChar("庚"), gender: "女", age: "四十许人" }, w)).toContain("圆髻");
+  // 诗人：束发或散发二选一（hash 定）
+  const poet = headwearOf({ ...mkChar("辛"), identity: "诗人" }, w);
+  expect(/披肩|布带束发/.test(poet)).toBe(true);
+  // 现代时代：短发，无发髻
+  const { emptyWorld } = require("../src/api/world");
+  const mw = emptyWorld(); mw.setting = { time: "现代", place: "都市", rules: [], tone: "" };
+  expect(headwearOf({ ...mkChar("壬"), gender: "男" }, mw)).toContain("短发");
+});
+
+test("headwearLead：逆先验头饰前置句首（官帽/武盔/冕冠/光头），无特殊身份返空", () => {
+  expect(headwearLead({ ...mkChar("甲"), identity: "知县" })).toBe("头戴乌纱帽，");
+  expect(headwearLead({ ...mkChar("乙"), identity: "将军" })).toBe("头戴红缨盔，");
+  expect(headwearLead({ ...mkChar("丙"), identity: "和尚" })).toBe("光头，");
+  expect(headwearLead({ ...mkChar("丁"), identity: "皇帝" })).toBe("头戴冕冠，");
+  expect(headwearLead({ ...mkChar("戊"), identity: "书生" })).toBe("");
+  expect(headwearLead({ ...mkChar("己"), gender: "女" })).toBe("");
+});
+
+test("identityDress：主身份优先（诗人当官取官服）+ 官服分级文武有别", () => {
+  expect(identityDress({ ...mkChar("甲"), identity: "礼部侍郎，擅长写诗" })).toContain("高官文官朝服");
+  expect(identityDress({ ...mkChar("乙"), identity: "诗人" })).not.toContain("官服");
+  expect(identityDress({ ...mkChar("丙"), identity: "知县" })).toContain("低品文官");
+  expect(identityDress({ ...mkChar("丁"), identity: "将军" })).toContain("山文甲");
+  expect(identityDress({ ...mkChar("戊"), identity: "校尉" })).toContain("鱼鳞甲");
 });
 
 test("distinctiveLook：身形池按性别过滤（防老周配「娇小」/秦夫人配「宽肩魁梧」性别错配）", () => {

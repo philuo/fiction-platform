@@ -114,7 +114,7 @@ export function validateJsonSchema(value: unknown, schema: JsonSchema, path = "$
 
 // —— JSON 输出重试：LLM 输出不合法 JSON 或不符合 schema 时，回填上次输出并要求修复（最多 1 次重试） ——
 import type { ChatMessage } from "./agnes";
-import { chat } from "./agnes";
+import { chatStream } from "./agnes";
 
 const JSON_FIX_RULE =
   "要求：只输出一个合法 JSON 对象（不要 markdown 围栏）；字符串值内部一律使用中文引号「」或『』，禁止在字符串里使用英文双引号（\"）。";
@@ -142,7 +142,9 @@ export async function chatJson<T>(
 ): Promise<T> {
   let msgs = opts.schema ? injectSchema(messages, opts.schema) : messages;
   for (let attempt = 0; attempt < 2; attempt++) {
-    const raw = await chat(msgs, opts);
+    // 流式聚合（chatStream）替代非流式 chat：流式持续返回数据，避开上游网关对长时非流式请求的空闲超时（504）——
+    // 审查/记账/评估等 JSON 任务耗时可达数分钟，非流式极易被网关切断
+    const raw = await chatStream(msgs, () => {}, opts);
     let parsed: T;
     try {
       parsed = extractJson<T>(raw);

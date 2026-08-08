@@ -71,6 +71,8 @@ export class RateLimiter {
 }
 
 // 三个全局限流器（企业认证默认值；env 可覆盖）
+// 设计决策：**全局共享而非按用户隔离**（多用户部署下共享企业配额；单个用户跑满自动连载时
+// 其他用户需排队等待 LLM 额度，但数据绝不串扰）。若需按用户独立配额可改为 per-user 池。
 export const textLimiter = new RateLimiter(envInt("AGNES_TEXT_CONCURRENCY", 5), envInt("AGNES_TEXT_RPM", 40), "text");
 export const imageLimiter = new RateLimiter(envInt("AGNES_IMAGE_CONCURRENCY", 5), envInt("AGNES_IMAGE_RPM", 40), "image");
 export const videoLimiter = new RateLimiter(envInt("AGNES_VIDEO_CONCURRENCY", 1), envInt("AGNES_VIDEO_RPM", 2), "video");

@@ -3,7 +3,7 @@
 // ③ 图生图/多图合成经 extra_body.image 传参考图（Data URI 或 URL）——用于角色形象一致性。
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { slugify } from "./storage";
+import { storyDir } from "./storage";
 import { imageLimiter } from "./limiter";
 
 const AGNES_IMAGE_BASE = (process.env.AGNES_BASE_URL ?? "https://api.agnes-ai.cn/v1").replace(/\/$/, "");
@@ -78,17 +78,17 @@ export async function compressToJpeg(buf: Uint8Array, width: number, height: num
   return new Uint8Array(await new Bun.Image(buf).resize(width, height).jpeg({ quality }).toBuffer());
 }
 
-/** 保存图像到 data/<story>/images/，返回相对路径 */
+/** 保存图像到 data/<username>/<slug>/images/，返回相对路径 */
 export function saveImage(storyTitle: string, name: string, data: Uint8Array): string {
-  const dir = join(process.cwd(), "data", slugify(storyTitle), "images");
+  const dir = join(storyDir(storyTitle), "images");
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, name), data);
   return `images/${name}`;
 }
 
-/** 读取图像（防路径穿越：只能读 data/<story>/ 内；目录/非文件返回 null） */
+/** 读取图像（防路径穿越：只能读 data/<username>/<slug>/ 内；目录/非文件返回 null） */
 export function readImage(storyTitle: string, rel: string): Uint8Array | null {
-  const base = join(process.cwd(), "data", slugify(storyTitle));
+  const base = storyDir(storyTitle);
   const full = join(base, rel);
   // Windows/Unix 分隔符兼容：归一化后比较前缀，防止 base/ 与 join 结果（反斜杠）不匹配
   const norm = (p: string) => p.replace(/[\\/]+/g, "/");
@@ -101,9 +101,9 @@ export function readImage(storyTitle: string, rel: string): Uint8Array | null {
   return new Uint8Array(readFileSync(full));
 }
 
-/** 删除媒体文件（与 readImage 同款路径穿越守卫：仅 data/<story>/ 内；不存在/非文件静默跳过） */
+/** 删除媒体文件（与 readImage 同款路径穿越守卫：仅 data/<username>/<slug>/ 内；不存在/非文件静默跳过） */
 export function deleteMediaFile(storyTitle: string, rel: string): boolean {
-  const base = join(process.cwd(), "data", slugify(storyTitle));
+  const base = storyDir(storyTitle);
   const full = join(base, rel);
   const norm = (p: string) => p.replace(/[\\/]+/g, "/");
   if (!norm(full).startsWith(norm(base) + "/") || norm(full) === norm(base)) return false;

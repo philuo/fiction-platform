@@ -125,6 +125,8 @@ export function applyCards(world: WorldState, picked: Card[]): { instructions: s
           traits: c.character?.traits ?? [],
           motivation: c.character?.motivation ?? c.description.slice(0, 60),
           voice: c.character?.voice,
+          // 推荐原因：卡片描述即"为什么值得让该角色登场"，缺省回退 effect
+          reason: (c.description || c.effect).trim().slice(0, 80) || undefined,
           source: "gacha",
           status: "pending",
         });

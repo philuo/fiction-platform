@@ -149,6 +149,12 @@ function readEvalCache(title: string): EvalCacheFile | null {
   }
 }
 
+/** 读取落盘的评估报告（无缓存返回 null；不校验指纹，调用方按需判断新鲜度）。
+ * 供中枢状态派生（brain-state）零成本复用已落盘 eval，避免重复烧 LLM。 */
+export function readEvalReport(title: string): EvalReport | null {
+  return readEvalCache(title)?.report ?? null;
+}
+
 function writeEvalCache(title: string, fingerprint: string, report: EvalReport): void {
   try {
     const dir = storyDir(title);

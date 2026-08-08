@@ -2,6 +2,7 @@ import { hydrateRoot } from "react-dom/client";
 import App from "./App";
 import type { HomeProps } from "./pages/Home";
 import "./styles/newspaper.css";
+import "./styles/auth.css";
 
 // 客户端水合：读取 SSR 注入的初始数据，保证与 SSR 渲染的初始状态一致
 // （否则 ?title= 页面 SSR=游戏界面 / 客户端=启动页，hydration 冲突导致事件失效）

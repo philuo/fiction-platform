@@ -5,7 +5,7 @@
 // 视频为异步任务；创建走 videoLimiter（企业版默认 1 并发 / 2 RPM），状态查询间歇 429（需容忍，由前端轮询频率控制）
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { slugify } from "./storage";
+import { storyDir } from "./storage";
 import { videoLimiter } from "./limiter";
 
 const AGNES_VIDEO_BASE = (process.env.AGNES_BASE_URL ?? "https://api.agnes-ai.cn/v1").replace(/\/$/, "");
@@ -144,9 +144,9 @@ export async function downloadVideo(url: string): Promise<Uint8Array> {
   return buf;
 }
 
-/** 保存视频到 data/<story>/videos/，返回相对路径 videos/<name> */
+/** 保存视频到 data/<username>/<slug>/videos/，返回相对路径 videos/<name> */
 export function saveVideo(storyTitle: string, name: string, data: Uint8Array): string {
-  const dir = join(process.cwd(), "data", slugify(storyTitle), "videos");
+  const dir = join(storyDir(storyTitle), "videos");
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, name), data);
   return `videos/${name}`;

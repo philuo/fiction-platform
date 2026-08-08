@@ -1,6 +1,6 @@
 // 报头（日式报纸 masthead）：左侧书单入口 + 标题 + 设置入口，右侧章号/更新时间/状态
 import type { Chapter, WorldState } from "../api/world";
-import { List, Settings } from "./icons";
+import { History, List, Settings } from "./icons";
 
 export const Masthead: React.FC<{
   world: WorldState;
@@ -8,9 +8,9 @@ export const Masthead: React.FC<{
   /** 当前查看的章节：展示「第x章」与该章最后保存更新时间 */
   chapter?: Chapter | null;
   onBackToList?: () => void;
+  /** 记忆台账入口（分层记忆 · 台账 · 操作日志） */
+  onOpenMemoryAudit?: () => void;
   onOpenSettings?: () => void;
-  /** 中枢指示器插槽（常驻报头右上角，点击查看记忆·台账·操作日志） */
-  brain?: React.ReactNode;
 }> = (p) => {
   // 时间取章节最后保存更新时间（更新正文/图片/视频/版本切换时刷新，见 touchChapter），
   // 无章节时回退全书 updatedAt；数据均来自 SSR 注入的 world，hydrate 前后渲染一致
@@ -28,9 +28,11 @@ export const Masthead: React.FC<{
           </div>
         )}
       </div>
-      {/* 右上角：中枢指示器 / 书单 / 设置 快捷入口 */}
+      {/* 右上角：记忆台账 / 书单 / 设置 快捷入口 */}
       <div className="masthead-actions">
-        {p.brain}
+        <button className="masthead-icon-btn" title="分层记忆·台账·操作日志" onClick={p.onOpenMemoryAudit}>
+          <History size={17} />
+        </button>
         <button className="masthead-icon-btn" title="返回书单" onClick={p.onBackToList}>
           <List size={17} />
         </button>

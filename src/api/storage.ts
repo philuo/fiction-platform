@@ -1,9 +1,13 @@
-// 持久化：data/<slug>/state.json（原子写：tmp + rename，写前备份 .bak）
-// 长篇架构：versions 外置到 data/<slug>/versions/；meta.json 供列表页快读；checkpoint.jsonl 断点日志
-import { mkdirSync, readFileSync, writeFileSync, existsSync, copyFileSync, mkdtempSync, rmSync, renameSync, appendFileSync, unlinkSync, readdirSync } from "node:fs";
+// 持久化：data/<username>/<slug>/state.json（原子写：tmp + rename，写前备份 .bak）
+// 账号隔离：每个用户一个目录（data/<username>/），目录内全部小说、会话记录、媒体完全隔离；
+// 用户来自请求会话（AsyncLocalStorage 注入，见 runAsUser/currentUser）；无用户上下文时回退
+// data/<slug>（遗留/未迁移数据与测试直调兼容）。
+// 长篇架构：versions 外置到 data/<username>/<slug>/versions/；meta.json 供列表页快读；checkpoint.jsonl 断点日志
+import { mkdirSync, readFileSync, writeFileSync, existsSync, copyFileSync, mkdtempSync, rmSync, renameSync, appendFileSync, unlinkSync, readdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { Arc, ChapterVersion, PendingChapter, WorldState } from "./world";
 import type { EvalReport } from "./eval";
 
@@ -14,9 +18,67 @@ export function slugify(title: string): string {
   return s;
 }
 
-export function storyDir(title: string): string {
+// —— 用户上下文（请求级隔离）：API / SSR 入口用 runAsUser 注入当前登录用户名，
+// 后续同步/异步调用（含 fire-and-forget 的后台任务链）经 AsyncLocalStorage 继承该上下文。
+const userCtx = new AsyncLocalStorage<string | null>();
+
+/** 当前请求的用户名（无用户上下文返回 null——遗留数据路径或测试直调） */
+export function currentUser(): string | null {
+  return userCtx.getStore() ?? null;
+}
+
+/** 在指定用户名上下文中执行 fn（API/SSR 入口与后台任务遍历用户时使用） */
+export function runAsUser<T>(username: string | null, fn: () => T): T {
+  return userCtx.run(username, fn);
+}
+
+/** 用户数据根目录：data/<username>（用户名经 auth 正则约束，无路径危险字符） */
+export function userDir(username: string): string {
+  return join(process.cwd(), "data", username);
+}
+
+/** 当前上下文对应的数据目录：登录用户 → data/<username>；无上下文 → data（遗留） */
+function dataDirFor(username?: string): string {
+  const u = username ?? currentUser();
+  return u ? userDir(u) : join(process.cwd(), "data");
+}
+
+export function storyDir(title: string, username?: string): string {
   // process.cwd()：bun 直接运行与 bun build 产物下均指向项目根
-  return join(process.cwd(), "data", slugify(title));
+  return join(dataDirFor(username), slugify(title));
+}
+
+/** 是否为书目录：目录且含 meta.json 或 state.json（app.db / 会话记录等非书条目一律不算书） */
+function isStoryDirectory(dir: string): boolean {
+  try {
+    if (!statSync(dir).isDirectory()) return false;
+  } catch {
+    return false;
+  }
+  return existsSync(join(dir, "meta.json")) || existsSync(join(dir, "state.json"));
+}
+
+/** 把 data/ 根下的遗留书目录迁移到指定用户目录（第一个注册用户认领旧数据）。
+ * 只迁移书目录（含 meta.json/state.json）；目标已存在同名目录则跳过（不覆盖）。返回迁移的书目数。 */
+export function migrateLegacyStoriesTo(username: string): number {
+  const root = join(process.cwd(), "data");
+  if (!existsSync(root)) return 0;
+  let moved = 0;
+  for (const d of readdir(root)) {
+    const src = join(root, d);
+    if (!isStoryDirectory(src)) continue;
+    const dest = join(root, username, d);
+    if (existsSync(dest)) continue; // 目标已存在：不覆盖
+    try {
+      mkdirSync(join(root, username), { recursive: true });
+      renameSync(src, dest);
+      moved++;
+      console.log(`[storage] 旧数据迁移：${d} → ${username}/${d}`);
+    } catch (e) {
+      console.warn("[storage] 旧数据迁移跳过:", d, (e as Error).message);
+    }
+  }
+  return moved;
 }
 
 /** 同名冲突检测：已存在同 slug 的存档则返回 true（修 G1：立项同名书不得静默覆盖） */
@@ -300,33 +362,35 @@ export function clearAutoSession(title: string): void {
   }
 }
 
-export function listStories(): string[] {
-  const dir = join(process.cwd(), "data");
+export function listStories(username?: string): string[] {
+  const dir = dataDirFor(username);
   if (!existsSync(dir)) return [];
-  return readdir(dir);
+  return readdir(dir).filter((d) => isStoryDirectory(join(dir, d)));
 }
 
 export type StoryMeta = { slug: string; title: string; genre: string; chapters: number; updatedAt: string; cover?: string };
 
-/** 列出所有故事的元信息（优先读 meta.json，缺失时回退解析 state.json） */
-export function listStoriesMeta(): StoryMeta[] {
-  const dir = join(process.cwd(), "data");
+/** 列出当前用户所有故事的元信息（优先读 meta.json，缺失时回退解析 state.json）。
+ * 只认书目录（含 meta.json/state.json）：app.db / 会话记录等非书条目不会出现在列表中。 */
+export function listStoriesMeta(username?: string): StoryMeta[] {
+  const dir = dataDirFor(username);
   if (!existsSync(dir)) return [];
   const slugs = readdir(dir);
   const metas: StoryMeta[] = [];
   for (const s of slugs) {
+    const storyPath = join(dir, s);
+    if (!isStoryDirectory(storyPath)) continue; // 非书目录/文件（sqlite、会话记录等）跳过
     try {
-      const metaPath = join(dir, s, "meta.json");
+      const metaPath = join(storyPath, "meta.json");
       if (existsSync(metaPath)) {
         metas.push(JSON.parse(readFileSync(metaPath, "utf-8")) as StoryMeta);
         continue;
       }
-      const raw = readFileSync(join(dir, s, "state.json"), "utf-8");
+      const raw = readFileSync(join(storyPath, "state.json"), "utf-8");
       const w = JSON.parse(raw) as WorldState;
       metas.push({ slug: s, title: w.title, genre: w.genre ?? "", chapters: w.chapters?.length ?? 0, updatedAt: w.updatedAt ?? "", cover: w.cover });
     } catch {
-      // 损坏的存档跳过
-      metas.push({ slug: s, title: s, genre: "", chapters: 0, updatedAt: "", cover: undefined });
+      // 损坏的存档跳过（不把非书目录当书）
     }
   }
   // 按更新时间倒序

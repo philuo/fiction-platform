@@ -4,6 +4,7 @@
 import { useEffect, useState } from "react";
 import type { Foreshadow, WorldState } from "../api/world";
 import { BookMarked, Plus, Trash2, X } from "./icons";
+import { apiFetch } from "../api/client";
 
 const STATUS_TEXT: Record<Foreshadow["status"], string> = { planted: "已埋设", active: "推进中", resolved: "已回收" };
 const STATUS_ORDER: Foreshadow["status"][] = ["active", "planted", "resolved"];
@@ -37,7 +38,7 @@ export const ForeshadowModal: React.FC<Props> = (p) => {
     if (p.taskActive) { p.showToast("任务运行中，伏笔编辑已禁止——请先取消任务。"); return null; } // 运行锁
     setBusy(true);
     try {
-      const res = await fetch("/api/novel/foreshadow", {
+      const res = await apiFetch("/api/novel/foreshadow", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: p.world.title, action, ...payload }),

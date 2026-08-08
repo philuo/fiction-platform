@@ -33,7 +33,7 @@
 | 6 | 中央正文区 | `components/ChapterView.tsx:243-287` | 选中章 `title/text/review/media/versions`；审查模式用 `review.findings` 渲染波浪线 | 随 world；写作中 liveDraft 由 SSE `delta` 局部填充（`Home.tsx:1578-1583`） |
 | 7 | 媒体生成内联进度 | `pages/Home.tsx:1597-1607` | `chapters[].media`（pending 的 id）+ 本地 mediaGen 态 | `/api/novel/media/status` 每 5s 轮询（`Home.tsx:626-674`），完成 → refreshWorld |
 | 8 | 右栏状态面板 | `components/StatusPanel.tsx:19-180` | `chapters`（数量/字数）、`foreshadowing`、`outline`、`characters`、`chapterSummaries[].appeared`（双轨判定 :38-52） | 随 world + 选中章节联动 |
-| 9 | 新角色提案横幅 | `pages/Home.tsx:1618-1631` | `characterProposals`（pending） | POST `/api/novel/proposal` 返回 world 直接 setWorld |
+| 9 | 新角色提案横幅 | `pages/Home.tsx:1999-2045` | `characterProposals`（pending，含 `reason` 推荐原因） | 折叠单行可关闭（✕）/可展开抽屉（200ms 覆盖三栏）；确认/拒绝走 POST `/api/novel/proposal` 返回 world 直接 setWorld；中枢对话「有哪些角色推荐」→ browse(proposal) 卡片内嵌确认/拒绝（`brain-chat.ts` executeQuery） |
 | 10 | 底部控制条 | `pages/Home.tsx:1638-1682` | `nextChapter`（statusText :1331-1333）、`chapters`（revise 过滤 :982） | 随 world |
 | 11 | 回溯重写队列横幅 | `pages/Home.tsx:1683-1689` | `rewriteQueue` | runRewrite / clearRewriteQueue 后 refreshWorld |
 | 12 | 抽卡弹层 | `components/GachaModal.tsx` | 仅 `world.title`；卡池来自 `/api/novel/gacha` 响应（**不读** `world.cards`） | onApplied → refreshWorld（`Home.tsx:1309-1315`） |
@@ -100,7 +100,7 @@ type HarnessCommand = {
 | `outline` | U08 状态面板、U13 设置·大纲 |
 | `qualityDebt` | U15 评估弹层、U16 连载 open 计数 |
 | `rewriteQueue` | U11 重写队列横幅 |
-| `characterProposals` | U09 提案横幅 |
+| `characterProposals` | U09 提案横幅（折叠单行/展开抽屉，`reason` 推荐原因；中枢对话 browse(proposal) 卡片可交互） |
 | `cover` | U01 书单、U13 设置 |
 | `gen`/`chapterGen`/`setting`/`lore`/`premise`/`lockedFields` | U13 设置 |
 | `nextChapter` | U10 控制条 |

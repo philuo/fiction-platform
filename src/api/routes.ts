@@ -5,9 +5,9 @@ import * as director from "./director";
 import { buildBlueprint, confirmBlueprint, expandArc, type BlueprintOption } from "./planner";
 import * as steering from "./steering";
 import { runAuto, stopAuto, pauseAuto } from "./autorun";
-import { evaluateBookCached } from "./eval";
+import { evaluateBookCached, readEvalReport } from "./eval";
 import { extractFingerprint } from "./style";
-import { loadWorld, listStories, listStoriesMeta, exportMarkdown, exportEpub, slugify as slug, saveWorld, storyDir, storyExists, loadAutoSession, clearAutoSession, loadPendingChapter, clearPendingChapter } from "./storage";
+import { loadWorld, listStories, listStoriesMeta, exportMarkdown, exportEpub, slugify as slug, saveWorld, storyDir, storyExists, loadAutoSession, clearAutoSession, loadPendingChapter, clearPendingChapter, currentUser, migrateLegacyStoriesTo, runAsUser, userDir } from "./storage";
 import { buildAutoLore, mergeLore, sanitizeLore } from "./lore";
 import { generateImage, saveImage, readImage, deleteMediaFile } from "./images";
 import { pollVideoTask, downloadVideo, saveVideo } from "./videos";
@@ -16,15 +16,33 @@ import { auditWorld, autoRepair, alignWorld, collectOrphanMediaFiles } from "./i
 import { resetChapterLedger, settleChapter } from "./chronicler";
 import { applyStateChange, finalizeStateChange } from "./statechange";
 import { withTitleLock } from "./titlelock";
+import { deriveBrainState } from "./brain-state";
+import { brainChatStream } from "./brain-chat";
+import {
+  attachSessionTask,
+  broadcastToSession,
+  createSession as createBrainSession,
+  deleteSession as deleteBrainSession,
+  finishSessionTask,
+  getSession as getBrainSession,
+  isSessionRunning,
+  lastPendingMessage,
+  listSessions as listBrainSessions,
+  registerSessionTask,
+  truncateSession as truncateBrainSession,
+} from "./brain-sessions";
+import { startAdvanceTask, updateAdvanceTaskPhase, completeAdvanceTask, failAdvanceTask, getAdvanceTaskForClient, clearAdvanceTask } from "./advancetask";
 import { migrateChapterMedia, touchChapter, genOf, type WorldState, type Character as WorldCharacter, type ChapterMedia, type ConsistencyFinding, type PendingChapter } from "./world";
+import { AuthError, clearSessionCookieValue, firstUsername, getPropClosed, listUsernames, loginUser, logoutSession, registerUser, sessionCookieValue, setPropClosed, userFromRequest, validateCredentials, SESSION_COOKIE } from "./auth";
+import type { AuthUser } from "./auth";
 import type { CardType } from "./cards";
 import { renameSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
-function json(data: unknown, status = 200): Response {
+function json(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json; charset=utf-8" },
+    headers: { "Content-Type": "application/json; charset=utf-8", ...extraHeaders },
   });
 }
 
@@ -40,8 +58,8 @@ function sseStream(produce: (send: (obj: unknown) => void) => Promise<void>): Re
           /* 客户端已断开，忽略 */
         }
       };
-      // 心跳（修 H3）：长回合（写+审+修可达数分钟）每 15s 发 ping，防代理断连
-      const heartbeat = setInterval(() => send({ phase: "ping" }), 15_000);
+      // 心跳：长回合（写+审+修可达数分钟）每 8s 发 ping 保活（必须小于 Bun.serve 的 idleTimeout=255s，并防中间代理断连）
+      const heartbeat = setInterval(() => send({ phase: "ping" }), 8_000);
       try {
         await produce(send);
       } catch (e) {
@@ -71,10 +89,14 @@ function sseStream(produce: (send: (obj: unknown) => void) => Promise<void>): Re
 /** 业务错误：消息可安全回显给前端（区别于内部异常） */
 export class AppError extends Error {}
 
-// 自动连载活跃运行注册表：同一书名同时只允许一个 runAuto 循环（防双跑重复写章/停止信号串扰）
+// 自动连载活跃运行注册表：同一用户名下同一书名同时只允许一个 runAuto 循环（防双跑重复写章/停止信号串扰）
 const activeAuto = new Set<string>();
 // 媒体重生成并发防护：同一 mediaId 同时只允许一个重生成（单进程部署，进程内集合即可）
 const regenBusy = new Set<string>();
+/** 进程内注册表 key：前缀当前用户，不同账号的同名书 / 相同 mediaId 互不串扰 */
+function mediaKey(id: string): string {
+  return `${currentUser() ?? ""}::${id}`;
+}
 
 async function readBody(req: Request): Promise<Record<string, unknown>> {
   try {
@@ -129,10 +151,11 @@ const VISUAL_RETRY_COOLDOWN = 60_000;
  * 注意：内部自带短事务落盘，调用方勿持锁（锁可重入，锁内启动亦安全）。 */
 function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter): void {
   if (c.portrait?.path && c.image) return; // 视觉已完整，跳过
-  const key = `${slug(title)}::${c.id}`;
+  const uk = currentUser() ?? "";
+  const key = `${uk}::${slug(title)}::${c.id}`;
   if (visualInFlight.has(key)) return; // 已在生成中
   visualInFlight.add(key);
-  const tKey = slug(title);
+  const tKey = `${uk}::${slug(title)}`;
   const tasks = visualTasks.get(tKey) ?? new Map<string, VisualTaskResult>();
   tasks.set(c.id, { status: "running" });
   visualTasks.set(tKey, tasks);
@@ -238,6 +261,13 @@ function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter
  * 中枢巡检也会兜底补全；触发条件与读时自愈完全一致（visualTriedAt 冷却共用 VISUAL_RETRY_COOLDOWN），幂等（视觉完整跳过）。
  * 由 startVisualSweep 周期调用；也可单次调用（服务启动立即扫一遍）。不阻塞：ensureCharacterVisuals 为 fire-and-forget。 */
 export function sweepVisualGaps(): void {
+  sweepVisualGapsFor(""); // 遗留根目录（未迁移前）
+  for (const username of listUsernames()) {
+    runAsUser(username, () => sweepVisualGapsFor(username));
+  }
+}
+
+function sweepVisualGapsFor(_username: string): void {
   for (const d of listStories()) {
     const w = loadWorldBySlug(d);
     if (!w) continue;
@@ -267,15 +297,95 @@ export function startVisualSweep(): void {
 }
 
 
-/** 返回 null 表示非 API 路径（由调用方继续处理页面渲染） */
+/** 返回 null 表示非 API 路径（由调用方继续处理页面渲染）。
+ * 入口注入用户上下文（AsyncLocalStorage）：小说/中枢 API 全程按登录用户路由与隔离。 */
 export async function handleApi(pathname: string, req: Request): Promise<Response | null> {
   if (!pathname.startsWith("/api/")) return null;
+  const user = userFromRequest(req);
+  return runAsUser(user?.username ?? null, () => handleApiInner(pathname, req, user));
+}
+
+async function handleApiInner(pathname: string, req: Request, user: AuthUser | null): Promise<Response | null> {
+  // 强制登录：全部业务数据/能力接口按账号隔离，未登录一律 401（前端未登录本就只显示登录页）。
+  // 覆盖小说、中枢、对话（/api/chat、/api/chat/stream）与搜索——全局功能均与账号绑定。
+  const requiresAuth =
+    pathname.startsWith("/api/novel") ||
+    pathname.startsWith("/api/brain") ||
+    pathname.startsWith("/api/chat") ||
+    pathname === "/api/search";
+  if (!user && requiresAuth) {
+    return json({ error: "未登录" }, 401);
+  }
 
   // 小说引擎路由优先
   const novelRes = await handleNovelApi(pathname, req);
   if (novelRes) return novelRes;
 
   switch (pathname) {
+    case "/api/auth/register": {
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const body = await readBody(req);
+      const username = String(body.username ?? "").trim();
+      const password = String(body.password ?? "");
+      const displayName = String(body.displayName ?? "").trim();
+      const err = validateCredentials(username, password);
+      if (err) return json({ error: err }, 400);
+      try {
+        const user = await registerUser(username, password, displayName);
+        // 首个注册用户：认领 data/ 根下的遗留旧数据（迁移到其用户目录，登录后立即可见）
+        if (user.isFirstUser) {
+          try {
+            migrateLegacyStoriesTo(user.username);
+          } catch (e) {
+            console.warn("[api/auth/register] 旧数据迁移失败:", (e as Error).message);
+          }
+        }
+        // 注册即登录：下发业务 token（响应体，前端存 localStorage 供 Authorization header）+ 只读会话 cookie（SSR 首帧识别）
+        const session = await loginUser(username, password);
+        const token = session?.token ?? "";
+        return json({ ok: true, token, user: { id: user.id, username: user.username, displayName: user.displayName } }, 200, token ? { "Set-Cookie": sessionCookieValue(token) } : undefined);
+      } catch (e) {
+        if (e instanceof AuthError) return json({ error: e.message }, 409);
+        console.error("[api/auth/register]", e);
+        return json({ error: "注册失败，请稍后重试" }, 500);
+      }
+    }
+
+    case "/api/auth/login": {
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const body = await readBody(req);
+      const username = String(body.username ?? "").trim();
+      const password = String(body.password ?? "");
+      const result = await loginUser(username, password);
+      if (!result) return json({ error: "用户名或密码错误" }, 401);
+      // 响应体带业务 token（前端存 localStorage 走 Authorization header）+ 只读会话 cookie（SSR 首帧识别）
+      return json({ ok: true, token: result.token, user: result.user }, 200, { "Set-Cookie": sessionCookieValue(result.token) });
+    }
+
+    case "/api/auth/logout": {
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      // 按凭证注销：Authorization header token 优先，回退 cookie（旧客户端/SSR 兼容）
+      const auth = req.headers.get("authorization");
+      let token = "";
+      if (auth?.startsWith("Bearer ")) token = auth.slice("Bearer ".length).trim();
+      if (!token) {
+        const cookie = req.headers.get("cookie") ?? "";
+        const pair = cookie
+          .split(";")
+          .map((s) => s.trim())
+          .find((s) => s.startsWith(`${SESSION_COOKIE}=`));
+        if (pair) token = pair.slice(SESSION_COOKIE.length + 1);
+      }
+      if (token) logoutSession(token);
+      return json({ ok: true }, 200, { "Set-Cookie": clearSessionCookieValue() });
+    }
+
+    case "/api/auth/me": {
+      const user = userFromRequest(req);
+      if (!user) return json({ error: "未登录" }, 401);
+      return json({ ok: true, user });
+    }
+
     case "/api/health": {
       // 文本 key 检查 TEXT_* 优先（当前文本走基元），媒体固定 AGNES_*
       const textOk = Boolean(process.env.TEXT_API_KEY ?? process.env.AGNES_API_KEY);
@@ -349,6 +459,123 @@ export async function handleApi(pathname: string, req: Request): Promise<Respons
       }
     }
 
+    case "/api/brain/sessions": {
+      // 中枢聊天会话 API：GET 历史列表（title/时间，最近更新倒序）；POST 新建会话（返回完整会话）
+      const bsBody = await readBody(req);
+      const bsTitle = String(bsBody.title ?? "").trim();
+      if (!bsTitle) return json({ error: "缺少 title" }, 400);
+      if (req.method === "GET") {
+        // 列表只回显标题/时间/流式标记（不含完整消息，历史详情走 /api/brain/sessions/:id）
+        const list = listBrainSessions(bsTitle).map((s) => ({
+          id: s.id,
+          title: s.title,
+          createdAt: s.createdAt,
+          updatedAt: s.updatedAt,
+          streaming: s.streaming,
+          messageCount: s.messages.length,
+        }));
+        return json({ sessions: list });
+      }
+      if (req.method === "POST") {
+        const firstPrompt = String(bsBody.prompt ?? "").trim();
+        const s = createBrainSession(bsTitle, firstPrompt);
+        return json({ session: s }, 201);
+      }
+      return json({ error: "仅支持 GET/POST" }, 405);
+    }
+
+    case "/api/brain/sessions/delete": {
+      // DELETE /api/brain/sessions/:id 用 POST + body.id（handleApi 无 path 参数解析，统一走 body）
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const bsBody = await readBody(req);
+      const bsTitle = String(bsBody.title ?? "").trim();
+      const bsId = String(bsBody.id ?? "").trim();
+      if (!bsTitle || !bsId) return json({ error: "缺少 title/id" }, 400);
+      const ok = deleteBrainSession(bsTitle, bsId);
+      return json({ ok });
+    }
+
+    case "/api/brain/sessions/detail": {
+      // GET /api/brain/sessions/:id 用 POST + body.id（返回完整会话含消息，供刷新恢复/历史回看）
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const bsBody = await readBody(req);
+      const bsTitle = String(bsBody.title ?? "").trim();
+      const bsId = String(bsBody.id ?? "").trim();
+      if (!bsTitle || !bsId) return json({ error: "缺少 title/id" }, 400);
+      const s = getBrainSession(bsTitle, bsId);
+      if (!s) return json({ error: "会话不存在" }, 404);
+      return json({ session: s });
+    }
+
+    case "/api/brain/sessions/truncate": {
+      // 编辑重发前置：删除 fromMessageId 及其后的消息（截断会话）
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const bsBody = await readBody(req);
+      const bsTitle = String(bsBody.title ?? "").trim();
+      const bsId = String(bsBody.id ?? "").trim();
+      const bsMsgId = String(bsBody.messageId ?? "").trim();
+      if (!bsTitle || !bsId || !bsMsgId) return json({ error: "缺少 title/id/messageId" }, 400);
+      const ok = truncateBrainSession(bsTitle, bsId, bsMsgId);
+      return json({ ok });
+    }
+
+    case "/api/brain/state": {
+      // 中枢四维状态派生（零 LLM）：world + autoSession runtime + 落盘 eval + 确定性完整性扫描
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const bsBody = await readBody(req);
+      const bsTitle = String(bsBody.title ?? "").trim();
+      if (!bsTitle) return json({ error: "缺少 title" }, 400);
+      const bw = loadWorld(bsTitle);
+      if (!bw) return json({ error: "故事不存在: " + bsTitle }, 404);
+      const bsSession = loadAutoSession(bsTitle);
+      const bsAutoRunning = bsSession?.status === "running";
+      const brainState = deriveBrainState(bw, {
+        busy: bsAutoRunning,
+        phase: bsAutoRunning ? bsSession?.phase : undefined,
+        autoRunning: bsAutoRunning,
+        evalReport: readEvalReport(bsTitle),
+        integrityReport: auditWorld(bw),
+      });
+      return json({ brainState });
+    }
+
+    case "/api/brain/chat": {
+      // 中枢对话编排（SSE，事件协议 v2）：意图识别 + 流式回复 + 卡片（查询直接执行 / 写操作预览 / L2·L3 确认卡）
+      // 会话化：body 带 sessionId（历史会话）或新建；resume=true 续流未完成消息
+      // 连接解耦：会话级任务注册表 —— 客户端断连不杀任务；刷新后新连接 attach 同一任务，
+      // 先重放已生成文本（{type:"reset",text}）再收后续 delta，支撑“刷新恢复流式输出完成”
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const bcChatBody = await readBody(req);
+      const bcChatTitle = String(bcChatBody.title ?? "").trim();
+      const bcChatPrompt = String(bcChatBody.prompt ?? "").trim();
+      const bcSessionId = String(bcChatBody.sessionId ?? "").trim();
+      const bcResume = bcChatBody.resume === true;
+      if (!bcChatTitle) return json({ error: "缺少 title" }, 400);
+      if (!bcResume && !bcChatPrompt) return json({ error: "缺少 prompt" }, 400);
+      if (!bcSessionId) return json({ error: "缺少 sessionId" }, 400);
+      return sseStream(async (send) => {
+        // 已有运行中任务（其他连接在流式）→ attach：先重放当前已生成文本，再收广播直到任务结束
+        const attached = attachSessionTask(bcSessionId, send);
+        if (attached) {
+          const sess = getBrainSession(bcChatTitle, bcSessionId);
+          const pending = sess ? lastPendingMessage(sess) : null;
+          if (pending) send({ type: "reset", messageId: pending.id, text: pending.text });
+          while (isSessionRunning(bcSessionId)) await Bun.sleep(300);
+          return;
+        }
+        // 新回合：注册任务（req.signal 取消时 abort 任务），回合内 send 一律广播给会话全部连接
+        const task = registerSessionTask(bcSessionId, send, req.signal);
+        task.running = true;
+        const broadcast = (obj: unknown) => broadcastToSession(bcSessionId, obj);
+        try {
+          await brainChatStream({ title: bcChatTitle, prompt: bcChatPrompt, sessionId: bcSessionId, send: broadcast, signal: req.signal, resume: bcResume });
+        } finally {
+          task.running = false;
+          finishSessionTask(bcSessionId);
+        }
+      });
+    }
+
     default:
       return json({ error: `未知 API: ${pathname}` }, 404);
   }
@@ -404,7 +631,16 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         return Date.now() - c.visualTriedAt > VISUAL_RETRY_COOLDOWN;
       });
       for (const c of needy) ensureCharacterVisuals(w.title, w, c);
-      return json({ world: sanitize(w), visualPending: needy.length > 0 });
+      // 中枢四维状态（轻量：复用落盘 eval，不含完整性扫描——完整扫描见 /api/brain/state）
+      const stSession = loadAutoSession(title);
+      const stAutoRunning = stSession?.status === "running";
+      const brainState = deriveBrainState(w, {
+        busy: stAutoRunning,
+        phase: stAutoRunning ? stSession?.phase : undefined,
+        autoRunning: stAutoRunning,
+        evalReport: readEvalReport(title),
+      });
+      return json({ world: sanitize(w), visualPending: needy.length > 0, brainState });
     }
 
     case "/api/novel/list": {
@@ -416,6 +652,11 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const title = String(body.title ?? "").trim();
       if (!title) return json({ error: "缺少 title" }, 400);
       const instruction = String(body.instruction ?? "").trim();
+      // 任务持久化：刷新/关闭页面后可恢复状态；上一任务 running 且未陈旧时拒绝
+      const stepWorld = loadWorld(title);
+      if (!stepWorld) return json({ error: "故事不存在: " + title }, 404);
+      const startRes = startAdvanceTask(title, stepWorld.nextChapter);
+      if (!startRes.ok) return json({ error: startRes.reason ?? "任务已在运行" }, 409);
       return sseStream(async (send) => {
         // loadWorld 必须与修改/保存同锁，防止并发下基于旧快照覆盖
         try {
@@ -423,18 +664,42 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             const w = loadWorld(title);
             if (!w) throw new AppError("故事不存在: " + title);
             send({ phase: "start", nextChapter: w.nextChapter });
-            return director.step(w, instruction, (e) => send(e), { commitPolicy: genOf(w).commitPolicy ?? "auto" });
+            return director.step(w, instruction, (e) => {
+              send(e);
+              // 阶段心跳：同步落盘 phase + updatedAt（前端断开后仍可恢复显示）
+              if (e && typeof e === "object" && "phase" in e) updateAdvanceTaskPhase(title, String((e as { phase: string }).phase));
+            }, { commitPolicy: genOf(w).commitPolicy ?? "auto" });
           });
+          completeAdvanceTask(title, { chapterIndex: result.chapter.index, verdict: result.review?.verdict, rounds: result.rounds });
           send({ phase: "result", result: { chapter: result.chapter, review: result.review, rounds: result.rounds } });
         } catch (e) {
           // commitPolicy=confirm：审查通过后暂存待人工确认（非错误，前端弹确认条）
           if (e instanceof director.PendingCommitError) {
+            completeAdvanceTask(title, { chapterIndex: e.chapterIndex, verdict: e.review?.verdict, rounds: e.review?.round, pendingCommit: true });
             send({ phase: "pending-commit", chapterIndex: e.chapterIndex, review: e.review });
             return;
           }
+          failAdvanceTask(title, e instanceof AppError ? e.message : "推进失败，请重试");
           throw e;
         }
       });
+    }
+
+    case "/api/novel/step/status": {
+      // 查询单章推进任务状态（前端刷新后恢复显示用）：陈旧 running 自动标记 failed
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const title = String(body.title ?? "").trim();
+      if (!title) return json({ error: "缺少 title" }, 400);
+      return json({ task: getAdvanceTaskForClient(title) });
+    }
+
+    case "/api/novel/step/clear": {
+      // 前端已读取 done/failed 结果后清除任务文件（避免刷新重复提示）
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const title = String(body.title ?? "").trim();
+      if (!title) return json({ error: "缺少 title" }, 400);
+      clearAdvanceTask(title);
+      return json({ ok: true });
     }
 
     case "/api/novel/chapter/confirm": {
@@ -938,6 +1203,21 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       }
     }
 
+    case "/api/novel/proposal-closed": {
+      // 新角色提案区关闭状态（按用户 + 书名存服务端，SSR 首帧读库，刷新不闪现）
+      const user = userFromRequest(req);
+      if (!user) return json({ error: "未登录" }, 401);
+      const query = new URL(req.url).searchParams;
+      const title = String(body.title ?? query.get("title") ?? "").trim();
+      if (!title) return json({ error: "缺少 title" }, 400);
+      if (req.method === "POST") {
+        const closed = body.closed === true;
+        setPropClosed(user.id, title, closed);
+        return json({ ok: true, closed });
+      }
+      return json({ closed: getPropClosed(user.id, title) });
+    }
+
     case "/api/novel/proposal": {
       // 新角色提案：confirm 入册 / reject 拒绝（抽卡角色卡与 writer 新角色统一走此入口）（P3.5）
       if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
@@ -1031,9 +1311,10 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
       const title = String(body.title ?? "").trim();
       if (!title) return json({ error: "缺少 title" }, 400);
-      const key = slug(title);
-      // 运行中守卫：同一书名同时只允许一个连载循环（防双跑重复写章/停止信号串扰）
-      if (activeAuto.has(key)) return json({ error: "该书自动连载已在运行中，请先停止" }, 409);
+      const lockKey = slug(title);
+      const autoKey = `${currentUser() ?? ""}::${slug(title)}`;
+      // 运行中守卫：同一用户同一书名同时只允许一个连载循环（防双跑重复写章/停止信号串扰）
+      if (activeAuto.has(autoKey)) return json({ error: "该书自动连载已在运行中，请先停止" }, 409);
       // 会话恢复：暂停态（审查未过）继续 → 复用原目标与已写章数；running 说明后台恢复中，拒绝双跑
       const session = loadAutoSession(title);
       if (session?.status === "running") return json({ error: "该书自动连载已在后台运行中，请先停止" }, 409);
@@ -1044,14 +1325,14 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const autoGacha = typeof body.autoGacha === "boolean" ? body.autoGacha : undefined;
       const rawEvalEvery = Number(body.runEvalEvery);
       const runEvalEvery = Number.isInteger(rawEvalEvery) && rawEvalEvery >= 0 ? Math.min(rawEvalEvery, 50) : undefined;
-      activeAuto.add(key);
+      activeAuto.add(autoKey);
       // 原 autoGacha 值：运行结束后还原（修：临时覆盖不得持久化污染后续手动写作）
       const savedAutoGacha = (() => { const w = loadWorld(title); return w?.gen?.autoGacha; })();
       return sseStream(async (send) => {
         try {
           // 断点恢复（修 D6）：崩溃窗口（章节已落盘但 nextChapter 未推进）→ 修正计数后从断点续跑
           let resumedFrom: number | null = null;
-          await withTitleLock(key, async () => {
+          await withTitleLock(lockKey, async () => {
             const w = loadWorld(title);
             if (w) {
               const maxIdx = w.chapters.reduce((m, c) => Math.max(m, c.index), 0);
@@ -1067,9 +1348,9 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           }
           const report = await runAuto(
             title,
-            { maxChapters, stopAvgScore, autoGacha, runEvalEvery, execRetry: buildAutoExecRetry(key, title) },
+            { maxChapters, stopAvgScore, autoGacha, runEvalEvery, execRetry: buildAutoExecRetry(lockKey, title) },
             // 每章在锁内重新加载最新世界（杜绝旧快照覆盖）；autoGacha 临时覆盖仅作用本章；requirePass：审查不通过不 commit
-            (_w, onEvent) => withTitleLock(key, async () => {
+            (_w, onEvent) => withTitleLock(lockKey, async () => {
               const fresh = loadWorld(title);
               if (!fresh) throw new AppError("故事不存在: " + title);
               if (autoGacha !== undefined && fresh.gen) fresh.gen.autoGacha = autoGacha;
@@ -1083,7 +1364,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         } finally {
           // 还原 autoGacha 临时覆盖（锁内短事务，保证持久化一致）
           if (autoGacha !== undefined) {
-            await withTitleLock(key, async () => {
+            await withTitleLock(lockKey, async () => {
               const w = loadWorld(title);
               if (w?.gen) {
                 w.gen.autoGacha = savedAutoGacha;
@@ -1092,7 +1373,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             });
           }
           // 释放活跃运行守卫（run 生命周期结束）
-          activeAuto.delete(key);
+          activeAuto.delete(autoKey);
         }
       });
     }
@@ -1478,7 +1759,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           let ok = 0;
           await Promise.allSettled(created.map(async (item, i) => {
             const s = toAdd[i];
-            imageGenTasks.set(item.id, true);
+            imageGenTasks.set(mediaKey(item.id), true);
             try {
               // 参考图级联：主体角色立绘绝对优先 → 跨章角色插画（仅用已就绪图）；角色无任何图时后台补立绘，不阻塞本次插画
               const ref = findCharacterRef(w0, idx, s.anchor, s.subject || undefined);
@@ -1536,7 +1817,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
                 }
               });
             } finally {
-              imageGenTasks.delete(item.id);
+              imageGenTasks.delete(mediaKey(item.id));
             }
           }));
           console.log(`[media/generate] 插画后台完成 ${ok}/${created.length}，总耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
@@ -1565,7 +1846,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         // 插画（或异常媒体）：ready/failed 直接返回；pending 查内存任务表区分生成中与中断
         if (media.status === "failed") return json({ ok: true, status: "failed", error: media.error ?? "插画生成失败" });
         if (media.status === "pending") {
-          if (imageGenTasks.has(mediaId)) return json({ ok: true, status: "pending", progress: 0 });
+          if (imageGenTasks.has(mediaKey(mediaId))) return json({ ok: true, status: "pending", progress: 0 });
           // 服务重启/进程中断：标记 failed，前端提示重新生成
           await withTitleLock(slug(title), async () => {
             const w = loadWorld(title);
@@ -1648,7 +1929,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
       const title = String(body.title ?? "").trim();
       if (!title) return json({ error: "缺少 title" }, 400);
-      const tKey = slug(title);
+      const tKey = `${currentUser() ?? ""}::${slug(title)}`;
       const tasks = visualTasks.get(tKey);
       const entries = [...(tasks?.entries() ?? [])];
       const w = loadWorld(title);
@@ -1677,7 +1958,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const newPrompt = String(body.prompt ?? "").trim().slice(0, 1200);
       if (!title || !mediaId) return json({ error: "缺少参数" }, 400);
       if (!Number.isInteger(idx) || idx < 1) return json({ error: "缺少有效的章节号" }, 400);
-      if (regenBusy.has(mediaId)) return json({ error: "该媒体正在重生成中，请稍候" }, 409);
+      if (regenBusy.has(mediaKey(mediaId))) return json({ error: "该媒体正在重生成中，请稍候" }, 409);
       try {
         // ① 锁内短事务：校验存在 + 记录快照（oldPath/oldPrompt）
         const snap = await withTitleLock(slug(title), async () => {
@@ -1691,7 +1972,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           if (!finalPrompt.trim()) throw new AppError("提示词不能为空");
           return { kind: m.kind, anchor: m.anchor, oldPath: m.path, prompt: finalPrompt, style: styleAnchor(w), caption: m.caption, sceneType: m.sceneType, subject: m.subject };
         });
-        regenBusy.add(mediaId);
+        regenBusy.add(mediaKey(mediaId));
         let newMedia: ChapterMedia;
         try {
           // ② 锁外生成（耗时操作不持锁）
@@ -1725,7 +2006,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             }
           }
         } catch (e) {
-          regenBusy.delete(mediaId);
+          regenBusy.delete(mediaKey(mediaId));
           throw e;
         }
         // ③ 锁内短事务：按 mediaId 重新定位（防期间被删/回滚）后交换
@@ -1749,7 +2030,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           saveWorld(w);
           return true;
         });
-        regenBusy.delete(mediaId);
+        regenBusy.delete(mediaKey(mediaId));
         if (!swapped) {
           if (snap.kind === "image" && snap.oldPath === undefined && newMedia.path) deleteMediaFile(title, newMedia.path);
           return json({ error: "媒体已被删除，重生成结果已丢弃" }, 404);
@@ -1758,7 +2039,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         if (snap.oldPath) deleteMediaFile(title, snap.oldPath);
         return json({ ok: true, mediaId, status: snap.kind === "image" ? "ready" : "pending", videoId: newMedia.videoId });
       } catch (e) {
-        regenBusy.delete(mediaId);
+        regenBusy.delete(mediaKey(mediaId));
         console.error("[api/novel/media/regenerate]", e);
         const st = (e as { status?: number }).status;
         return json({ error: e instanceof AppError ? e.message : "重生成失败，请稍后重试" }, st === 429 ? 429 : 502);
@@ -1773,7 +2054,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const mediaId = String(body.mediaId ?? "").trim();
       if (!title || !mediaId) return json({ error: "缺少参数" }, 400);
       if (!Number.isInteger(idx) || idx < 1) return json({ error: "缺少有效的章节号" }, 400);
-      if (regenBusy.has(mediaId)) return json({ error: "该媒体正在重生成中，无法删除" }, 409);
+      if (regenBusy.has(mediaKey(mediaId))) return json({ error: "该媒体正在重生成中，无法删除" }, 409);
       try {
         const oldPath = await withTitleLock(slug(title), async () => {
           const w = loadWorld(title);
@@ -1906,7 +2187,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       if (!w0) return json({ error: "故事不存在: " + title }, 404);
       const ch0 = w0.chapters.find((c) => c.index === index);
       if (!ch0) return json({ error: "章节不存在" }, 404);
-      if ((ch0.media ?? []).some((m) => regenBusy.has(m.id))) return json({ error: "本章有媒体正在重生成中，无法删除" }, 409);
+      if ((ch0.media ?? []).some((m) => regenBusy.has(mediaKey(m.id)))) return json({ error: "本章有媒体正在重生成中，无法删除" }, 409);
       try {
         if (!strategy) {
           // 预览：确定性收集危险项；删中间章（非尾章）追加 1 次语义冲突评估（失败降级）
@@ -2042,10 +2323,10 @@ function buildAutoExecRetry(key: string, title: string) {
     });
 }
 
-/** 按 slug 读世界（恢复会话时目录名 → 书名） */
+/** 按 slug 读世界（恢复会话时目录名 → 书名；路径随当前用户上下文，无上下文时读 data/ 根遗留） */
 function loadWorldBySlug(slugName: string): WorldState | null {
   try {
-    const p = join(process.cwd(), "data", slugName, "state.json");
+    const p = join(userDir(currentUser() ?? ""), slugName, "state.json");
     if (!existsSync(p)) return null;
     return JSON.parse(readFileSync(p, "utf-8")) as WorldState;
   } catch {
@@ -2055,12 +2336,13 @@ function loadWorldBySlug(slugName: string): WorldState | null {
 
 /** 后台续跑（服务重启恢复）：无 SSE 消费者，进度仅写入 autorun-session.json */
 async function runAutoInBackground(title: string, target: number, written: number): Promise<void> {
-  const key = slug(title);
+  const lockKey = slug(title);
+  const autoKey = `${currentUser() ?? ""}::${slug(title)}`;
   try {
     const report = await runAuto(
       title,
-      { maxChapters: target, runEvalEvery: 10, execRetry: buildAutoExecRetry(key, title) },
-      (_w, onEvent) => withTitleLock(key, async () => {
+      { maxChapters: target, runEvalEvery: 10, execRetry: buildAutoExecRetry(lockKey, title) },
+      (_w, onEvent) => withTitleLock(lockKey, async () => {
         const fresh = loadWorld(title);
         if (!fresh) throw new AppError("故事不存在: " + title);
         return director.writeOneChapter(fresh, "", onEvent, null, { requirePass: true });
@@ -2075,13 +2357,29 @@ async function runAutoInBackground(title: string, target: number, written: numbe
   } catch (e) {
     console.error("[auto] 后台连载异常:", title, e);
   } finally {
-    activeAuto.delete(key);
+    activeAuto.delete(autoKey);
   }
 }
 
-/** 服务启动时恢复未停止的连载：扫描 data 下各故事目录的 autorun-session.json，status==="running" → 后台续跑（未被人工停止的任务不因重启丢失） */
+/** 启动兜底迁移：把 data/ 根下遗留的旧书目录迁移给现存第一个注册用户（首个注册用户认领语义）。
+ * 注册时的 isFirstUser 迁移只覆盖「迁移上线后才注册首个用户」的环境；存量环境（已有用户 + 根下旧书）
+ * 由本函数在服务启动时补上，避免旧数据成为无主孤儿。 */
+export function migrateLegacyOnBoot(): void {
+  const first = firstUsername();
+  if (!first) return;
+  migrateLegacyStoriesTo(first);
+}
+
+/** 服务启动时恢复未停止的连载：遍历所有用户目录（+遗留根目录），status==="running" 的 autorun-session.json → 后台续跑（未被人工停止的任务不因重启丢失） */
 export function resumeAutoSessions(): void {
-  const dataDir = join(process.cwd(), "data");
+  resumeAutoForDir(""); // 遗留根目录（未迁移前）
+  for (const username of listUsernames()) {
+    runAsUser(username, () => resumeAutoForDir(username));
+  }
+}
+
+function resumeAutoForDir(username: string): void {
+  const dataDir = userDir(username);
   if (!existsSync(dataDir)) return;
   for (const d of readdirSync(dataDir)) {
     if (d === ".DS_Store") continue;
@@ -2092,9 +2390,9 @@ export function resumeAutoSessions(): void {
       if (s.status !== "running") continue; // paused（等待人工决策）/ stopped / done 不自动恢复
       const w = loadWorldBySlug(d);
       if (!w) continue;
-      const key = slug(w.title);
-      if (activeAuto.has(key)) continue; // 防重复恢复（同进程内已有任务）
-      activeAuto.add(key);
+      const autoKey = `${currentUser() ?? ""}::${slug(w.title)}`;
+      if (activeAuto.has(autoKey)) continue; // 防重复恢复（同进程内已有任务）
+      activeAuto.add(autoKey);
       const target = Math.max(1, Math.min(Number(s.target) || 3, 30));
       const written = Math.max(0, Number(s.written) || 0);
       void runAutoInBackground(w.title, target, written);

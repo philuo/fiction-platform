@@ -35,10 +35,8 @@ export type AgnesOptions = {
   timeoutMs?: number;
   /** 主模型+回退模型各自的失败重试次数上限（缺省 4 次；分镜等交互任务建议 1 次） */
   retries?: number;
-  /** 思考强度（agnes-2.5-flash 为思考型模型，reasoning 与正文共享输出预算）：high/medium/low；
-   * 缺省读环境变量 AGNES_REASONING_EFFORT，再缺省不传（服务端默认思考，实测稳定）。
-   * 注意：high 思考量无上界（实测 1000~32000+），会间歇性吃光预算导致空输出/超时，需配合极大 max_tokens 兜底 */
-  reasoningEffort?: "low" | "medium" | "high";
+  /** 外部取消信号（"停止生成"）：abort 时终止 LLM 请求（与超时合并，不覆盖超时） */
+  signal?: AbortSignal;
 };
 
 export class LLMError extends Error {
@@ -60,14 +58,15 @@ const MODEL = process.env.TEXT_MODEL ?? process.env.AGNES_MODEL ?? "agnes-2.5-fl
 // Responses API 仅 Agnes 端点支持；其他 OpenAI 兼容端点直接走 chat/completions，避免无效降级重试
 const USE_RESPONSES_API = BASE_URL === AGNES_BASE;
 
-async function postJson(url: string, body: unknown, timeoutMs = 120_000): Promise<Response> {
+async function postJson(url: string, body: unknown, timeoutMs = 120_000, signal?: AbortSignal): Promise<Response> {
   // 全局文本限流（并发 + RPM）：排队不触发 429；超时在拿到槽位后才起算
   return textLimiter.run(() =>
     fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${API_KEY}` },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
+      // 外部取消信号与超时合并：任一触发即中止（AbortSignal.any 需同时兼容两者）
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
     }),
   );
 }
@@ -84,26 +83,30 @@ function isRetryable(msg: string): boolean {
 }
 
 /** 可感知错误的智能重试：失败可重试则按指数退避重试；
- * 空内容且 finish_reason=length（思考/正文吃光预算）时，下一次请求自动降档 reasoning_effort=low，
- * 把预算让给正文输出——避免相同参数盲重试全部失败。返回最后一次错误。 */
+ * 任何异常（503/504/空内容/超时）先输出诊断分析日志（HTTP 状态/finish_reason/token 用量），
+ * 再常规退避重试，不修改任何请求参数（不使用 reasoning_effort）。返回最后一次错误。 */
 async function withSmartRetry(
   doCall: (attemptOpts: AgnesOptions) => Promise<unknown>,
   opts: AgnesOptions,
   maxRetries = 4,
 ): Promise<unknown> {
   let lastErr: Error | null = null;
-  let curOpts = opts;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      return await doCall(curOpts);
+      return await doCall(opts);
     } catch (e) {
       lastErr = e as Error;
       if (!isRetryable(lastErr.message)) throw lastErr;
-      // 思考吃光预算：降档思考强度重试（显式 reasoning_effort 时不覆盖用户配置）
-      if (lastErr instanceof LLMError && lastErr.finishReason === "length" && !curOpts.reasoningEffort) {
-        console.warn(`[agnes] 空内容疑似思考吃光预算（finish_reason=length，reasoning=${lastErr.reasoningTokens ?? "?"} text=${lastErr.textTokens ?? "?"}），重试降档 reasoning_effort=low`);
-        curOpts = { ...curOpts, reasoningEffort: "low" };
+      // 诊断分析：汇总错误特征供运维定位（不改变请求参数，仅常规指数退避重试）
+      const diag: string[] = [`第${attempt + 1}/${maxRetries}次尝试失败`, `err=${lastErr.message.slice(0, 120)}`];
+      if (lastErr instanceof LLMError) {
+        if (lastErr.finishReason) diag.push(`finish_reason=${lastErr.finishReason}`);
+        if (lastErr.reasoningTokens != null || lastErr.textTokens != null) diag.push(`reasoning=${lastErr.reasoningTokens ?? "?"} text=${lastErr.textTokens ?? "?"} tokens`);
       }
+      if (/HTTP 503/.test(lastErr.message)) diag.push("上游限流/渠道暂满，等待后重试");
+      else if (/HTTP 504|非 JSON/.test(lastErr.message)) diag.push("上游网关超时，等待后重试（chatJson 已走流式规避）");
+      else if (/空内容|空输出/.test(lastErr.message)) diag.push("模型空输出，可能输入过大或服务端异常，等待后重试");
+      console.warn(`[agnes] 诊断 ${diag.join(" | ")}`);
       await Bun.sleep(2 ** attempt * 1000);
     }
   }
@@ -119,11 +122,9 @@ async function callOnce(model: string, messages: ChatMessage[], opts: AgnesOptio
   if (opts.tools) payload.tools = opts.tools;
   if (opts.maxTokens) payload.max_tokens = opts.maxTokens;
   if (opts.stream) payload.stream = true;
-  // 思考强度：优先调用级配置，其次环境变量 AGNES_REASONING_EFFORT；不传则服务端默认思考（实测稳定）。
-  // 注意：服务端默认输出上限 4096，思考型任务思考可吃光全部预算导致空输出，各调用点必须显式传大 max_tokens 兜底
-  const effort = opts.reasoningEffort ?? (process.env.AGNES_REASONING_EFFORT as "low" | "medium" | "high" | undefined);
-  if (effort) payload.reasoning_effort = effort;
-  return postJson(`${BASE_URL}/chat/completions`, payload, opts.timeoutMs ?? 120_000);
+  // 不使用 reasoning_effort：任何端点都不传思考强度参数，由服务端默认策略决定；
+  // 注意：服务端默认输出上限 4096，各调用点必须显式传大 max_tokens 兜底避免空输出
+  return postJson(`${BASE_URL}/chat/completions`, payload, opts.timeoutMs ?? 120_000, opts.signal);
 }
 
 async function parseMessage(res: Response, ctx?: { model?: string; msgChars?: number }): Promise<{ content: string; tool_calls?: ToolCall[] }> {
@@ -131,10 +132,16 @@ async function parseMessage(res: Response, ctx?: { model?: string; msgChars?: nu
   if (res.status === 503) {
     throw new LLMError("AI 服务繁忙（免费额度渠道暂满），请稍等片刻重试");
   }
-  const data = (await res.json()) as {
+  // 上游偶发返回非 JSON（网关错误页/截断响应）：SyntaxError 转为可重试 LLMError，避免不重试直接失败
+  let data: {
     choices?: { message?: { content?: string | null; tool_calls?: ToolCall[] }; finish_reason?: string }[];
     error?: { message?: string };
   };
+  try {
+    data = (await res.json()) as typeof data;
+  } catch (e) {
+    throw new LLMError(`HTTP ${res.status} 响应非 JSON（上游异常），网络错误请重试: ${(e as Error).message.slice(0, 100)}`);
+  }
   if (!res.ok || data.error || !data.choices?.length) {
     throw new LLMError(`HTTP ${res.status}: ${data.error?.message ?? JSON.stringify(data).slice(0, 300)}`);
   }
@@ -172,7 +179,7 @@ async function callResponsesOnce(model: string, messages: ChatMessage[], opts: A
     // 思考型模型 reasoning 与正文共享输出预算：缺省给足 60000（服务端上限 65.5K），避免 incomplete
     max_output_tokens: opts.maxTokens ?? 60000,
   };
-  return postJson(`${BASE_URL}/responses`, payload, opts.timeoutMs ?? 120_000);
+  return postJson(`${BASE_URL}/responses`, payload, opts.timeoutMs ?? 120_000, opts.signal);
 }
 
 async function parseResponses(res: Response, ctx?: { model?: string; msgChars?: number }): Promise<{ content: string }> {
@@ -180,12 +187,16 @@ async function parseResponses(res: Response, ctx?: { model?: string; msgChars?: 
   if (res.status === 503) {
     throw new LLMError("AI 服务繁忙（免费额度渠道暂满），请稍等片刻重试");
   }
+  // 上游偶发返回非 JSON（网关错误页/截断响应）：解析失败转可重试 LLMError，避免不重试直接失败
   const data = (await res.json().catch(() => null)) as {
     status?: string;
     output?: { type?: string; content?: { type?: string; text?: string }[] }[];
     error?: { message?: string } | null;
     incomplete_details?: unknown;
   } | null;
+  if (data === null && res.ok) {
+    throw new LLMError(`HTTP ${res.status} 响应非 JSON（上游异常），网络错误请重试`);
+  }
   if (!res.ok || !data || data.error) {
     throw new LLMError(`HTTP ${res.status}: ${data?.error?.message ?? JSON.stringify(data).slice(0, 300)}`);
   }

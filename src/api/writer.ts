@@ -3,7 +3,7 @@
 // - 走 chatStream 流式（onDelta 透传 SSE），maxTokens 60000 防截断（思考型模型 reasoning 与正文共享预算）
 // - 字数治理：short → 1 次续写补足；long → warning 不截断（inkos 式）
 // - 注入：记忆层上下文（自适应档位+预算）+ 世界书关键词匹配 + 风格指纹 + 反 AI 味规则
-import { chatStream } from "./agnes";
+import { chat, chatStream } from "./agnes";
 import { loreBlock } from "./lore";
 import { buildWriterContext } from "./memory";
 import { antiAiToneRules, detectAiTone, wordCountGuard } from "./style";
@@ -23,21 +23,63 @@ const WRITER_SYSTEM = `你是小说的"导演"（Writer）。基于世界状态�
 - 人物行为必须符合人设与动机；已埋设的伏笔要有意识地推进或暗示
 - 段落自然分行；直接写正文，不要输出任何 JSON、markdown、标题编号或解释性文字
 输出格式（严格遵守）：
-第一行：【标题】本章标题（贴合本章内容，禁止用"第N章"作为标题）
+第一行：【标题】XX，其中 XX 为本章标题（2-8 字短语，贴合本章内容；标题本身不得再包裹【】《》等符号，禁止用"第N章"作为标题）
 其后：正文段落（空行分段）`;
 
-function parseDraft(raw: string, fallbackTitle: string): { title: string; text: string } {
+/** 标题健全判定：章节标题应是简短词组；含句读标点、括号符号、反引号、超长或以"第N章"开头视为目标句/无效标题 */
+export function isTitleLike(t: string): boolean {
+  const s = t.trim();
+  if (!s || s.length > 12) return false;
+  if (s.includes("`")) return false; // 代码围栏等非标题
+  if (/[，。！？；：、…【】《》「」『』{}[\]<>"'“”‘’]/.test(s)) return false;
+  if (/^第[\d一二三四五六七八九十百零]+章/.test(s)) return false;
+  return true;
+}
+
+/** 解析 LLM 草稿首行标题：
+ * 1.【标题】XX（约定格式）；
+ * 2.【XX】（模型自创格式，如【衣债】）→ 采纳 XX 并从正文剥离该行；
+ * 3.「标题：XX」冒号变体。
+ * 均不匹配时回退 fallbackTitle（正文不动）。标题是否健全由调用方用 isTitleLike 兜底。 */
+export function parseDraft(raw: string, fallbackTitle: string): { title: string; text: string } {
   const lines = raw.trim().split("\n");
-  let title = fallbackTitle;
+  const first = lines[0]?.trim() ?? "";
+  let title: string | null = null;
   let start = 0;
-  const m = lines[0]?.match(/^【标题】\s*(.+)$/);
+  let m = first.match(/^【标题】[：:\s]*(.+)$/);
   if (m) {
-    title = m[1].trim().slice(0, 60) || fallbackTitle;
+    title = m[1].trim();
+    start = 1;
+  } else if ((m = first.match(/^【([^【】]+)】$/))) {
+    title = m[1].trim();
+    start = 1;
+  } else if ((m = first.match(/^(?:本章)?标题[：:]\s*(.+)$/))) {
+    title = m[1].trim();
     start = 1;
   }
   const text = lines.slice(start).join("\n").trim();
-  return { title, text };
+  return { title: (title ? title.slice(0, 60) : "") || fallbackTitle, text };
 }
+
+/** 标题兜底：草稿缺少健全标题时轻量 LLM 提炼短标题（失败返回 null，调用方退回「第N章」）。
+ * 禁止用 plan.goal 截断造标题——目标句不是标题，截断后更是不完整的长句 */
+async function summarizeChapterTitle(w: WorldState, plan: ChapterPlan | null, text: string): Promise<string | null> {
+  try {
+    const out = await chat(
+      [
+        { role: "system", content: "你是章节命名编辑。根据给定的章节内容提炼本章标题。只输出标题本身（2-8 字短语，禁止输出引号、书名号、【】、标点、序号或任何解释）。" },
+        { role: "user", content: `本章任务：${plan?.goal ?? "（无）"}\n正文开头：\n${text.slice(0, 600)}` },
+      ],
+      { temperature: 0.3, maxTokens: 60 },
+    );
+    const t = out.split("\n")[0].trim().replace(/^【标题】[：:\s]*/, "").replace(/[《》【】「」『』"']/g, "").trim();
+    return isTitleLike(t) ? t : null;
+  } catch {
+    return null;
+  }
+}
+
+
 
 export interface WriteChapterOpts {
   world: WorldState;
@@ -118,8 +160,8 @@ export async function writeChapter(o: WriteChapterOpts): Promise<WriterResult> {
   const w = o.world;
   const idx = o.chapterIndex ?? w.nextChapter;
   const g = genOf(w, idx);
-  // 标题兜底：有本章计划时用本章计划目标提炼（比"第N章"更有信息量），无本章计划才退回"第N章"
-  const fallbackTitle = o.plan?.goal?.slice(0, 20) || `第${idx}章`;
+  // 标题兜底：绝不用 plan.goal 截断造标题（会产生半句话的"长句标题"）；解析/提炼均失败才退回「第N章」
+  const fallbackTitle = `第${idx}章`;
 
   const raw = await chatStream(
     [
@@ -144,6 +186,12 @@ export async function writeChapter(o: WriteChapterOpts): Promise<WriterResult> {
       { temperature: g.temperature, maxTokens: 60000, timeoutMs: 240_000 },
     );
     ({ title, text } = parseDraft(retry, fallbackTitle));
+  }
+
+  // 标题健全兜底：解析回退（「第N章」）或模型输出句目标题 → 轻量 LLM 提炼短标题；仍失败保留「第N章」
+  if (!isTitleLike(title)) {
+    const named = await summarizeChapterTitle(w, o.plan ?? null, text);
+    if (named) title = named;
   }
 
   // 字数治理（修 C3）：short → 1 次续写补足；long → warning 不截断

@@ -64,13 +64,46 @@ mock.module("../src/api/images", () => ({
 
 let tmp: string;
 let oldCwd: string;
-beforeAll(() => {
+const TEST_USER = "mediatest";
+let authCookie = "";
+let runAsUser: <T>(username: string | null, fn: () => T) => T;
+
+beforeAll(async () => {
   oldCwd = process.cwd();
   tmp = mkdtempSync(join(tmpdir(), "ai-novel-media-"));
   process.chdir(tmp);
+  process.env.APP_DB_PATH = join(tmp, "app-test.db");
+  // 账号隔离后 novel API 需登录：占位首用户（消耗「首个注册用户认领旧数据」）+ 测试用户
+  const { handleApi } = await import("../src/api/routes");
+  const { runAsUser: rau } = await import("../src/api/storage");
+  runAsUser = rau;
+  await handleApi("/api/auth/register", new Request("http://x/api/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "dummyfirst", password: "secret123" }),
+  }));
+  await handleApi("/api/auth/register", new Request("http://x/api/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: TEST_USER, password: "secret123" }),
+  }));
+  const login = await handleApi("/api/auth/login", new Request("http://x/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: TEST_USER, password: "secret123" }),
+  }));
+  authCookie = login!.headers.get("Set-Cookie")!.split(";")[0];
 });
 afterAll(() => {
   process.chdir(oldCwd);
+  delete process.env.APP_DB_PATH;
+  // 视觉巡检会经 listUsernames 初始化 db（临时库）：先关闭释放句柄再删目录（Windows 文件锁）
+  const { getDb } = require("../src/api/db") as typeof import("../src/api/db");
+  try {
+    getDb().close();
+  } catch {
+    /* 未初始化则忽略 */
+  }
   rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -126,7 +159,7 @@ describe("P5 角色媒体自动生成", () => {
     expect(p.prompt).toContain("与参考头像完全同一人");
     expect(p.prompt).toContain("性别与参考头像一致");
     expect(p.prompt).toContain("容貌、发型、服饰全部保持参考图原样");
-    expect(p.prompt).toContain("不戴任何帽子");
+    expect(p.prompt).toContain("不戴帽"); // 差异化头饰子句（headwearOf）
     expect(p.prompt).toContain("面向观者");
     expect(p.prompt).not.toContain("或略侧身");
     // 短 prompt 不再重述性别/年龄/身份/时代服饰（头像已承载，重述会干扰弱模型保持参考图）
@@ -177,7 +210,7 @@ describe("P5 角色媒体自动生成", () => {
     expect(avatar.prompt).toContain("年轻女子");
     expect(avatar.prompt).toContain("严禁画成异性");
     expect(avatar.prompt).toContain("五官柔和"); // 性别面部特征强化（实测修复女相/男相错画）
-    expect(avatar.prompt).toContain("不戴任何帽子");
+    expect(avatar.prompt).toContain("不戴帽"); // 差异化头饰子句（headwearOf）
     expect(avatar.prompt.startsWith("年轻女子，")).toBe(true);
     // 渠道单一：纯文生——无 i2i 保持前缀（不参考立绘/任何图像）
     expect(avatar.prompt).not.toContain("容貌基准");
@@ -185,6 +218,7 @@ describe("P5 角色媒体自动生成", () => {
   });
 
   test("proposal 确认入册：角色入册后自动生成立绘+头像（fire-and-forget），操作日志留痕 CMD-M07/M08", async () => {
+    await runAsUser(TEST_USER, async () => {
     const { handleApi } = await import("../src/api/routes");
     const { saveWorld, loadWorld } = await import("../src/api/storage");
     const { emptyWorld } = await import("../src/api/world");
@@ -199,7 +233,7 @@ describe("P5 角色媒体自动生成", () => {
     failImage = false;
     const res = await handleApi("/api/novel/proposal", new Request("http://localhost/api/novel/proposal", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", cookie: authCookie },
       body: JSON.stringify({ title: w.title, proposalId: "cp1", action: "confirm" }),
     }));
     const data = (await res!.json()) as { ok?: boolean; world?: import("../src/api/world").WorldState };
@@ -225,14 +259,16 @@ describe("P5 角色媒体自动生成", () => {
     // 幂等：视觉已完整，再次确认/读时自愈不再触发自动生成
     const res2 = await handleApi("/api/novel/state", new Request("http://localhost/api/novel/state", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", cookie: authCookie },
       body: JSON.stringify({ title: w.title }),
     }));
     const st2 = (await res2!.json()) as { visualPending?: boolean };
     expect(st2.visualPending).toBe(false);
+    });
   });
 
   test("生成失败：不阻塞角色入册，操作日志留痕 visual-fail（失败可见，可稍后手动补）", async () => {
+    await runAsUser(TEST_USER, async () => {
     const { handleApi } = await import("../src/api/routes");
     const { saveWorld, loadWorld } = await import("../src/api/storage");
     const { emptyWorld } = await import("../src/api/world");
@@ -246,7 +282,7 @@ describe("P5 角色媒体自动生成", () => {
     failImage = true; // 图像生成全部失败（模拟图像服务不可用）
     const res = await handleApi("/api/novel/proposal", new Request("http://localhost/api/novel/proposal", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", cookie: authCookie },
       body: JSON.stringify({ title: w.title, proposalId: "cp1", action: "confirm" }),
     }));
     const data = (await res!.json()) as { ok?: boolean; world?: import("../src/api/world").WorldState };
@@ -275,7 +311,7 @@ describe("P5 角色媒体自动生成", () => {
     for (;;) {
       const rs = await handleApi("/api/novel/visual/status", new Request("http://localhost/api/novel/visual/status", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", cookie: authCookie },
         body: JSON.stringify({ title: w.title }),
       }));
       statusRes = (await rs!.json()) as typeof statusRes;
@@ -286,9 +322,11 @@ describe("P5 角色媒体自动生成", () => {
     const failedEntry = (statusRes.failed ?? []).find((f) => f.name === "失败角色");
     expect(failedEntry).toBeDefined();
     expect(failedEntry?.reason).toContain("模拟图像生成失败");
+    });
   });
 
   test("读时自愈：打开已有故事，视觉缺失且未尝试（或过冷却期）的角色自动补立绘+头像", async () => {
+    await runAsUser(TEST_USER, async () => {
     const { handleApi } = await import("../src/api/routes");
     const { saveWorld, loadWorld } = await import("../src/api/storage");
     const { emptyWorld } = await import("../src/api/world");
@@ -304,7 +342,7 @@ describe("P5 角色媒体自动生成", () => {
     failImage = false;
     const res = await handleApi("/api/novel/state", new Request("http://localhost/api/novel/state", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", cookie: authCookie },
       body: JSON.stringify({ title: w.title }),
     }));
     const st = (await res!.json()) as { visualPending?: boolean };
@@ -319,11 +357,12 @@ describe("P5 角色媒体自动生成", () => {
     // 幂等：视觉已完整 → 再次打开不触发
     const res2 = await handleApi("/api/novel/state", new Request("http://localhost/api/novel/state", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", cookie: authCookie },
       body: JSON.stringify({ title: w.title }),
     }));
     const st2 = (await res2!.json()) as { visualPending?: boolean };
     expect(st2.visualPending).toBe(false);
+    });
   });
 
   test("中枢巡检 sweepVisualGaps：扫描所有故事，视觉缺失角色自动补头像+立绘；冷却期内不重复触发", async () => {

@@ -1,4 +1,4 @@
-// 共享 HTML 组装：dev（bun --hot）与 prod（Bun.serve）共用
+﻿// 共享 HTML 组装：dev（bun --hot）与 prod（Bun.serve）共用
 import { readFileSync } from "node:fs";
 
 const template = readFileSync("index.html", "utf-8");

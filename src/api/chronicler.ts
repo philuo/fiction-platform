@@ -5,6 +5,7 @@ import { chatJson } from "./jsonutil";
 import { activeForeshadows, genOf, type Chapter, type ChapterDelta, type ChapterPlan, type ChapterSummary, type CharacterFieldDelta, type WorldState } from "./world";
 import { upsertSummary } from "./memory";
 import { logChange } from "./steering";
+import { appearedInChapter, normCharName } from "../shared/appearance";
 
 export type SettleOutput = {
   summary: string;
@@ -20,7 +21,7 @@ export type SettleOutput = {
   timeline_summary: string;
   world_current: string;
   plot_threads: { id: string; status: string; note: string }[];
-  new_characters: { name: string; role: string; gender?: string; age?: string; identity?: string; traits: string[]; motivation: string; voice?: string }[];
+  new_characters: { name: string; role: string; gender?: string; age?: string; identity?: string; traits: string[]; motivation: string; voice?: string; reason?: string }[];
   setting_rules: string[];
 };
 
@@ -48,11 +49,11 @@ const SETTLE_SYSTEM = `你是小说的"记账者"（Chronicler）。给定一章
 "timeline_summary":"本章事件一句话",
 "world_current":"本章结束后的全局状态一句话（季节/天气/昼夜/局势/关键人物处境，覆盖全书当前动态）",
 "plot_threads":[{"id":"弧线ID","status":"进行中或已解决","note":"本章进展"}],
-"new_characters":[{"name":"名字","role":"定位","gender":"男或女","age":"年龄（如二十出头）","identity":"社会身份/职业","traits":["特质"],"motivation":"动机","voice":"说话风格（可空）"}],
+"new_characters":[{"name":"名字","role":"定位","gender":"男或女","age":"年龄（如二十出头）","identity":"社会身份/职业","traits":["特质"],"motivation":"动机","voice":"说话风格（可空）","reason":"一句话推荐原因（为什么建议让该角色登场，如：与主角身份成反差，推动悬疑线）"}],
 "setting_rules":["正文明确体现的世界规则/约束/禁忌，无则留空数组"]}
 规则：
 - resolved_foreshadowing 的 id 必须严格引用[伏笔账本]中方括号内的 ID；plot_threads 的 id 必须引用[弧线列表]中的 ID，不得自造
-- new_foreshadowing 只登记正文确实埋下的悬念；new_characters 只登记正文确实登场（有台词或行动）的新角色，gender/age/identity 必须给出
+- new_foreshadowing 只登记正文确实埋下的悬念；new_characters 只登记正文确实登场（有台词或行动）的新角色，gender/age/identity 必须给出，reason 给出一句话推荐原因（为什么值得让该角色登场，可空）
 - character_relations 只登记正文明确展现的关系（互动/称呼/立场），对方名尽量与现有角色名一致；仅记录本章出现或变化的关系
 - setting_rules 只提取正文明确确立的新规则/禁忌/限制（如"入梦需在月圆之夜"），每条一句话，≤3 条
 - look 只记正文中明确的容貌/装扮/伤情变化（如受伤、换装、易容），无变化不填；world_current 必须给出一句话
@@ -63,10 +64,8 @@ const SETTLE_SYSTEM = `你是小说的"记账者"（Chronicler）。给定一章
 const strArr = (v: unknown, cap = 12): string[] =>
   Array.isArray(v) ? v.map(String).filter((s) => s.trim()).slice(0, cap) : [];
 
-/** 角色名别名归一（修 E3）：去「阿/小/老」前缀与空白，便于宽松匹配 */
-export function normCharName(name: string): string {
-  return name.replace(/\s+/g, "").replace(/^(阿|小|老)/, "");
-}
+/** 角色名别名归一（修 E3）：去「阿/小/老」前缀与空白，便于宽松匹配 —— 实现见 shared/appearance.ts（与出场角色判定同源） */
+export { normCharName };
 
 function findCharacter(w: WorldState, rawName: string) {
   const name = String(rawName ?? "").trim();
@@ -81,14 +80,15 @@ function isLocked(w: WorldState, characterId: string, field: string): boolean {
   return (w.lockedFields ?? []).some((l) => l.characterId === characterId && l.field === field);
 }
 
-/** 重算全体角色登场章节（appearedIn）：以正文出现为准（从 director 迁入） */
+/** 重算全体角色登场章节（appearedIn）：与「本章出场角色」同源双轨判定（LLM 记账名单优先，名单空回退正文匹配+别名归一）
+ * —— 修「角色卡登场章节与出场角色统计不一致」：正文只写代词/称呼（名单判定出场）或别名（小飞侠→飞侠）时不再漏章 */
 export function recomputeAppearedIn(w: WorldState): boolean {
   let changed = false;
   for (const c of w.characters) {
     const appears: number[] = [];
     if (c.name) {
       for (const ch of w.chapters) {
-        if (ch.text.includes(c.name)) appears.push(ch.index);
+        if (appearedInChapter(w, c, ch.index)) appears.push(ch.index);
       }
     }
     const next = appears.length ? appears : undefined;
@@ -278,6 +278,7 @@ function applySettle(w: WorldState, out: Partial<SettleOutput>, chapterIndex: nu
       traits: strArr(nc?.traits, 6),
       motivation: String(nc?.motivation ?? "").trim().slice(0, 120),
       voice: typeof nc?.voice === "string" ? nc.voice.trim().slice(0, 80) || undefined : undefined,
+      reason: typeof nc?.reason === "string" ? nc.reason.trim().slice(0, 80) || undefined : undefined,
       source: "writer",
       status: "pending",
     });
@@ -353,7 +354,7 @@ export async function settleChapter(w: WorldState, ch: Chapter, plan?: ChapterPl
             character_exits: { type: "array", items: { type: "object", required: ["name"], properties: { name: { type: "string" }, reason: { type: "string" } } } },
             timeline_summary: { type: "string" },
             world_current: { type: "string" },
-            new_characters: { type: "array", items: { type: "object", required: ["name"], properties: { name: { type: "string" }, role: { type: "string" }, gender: { type: "string" }, age: { type: "string" }, identity: { type: "string" }, traits: { type: "array", items: { type: "string" } }, motivation: { type: "string" } } } },
+            new_characters: { type: "array", items: { type: "object", required: ["name"], properties: { name: { type: "string" }, role: { type: "string" }, gender: { type: "string" }, age: { type: "string" }, identity: { type: "string" }, traits: { type: "array", items: { type: "string" } }, motivation: { type: "string" }, reason: { type: "string" } } } },
             plot_threads: { type: "array", items: { type: "object", required: ["id", "status"], properties: { id: { type: "string" }, status: { type: "string" }, note: { type: "string" } } } },
             setting_rules: { type: "array", items: { type: "string" } },
           },

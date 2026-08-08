@@ -8,7 +8,7 @@ import { logChange } from "./steering";
 import { withTitleLock } from "./titlelock";
 import { genOf, type PendingChapter, type ReviewFinding, type WorldState } from "./world";
 import {
-  clearPendingChapter, loadAutoSession, loadPendingChapter, saveAutoSession, savePendingChapter, saveWorld,
+  clearPendingChapter, currentUser, loadAutoSession, loadPendingChapter, saveAutoSession, savePendingChapter, saveWorld,
   type AutoSession,
 } from "./storage";
 
@@ -34,26 +34,29 @@ export type AutoReport = {
   failedChapter?: number;
 };
 
-// —— 停止标志（/api/novel/auto/stop 置位） ——
+// —— 停止标志（/api/novel/auto/stop 置位；key 前缀当前用户，不同账号的同名书互不干扰） ——
 const stopFlags = new Map<string, boolean>();
 const pauseFlags = new Map<string, boolean>(); // 用户主动暂停（章边界停下，保持 paused 会话可恢复）
+function flagKey(title: string): string {
+  return `${currentUser() ?? ""}::${title}`;
+}
 export function stopAuto(title: string): void {
-  stopFlags.set(title, true);
+  stopFlags.set(flagKey(title), true);
   // 立即持久化停止意图：防止服务在 runAuto 检测到 stopFlags 前重启 → resumeAutoSessions 误续跑
   touchSession(title, { status: "stopped", phase: "用户手动停止", pauseReason: "用户手动停止" });
 }
 export function pauseAuto(title: string): void {
-  pauseFlags.set(title, true);
+  pauseFlags.set(flagKey(title), true);
 }
 export function clearAutoStop(title: string): void {
-  stopFlags.delete(title);
-  pauseFlags.delete(title);
+  stopFlags.delete(flagKey(title));
+  pauseFlags.delete(flagKey(title));
 }
 function isStopped(title: string): boolean {
-  return stopFlags.get(title) === true;
+  return stopFlags.get(flagKey(title)) === true;
 }
 function isPausedByUser(title: string): boolean {
-  return pauseFlags.get(title) === true;
+  return pauseFlags.get(flagKey(title)) === true;
 }
 
 // —— 会话状态辅助：合并更新 autorun-session.json（不存在则忽略） ——

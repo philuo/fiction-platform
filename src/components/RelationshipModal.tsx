@@ -4,6 +4,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Plus, Trash2, X } from "../components/icons";
 import type { Character, WorldState } from "../api/world";
+import { formatChapterRange } from "../shared/appearance";
 
 type GNode = { id: string; name: string; role: string; x: number; y: number };
 type GEdge = { from: string; to: string; label: string };
@@ -598,7 +599,7 @@ export const RelationshipModal: React.FC<{
                     {c.name}
                     <span className="rp-char-role">{c.role}</span>
                     {(c.appearedIn?.length ?? 0) > 0 && (
-                      <span className="rp-char-role">登场 {c.appearedIn!.join("、")} 章</span>
+                      <span className="rp-char-role">登场 {formatChapterRange(c.appearedIn)} 章</span>
                     )}
                   </div>
                   <div className="rp-char-status">{c.status}</div>

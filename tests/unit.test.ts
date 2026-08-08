@@ -224,6 +224,19 @@ describe("director.editWorld 手动新增角色", () => {
     expect(() => editWorld(w, { characters: [{ id: "c1", name: "沈夜" }] })).toThrow("已存在");
     expect(w.characters.find((c) => c.id === "c1")?.name).toBe("阿青"); // 未被改名
   });
+  test("更新角色 gender：非法值保留原值（不覆盖合法性别）", () => {
+    const w = emptyWorld();
+    w.characters.push({ id: "c1", name: "阿青", role: "主角", gender: "女", traits: [], motivation: "", status: "登场", relations: {}, introducedAt: 1 });
+    // 非法 gender 值 → 保留原值"女"（不清空、不写入非法值）
+    editWorld(w, { characters: [{ id: "c1", gender: "未知" }] });
+    expect(w.characters[0].gender).toBe("女");
+    // 合法值正常更新
+    editWorld(w, { characters: [{ id: "c1", gender: "男" }] });
+    expect(w.characters[0].gender).toBe("男");
+    // 空字符串 → 保留原值（不因 trim 后空串清空已有合法值）
+    editWorld(w, { characters: [{ id: "c1", gender: "  " }] });
+    expect(w.characters[0].gender).toBe("男");
+  });
 });
 
 describe("media.normAnchor", () => {

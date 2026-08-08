@@ -4,7 +4,9 @@ import { useEffect, useMemo, useState } from "react";
 import type { ChangeLogEntry, WorldState } from "../api/world";
 import { getCommand, commandTooltip } from "../api/harness";
 import { lensCn, severityCn } from "../terms";
+import { formatChapterRange } from "../shared/appearance";
 import { X } from "./icons";
+import { apiFetch } from "../api/client";
 
 type Tab = "memory" | "ledger" | "log";
 
@@ -35,7 +37,7 @@ export const MemoryAuditModal: React.FC<{ world: WorldState; onClose: () => void
     (async () => {
       try {
         setLogLoading(true);
-        const res = await fetch("/api/novel/changelog", {
+        const res = await apiFetch("/api/novel/changelog", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ title: w.title }),
@@ -116,7 +118,7 @@ export const MemoryAuditModal: React.FC<{ world: WorldState; onClose: () => void
                       <b>{c.name}</b><span className="mem-char-role">{c.role}</span>
                       <span className="mem-char-status">{c.status}</span>
                       {c.exit && <span className="mem-badge mem-badge-off">离场·{c.exit.chapter}章</span>}
-                      <span className="mem-char-meta">登场 {c.appearedIn?.length ?? 0} 章</span>
+                      <span className="mem-char-meta">登场 {formatChapterRange(c.appearedIn)} 章</span>
                     </div>
                   ))}
                 </>

@@ -12,7 +12,10 @@ let nextChatContent = "";
 mock.module("../src/api/agnes", () => ({
   chat: async () => nextChatContent,
   complete: async () => ({ content: nextChatContent }),
-  chatStream: async () => "",
+  chatStream: async (_m: unknown, onChunk: (d: string) => void) => {
+    onChunk(nextChatContent);
+    return nextChatContent;
+  },
   ChatRole: {},
 }));
 

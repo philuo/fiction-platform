@@ -15,12 +15,13 @@ import { markOrphanMedia } from "./media";
 import { deleteMediaFile } from "./images";
 import { auditWorld, deleteChapterCascade } from "./integrity";
 import { buildAutoLore, sanitizeLore } from "./lore";
+import { formatChapterRange } from "../shared/chapterRange";
 import {
   activeForeshadows, emptyWorld, genOf, worldSummary, DEFAULT_GEN,
   type Card, type Character, type Chapter, type ChapterPlan, type ChapterVersion, type ConsistencyReport, type GenProfile,
   type LoreEntry, type PendingChapter, type ReviewResult, type SteeringItem, type WorldState,
 } from "./world";
-import { writeChapter } from "./writer";
+import { isTitleLike, writeChapter } from "./writer";
 import { applyBrainReview, brainGateEnabled, brainReviewAfterCommit, computeDisposition } from "./brain";
 
 // —— SSE v2 事件协议（保留旧 writing/reviewing/saving/result 字段向后兼容） ——
@@ -471,14 +472,16 @@ async function reviewFixLoop(
         plan,
         onDelta: (delta) => onEvent?.({ phase: "delta", delta }),
       });
-      title = redo.title || title;
+      // 健全闸门：rewrite 产出目标句/垃圾标题时保留进入修复循环前的标题（比降级「第N章」更贴近章节）
+      title = isTitleLike(redo.title) ? redo.title : title;
       text = redo.text;
       onEvent?.({ phase: "reviewing", round: rounds });
       verdict = await reviewChapter(world, text, title, chapterIndex, plan);
       verdict.round = rounds;
     }
   }
-  return { title, text, verdict, rounds };
+  // 出口健全闸门（writeOneChapter/retryChapter 共用）：目标句永不能成为章名，兜底「第N章」
+  return { title: isTitleLike(title) ? title : `第${chapterIndex}章`, text, verdict, rounds };
 }
 
 /**
@@ -617,7 +620,8 @@ export async function retryChapter(
     plan,
     onDelta: (delta) => onEvent?.({ phase: "delta", delta }),
   });
-  let title = draft.title || pending.title;
+  // 健全闸门：writeChapter 已兜底（非空），pending.title 仅作极端空值兜底，仍须过 isTitleLike
+  let title = draft.title || (isTitleLike(pending.title) ? pending.title : `第${chapterIndex}章`);
   let text = draft.text;
   onEvent?.({ phase: "selfcheck", aiToneHits: draft.aiToneHits, guard: draft.guard });
   // 打断检查（写作后 / 审查前）
@@ -668,9 +672,11 @@ export async function confirmPendingChapter(world: WorldState): Promise<StepResu
   if (!pending.verdictJson) throw new Error("待确认章节缺少审查记录，无法入册");
   const verdict = JSON.parse(pending.verdictJson) as CriticVerdict;
   const plan = (world.chapterPlans ?? []).find((p) => p.index === pending.chapterIndex) ?? null;
+  // 健全闸门：消费旧暂存草稿标题时仍须过 isTitleLike（兼容修复前落盘的脏标题）
+  const safeTitle = isTitleLike(pending.title) ? pending.title : `第${pending.chapterIndex}章`;
   const chapter = await commitChapter(
     world,
-    { index: pending.chapterIndex, title: pending.title, text: pending.text, verdict, plan, rounds: verdict.round, instructions: [], appliedCards: [], checkpointStep: "confirm-commit" },
+    { index: pending.chapterIndex, title: safeTitle, text: pending.text, verdict, plan, rounds: verdict.round, instructions: [], appliedCards: [], checkpointStep: "confirm-commit" },
   );
   clearPendingChapter(world.title);
   logChange(world, { chapter: pending.chapterIndex, actor: "user", kind: "chapter-confirm", detail: `人工确认第 ${pending.chapterIndex} 章《${pending.title}》入册（审查通过后待确认模式）`, commandId: "CMD-N04" });
@@ -933,7 +939,7 @@ export function editWorld(world: WorldState, patch: {
       const c = world.characters.find((x) => x.id === id);
       if (!c) continue;
       if (c.appearedIn?.length) {
-        throw new Error(`角色「${c.name}」已在第 ${c.appearedIn.join("、")} 章登场，禁止移除`);
+        throw new Error(`角色「${c.name}」已在第 ${formatChapterRange(c.appearedIn)} 章登场，禁止移除`);
       }
     }
     // 移除角色同步删盘其立绘/头像文件（best-effort，引用守卫在 deleteMediaFile 内）：
@@ -1148,7 +1154,8 @@ export async function regenerateChapter(
     onDelta: (delta) => onEvent?.({ phase: "delta", delta }),
   });
   let text = draft.text;
-  let title = draft.title || ch.title;
+  // 健全闸门：writeChapter 内部已兜底，但「第N章」对重写是降级——既成短标题优先保留
+  let title = isTitleLike(draft.title) ? draft.title : isTitleLike(ch.title) ? ch.title : `第${index}章`;
 
   // 打断检查（写作后 / 审查前）
   it = checkInterrupt(world.title);
@@ -1174,7 +1181,7 @@ export async function regenerateChapter(
     const revisionNotes = verdict.findings.map((f) => `[${f.lens}/${f.severity}] ${f.issue}（原文：${f.evidence}）建议：${f.suggestion}`).join("\n");
     const redo = await writeChapter({ world, instruction: baseInstruction, revisionNotes, draft: text, chapterIndex: index, plan: null });
     text = redo.text;
-    title = redo.title || title;
+    title = isTitleLike(redo.title) ? redo.title : title;
     verdict = await reviewChapter(world, text, title, index, null);
     verdict.round = rounds;
   }

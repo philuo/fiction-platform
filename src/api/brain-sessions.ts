@@ -1,0 +1,316 @@
+// 中枢聊天会话（brain sessions）：多会话模型 + 持久化 + 会话级生成任务注册表
+// 存储：data/<username>/<slug>/brain-sessions.json（原子写 tmp + rename，复用 storage.ts 模式）；
+// 用户目录随会话隔离：不同账号的同名书会话互不可见。
+//
+// 关键设计：
+// 1. 流式生成中，会话消息在**内存**实时更新（不逐 delta 落盘，避免 IO 尖峰）；
+//    关键节点（回合开始 / 完成 / 中断）落盘。服务器重启仅丢失"未完成消息的尾部增量"。
+// 2. 会话级生成任务注册表：SSE 连接断开**不杀死**生成任务，任务继续写会话内存；
+//    刷新后新连接 attach 到同一任务，立即重放已生成文本（resume 事件）再收后续 delta，
+//    从而支撑"刷新恢复状态、流式输出完成"且不重复生成。
+import { mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { join } from "node:path";
+import { slugify, currentUser } from "./storage";
+
+export type BrainChatRole = "user" | "assistant";
+
+/** 卡片 JSON：与 components/brain-cards.tsx 的 BrainCard 一致（kind/title/…），后端透传前端渲染 */
+export type BrainChatCard = Record<string, unknown>;
+
+export type BrainChatMsg = {
+  id: string;
+  role: BrainChatRole;
+  /** 消息正文：流式生成中实时追加 */
+  text: string;
+  /** 完成后携带的卡片（预览/确认/结果/浏览/计划/意见询问） */
+  cards?: BrainChatCard[];
+  /** epoch ms */
+  at: number;
+  /** 生成中（未完成）；刷新恢复据此识别可续流消息 */
+  pending?: boolean;
+  /** 被用户中断 */
+  interrupted?: boolean;
+};
+
+export type BrainSession = {
+  id: string;
+  /** 会话标题：首条用户消息截断生成 */
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  messages: BrainChatMsg[];
+  /** 当前是否有进行中的生成回合（供前端渲染运行中波纹） */
+  streaming: boolean;
+};
+
+/** 单会话消息条数上限（防文件膨胀；超出丢最旧） */
+const MAX_MESSAGES = 100;
+
+// —— 持久化：data/<username>/<slug>/brain-sessions.json（内存缓存 + 写时同步落盘） ——
+
+const cache = new Map<string, BrainSession[]>();
+
+/** 缓存 key：用户前缀 + slug，不同账号的同名书会话缓存互不串扰 */
+function cacheKey(title: string): string {
+  return `${currentUser() ?? ""}::${slugify(title)}`;
+}
+
+function sessionsPath(title: string): string {
+  return join(sessionsDir(title), "brain-sessions.json");
+}
+
+/** 数据根：默认 <cwd>/data；测试可用 BRAIN_SESSIONS_DATA_DIR 覆盖（生产不设置） */
+export function dataRoot(): string {
+  return process.env.BRAIN_SESSIONS_DATA_DIR || join(process.cwd(), "data");
+}
+
+/** 会话目录：data/<username>/<slug>（无用户上下文时 data/<slug>，兼容遗留/测试） */
+export function sessionsDir(title: string): string {
+  return join(dataRoot(), currentUser() ?? "", slugify(title));
+}
+
+export function loadSessions(title: string): BrainSession[] {
+  const key = cacheKey(title);
+  const hit = cache.get(key);
+  if (hit) return hit;
+  let sessions: BrainSession[] = [];
+  try {
+    const raw = readFileSync(sessionsPath(title), "utf-8");
+    const parsed = JSON.parse(raw) as { sessions?: unknown };
+    if (Array.isArray(parsed.sessions)) sessions = parsed.sessions as BrainSession[];
+  } catch {
+    /* 文件不存在/损坏：从空列表开始 */
+  }
+  cache.set(key, sessions);
+  return sessions;
+}
+
+export function saveSessions(title: string, sessions: BrainSession[]): void {
+  const key = cacheKey(title);
+  cache.set(key, sessions);
+  const dir = sessionsDir(title);
+  mkdirSync(dir, { recursive: true });
+  const p = sessionsPath(title);
+  const tmp = `${p}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ sessions }, null, 2), "utf-8");
+  renameSync(tmp, p);
+}
+
+export function getSession(title: string, id: string): BrainSession | undefined {
+  return loadSessions(title).find((s) => s.id === id);
+}
+
+/** 会话级写操作（内存缓存实时；persist=false 时仅更新内存，供流式高频 delta 节流落盘） */
+function mutateSession(title: string, id: string, fn: (s: BrainSession) => void, persist = true): BrainSession | undefined {
+  const sessions = loadSessions(title);
+  const s = sessions.find((x) => x.id === id);
+  if (!s) return undefined;
+  fn(s);
+  s.updatedAt = Date.now();
+  // 单会话消息条数上限：丢最旧
+  if (s.messages.length > MAX_MESSAGES) s.messages = s.messages.slice(-MAX_MESSAGES);
+  if (persist) saveSessions(title, sessions);
+  return s;
+}
+
+export function createSession(title: string, firstPrompt?: string, id?: string): BrainSession {
+  const now = Date.now();
+  const s: BrainSession = {
+    id: id ?? crypto.randomUUID(),
+    title: makeTitle(firstPrompt ?? "新会话"),
+    createdAt: now,
+    updatedAt: now,
+    messages: [],
+    streaming: false,
+  };
+  const sessions = loadSessions(title);
+  sessions.push(s);
+  saveSessions(title, sessions);
+  return s;
+}
+
+export function deleteSession(title: string, id: string): boolean {
+  const sessions = loadSessions(title);
+  const next = sessions.filter((s) => s.id !== id);
+  if (next.length === sessions.length) return false;
+  saveSessions(title, next);
+  return true;
+}
+
+/** 截断会话：删除 fromMessageId 及其之后的所有消息（编辑重发前置：清掉旧问答） */
+export function truncateSession(title: string, id: string, fromMessageId: string): boolean {
+  let hit = false;
+  mutateSession(title, id, (s) => {
+    const idx = s.messages.findIndex((m) => m.id === fromMessageId);
+    if (idx >= 0) {
+      hit = true;
+      s.messages = s.messages.slice(0, idx);
+    }
+  });
+  return hit;
+}
+
+export function listSessions(title: string): BrainSession[] {
+  // 按最近更新倒序（更新时间相同按创建时间新者优先，保证稳定排序）
+  return [...loadSessions(title)].sort((a, b) => b.updatedAt - a.updatedAt || b.createdAt - a.createdAt);
+}
+
+/** 会话标题：首条用户消息截断 24 字符（去空白） */
+export function makeTitle(text: string): string {
+  const t = text.replace(/\s+/g, " ").trim();
+  return t.length > 24 ? `${t.slice(0, 24)}…` : t || "新会话";
+}
+
+export function appendMessage(title: string, sessionId: string, msg: BrainChatMsg): void {
+  mutateSession(title, sessionId, (s) => {
+    s.messages.push(msg);
+    if (!s.title || s.title === "新会话") s.title = makeTitle(msg.text);
+  });
+}
+
+/** 流式生成中更新消息文本：persist=true 落盘（消息完成/关键节点），false 仅内存（高频 delta 节流） */
+export function updateMessageText(title: string, sessionId: string, messageId: string, text: string, persist = true): void {
+  mutateSession(
+    title,
+    sessionId,
+    (s) => {
+      const m = s.messages.find((x) => x.id === messageId);
+      if (m) m.text = text;
+    },
+    persist,
+  );
+}
+
+/** 回合完成：清 pending，附卡片，streaming=false，落盘 */
+export function markMessageDone(title: string, sessionId: string, messageId: string, cards?: BrainChatCard[]): void {
+  mutateSession(title, sessionId, (s) => {
+    const m = s.messages.find((x) => x.id === messageId);
+    if (m) {
+      m.pending = false;
+      if (cards?.length) m.cards = cards;
+    }
+    s.streaming = false;
+  });
+}
+
+/** 回合中断：清 pending，标 interrupted，streaming=false，落盘 */
+export function markMessageInterrupted(title: string, sessionId: string, messageId: string): void {
+  mutateSession(title, sessionId, (s) => {
+    const m = s.messages.find((x) => x.id === messageId);
+    if (m) {
+      m.pending = false;
+      m.interrupted = true;
+    }
+    s.streaming = false;
+  });
+}
+
+/** 回合开始：streaming=true，落盘（刷新后可见运行中） */
+export function markStreaming(title: string, sessionId: string): void {
+  mutateSession(title, sessionId, (s) => {
+    s.streaming = true;
+  });
+}
+
+/** 会话最后一条未完成（pending=流式进行中 或 interrupted=被中断）消息；无则 null（resume 续流目标） */
+export function lastIncompleteMessage(s: BrainSession): BrainChatMsg | null {
+  for (let i = s.messages.length - 1; i >= 0; i--) {
+    if (s.messages[i].role === "assistant" && (s.messages[i].pending || s.messages[i].interrupted)) return s.messages[i];
+  }
+  return null;
+}
+
+/** 会话最后一条 pending（流式进行中）消息；无则 null */
+export function lastPendingMessage(s: BrainSession): BrainChatMsg | null {
+  for (let i = s.messages.length - 1; i >= 0; i--) {
+    if (s.messages[i].pending) return s.messages[i];
+  }
+  return null;
+}
+
+/** 会话最后一条 user 消息（resume 重放 prompt 用） */
+export function lastUserMessage(s: BrainSession): BrainChatMsg | null {
+  for (let i = s.messages.length - 1; i >= 0; i--) {
+    if (s.messages[i].role === "user") return s.messages[i];
+  }
+  return null;
+}
+
+// —— 会话级生成任务注册表（连接解耦：断连不杀任务，新连接可附加恢复） ——
+
+export type SessionTask = {
+  running: boolean;
+  /** 当前附加的 SSE 连接 emitter（广播目标） */
+  emitters: Set<(obj: unknown) => void>;
+  /** 任务自身的 AbortController（"停止生成"入口；req.signal 取消时同步 abort） */
+  abort: AbortController;
+};
+
+const tasks = new Map<string, SessionTask>();
+
+/** 任务表 key：前缀当前用户——sessionId 可由调用方指定（brain-chat 传请求 body 的 id），不同账号不可互串 */
+function taskKey(sessionId: string): string {
+  return `${currentUser() ?? ""}::${sessionId}`;
+}
+
+/** 若会话已有进行中任务则注册 emitter 并返回任务；没有返回 null（调用方自行开新回合） */
+export function attachSessionTask(sessionId: string, emitter: (obj: unknown) => void): SessionTask | null {
+  const t = tasks.get(taskKey(sessionId));
+  if (!t || !t.running) return null;
+  t.emitters.add(emitter);
+  return t;
+}
+
+/** 创建（或复用已结束的）任务并注册 emitter；abortSignal 取消时自动 abort 任务 */
+export function registerSessionTask(sessionId: string, emitter: (obj: unknown) => void, signal?: AbortSignal): SessionTask {
+  const key = taskKey(sessionId);
+  let t = tasks.get(key);
+  if (!t) {
+    t = { running: false, emitters: new Set(), abort: new AbortController() };
+    tasks.set(key, t);
+  }
+  t.emitters.add(emitter);
+  if (signal) {
+    signal.addEventListener("abort", () => {
+      if (t) t.abort.abort();
+    }, { once: true });
+  }
+  return t;
+}
+
+/** 向会话所有附加连接广播（连接断开吞掉 enqueue 异常） */
+export function broadcastToSession(sessionId: string, obj: unknown): void {
+  const t = tasks.get(taskKey(sessionId));
+  if (!t) return;
+  for (const e of [...t.emitters]) {
+    try {
+      e(obj);
+    } catch {
+      /* 客户端已断开，忽略 */
+    }
+  }
+}
+
+/** 移除一个 emitter；空集时任务停表（内存泄漏防护） */
+export function detachSessionTask(sessionId: string, emitter: (obj: unknown) => void): void {
+  const key = taskKey(sessionId);
+  const t = tasks.get(key);
+  if (!t) return;
+  t.emitters.delete(emitter);
+  if (t.emitters.size === 0) tasks.delete(key);
+}
+
+/** 回合结束：running=false，清空 emitter（任务停表） */
+export function finishSessionTask(sessionId: string): void {
+  const key = taskKey(sessionId);
+  const t = tasks.get(key);
+  if (!t) return;
+  t.running = false;
+  t.emitters.clear();
+  tasks.delete(key);
+}
+
+export function isSessionRunning(sessionId: string): boolean {
+  const t = tasks.get(taskKey(sessionId));
+  return !!t && t.running;
+}

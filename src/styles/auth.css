@@ -1,0 +1,235 @@
+/* ============ 登录 / 注册页（墨枢品牌 · 宣纸墨印风 · 动效） ============ */
+.auth-shell {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background:
+    radial-gradient(1200px 700px at 75% 15%, rgba(59, 77, 143, 0.22), transparent 60%),
+    radial-gradient(900px 600px at 15% 85%, rgba(176, 58, 46, 0.16), transparent 60%),
+    linear-gradient(150deg, #0e0b07 0%, #16101a 48%, #0d1216 100%);
+  color: #f6f1e6;
+  font-family: var(--serif);
+}
+
+/* 流动光晕：缓慢漂移的墨金微光 */
+.auth-glow {
+  position: absolute;
+  inset: -40%;
+  pointer-events: none;
+  background:
+    radial-gradient(420px 260px at 30% 30%, rgba(166, 124, 46, 0.14), transparent 70%),
+    radial-gradient(520px 340px at 72% 62%, rgba(214, 196, 150, 0.08), transparent 70%);
+  animation: authGlow 16s ease-in-out infinite alternate;
+}
+@keyframes authGlow {
+  0%   { transform: translate(-2%, -1%) scale(1); opacity: 0.85; }
+  100% { transform: translate(3%, 2%) scale(1.12); opacity: 1; }
+}
+
+.auth-particles {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+/* 毛玻璃卡片 */
+.auth-card {
+  position: relative;
+  z-index: 2;
+  width: min(420px, 92vw);
+  padding: 44px 44px 30px;
+  border-radius: 20px;
+  background: rgba(24, 20, 15, 0.55);
+  border: 1px solid rgba(214, 196, 150, 0.16);
+  box-shadow:
+    0 24px 70px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  animation: authCardIn 0.7s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes authCardIn {
+  from { opacity: 0; transform: translateY(26px) scale(0.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* 品牌区：朱砂印章盖下 */
+.auth-brand { text-align: center; margin-bottom: 30px; }
+.auth-seal {
+  display: inline-block;
+  padding: 0.42em 0.62em;
+  font-size: 1.55rem;
+  letter-spacing: 0.34em;
+  text-indent: 0.34em;
+  color: #f6f1e6;
+  background: linear-gradient(160deg, #c2403a, #9c2f26);
+  box-shadow: 0 4px 18px rgba(176, 58, 46, 0.45);
+  animation: authSeal 0.9s cubic-bezier(0.2, 1.4, 0.4, 1) 0.15s both;
+}
+@keyframes authSeal {
+  0%   { opacity: 0; transform: scale(1.6) rotate(-14deg); }
+  55%  { opacity: 1; transform: scale(0.94) rotate(-4deg); }
+  100% { opacity: 1; transform: scale(1) rotate(-5deg); }
+}
+.auth-sub {
+  margin: 14px 0 0;
+  font-size: 0.8rem;
+  letter-spacing: 0.42em;
+  text-indent: 0.42em;
+  color: rgba(214, 196, 150, 0.66);
+  font-family: var(--sans);
+}
+
+/* Tab 切换：下划线墨迹滑动 */
+.auth-tabs {
+  position: relative;
+  display: flex;
+  margin-bottom: 26px;
+  border-bottom: 1px solid rgba(214, 196, 150, 0.16);
+}
+.auth-tab {
+  flex: 1;
+  padding: 10px 0 12px;
+  background: none;
+  border: none;
+  color: rgba(246, 241, 230, 0.45);
+  font-family: var(--serif);
+  font-size: 1.02rem;
+  letter-spacing: 0.5em;
+  text-indent: 0.5em;
+  cursor: pointer;
+  transition: color 0.25s ease;
+}
+.auth-tab:hover { color: rgba(246, 241, 230, 0.75); }
+.auth-tab.active { color: #d6c496; }
+.auth-tab-ink {
+  position: absolute;
+  bottom: -1px;
+  height: 2px;
+  width: 50%;
+  background: linear-gradient(90deg, transparent, var(--gold), transparent);
+  transition: transform 0.32s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.auth-tab-ink.left { transform: translateX(0); }
+.auth-tab-ink.right { transform: translateX(100%); }
+
+/* 输入框：浮动 label + 底部高亮 */
+.auth-form { display: flex; flex-direction: column; gap: 6px; }
+.auth-field { position: relative; margin-top: 8px; }
+.auth-field input {
+  width: 100%;
+  padding: 13px 2px 9px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid rgba(214, 196, 150, 0.28);
+  border-radius: 0;
+  color: #f6f1e6;
+  font-family: var(--serif);
+  font-size: 1rem;
+  outline: none;
+  transition: border-color 0.25s ease;
+}
+.auth-field input:focus { border-bottom-color: var(--gold); }
+.auth-field label {
+  position: absolute;
+  left: 2px;
+  top: 12px;
+  color: rgba(246, 241, 230, 0.42);
+  font-size: 0.95rem;
+  letter-spacing: 0.12em;
+  pointer-events: none;
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.auth-field input:focus + label,
+.auth-field input:not(:placeholder-shown) + label {
+  top: -9px;
+  font-size: 0.72rem;
+  letter-spacing: 0.2em;
+  color: #c9a95f;
+}
+
+/* 错误提示：出现 + 抖动 */
+.auth-error {
+  min-height: 0;
+  overflow: hidden;
+  transition: min-height 0.25s ease, margin 0.25s ease;
+}
+.auth-error.show { min-height: 28px; margin-top: 6px; }
+.auth-error-text {
+  display: block;
+  color: #e08a7f;
+  font-size: 0.82rem;
+  letter-spacing: 0.06em;
+  font-family: var(--sans);
+  animation: authShake 0.4s ease;
+}
+@keyframes authShake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-6px); }
+  50% { transform: translateX(5px); }
+  75% { transform: translateX(-3px); }
+}
+
+/* 提交按钮：金色墨染渐变 */
+.auth-submit {
+  position: relative;
+  margin-top: 20px;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  font-family: var(--serif);
+  font-size: 1.02rem;
+  letter-spacing: 0.34em;
+  text-indent: 0.34em;
+  color: #1a1208;
+  background: linear-gradient(120deg, #c9a95f 0%, #e2c98c 50%, #c9a95f 100%);
+  background-size: 200% 100%;
+  box-shadow: 0 6px 22px rgba(166, 124, 46, 0.35);
+  transition: transform 0.2s ease, box-shadow 0.2s ease, background-position 0.6s ease;
+}
+.auth-submit:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 10px 30px rgba(166, 124, 46, 0.45); background-position: 100% 0; }
+.auth-submit:active:not(:disabled) { transform: translateY(0) scale(0.985); }
+.auth-submit:disabled { opacity: 0.75; cursor: default; }
+
+.auth-spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(26, 18, 8, 0.35);
+  border-top-color: #1a1208;
+  border-radius: 50%;
+  animation: authSpin 0.7s linear infinite;
+}
+@keyframes authSpin { to { transform: rotate(360deg); } }
+
+.auth-ok {
+  width: 24px;
+  height: 24px;
+  color: #1a1208;
+}
+.auth-ok path {
+  stroke-dasharray: 30;
+  stroke-dashoffset: 30;
+  animation: authOk 0.5s ease 0.1s forwards;
+}
+@keyframes authOk { to { stroke-dashoffset: 0; } }
+
+.auth-foot {
+  margin: 26px 0 0;
+  text-align: center;
+  font-size: 0.74rem;
+  letter-spacing: 0.4em;
+  text-indent: 0.4em;
+  color: rgba(214, 196, 150, 0.35);
+  font-family: var(--sans);
+}

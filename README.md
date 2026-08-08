@@ -61,13 +61,27 @@ bun 会自动加载项目根 `.env`。密钥不进入代码 / git。
 | `POST /api/novel/new` | 立项：一句话灵感 → 世界设定 + 人物（LLM） |
 | `POST /api/novel/step` | 回合：写→审→重写→存档（SSE 阶段事件） |
 | `POST /api/novel/gacha` | 抽卡：生成卡池 / 自动抽取 / 指定抽取 |
-| `POST /api/novel/state` | 世界状态 |
+| `POST /api/novel/state` | 世界状态（响应附带 `brainState` 中枢四维状态） |
+| `POST /api/brain/state` | 中枢四维状态（presence/activity/governance/vitals，零 LLM 确定性派生） |
+| `POST /api/brain/chat` | 中枢对话编排（SSE）：意图识别 → 回复 + 卡片（查询直接执行/写操作预览/L2·L3 确认） |
 | `GET /api/novel/export?title=` | 导出全书 Markdown |
 
 ## 界面
 
 日式报纸风格（纸色/衬线/报头双线/朱印/竖排标签）+ 游戏 HUD（左目录/中正文/右状态面板/底部控制条）。
 人在界面上的操作极小：立项一句话 → [推进剧情] → 抽卡筛选 → 看审查报告；其余全部由 AI 完成。
+
+### 中枢（brain）
+
+报头常驻「中枢之眼·印灵」指示器：半具象拟人化视觉（SVG 同心圆朱印 + Canvas 环绕粒子 + motion 瞳孔开合），
+由四维状态驱动——① presence 存在态（休眠/待命/觉醒/专注/深思/警觉/疲倦，7 档色相与神态）；
+② activity 动作态（导演写作/对抗审查/章末记账… 12 档，驱动符纹转速与粒子流速）；
+③ governance 治理裁决态（放行/认可/建议修正/驳回/干预待决/降级放行，角标显示）；
+④ vitals 全书健康脉象（连贯度/伏笔回收率/质量债/完整性/目标 disposition）。
+
+点击印灵打开「对话舱」侧边抽屉：与中枢聊天实现卡片式浏览与智能控制——
+所有手动操作（推进/连载/抽卡/编辑/删章/媒体/评估/巡检/导出等 16 类入口）均可通过自然语言触发，
+supervised 半自动（L0/L1 直接执行，L2/L3 出确认卡三选一），治理结果以主动卡片推送。
 恢复已存故事：`http://localhost:3000/?title=断梦录`
 
 ## 目录结构

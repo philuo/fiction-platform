@@ -5,6 +5,8 @@ import { BookMarked, FileText, Settings, Upload, Wand2, X, Sparkles, Plus } from
 import { DEFAULT_GEN, type Character, type FidelityRule, type GenProfile, type LoreEntry, type WorldState, type WorldPatch } from "../api/world";
 import { RangeSlider } from "./RangeSlider";
 import { IntegrityModal, type IntegrityReportView } from "./IntegrityModal";
+import { formatChapterRange } from "../shared/appearance";
+import { apiFetch } from "../api/client";
 
 type Tab = "全局" | "章节" | "设定" | "角色" | "大纲" | "导出";
 
@@ -240,7 +242,7 @@ const GlobalSettings: React.FC<{ world: WorldState; onSave: Props["onSave"]; onI
             setStyleBusy(true);
             setMsg("风格指纹提取中…");
             try {
-              const res = await fetch("/api/novel/style", {
+              const res = await apiFetch("/api/novel/style", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ title: p.world.title, sample: styleSample.trim() }),
@@ -385,7 +387,7 @@ const ChapterSettings: React.FC<{ world: WorldState; onSave: Props["onSave"]; on
     if (!c) return;
     setDelState({ index, title: c.title, report: { autoFixed: [], findings: [], orphanMedia: [] }, busy: true });
     try {
-      const res = await fetch("/api/novel/chapter/delete", {
+      const res = await apiFetch("/api/novel/chapter/delete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: p.world.title, chapterIndex: index }),
@@ -406,7 +408,7 @@ const ChapterSettings: React.FC<{ world: WorldState; onSave: Props["onSave"]; on
     const { index } = delState;
     setDelState({ ...delState, busy: true });
     try {
-      const res = await fetch("/api/novel/chapter/delete", {
+      const res = await apiFetch("/api/novel/chapter/delete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: p.world.title, chapterIndex: index, strategy: "merge" }),
@@ -957,7 +959,7 @@ const CharacterEditor: React.FC<{ world: WorldState; onSave: Props["onSave"]; on
             <label>登场章节</label>
             <span>
               {(selected?.appearedIn?.length ?? 0) > 0
-                ? `第 ${selected!.appearedIn!.join("、")} 章`
+                ? `第 ${formatChapterRange(selected!.appearedIn)} 章`
                 : creating
                   ? "新角色尚未入册（保存后可在后续章节登场）"
                   : "尚未登场（AI 在正文中写入该角色后自动登记）"}

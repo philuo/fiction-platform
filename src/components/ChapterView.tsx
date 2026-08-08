@@ -158,6 +158,9 @@ const MediaBlock: React.FC<{ m: ChapterMedia; storyTitle: string; chapter: Chapt
   );
 };
 
+/** 段落首字符是否为文字（字母/汉字/数字）：仅此类首段应用首字下沉；以引号、破折号、省略号等特殊符号开头的段落放大会很难看，故跳过 */
+const startsWithWord = (s: string) => /^[\p{L}\p{N}]/u.test(s);
+
 /** 按中文句末标点切分句子（保留标点），用于把媒体精确插到 anchor 所在句子之后 */
 function splitSentences(s: string): string[] {
   const out: string[] = [];
@@ -199,10 +202,12 @@ function renderParagraphsWithMedia(
       return false;
     });
   };
-  /** 段落渲染：有媒体时按句拆分，媒体紧跟 anchor 所在句子之后；无媒体时整段普通渲染 */
-  const renderPara = (para: string, nextPara: string | undefined): React.ReactNode => {
+  /** 段落渲染：有媒体时按句拆分，媒体紧跟 anchor 所在句子之后；无媒体时整段普通渲染。
+   * 首段若以特殊符号开头则加 no-dropcap（CSS 首字下沉仅对文字开头的段落生效）。 */
+  const renderPara = (para: string, nextPara: string | undefined, isFirst: boolean): React.ReactNode => {
     const ms = mediaFor(para, nextPara);
-    if (!ms.length) return <p className="para">{renderWithCitations(para, review, reviewMode, activeFindingIdx, onMarkClick)}</p>;
+    const cls = isFirst && !startsWithWord(para) ? "para no-dropcap" : "para";
+    if (!ms.length) return <p className={cls}>{renderWithCitations(para, review, reviewMode, activeFindingIdx, onMarkClick)}</p>;
     const sentences = splitSentences(para);
     // 每句后要插入的媒体列表（同一句多个媒体并列展示）
     const after: ChapterMedia[][] = sentences.map(() => []);
@@ -217,7 +222,7 @@ function renderParagraphsWithMedia(
       after[target].push(m);
     }
     return (
-      <div className="para">
+      <div className={cls}>
         {sentences.map((s, j) => (
           <Fragment key={j}>
             {renderWithCitations(s, review, reviewMode, activeFindingIdx, onMarkClick)}
@@ -230,7 +235,7 @@ function renderParagraphsWithMedia(
   return (
     <>
       {paras.map((para, i) => (
-        <Fragment key={i}>{renderPara(para, paras[i + 1])}</Fragment>
+        <Fragment key={i}>{renderPara(para, paras[i + 1], i === 0)}</Fragment>
       ))}
       {/* 失配媒体：末尾兜底展示并强制提示锚定失败 */}
       {media.filter((m) => !claimed.has(m.id)).map((m) => (

@@ -1,7 +1,9 @@
 // 生产服务器：bun run start（先 bun run build 生成 dist/）
 // 纯 Bun.serve：静态资源（dist/client）+ API + SSR（bun build 的 server bundle）
-import { handleApi, resumeAutoSessions, startVisualSweep } from "../src/api/routes";
-import { loadWorld } from "../src/api/storage";
+import { handleApi, migrateLegacyOnBoot, resumeAutoSessions, startVisualSweep } from "../src/api/routes";
+import { cleanupStaleAdvanceTasks } from "../src/api/advancetask";
+import { loadWorld, runAsUser } from "../src/api/storage";
+import { userFromRequest, getPropClosed } from "../src/api/auth";
 import { buildHtml } from "./render";
 
 const port = Number(process.env.PORT) || 3000;
@@ -33,6 +35,8 @@ const MIME: Record<string, string> = {
 Bun.serve({
   hostname: "0.0.0.0", // 监听所有网卡（局域网/容器可访问）
   port,
+  // idleTimeout：默认 10s 会切断 SSE 长连接（写+审+记账可达数分钟）；设 255s（Bun 允许最大值），配合 sseStream 8s 心跳保活
+  idleTimeout: 255,
   async fetch(req) {
     const url = new URL(req.url);
     const pathname = url.pathname;
@@ -61,9 +65,17 @@ Bun.serve({
     try {
       const initialData: Record<string, unknown> = { serverTime: new Date().toISOString(), ssr: true };
       const title = url.searchParams.get("title");
-      if (title) initialData.world = loadWorld(title) ?? undefined;
       const chapterParam = url.searchParams.get("chapter");
       if (chapterParam) initialData.chapter = Number(chapterParam); // 刷新恢复选中章节
+      // 账号：按会话 cookie 注入登录用户；已登录才按用户加载世界数据（账号隔离，未登录不读任何书）
+      const user = userFromRequest(req);
+      if (user) {
+        initialData.user = { id: user.id, username: user.username, displayName: user.displayName };
+        runAsUser(user.username, () => {
+          if (title) initialData.world = loadWorld(title) ?? undefined;
+          if (title) initialData.propClosed = getPropClosed(user.id, title);
+        });
+      }
       const appHtml = serverEntry.render(pathname + url.search, initialData);
       const html = buildHtml(appHtml, {
         clientJs: "/assets/entry-client.js",
@@ -71,7 +83,7 @@ Bun.serve({
         initialData,
       });
       return new Response(html, {
-        headers: { "Content-Type": "text/html; charset=utf-8", "X-Content-Type-Options": "nosniff" },
+        headers: { "Content-Type": "text/html; charset=utf-8", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store" },
       });
     } catch (e) {
       console.error("[prod] SSR 错误:", e);
@@ -84,6 +96,12 @@ console.log(`[prod] 墨枢 SSR 服务器: http://localhost:${port}`);
 
 // 服务重启恢复：未被人工停止的自动连载会话自动续跑（不阻塞启动，失败仅记日志）
 setTimeout(() => {
+  // 旧数据兜底迁移：data/ 根遗留书目录迁给第一个注册用户（首用户认领语义，幂等）
+  try {
+    migrateLegacyOnBoot();
+  } catch (e) {
+    console.error("[prod] 旧数据迁移失败:", e);
+  }
   try {
     resumeAutoSessions();
   } catch (e) {
@@ -94,5 +112,11 @@ setTimeout(() => {
     startVisualSweep();
   } catch (e) {
     console.error("[prod] 中枢视觉巡检启动失败:", e);
+  }
+  // 单章推进任务：清理陈旧 running（服务重启中断，无执行上下文不自动续跑，标记 failed 让前端可见）
+  try {
+    cleanupStaleAdvanceTasks();
+  } catch (e) {
+    console.error("[prod] 推进任务清理失败:", e);
   }
 }, 0);

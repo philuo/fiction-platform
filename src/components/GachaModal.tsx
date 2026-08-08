@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { Dices, RefreshCw, X } from "../components/icons";
 import type { Card, WorldState } from "../api/world";
+import { apiFetch } from "../api/client";
 
 type Props = {
   world: WorldState;
@@ -34,7 +35,7 @@ export const GachaModal: React.FC<Props> = (p) => {
     setMsg("抽卡系统生成卡池中…");
     setAppliedCards(null);
     try {
-      const res = await fetch("/api/novel/gacha", {
+      const res = await apiFetch("/api/novel/gacha", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "generate", title: p.world.title, count, types: [...types] }),
@@ -83,7 +84,7 @@ export const GachaModal: React.FC<Props> = (p) => {
     setBusy(true);
     setMsg(auto ? "自动抽取中（AI 优先稀有度与伏笔/人物卡）…" : "应用所选卡牌…");
     try {
-      const res = await fetch("/api/novel/gacha", {
+      const res = await apiFetch("/api/novel/gacha", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
