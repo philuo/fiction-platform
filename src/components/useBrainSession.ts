@@ -3,6 +3,8 @@
 // - 多会话独立 SSE 连接：切换 tab 只改展示，不中断各自流式生成（abort 仅由「停止」/卸载触发）
 // - 消息缓存 per-session：切换 tab 即时展示，回看不重复拉取
 // - 挂载恢复：拉列表；打开 streaming 会话（刷新前仍在生成）自动 resume 续流至完成
+// - activeIdRef：修复 stale closure——async 流程（newSession→send）内用旧渲染闭包时，
+//   「是否当前会话」判断读 ref 而非闭包捕获的 state，保证首次发送立即展示
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { BrainCard } from "./brain-cards";
 import { apiFetch } from "../api/client";
@@ -79,19 +81,29 @@ export function useBrainSession(title: string) {
   // 各会话独立 AbortController：切换 tab 不打断（仅「停止」/卸载/删除 abort）
   const abortRef = useRef<Map<string, AbortController>>(new Map());
   const loadedTitleRef = useRef("");
+  // 最新 activeId 镜像：async 流程（newSession→send 首次对话）中旧渲染闭包也能读到当前值
+  const activeIdRef = useRef("");
+
+  /** 设置当前会话：同步 state + ref（ref 供陈旧闭包内的「是否当前」判断） */
+  function setActive(id: string) {
+    activeIdRef.current = id;
+    setActiveId(id);
+  }
 
   /** 拉取会话列表（挂载/新建/删除/回合结束后刷新） */
-  const refreshList = useCallback(async () => {
+  const refreshList = useCallback(async (): Promise<SessionMeta[]> => {
     try {
       const res = await apiFetch("/api/brain/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title }),
       });
-      if (!res.ok) return;
+      if (!res.ok) return [];
       const data = (await res.json()) as { sessions?: SessionMeta[] };
-      setSessions(data.sessions ?? []);
-    } catch { /* 网络异常静默 */ }
+      const list = data.sessions ?? [];
+      setSessions(list);
+      return list;
+    } catch { /* 网络异常静默 */ return []; }
   }, [title]);
 
   /** 更新某会话消息缓存；active 会话同步展示 */
@@ -100,16 +112,16 @@ export function useBrainSession(title: string) {
     if (!arr) return;
     const next = arr.map((m) => (m.id === messageId ? { ...m, ...patch } : m));
     cacheRef.current.set(sessionId, next);
-    if (sessionId === activeId) setMessages(next);
-  }, [activeId]);
+    if (sessionId === activeIdRef.current) setMessages(next);
+  }, []);
 
   const patchStreaming = useCallback((sessionId: string, on: boolean) => {
-    if (sessionId === activeId) setStreaming(on);
-  }, [activeId]);
+    if (sessionId === activeIdRef.current) setStreaming(on);
+  }, []);
 
   const setThinkingFor = useCallback((sessionId: string, on: boolean) => {
-    if (sessionId === activeId) setThinking(on);
-  }, [activeId]);
+    if (sessionId === activeIdRef.current) setThinking(on);
+  }, []);
 
   /** 会话最后一条 assistant 消息（按展示缓存取） */
   function lastMsgOf(sessionId: string): ChatMessage | undefined {
@@ -136,7 +148,8 @@ export function useBrainSession(title: string) {
       const arr = cacheRef.current.get(sessionId) ?? [];
       arr.push(userMsg, brainMsg);
       cacheRef.current.set(sessionId, arr);
-      if (sessionId === activeId) setMessages([...arr]);
+      // 用 ref 判断：首次对话 newSession 后才 setActive，此处闭包可能仍是旧渲染，必须读最新值
+      if (sessionId === activeIdRef.current) setMessages([...arr]);
     }
 
     const events: SSEEvents = {
@@ -151,7 +164,7 @@ export function useBrainSession(title: string) {
         if (!arr) return;
         const next = arr.map((m) => (m.id === messageId ? { ...m, cards: [...(m.cards ?? []), card] } : m));
         cacheRef.current.set(sessionId, next);
-        if (sessionId === activeId) setMessages(next);
+        if (sessionId === activeIdRef.current) setMessages(next);
       },
       onDone: (messageId) => patchMsg(sessionId, messageId, { pending: false, interrupted: false }),
       onInterrupted: (messageId) => patchMsg(sessionId, messageId, { pending: false, interrupted: true }),
@@ -211,11 +224,11 @@ export function useBrainSession(title: string) {
       setThinkingFor(sessionId, false);
       void refreshList(); // 更新会话列表（标题/时间/streaming 标记）
     }
-  }, [title, activeId, patchMsg, patchStreaming, setThinkingFor, refreshList]);
+  }, [title, patchMsg, patchStreaming, setThinkingFor, refreshList]);
 
   /** 展示某会话（缓存命中即时；未命中从服务端拉详情；streaming 会话自动 resume 续流） */
   const openSession = useCallback(async (id: string) => {
-    setActiveId(id);
+    setActive(id);
     setMessages(cacheRef.current.get(id) ?? []);
     setStreaming(abortRef.current.has(id));
     if (cacheRef.current.has(id)) return; // 已有缓存：即时展示，不重复拉取/续流
@@ -242,14 +255,25 @@ export function useBrainSession(title: string) {
     } catch { /* 静默 */ }
   }, [title, send]);
 
-  /** 新建会话（前端预生成 id，服务端按 id 创建；可带首条 prompt） */
+  /**
+   * 新建会话（前端预生成 id，服务端按 id 创建；可带首条 prompt）。
+   * 无 prompt（如「+」新建按钮）→ 不创建会话，仅清空当前视图（空态），
+   * 等用户发出第一条消息时 doSend 自动创建并绑定——符合「初始无会话，首条消息时创建」。
+   */
   const newSession = useCallback(async (firstPrompt?: string) => {
+    if (!firstPrompt?.trim()) {
+      setActive("");
+      setMessages([]);
+      setStreaming(false);
+      setThinking(false);
+      return "";
+    }
     const id = crypto.randomUUID();
     try {
       const res = await apiFetch("/api/brain/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, id, prompt: firstPrompt ?? "" }),
+        body: JSON.stringify({ title, id, prompt: firstPrompt }),
       });
       if (!res.ok) return id;
       await refreshList();
@@ -271,12 +295,12 @@ export function useBrainSession(title: string) {
       });
     } catch { /* 静默 */ }
     await refreshList();
-    if (activeId === id) {
-      setActiveId("");
+    if (activeIdRef.current === id) {
+      setActive("");
       setMessages([]);
       setStreaming(false);
     }
-  }, [title, activeId, refreshList]);
+  }, [title, refreshList]);
 
   /** 截断会话到指定消息（编辑重发前置）：服务端 + 本地缓存同步删该消息及其后 */
   const truncate = useCallback(async (id: string, messageId: string) => {
@@ -295,24 +319,24 @@ export function useBrainSession(title: string) {
       if (idx >= 0) {
         const next = arr.slice(0, idx);
         cacheRef.current.set(id, next);
-        if (id === activeId) setMessages(next);
+        if (id === activeIdRef.current) setMessages(next);
       }
     }
     void refreshList();
-  }, [title, activeId, refreshList]);
+  }, [title, refreshList]);
 
   /** 纯追加一条展示消息（卡片执行结果等，不触发 SSE） */
   const appendMsg = useCallback((id: string, msg: ChatMessage) => {
     const arr = cacheRef.current.get(id) ?? [];
     arr.push(msg);
     cacheRef.current.set(id, arr);
-    if (id === activeId) setMessages([...arr]);
-  }, [activeId]);
+    if (id === activeIdRef.current) setMessages([...arr]);
+  }, []);
 
   /** 停止 active 会话生成 */
   const stop = useCallback(() => {
-    abortRef.current.get(activeId)?.abort();
-  }, [activeId]);
+    abortRef.current.get(activeIdRef.current)?.abort();
+  }, []);
 
   /** 挂载/切换书时恢复：清缓存 → 拉列表 → 打开最近会话（streaming 会话由 openSession 自动续流） */
   useEffect(() => {
@@ -320,17 +344,12 @@ export function useBrainSession(title: string) {
     loadedTitleRef.current = title;
     cacheRef.current.clear();
     abortRef.current.clear();
-    setActiveId("");
+    setActive("");
     setMessages([]);
     setStreaming(false);
     void (async () => {
-      await refreshList();
-      const list = (await apiFetch("/api/brain/sessions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title }),
-      }).then((r) => (r.ok ? r.json() : null)).catch(() => null)) as { sessions?: SessionMeta[] } | null;
-      const latest = list?.sessions?.[0];
+      const list = await refreshList();
+      const latest = list[0];
       if (latest) await openSession(latest.id);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps

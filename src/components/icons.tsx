@@ -222,6 +222,19 @@ export const Upload = (p: IconProps) => (
   </Icon>
 );
 
+export const Send = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="m22 2-7 20-4-9-9-4Z" />
+    <path d="M22 2 11 13" />
+  </Icon>
+);
+
+export const Square = (p: IconProps) => (
+  <Icon {...p}>
+    <rect width="18" height="18" x="3" y="3" rx="2" />
+  </Icon>
+);
+
 export const RefreshCw = (p: IconProps) => (
   <Icon {...p}>
     <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />

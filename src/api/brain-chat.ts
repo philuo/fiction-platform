@@ -18,7 +18,9 @@ import { loadWorld } from "./storage";
 import { readEvalReport } from "./eval";
 import { isPendingForeshadow } from "./world";
 import { mediaDataUri } from "./media";
-import type { WorldState } from "./world";
+import { gachaGenerate as directorGachaGenerate } from "./director";
+import type { CardType } from "./cards";
+import type { Card as WorldCard, WorldState } from "./world";
 import {
   appendMessage,
   createSession,
@@ -101,10 +103,13 @@ export const INTENTS: Record<string, IntentMeta> = {
   read_worldbook: { commandId: "CMD-Q01", level: "L0", title: "查看设定/世界书" },
   read_media: { commandId: "CMD-Q01", level: "L0", title: "查看媒体资源" },
   read_review: { commandId: "CMD-Q01", level: "L0", title: "查看审查报告" },
+  read_gacha: { commandId: "CMD-Q01", level: "L0", title: "查看卡池（抽到的卡）" },
   eval: { commandId: "CMD-S09", level: "L0", title: "整书质量评估", action: { endpoint: "/api/novel/eval", method: "POST", body: {} } },
   edit_world: { commandId: "CMD-W12", level: "L2", title: "编辑设定/角色", action: { endpoint: "/api/novel/world", method: "POST", body: {} } },
   delete_chapter: { commandId: "CMD-N08", level: "L3", title: "删除章节", action: { endpoint: "/api/novel/chapter/delete", method: "POST", body: { phase: "preview" } } },
   regenerate: { commandId: "CMD-N05", level: "L2", title: "AI 重写章节", action: { endpoint: "/api/novel/chapter/regenerate", method: "POST", body: {} } },
+  rewrite: { commandId: "CMD-G06", level: "L2", title: "回溯重写（消费重写队列）", action: { endpoint: "/api/novel/rewrite", method: "POST", body: { action: "start" } } },
+  autoskip: { commandId: "CMD-N14", level: "L1", title: "跳过连载草稿章", action: { endpoint: "/api/novel/auto/skip", method: "POST", body: {} } },
   resettle: { commandId: "CMD-L03", level: "L2", title: "重算本章账本", action: { endpoint: "/api/novel/chapter/resettle", method: "POST", body: {} } },
   media_image: { commandId: "CMD-M02", level: "L0", title: "生成章节插画", action: { endpoint: "/api/novel/media/generate", method: "POST", body: { kind: "image" } } },
   media_video: { commandId: "CMD-M03", level: "L0", title: "生成章节视频", action: { endpoint: "/api/novel/media/generate", method: "POST", body: { kind: "video" } } },
@@ -151,10 +156,13 @@ const INTENT_HINT: Record<string, string> = {
   read_worldbook: "查看设定/世界书/世界观/规则",
   read_media: "查看媒体资源/插画/视频/立绘/配图",
   read_review: "查看审查报告/评分/审查意见/这章评价",
+  read_gacha: "查看抽到的卡/查看卡池/应用卡牌/抽卡结果/看看抽到了什么/卡池里有什么",
   eval: "整书质量评估",
   edit_world: "编辑设定/角色",
   delete_chapter: "删除章节",
   regenerate: "AI 重写章节",
+  rewrite: "回溯重写/重写队列/按计划重写/处理重写任务/重新写那几章",
+  autoskip: "跳过草稿/跳过这章/放弃草稿/不要这章草稿/跳过连载章",
   resettle: "重算本章账本",
   media_image: "生成章节插画",
   media_video: "生成章节视频",
@@ -224,6 +232,33 @@ function brainDisposition(w: WorldState): "continue" | "complete" | "blocked" {
   return "continue";
 }
 
+/** 抽卡卡池 → 浏览卡（gacha）：每张带「应用此卡」，顶层带「全部应用（AI 优选）」；
+ *  供 executeQuery(read_gacha) 与 gacha 意图特判共用（聊天内完成 生成→浏览→应用 闭环） */
+function gachaBrowseCard(pool: WorldCard[], title: string): Record<string, unknown> {
+  const list = pool.map((c) => ({
+    id: c.id,
+    type: c.type,
+    rarity: c.rarity,
+    title: c.title,
+    description: c.description,
+    effect: c.effect,
+    dueHint: c.dueHint,
+    character: c.character,
+    actions: [
+      { label: "应用此卡", action: { endpoint: "/api/novel/gacha", method: "POST", body: { title, action: "apply", pick: [c.id] } } },
+    ],
+  }));
+  return {
+    kind: "browse",
+    title: `抽卡卡池（${pool.length} 张）`,
+    browseType: "gacha",
+    data: { list },
+    actions: [
+      { label: "全部应用（AI 优选）", action: { endpoint: "/api/novel/gacha", method: "POST", body: { title, action: "apply", auto: true } } },
+    ],
+  };
+}
+
 /** L0 查询直接执行 → BrowseCard / ResultCard */
 export function executeQuery(w: WorldState, intent: string, params: Record<string, unknown>): Record<string, unknown> | null {
   /** 目标章数：goal 显式目标 > 弧线估计合计 > 章纲总数；无则 null（前端不显示进度条） */
@@ -280,6 +315,14 @@ export function executeQuery(w: WorldState, intent: string, params: Record<strin
       }));
     if (!list.length) return { kind: "result", title: "暂无新角色提案", success: false, detail: "当前没有待确认的新角色提案，抽卡或推进剧情可能产生提案。" };
     return { kind: "browse", title: `新角色提案（${list.length} 项）`, browseType: "proposal", data: { list } };
+  }
+  if (intent === "read_gacha") {
+    // 抽卡卡池：pendingCards 浏览 + 逐张应用/全部应用（聊天内完成「生成 → 浏览 → 应用」闭环）
+    const pool = w.pendingCards ?? [];
+    if (!pool.length) {
+      return { kind: "result", title: "暂无卡池", success: false, detail: "当前没有待应用的卡池，说「抽卡」先生成卡池。" };
+    }
+    return gachaBrowseCard(pool, w.title);
   }
   if (intent === "read_chapters") {
     // 章节目录：状态/审查分/字数/媒体数 + 章进度（done/target）
@@ -423,6 +466,7 @@ export const brainChatDeps = {
   chatJson,
   chatStream,
   loadWorld,
+  gachaGenerate: directorGachaGenerate,
 };
 
 /** 纯对话回复：真流式（chatStream 逐 delta），每 500ms 节流落盘一次 */
@@ -793,6 +837,36 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
       };
       markMessageDone(title, sessionId, messageId, [card]);
       send({ type: "card", messageId, card });
+      send({ type: "done", messageId });
+      return;
+    }
+
+    // 抽卡：聊天内完整闭环——直接生成卡池 → 浏览卡（逐张应用/全部应用），不走 preview 卡
+    if (intent === "gacha") {
+      const text = reply || meta.title;
+      if (text) {
+        updateMessageText(title, sessionId, messageId, text, true);
+        send({ type: "delta", messageId, text });
+      }
+      const count = Math.max(1, Math.min(Number(params.count ?? 4) || 4, 6));
+      const types = Array.isArray(params.types)
+        ? (params.types.map(String).filter((t) => ["角色", "发展方向", "伏笔", "章节", "道具", "场景"].includes(t)) as CardType[])
+        : undefined;
+      const w2 = brainChatDeps.loadWorld(title);
+      if (!w2) {
+        markMessageDone(title, sessionId, messageId, []);
+        send({ type: "done", messageId });
+        return;
+      }
+      try {
+        const { pool } = await brainChatDeps.gachaGenerate(w2, { count, types });
+        const card = gachaBrowseCard(pool, title);
+        markMessageDone(title, sessionId, messageId, [card]);
+        send({ type: "card", messageId, card });
+      } catch (e) {
+        markMessageDone(title, sessionId, messageId, []);
+        send({ error: `抽卡失败：${(e as Error).message}` });
+      }
       send({ type: "done", messageId });
       return;
     }

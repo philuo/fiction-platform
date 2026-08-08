@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { emptyWorld, type WorldState } from "../src/api/world";
+import type { Card as WorldCard } from "../src/api/world";
 import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues } from "../src/api/brain-chat";
 import { getSession as sessGet, lastPendingMessage as sessLastPending } from "../src/api/brain-sessions";
 import type { ChatMessage } from "../src/api/agnes";
@@ -34,6 +35,10 @@ brainChatDeps.chatStream = (async (_msgs: ChatMessage[], onChunk: (d: string) =>
 let mockWorld: WorldState | null = null;
 brainChatDeps.loadWorld = (() => mockWorld) as typeof brainChatDeps.loadWorld;
 
+// gachaGenerate 注入：返回内存 mockPool（不触碰真实 LLM/磁盘）
+let mockPool: WorldCard[] = [];
+brainChatDeps.gachaGenerate = (async () => ({ pool: mockPool })) as typeof brainChatDeps.gachaGenerate;
+
 // 会话持久化隔离：BRAIN_SESSIONS_DATA_DIR 指向临时目录，不污染真实 data/
 let sessDataDir = "";
 beforeAll(() => {
@@ -47,6 +52,7 @@ afterAll(() => {
   brainChatDeps.chatJson = originalDeps.chatJson;
   brainChatDeps.chatStream = originalDeps.chatStream;
   brainChatDeps.loadWorld = originalDeps.loadWorld;
+  brainChatDeps.gachaGenerate = originalDeps.gachaGenerate;
 });
 
 /** 收集一次回合的全部事件 */
@@ -114,6 +120,16 @@ describe("INTENTS 意图映射", () => {
     expect(INTENTS.delete_chapter.level).toBe("L3");
     expect(INTENTS.delete_chapter.action?.endpoint).toBe("/api/novel/chapter/delete");
   });
+
+  test("rewrite/autoskip：聊天补齐回溯重写与跳过连载章手动入口", () => {
+    expect(INTENTS.rewrite.level).toBe("L2");
+    expect(INTENTS.rewrite.commandId).toBe("CMD-G06");
+    expect(INTENTS.rewrite.action?.endpoint).toBe("/api/novel/rewrite");
+    expect(INTENTS.rewrite.action?.body).toEqual({ action: "start" });
+    expect(INTENTS.autoskip.level).toBe("L1");
+    expect(INTENTS.autoskip.commandId).toBe("CMD-N14");
+    expect(INTENTS.autoskip.action?.endpoint).toBe("/api/novel/auto/skip");
+  });
 });
 
 describe("executeQuery（L0 查询直接执行）", () => {
@@ -179,6 +195,37 @@ describe("executeQuery（L0 查询直接执行）", () => {
     const card = executeQuery(w, "read_proposals", {});
     expect(card?.kind).toBe("result");
     expect(card?.success).toBe(false);
+  });
+
+  test("read_gacha：有 pendingCards → BrowseCard(gacha) 含逐张应用与全部应用操作（聊天内抽卡闭环）", () => {
+    const w = mkWorld();
+    w.pendingCards = [
+      { id: "g1", type: "伏笔", rarity: "SR", title: "锈剑", description: "一把生锈的剑", effect: "在关键情节取出锈剑", dueHint: "第 8 章前后回收" },
+      { id: "g2", type: "角色", rarity: "SSR", title: "哑巴师父", description: "沉默的武师", effect: "收哑巴师父为徒", character: { name: "哑巴师父", role: "武师", traits: ["寡言"], motivation: "守护传人" } },
+    ];
+    const card = executeQuery(w, "read_gacha", {});
+    expect(card?.kind).toBe("browse");
+    expect(card?.browseType).toBe("gacha");
+    const list = (card!.data as { list: Record<string, unknown>[] }).list;
+    expect(list.length).toBe(2);
+    expect(list[0].title).toBe("锈剑");
+    const actions = list[0].actions as { label: string; action: { endpoint: string; body: Record<string, unknown> } }[];
+    expect(actions.length).toBe(1);
+    expect(actions[0].label).toBe("应用此卡");
+    expect(actions[0].action.endpoint).toBe("/api/novel/gacha");
+    expect(actions[0].action.body).toEqual({ title: "brain-chat-test", action: "apply", pick: ["g1"] });
+    // 卡片级「全部应用」action（AI 优选）
+    const topActions = card!.actions as { label: string; action: { endpoint: string; body: Record<string, unknown> } }[];
+    expect(topActions.length).toBe(1);
+    expect(topActions[0].action.body).toEqual({ title: "brain-chat-test", action: "apply", auto: true });
+  });
+
+  test("read_gacha：无 pendingCards → ResultCard 提示先生成卡池", () => {
+    const w = mkWorld();
+    const card = executeQuery(w, "read_gacha", {});
+    expect(card?.kind).toBe("result");
+    expect(card?.success).toBe(false);
+    expect(String(card?.detail)).toContain("抽卡");
   });
 
   test("eval：无落盘评估 → ResultCard 提示", () => {
@@ -566,6 +613,29 @@ describe("brainChatStream（SSE 编排，事件协议 v2）", () => {
     const confirmCard = events.filter((e) => e.type === "card").map((e) => e.card as Record<string, unknown>).find((c) => c?.kind === "confirm");
     expect(confirmCard).toBeTruthy();
     expect(confirmCard!.options).toEqual(["abort"]);
+  });
+
+  test("意图 gacha → 直接生成卡池 → card(browse/gacha) 含逐张/全部应用（聊天内抽卡闭环）", async () => {
+    mockWorld = mkWorld();
+    mockPool = [
+      { id: "g1", type: "伏笔", rarity: "SR", title: "锈剑", description: "一把生锈的剑", effect: "在关键情节取出锈剑", dueHint: "第 8 章前后回收" },
+      { id: "g2", type: "角色", rarity: "SSR", title: "哑巴师父", description: "沉默的武师", effect: "收哑巴师父为徒", character: { name: "哑巴师父", role: "武师", traits: ["寡言"], motivation: "守护传人" } },
+    ];
+    nextChatContent = JSON.stringify({ intent: "gacha", params: { count: 2 }, reply: "为你抽了 2 张卡" });
+    const events = await runTurn("抽两张卡");
+    // 不再走 preview 卡：直接出卡池浏览卡
+    const card = (events.find((e) => e.type === "card") as { card?: Record<string, unknown> } | undefined)?.card;
+    expect(card?.kind).toBe("browse");
+    expect(card?.browseType).toBe("gacha");
+    expect(String(card?.title)).toContain("2 张");
+    const list = (card!.data as { list: Record<string, unknown>[] }).list;
+    expect(list.length).toBe(2);
+    const itemActions = list[0].actions as { label: string; action: { endpoint: string; body: Record<string, unknown> } }[];
+    expect(itemActions[0].label).toBe("应用此卡");
+    expect(itemActions[0].action.body).toEqual({ title: "brain-chat-test", action: "apply", pick: ["g1"] });
+    const topActions = card!.actions as { label: string; action: { endpoint: string; body: Record<string, unknown> } }[];
+    expect(topActions[0].action.body).toEqual({ title: "brain-chat-test", action: "apply", auto: true });
+    expect(events[events.length - 1].type).toBe("done");
   });
 
   test("意图 plan → delta + card(plan 选项) + done", async () => {

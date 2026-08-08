@@ -3758,7 +3758,7 @@ html { scroll-behavior: smooth; }
 .bc-link-btn:hover { color: var(--ink); }
 .bc-link-btn:disabled { opacity: 0.4; cursor: default; }
 .bc-user-actions { display: flex; justify-content: flex-end; margin-top: 0.2rem; }
-.bc-stop { flex-shrink: 0; }
+.bc-send { flex-shrink: 0; }
 
 /* —— 中枢回复 Markdown 富文本（表格/图片/列表/代码块） —— */
 .bc-md { font-size: 0.82rem; line-height: 1.65; word-break: break-word; }
@@ -3773,15 +3773,64 @@ html { scroll-behavior: smooth; }
 .bc-md pre code { background: none; padding: 0; }
 .bc-md blockquote { border-left: 3px solid var(--seal); margin: 0.3rem 0; padding-left: 0.6rem; color: var(--ink-dim, #666); }
 
-.brain-cabin-input { display: flex; gap: 0.5rem; padding: 0.7rem 1rem; border-top: 1px solid var(--line); background: var(--paper-dark); }
+/* —— 输入框上方上下文操作区：会话话题 + 未决交互按钮（二次确认/意见征询/待执行）+ 连载进度条 —— */
+.bc-context-bar {
+  display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;
+  padding: 0.3rem 1rem; flex-shrink: 0;
+  border-top: 1px solid var(--line);
+  background: var(--paper);
+  font-size: 0.68rem; color: var(--ink-soft);
+}
+.bc-context-main { display: flex; align-items: center; gap: 0.5rem; min-width: 0; flex: 1; }
+.bc-context-session {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40%;
+  font-weight: 600; color: var(--ink); letter-spacing: 0.02em;
+}
+.bc-context-status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55%; color: var(--seal); font-weight: 600; }
+.bc-context-actions { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
+.bc-context-label { font-weight: 700; color: var(--seal); white-space: nowrap; }
+.bc-ctx-btn {
+  border: 1px solid var(--line); background: var(--paper); color: var(--ink);
+  border-radius: 999px; padding: 0.14rem 0.6rem; font-size: 0.68rem; cursor: pointer;
+  transition: all var(--transition);
+}
+.bc-ctx-btn:hover:not(:disabled) { border-color: var(--seal); color: var(--seal); background: rgba(176, 58, 46, 0.06); }
+.bc-ctx-btn.primary { background: var(--seal); border-color: var(--seal); color: var(--paper); }
+.bc-ctx-btn.primary:hover:not(:disabled) { background: #9a2f25; }
+.bc-ctx-btn.danger { color: var(--seal); border-color: rgba(176, 58, 46, 0.4); }
+.bc-ctx-btn.danger:hover:not(:disabled) { background: rgba(176, 58, 46, 0.1); }
+.bc-ctx-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.brain-cabin-input {
+  position: relative;
+  display: flex; align-items: center; gap: 0.5rem; padding: 0.7rem 1rem; border-top: 1px solid var(--line); background: var(--paper-dark);
+}
 .brain-cabin-input textarea {
-  flex: 1; resize: vertical; min-height: 3rem; max-height: 11rem;
+  flex: 1; resize: none; min-height: 3rem; max-height: 11rem;
   border: 1px solid var(--line); border-radius: 0.4rem;
   padding: 0.55rem 0.6rem; font-family: var(--serif); font-size: 0.82rem; background: var(--paper);
   color: var(--ink);
 }
 .brain-cabin-input textarea:focus { outline: none; border-color: var(--seal); }
-.bc-send { flex-shrink: 0; }
+/* 输入区上边界拖拽手柄：跨越边界线，拖动改变输入区高度（悬停显示小横杠提示） */
+.bc-input-resize {
+  position: absolute; top: -6px; left: 0; right: 0; height: 12px;
+  cursor: ns-resize; z-index: 5;
+}
+.bc-input-resize::after {
+  content: ""; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  width: 44px; height: 3px; border-radius: 2px; background: var(--line);
+  opacity: 0; transition: opacity 0.15s;
+}
+.brain-cabin-input:hover .bc-input-resize::after,
+.bc-input-resize:hover::after { opacity: 1; }
+.bc-input-resize:hover::after { background: var(--seal); }
+.bc-send {
+  flex-shrink: 0; white-space: nowrap;
+  height: 2.1rem; padding: 0 0.9rem;
+  font-size: 0.8rem; letter-spacing: 0.08em;
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.35em;
+}
 
 /* —— 会话 tab 栏（独立区域，与头部上下分区；单行横滑 + 悬浮 ✕ 关闭窗口） —— */
 .bc-tabs {
@@ -3893,6 +3942,32 @@ html { scroll-behavior: smooth; }
 .bc-proposal-name { font-weight: 700; font-size: 0.78rem; color: var(--ink); }
 .bc-proposal-reason { font-size: 0.74rem; color: var(--seal); line-height: 1.5; margin: 0.25rem 0 0; }
 .bc-browse-actions { display: flex; gap: 0.35rem; margin-top: 0.35rem; flex-wrap: wrap; }
+
+/* —— 抽卡卡池（gacha）浏览卡：稀有度色标网格 + 逐张应用 —— */
+.bc-gacha-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr)); gap: 0.45rem; margin-top: 0.45rem; }
+.bc-gacha-card {
+  display: flex; flex-direction: column; gap: 0.25rem;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 0.45rem 0.5rem; background: var(--paper-dark);
+  border-top: 3px solid var(--line-strong);
+}
+.bc-gacha-n { border-top-color: #8d8d8d; }
+.bc-gacha-r { border-top-color: #4d7a4d; }
+.bc-gacha-sr { border-top-color: #3b4d8f; }
+.bc-gacha-ssr { border-top-color: #b03a2e; }
+.bc-gacha-head { display: flex; align-items: center; justify-content: space-between; gap: 0.3rem; }
+.bc-gacha-rarity {
+  font-family: var(--sans); font-size: 0.62rem; font-weight: 700; letter-spacing: 0.06em;
+  padding: 0.02rem 0.35rem; border-radius: 999px; color: var(--paper); background: var(--ink-soft);
+}
+.bc-gacha-n .bc-gacha-rarity { background: #8d8d8d; }
+.bc-gacha-r .bc-gacha-rarity { background: #4d7a4d; }
+.bc-gacha-sr .bc-gacha-rarity { background: #3b4d8f; }
+.bc-gacha-ssr .bc-gacha-rarity { background: #b03a2e; }
+.bc-gacha-type { font-size: 0.62rem; color: var(--ink-soft); }
+.bc-gacha-title { font-family: var(--serif); font-size: 0.8rem; font-weight: 700; color: var(--ink); line-height: 1.35; }
+.bc-gacha-effect { font-size: 0.7rem; color: var(--ink); line-height: 1.5; margin: 0; }
+.bc-gacha-card .bc-browse-meta { font-size: 0.66rem; }
 
 /* —— 查询可视化（Phase 1：进度条/统计网格/徽章/列表操作） —— */
 .bc-progress { display: flex; align-items: center; gap: 0.5rem; margin: 0.3rem 0 0.5rem; }

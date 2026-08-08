@@ -1,12 +1,12 @@
 // 中枢对话舱（BrainCabin）：常驻侧边抽屉，卡片式浏览 + 智能控制入口
 // 顶部：印灵大图 + 四维状态脉象 + 右上角无边框 icon 操作组（新建/历史/关闭）；会话横滑栏；
-// 中部：对话流（富文本 Markdown + 卡片 + loading 骨架）或历史会话视图（可删除/切换）；底部：输入条 + 停止生成
+// 中部：对话流（富文本 Markdown + 卡片 + loading 骨架）或历史会话视图（可删除/切换）；底部：输入条 + 发送/中断（上边界可拖高）
 // 直接输入即开启首次对话（无需先点新建）；历史 icon 切换下方为历史列表
 // 接入 /api/brain/chat SSE（协议 v2）：intent/delta/card/done/interrupted/reset
 // 多会话：useBrainSession（服务端持久化 + 独立 SSE 连接，切换 tab 不打断；刷新自动续流）
 import { useEffect, useMemo, useRef, useState } from "react";
 import { BrainCore } from "./BrainCore";
-import { History, Plus, X } from "./icons";
+import { History, Plus, Send, Square, X } from "./icons";
 import { BrainCardView, type BrainCard, type PreviewCard, type ChoiceOption, type FormCard, type FormField } from "./brain-cards";
 import { MarkdownView } from "./MarkdownView";
 import { useBrainSession, type ChatMessage } from "./useBrainSession";
@@ -153,6 +153,21 @@ export const BrainCabin: React.FC<{
   const activity = brainState?.activity ?? "idle";
   const governance = brainState?.governance ?? "passthrough";
 
+  // —— 输入框上方上下文操作区：当前会话话题 + 未决交互（二次确认/意见征询/待执行）+ 连载进度 ——
+  const activeSessionTitle = sessions.find((s) => s.id === activeId)?.title ?? "";
+  const lastBrainMsg = [...messages].reverse().find((m) => m.role === "brain");
+  const lastCards = lastBrainMsg?.cards ?? [];
+  const ctxCard = lastCards.find(
+    (c) => c.kind === "confirm" || c.kind === "plan" || c.kind === "opinion" || (c.kind === "preview" && (c as PreviewCard).confirmRequired)
+  ) as (BrainCard & { options?: ChoiceOption[] }) | undefined;
+  const ctxBusy = streaming || executing;
+  const runningStatus = (() => {
+    if (streaming) return "中枢正在生成回复…";
+    if (thinking) return "中枢正在思考…";
+    if (activity !== "idle") return `中枢正在${ACTIVITY_LABEL[activity]}`;
+    return "";
+  })();
+
   return (
     <div className="brain-cabin-mask" onClick={onClose}>
       <div className="brain-cabin" onClick={(e) => e.stopPropagation()}>
@@ -250,7 +265,7 @@ export const BrainCabin: React.FC<{
         <div className="brain-cabin-stream" ref={scrollRef}>
           {messages.length === 0 && (
             <div className="brain-cabin-empty">
-              <p className="bc-hint">直接输入即可开始对话；试试：「再写一章」「这本书质量怎么样」「给第三章配张插画」</p>
+              <p className="bc-hint">试一试：「再写一章」「这本书质量怎么样」「给第三章配张插画」</p>
             </div>
           )}
           {messages.map((msg) => (
@@ -270,6 +285,7 @@ export const BrainCabin: React.FC<{
                   <div className="bc-interrupted-bar">
                     <span className="bc-interrupted-tag">已停止</span>
                     <button className="bc-link-btn" onClick={regenerate} disabled={streaming}>重新生成</button>
+                    <button className="bc-link-btn" onClick={retryInInput} disabled={streaming} title="把最后一个问题移到底部输入框，并从记录中移除本回合">移至输入 · 移除本回合</button>
                   </div>
                 )}
                 {msg.cards?.map((card, i) => (
@@ -286,7 +302,7 @@ export const BrainCabin: React.FC<{
               </div>
               {msg.role === "user" && (
                 <div className="bc-user-actions">
-                  <button className="bc-link-btn" onClick={() => editPrompt(msg)} disabled={streaming} title="编辑并重发（截断后续对话）">✎ 编辑</button>
+                  <button className="bc-link-btn" onClick={() => editPrompt(msg)} disabled={streaming || thinking} title="编辑并重发（截断后续对话）">✎ 编辑</button>
                 </div>
               )}
             </div>
@@ -294,9 +310,43 @@ export const BrainCabin: React.FC<{
         </div>
         )}
 
-        {/* 底部：输入条 + 停止生成（历史视图隐藏） */}
+        {/* 输入框上方上下文操作区：会话话题 + 二次确认/意见征询按钮；无内容时整条隐藏 */}
+        {!showHistory && (activeSessionTitle || ctxCard || runningStatus) && (
+          <div className="bc-context-bar">
+            <div className="bc-context-main">
+              {activeSessionTitle && <span className="bc-context-session" title="当前会话">{activeSessionTitle}</span>}
+              {runningStatus && <span className="bc-context-status">{runningStatus}</span>}
+            </div>
+            {ctxCard && (
+              <div className="bc-context-actions">
+                {ctxCard.kind === "confirm" && (
+                  <>
+                    <span className="bc-context-label">待确认</span>
+                    <button className="bc-ctx-btn" disabled={ctxBusy} onClick={() => confirmChoose("merge", lastBrainMsg?.cards)} title="合并本次改动">合并</button>
+                    <button className="bc-ctx-btn" disabled={ctxBusy} onClick={() => confirmChoose("rewrite", lastBrainMsg?.cards)} title="按计划重写受影响章节">重写</button>
+                    <button className="bc-ctx-btn danger" disabled={ctxBusy} onClick={() => confirmChoose("abort")} title="放弃本次操作">放弃</button>
+                  </>
+                )}
+                {(ctxCard.kind === "plan" || ctxCard.kind === "opinion") && (
+                  <>
+                    <span className="bc-context-label">{ctxCard.kind === "plan" ? "计划选项" : "意见征询"}</span>
+                    {ctxCard.options?.map((o, i) => (
+                      <button key={i} className="bc-ctx-btn" disabled={ctxBusy} onClick={() => handleOption(o)} title={o.description}>{o.label}</button>
+                    ))}
+                  </>
+                )}
+                {ctxCard.kind === "preview" && (
+                  <button className="bc-ctx-btn primary" disabled={ctxBusy} onClick={() => executeCard(ctxCard)} title="执行此操作">执行操作</button>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 底部：输入条 + 发送/中断（历史视图隐藏）；上边界可拖动调整输入区高度 */}
         {!showHistory && (
         <div className="brain-cabin-input">
+          <div className="bc-input-resize" onPointerDown={startInputResize} title="拖动调整输入区高度" />
           <textarea
             ref={inputRef}
             value={input}
@@ -309,10 +359,12 @@ export const BrainCabin: React.FC<{
             disabled={streaming}
           />
           {streaming ? (
-            <button className="btn btn-danger bc-stop" onClick={stop} title="停止生成（保留已输出内容）">■ 停止</button>
+            <button className="btn btn-danger bc-send" onClick={stop} title="中断生成（保留已输出内容）">
+              <Square size={15} /> 中断
+            </button>
           ) : (
-            <button className="btn btn-primary bc-send" onClick={() => void doSend()} disabled={!input.trim()}>
-              发送
+            <button className="btn btn-primary bc-send" onClick={() => void doSend()} disabled={!input.trim()} title="发送">
+              <Send size={15} /> 发送
             </button>
           )}
         </div>
@@ -322,6 +374,33 @@ export const BrainCabin: React.FC<{
   );
 
   // —— 以下为组件内操作函数（依赖上方 JSX 引用的状态） ——
+
+  /**
+   * 输入区上边界拖拽：以 textarea 当前高度为基准，随指针垂直位移实时调整高度
+   * （钳制在 CSS min-height:3rem / max-height:11rem 对应像素值内）
+   */
+  function startInputResize(e: React.PointerEvent<HTMLDivElement>) {
+    e.preventDefault();
+    const ta = inputRef.current;
+    if (!ta) return;
+    const startY = e.clientY;
+    const startH = ta.getBoundingClientRect().height;
+    const MIN = 48, MAX = 176;
+    const onMove = (ev: PointerEvent) => {
+      const h = Math.min(MAX, Math.max(MIN, startH + (startY - ev.clientY)));
+      ta.style.height = `${h}px`;
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    document.body.style.cursor = "ns-resize";
+    document.body.style.userSelect = "none";
+  }
 
   /** 发送：无 activeId 时自动新建会话（直接输入即首次对话） */
   async function doSend() {
@@ -340,6 +419,22 @@ export const BrainCabin: React.FC<{
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
     if (!lastBrain || !lastUser) return;
     void send({ prompt: lastUser.text ?? "", sessionId: activeId, resume: true });
+  }
+
+  /**
+   * 中断轮次移至输入框：把最后一个问题回填到底部输入框，
+   * 并从聊天记录中移除被中断的最后一轮（truncate 删除最后一条 user 消息及其后的 brain 消息）。
+   */
+  async function retryInInput() {
+    if (!activeId || streaming) return;
+    const lastUser = [...messages].reverse().find((m) => m.role === "user");
+    const last = messages[messages.length - 1];
+    // 移除对象：最后一条 user 消息（连带其后的被中断回复）；若仅剩 brain 消息则移除该条
+    const target = lastUser ?? (last?.role === "brain" ? last : undefined);
+    if (!target) return;
+    setInput(lastUser?.text ?? "");
+    await truncate(activeId, target.id);
+    inputRef.current?.focus();
   }
 
   /** 编辑用户消息：截断该消息及其后（服务端+本地），回填输入框 */

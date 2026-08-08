@@ -460,28 +460,34 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
     }
 
     case "/api/brain/sessions": {
-      // 中枢聊天会话 API：GET 历史列表（title/时间，最近更新倒序）；POST 新建会话（返回完整会话）
+      // 中枢聊天会话 API（POST 语义按 body.id 分派）：
+      // - POST body 无 id → 返回历史列表（title/时间/流式标记，最近更新倒序；历史详情走 /api/brain/sessions/detail）
+      // - POST body 有 id → 新建会话，透传前端预生成的 id（一次请求拿回完整会话）
+      // （前端统一走 POST：无 body 的 GET 无法传 title，历史遗留 GET 分支已移除）
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
       const bsBody = await readBody(req);
       const bsTitle = String(bsBody.title ?? "").trim();
       if (!bsTitle) return json({ error: "缺少 title" }, 400);
-      if (req.method === "GET") {
-        // 列表只回显标题/时间/流式标记（不含完整消息，历史详情走 /api/brain/sessions/:id）
-        const list = listBrainSessions(bsTitle).map((s) => ({
-          id: s.id,
-          title: s.title,
-          createdAt: s.createdAt,
-          updatedAt: s.updatedAt,
-          streaming: s.streaming,
-          messageCount: s.messages.length,
-        }));
-        return json({ sessions: list });
-      }
-      if (req.method === "POST") {
+      const bsId = String(bsBody.id ?? "").trim();
+      if (bsId) {
+        // 幂等：id 已存在（重放/前端重试）→ 返回已有会话，不重复创建
+        const existing = getBrainSession(bsTitle, bsId);
+        if (existing) return json({ session: existing }, 200);
         const firstPrompt = String(bsBody.prompt ?? "").trim();
-        const s = createBrainSession(bsTitle, firstPrompt);
+        const s = createBrainSession(bsTitle, firstPrompt, bsId);
         return json({ session: s }, 201);
       }
-      return json({ error: "仅支持 GET/POST" }, 405);
+      // 列表只回显标题/时间/流式标记（不含完整消息，历史详情走 /api/brain/sessions/detail）
+      // 过滤空壳会话（messages=0，从未发消息）：用户期望「初始无会话，首条消息时自动创建」，空壳无存在意义
+      const list = listBrainSessions(bsTitle).filter((s) => s.messages.length > 0).map((s) => ({
+        id: s.id,
+        title: s.title,
+        createdAt: s.createdAt,
+        updatedAt: s.updatedAt,
+        streaming: s.streaming,
+        messageCount: s.messages.length,
+      }));
+      return json({ sessions: list });
     }
 
     case "/api/brain/sessions/delete": {

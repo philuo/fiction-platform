@@ -52,7 +52,7 @@ export type BrowseCard = {
   kind: "browse";
   title: string;
   browseType:
-    | "chapter" | "character" | "foreshadow" | "review" | "eval" | "proposal"
+    | "chapter" | "character" | "foreshadow" | "review" | "eval" | "proposal" | "gacha"
     // —— 查询扩展（Phase 1）：列表/进度/统计可视化 ——
     | "chapters" | "characters" | "plans" | "tasks" | "logs" | "worldbook" | "media";
   data: unknown;
@@ -361,6 +361,35 @@ export const BrowseCardView: React.FC<{
           </div>
         ))}
       </div>
+    );
+  } else if (card.browseType === "gacha" && d) {
+    // 抽卡卡池：稀有度色标 + 类型标签 + 卡牌信息 + 逐张应用；顶部全部应用（AI 优选）
+    const list = (Array.isArray(d.list) ? d.list : []) as Record<string, unknown>[];
+    body = (
+      <>
+        <CardItemActions item={{ actions: card.actions }} busy={busy} onAction={onAction} />
+        <div className="bc-gacha-grid">
+          {list.map((c) => (
+            <div key={String(c.id ?? "")} className={`bc-gacha-card bc-gacha-${String(c.rarity ?? "N").toLowerCase()}`}>
+              <div className="bc-gacha-head">
+                <span className="bc-gacha-rarity">{String(c.rarity ?? "N")}</span>
+                <span className="bc-gacha-type">{String(c.type ?? "")}</span>
+              </div>
+              <div className="bc-gacha-title">{String(c.title ?? "")}</div>
+              {c.description ? <p className="bc-browse-text">{String(c.description)}</p> : null}
+              {c.effect ? <p className="bc-gacha-effect">效果：{String(c.effect)}</p> : null}
+              {c.dueHint ? <p className="bc-browse-meta">回收时机：{String(c.dueHint)}</p> : null}
+              {(c.character as Record<string, unknown> | null) && (
+                <p className="bc-browse-meta">
+                  人物：{String((c.character as Record<string, unknown>).name)} · {String((c.character as Record<string, unknown>).role)}
+                  {((c.character as Record<string, unknown>).traits as unknown[])?.length ? ` · ${((c.character as Record<string, unknown>).traits as unknown[]).map(String).join("/")}` : ""}
+                </p>
+              )}
+              <CardItemActions item={c} busy={busy} onAction={onAction} />
+            </div>
+          ))}
+        </div>
+      </>
     );
   } else if (card.browseType === "chapters" && d) {
     // 章节目录：进度条 + 每章（状态徽章/分数/字数/媒体数）
