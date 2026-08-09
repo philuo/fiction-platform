@@ -5,7 +5,7 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import { Window } from "happy-dom";
 import React from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { isCollapsibleMsg, msgCollapseSummary, completedItemIdsOf, actionItemId } from "../src/components/BrainCabin";
+import { isCollapsibleMsg, msgCollapseSummary, completedItemIdsOf, actionItemId, guardAction } from "../src/components/BrainCabin";
 import { BrainCardView, type ProgressCard } from "../src/components/brain-cards";
 import type { ChatMessage } from "../src/components/useBrainSession";
 
@@ -56,6 +56,40 @@ test("actionItemId：proposal/tasks/gacha 单卡提取 item id；gacha 全部应
   expect(actionItemId({ pick: ["c7"], action: "apply" })).toBe("c7");
   expect(actionItemId({ action: "apply", auto: true })).toBeUndefined();
   expect(actionItemId({})).toBeUndefined();
+});
+
+test("guardAction：系统忙（executing/streaming）与写作运行中均拦截写操作", () => {
+  const act = { endpoint: "/api/novel/world", body: { premise: "x" } };
+  expect(guardAction(act, {})).toBeNull(); // 空闲放行
+  expect(guardAction(act, { executing: true })).toContain("正在运行");
+  expect(guardAction(act, { streaming: true })).toContain("正在运行");
+  expect(guardAction(act, { writingRunning: true })).toContain("写作任务进行中");
+  // 空闲 + 资源校验正常 → 放行
+  const w = { characterProposals: [{ id: "cp1", status: "pending" }], pendingCards: [{ id: "c1" }], qualityDebt: [{ id: "d1", status: "open" }] };
+  expect(guardAction({ endpoint: "/api/novel/proposal", body: { proposalId: "cp1" } }, { world: w })).toBeNull();
+});
+
+test("guardAction：目标资源存在性校验（proposal / gacha / debt 已消耗则拦截）", () => {
+  const w = {
+    characterProposals: [{ id: "cp1", status: "pending" }, { id: "cp2", status: "confirmed" }],
+    pendingCards: [{ id: "c1" }],
+    qualityDebt: [{ id: "d1", status: "open" }, { id: "d2", status: "ignored" }],
+  };
+  // proposal：pending 放行；confirmed/不存在/缺 id 拦截
+  expect(guardAction({ endpoint: "/api/novel/proposal", body: { proposalId: "cp1" } }, { world: w })).toBeNull();
+  expect(guardAction({ endpoint: "/api/novel/proposal", body: { proposalId: "cp2" } }, { world: w })).toContain("已处理");
+  expect(guardAction({ endpoint: "/api/novel/proposal", body: { proposalId: "cp9" } }, { world: w })).toContain("已处理");
+  expect(guardAction({ endpoint: "/api/novel/proposal", body: {} }, { world: w })).toContain("缺少提案标识");
+  // gacha：单卡在池放行；不在池拦截；auto 且卡池空拦截
+  expect(guardAction({ endpoint: "/api/novel/gacha", body: { action: "apply", pick: ["c1"] } }, { world: w })).toBeNull();
+  expect(guardAction({ endpoint: "/api/novel/gacha", body: { action: "apply", pick: ["c9"] } }, { world: w })).toContain("不在卡池");
+  expect(guardAction({ endpoint: "/api/novel/gacha", body: { action: "apply", auto: true } }, { world: { ...w, pendingCards: [] } })).toContain("卡池已空");
+  expect(guardAction({ endpoint: "/api/novel/gacha", body: { action: "generate" } }, { world: w })).toBeNull(); // 非 apply 放行
+  // debt：open 放行；ignored/不存在/缺 id 拦截
+  expect(guardAction({ endpoint: "/api/novel/debt", body: { id: "d1" } }, { world: w })).toBeNull();
+  expect(guardAction({ endpoint: "/api/novel/debt", body: { id: "d2" } }, { world: w })).toContain("已处理");
+  expect(guardAction({ endpoint: "/api/novel/debt", body: { id: "d9" } }, { world: w })).toContain("已处理");
+  expect(guardAction({ endpoint: "/api/novel/debt", body: {} }, { world: w })).toContain("缺少质量债标识");
 });
 
 test("ProgressCardView：running 显示阶段步骤条 + 流式正文 + 中断按钮", async () => {

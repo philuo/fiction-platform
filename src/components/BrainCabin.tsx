@@ -102,6 +102,51 @@ export function actionItemId(body: Record<string, unknown>): string | undefined 
   return undefined;
 }
 
+/** 操作前置校验（纯前端只读）：返回不可执行原因字符串，null = 可执行。
+ *  服务端仍是权威（world 可能过期）；此处拦截「系统忙 / 写作运行中 / 目标资源已消耗」的点击，
+ *  给出即时反馈而不发请求——绝不改变系统状态，稳定性由服务端校验兜底。
+ *  act：待执行端点；ctx：组件运行时快照（executing/streaming/writingRunning/world）。
+ *  body 约定（与 brain-chat.ts 卡片生成一致）：proposalId / id(debt) / pick(gacha) / action */
+export function guardAction(
+  act: { endpoint: string; body?: Record<string, unknown> },
+  ctx: {
+    executing?: boolean;
+    streaming?: boolean;
+    writingRunning?: boolean;
+    world?: { characterProposals?: { id: string; status: string }[]; pendingCards?: { id: string }[]; qualityDebt?: { id: string; status: string }[] };
+  },
+): string | null {
+  // 系统忙：对话流式生成中或已有操作执行中 → 禁止并发写操作（防重复生成/双跑）
+  if (ctx.executing || ctx.streaming) return "当前有对话或任务正在运行，请稍候再试";
+  // 写作流式进行中（progress 卡运行）：任何写操作均拦截（服务端任务锁兜底，前端先行避免误触）
+  if (ctx.writingRunning) return "写作任务进行中，请等待完成或先中断";
+  const body = act.body ?? {};
+  const ep = act.endpoint;
+  // 新角色提案：目标项必须仍为 pending（已确认/拒绝/删除 → 不可再操作）
+  if (ep === "/api/novel/proposal") {
+    const pid = String(body.proposalId ?? "");
+    const p = ctx.world?.characterProposals?.find((x) => x.id === pid);
+    if (!p || p.status !== "pending") return pid ? "该提案已处理或不存在" : "缺少提案标识";
+  }
+  // 抽卡应用：单卡须仍在 pendingCards；全部应用须卡池非空
+  if (ep === "/api/novel/gacha" && body.action === "apply") {
+    const pick = Array.isArray(body.pick) ? body.pick : [];
+    const pool = ctx.world?.pendingCards ?? [];
+    if (body.auto === true) {
+      if (pool.length === 0) return "卡池已空，无待应用卡牌";
+    } else if (pick.length === 1) {
+      if (!pool.some((c) => c.id === String(pick[0]))) return "该卡已应用或不在卡池";
+    }
+  }
+  // 质量债处理：目标项须仍为 open（已修复/忽略 → 不可再操作）
+  if (ep === "/api/novel/debt") {
+    const did = String(body.id ?? "");
+    const d = ctx.world?.qualityDebt?.find((x) => x.id === did);
+    if (!d || d.status !== "open") return did ? "该质量债已处理或不存在" : "缺少质量债标识";
+  }
+  return null;
+}
+
 export function findProposalCardMessageId(messages: ChatMessage[]): string | undefined {
   return messages.find((m) => (m.cards ?? []).some((c) => c.kind === "browse" && c.browseType === "proposal"))?.id;
 }
@@ -615,13 +660,35 @@ export const BrainCabin: React.FC<{
     inputRef.current?.focus();
   }
 
+  /** 操作被前置校验拦截时的反馈：追加失败结果卡；若最后一条消息已是同标题+原因的失败卡则不重复（防刷屏） */
+  function notifyBlocked(title: string, reason: string) {
+    const last = messages[messages.length - 1];
+    const lastCard = last?.cards?.[last.cards.length - 1];
+    if (lastCard?.kind === "result" && lastCard.title === title && lastCard.detail === reason) return;
+    appendBrainMsg([{ kind: "result", title, success: false, detail: reason }]);
+  }
+
+  /** 统一操作守卫：不可执行时反馈原因并返回 true（调用方直接 return，不发请求、不标记完成） */
+  function guardBlocked(act: { endpoint: string; body?: Record<string, unknown> }, title: string): boolean {
+    const reason = guardAction(act, {
+      executing, streaming,
+      writingRunning: writing?.status === "running",
+      world,
+    });
+    if (reason) {
+      notifyBlocked(title, reason);
+      return true;
+    }
+    return false;
+  }
+
   /** 计划/意见选项卡点击：有动作则执行并回执；纯说明则记录选择 */
   async function handleOption(option: ChoiceOption) {
-    if (executing || streaming) return;
     if (!option.action) {
       appendBrainMsg([{ kind: "result", title: option.label, success: true, detail: option.description ?? "已选择，中枢将据此继续" }]);
       return;
     }
+    if (guardBlocked(option.action, option.label)) return;
     setExecuting(true);
     try {
       const r = await fetchAction(option.action.endpoint, option.action.method ?? "POST", option.action.body);
@@ -735,9 +802,9 @@ export const BrainCabin: React.FC<{
 
   /** 执行卡片操作（msgId/cardIndex 供成功后标记完成态） */
   async function executeCard(card: BrainCard, action?: { endpoint: string; method?: string; body: Record<string, unknown> }, msgId?: string, cardIndex?: number) {
-    if (executing || streaming) return;
     const act = action ?? (card.kind === "preview" ? card.action : undefined);
     if (!act) return;
+    if (guardBlocked(act, card.title)) return; // 前置校验：不可执行时反馈原因，不发请求（服务端仍兜底权威）
     setExecuting(true);
     try {
       // 推进剧情 / 自动连载：聊天内流式显示写作过程（progress 卡实时阶段+正文），结束后 result 卡回执；
@@ -828,13 +895,13 @@ export const BrainCabin: React.FC<{
       if (pIdx >= 0) markCardDone(msg?.id, pIdx);
       return;
     }
-    if (executing || streaming) return;
     const cards = msg?.cards;
     const action = findPreviewAction(cards);
     if (!action) {
       appendBrainMsg([{ kind: "result", title: "无法执行", success: false, detail: "未找到操作端点" }]);
       return;
     }
+    if (guardBlocked(action, `已执行（${opt}）`)) return; // 前置校验：系统忙/写作运行中/资源已消耗时拦截
     setExecuting(true);
     try {
       const body = { ...action.body, strategy: opt };
@@ -861,7 +928,7 @@ export const BrainCabin: React.FC<{
    * 否则结果回执 + 刷新世界。confirmRequired 卡（如删除伏笔）由按钮文案承担确认语义。
    */
   async function submitForm(card: FormCard, values: Record<string, unknown>, msgId?: string, cardIndex?: number) {
-    if (executing || streaming) return;
+    if (guardBlocked(card.action, card.title)) return; // 前置校验：系统忙/写作运行中拦截
     const flat = flattenFormValues(card.fields ?? [], values);
     const body: Record<string, unknown> = { ...(card.action.body ?? {}), ...flat, title: world.title };
     setExecuting(true);
