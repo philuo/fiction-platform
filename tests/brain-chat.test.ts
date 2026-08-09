@@ -114,6 +114,12 @@ describe("INTENTS 意图映射", () => {
     expect(INTENTS.read_proposals.title).toContain("提案");
   });
 
+  test("open_proposals：打开类意图（无 action，纯 UI 动作不列列表）", () => {
+    expect(INTENTS.open_proposals.level).toBe("L0");
+    expect(INTENTS.open_proposals.action).toBeUndefined();
+    expect(INTENTS.open_proposals.title).toContain("打开");
+  });
+
   test("L2/L3 写操作有 action 端点", () => {
     expect(INTENTS.advance.level).toBe("L2");
     expect(INTENTS.advance.action?.endpoint).toBe("/api/novel/step");
@@ -616,6 +622,23 @@ describe("brainChatStream（SSE 编排，事件协议 v2）", () => {
     const card = events.find((e) => e.type === "card") as { card?: Record<string, unknown> } | undefined;
     expect(card!.card!.kind).toBe("browse");
     expect(card!.card!.browseType).toBe("proposal");
+  });
+
+  test("意图 open_proposals → 不列浏览卡，仅回复 + 发「已打开」result 卡（前端据此恢复底部提案区）", async () => {
+    mockWorld = mkWorld();
+    mockWorld.characterProposals = [{ id: "cp1", name: "小翠", role: "掌柜", traits: [], motivation: "查清身世", reason: "呼应身世线", source: "writer", status: "pending" }];
+    nextChatContent = JSON.stringify({ intent: "open_proposals", params: {}, reply: "已为你打开新角色提案" });
+    const events = await runTurn("打开新角色提案");
+    const delta = events.find((e) => e.type === "delta") as { text?: string } | undefined;
+    expect(delta?.text).toBe("已为你打开新角色提案");
+    const cards = events.filter((e) => e.type === "card").map((e) => e.card as Record<string, unknown>);
+    // 不列提案浏览卡（不会把提案内容铺进聊天列表）
+    expect(cards.some((c) => c.kind === "browse" && c.browseType === "proposal")).toBe(false);
+    expect(cards.length).toBe(1);
+    expect(cards[0].kind).toBe("result");
+    expect(cards[0].title).toBe("新角色提案");
+    expect((cards[0].detail as string).includes("打开")).toBe(true);
+    expect(events[events.length - 1].type).toBe("done");
   });
 
   test("意图 advance（L2）→ delta + card(preview/confirmRequired) + card(confirm)", async () => {

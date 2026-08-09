@@ -148,7 +148,12 @@ export function guardAction(
 }
 
 export function findProposalCardMessageId(messages: ChatMessage[]): string | undefined {
-  return messages.find((m) => (m.cards ?? []).some((c) => c.kind === "browse" && c.browseType === "proposal"))?.id;
+  return messages.find((m) =>
+    (m.cards ?? []).some((c) =>
+      (c.kind === "browse" && c.browseType === "proposal") || // 提案浏览卡（read_proposals 查询）
+      (c.kind === "result" && c.title === "新角色提案"), // 「打开新角色提案」已打开 result 卡（open_proposals 意图）
+    ),
+  )?.id;
 }
 
 /** 任务/指令类卡片 kind：含这类卡的消息支持折叠（预览/确认/表单/计划/意见/进度/结果） */
@@ -241,6 +246,9 @@ export const BrainCabin: React.FC<{
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   /** 已执行完成的卡片 key（`消息id:卡片下标[:列表项id]`）：useBrainSession 管理，服务端持久化（刷新后恢复） */
   // completed / markCompleted 来自 useBrainSession
+  /** 媒体生成输入条：所选章节 / 张数（默认取 form 卡默认值：当前选中章 / 1 张） */
+  const [mediaChapter, setMediaChapter] = useState<string>("");
+  const [mediaCount, setMediaCount] = useState<number>(1);
   /** 已手动展开的任务/指令类消息（默认折叠为摘要行，点击展开） */
   const [expandedMsgs, setExpandedMsgs] = useState<Set<string>>(new Set());
   /** 聊天内写作进度（推进剧情/连载）：流式显示阶段与正文，结束后追加结果卡 */
@@ -334,6 +342,22 @@ export const BrainCabin: React.FC<{
   const ctxCardIdx = ctxCard ? lastCards.indexOf(ctxCard) : -1;
   /** ctx-bar 对应卡片是否已完成（confirm 已处理 / preview 已执行）：完成则禁用，防重复触发后端操作 */
   const ctxCardDone = ctxCardIdx >= 0 && !!lastBrainMsg && completed.has(`${lastBrainMsg.id}:${ctxCardIdx}`);
+  /** 媒体生成输入条：识别最后一条消息中的媒体 form 卡（「帮我生成插画」→ 输入区上方出现章节/张数选择） */
+  const mediaCtxCard = (() => {
+    if (!lastBrainMsg) return undefined;
+    const c = lastBrainMsg.cards?.[lastBrainMsg.cards.length - 1];
+    if (c?.kind === "form" && c.action.endpoint === "/api/novel/media/plan") return c as FormCard;
+    return undefined;
+  })();
+  const mediaCtxIdx = mediaCtxCard && lastBrainMsg ? lastBrainMsg.cards!.indexOf(mediaCtxCard) : -1;
+  const mediaCtxDone = mediaCtxIdx >= 0 && !!lastBrainMsg && completed.has(`${lastBrainMsg.id}:${mediaCtxIdx}`);
+  // 新卡出现（或默认值变化）时重置选择为默认（默认当前选中章 / 1 张；服务端 buildMediaCard 已兜底）
+  useEffect(() => {
+    if (mediaCtxCard) {
+      setMediaChapter(String(mediaCtxCard.fields[0]?.value ?? ""));
+      setMediaCount(Number(mediaCtxCard.fields[1]?.value ?? 1));
+    }
+  }, [mediaCtxCard?.title, mediaCtxCard?.fields?.[0]?.value, mediaCtxCard?.fields?.[1]?.value]);
   const ctxBusy = streaming || executing;
   const runningStatus = (() => {
     if (reconnecting) return "连接已断开，正在重连…";
@@ -525,13 +549,46 @@ export const BrainCabin: React.FC<{
         </div>
         )}
 
-        {/* 输入框上方上下文操作区：会话话题 + 二次确认/意见征询按钮；无内容时整条隐藏 */}
-        {!showHistory && (activeSessionTitle || ctxCard || runningStatus) && (
+        {/* 输入框上方上下文操作区：会话话题 + 媒体生成输入条 + 二次确认/意见征询按钮；无内容时整条隐藏 */}
+        {!showHistory && (activeSessionTitle || ctxCard || mediaCtxCard || runningStatus) && (
           <div className="bc-context-bar">
             <div className="bc-context-main">
               {activeSessionTitle && <span className="bc-context-session" title="当前会话">{activeSessionTitle}</span>}
               {runningStatus && <span className={`bc-context-status${reconnecting ? " bc-status-warn" : ""}`}>{runningStatus}</span>}
             </div>
+            {mediaCtxCard && (
+              <div className="bc-media-bar">
+                <span className="bc-context-label">{mediaCtxDone ? "✓ 已生成" : "生成插画"}</span>
+                <label className="bc-media-field">章节
+                  <select
+                    value={mediaChapter}
+                    disabled={ctxBusy || mediaCtxDone}
+                    onChange={(e) => setMediaChapter(e.target.value)}
+                    title="选择要生成插画的章节"
+                  >
+                    {(mediaCtxCard.fields[0]?.options ?? []).map((o) => (
+                      <option key={o.value} value={o.value}>{o.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="bc-media-field">张数
+                  <input
+                    type="number" min={1} max={4} value={mediaCount}
+                    disabled={ctxBusy || mediaCtxDone}
+                    onChange={(e) => setMediaCount(Math.max(1, Math.min(4, Number(e.target.value) || 1)))}
+                    title="生成张数（1-4）"
+                  />
+                </label>
+                <button
+                  className="bc-ctx-btn primary"
+                  disabled={ctxBusy || mediaCtxDone || !lastBrainMsg || mediaCtxIdx < 0}
+                  onClick={() => lastBrainMsg && mediaCtxIdx >= 0 && submitForm(mediaCtxCard, { chapterIndex: mediaChapter, count: mediaCount }, lastBrainMsg.id, mediaCtxIdx)}
+                  title="按所选章节与张数生成插画（生成前校验时机，中断不影响系统）"
+                >
+                  生成
+                </button>
+              </div>
+            )}
             {ctxCard && (
               <div className="bc-context-actions">
                 {ctxCard.kind === "confirm" && (

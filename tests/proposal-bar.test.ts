@@ -207,4 +207,14 @@ describe("中枢话题恢复（findProposalCardMessageId）", () => {
     ] as unknown as { id: string; cards?: BrainCard[] }[];
     expect(findProposalCardMessageId(msgs as never)).toBeUndefined();
   });
+  test("「打开新角色提案」的已打开 result 卡同样被识别（open_proposals 意图 → 恢复底部提案区）", () => {
+    const resultCard: BrainCard = {
+      kind: "result", title: "新角色提案", success: true, detail: "已为你打开底部新角色提案面板",
+    };
+    const msgs = [
+      { id: "m1", role: "user", text: "打开新角色提案", at: "" },
+      { id: "m2", role: "brain", cards: [resultCard], at: "" },
+    ] as unknown as { id: string; cards?: BrainCard[] }[];
+    expect(findProposalCardMessageId(msgs as never)).toBe("m2");
+  });
 });

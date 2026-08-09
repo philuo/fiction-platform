@@ -95,6 +95,7 @@ export const INTENTS: Record<string, IntentMeta> = {
   read_character: { commandId: "CMD-Q01", level: "L0", title: "浏览角色" },
   read_foreshadow: { commandId: "CMD-Q01", level: "L0", title: "伏笔情况" },
   read_proposals: { commandId: "CMD-Q01", level: "L0", title: "新角色提案（角色推荐）" },
+  open_proposals: { commandId: "CMD-L11", level: "L0", title: "打开新角色提案" },
   read_chapters: { commandId: "CMD-Q01", level: "L0", title: "浏览章节目录" },
   read_characters: { commandId: "CMD-Q01", level: "L0", title: "浏览角色列表" },
   read_plans: { commandId: "CMD-Q01", level: "L0", title: "查看计划/章纲进度" },
@@ -147,7 +148,8 @@ const INTENT_HINT: Record<string, string> = {
   read_chapter: "浏览/查看章节内容",
   read_character: "浏览/查看角色",
   read_foreshadow: "查看伏笔情况",
-  read_proposals: "查看新角色提案/角色推荐（有哪些角色推荐）",
+  read_proposals: "查看新角色提案列表/有哪些角色推荐/列出提案（看内容）",
+  open_proposals: "打开新角色提案/新角色提案（仅打开底部提案面板，不列列表）",
   read_chapters: "浏览/查看章节列表/章节目录/写到哪了/目录",
   read_characters: "浏览/查看角色列表/有哪些角色/登场角色",
   read_plans: "查看计划/章纲进度/弧线/接下来怎么写/大纲进度",
@@ -188,7 +190,8 @@ ${INTENT_ENUM.map((k) => `- ${k}：${INTENT_HINT[k] ?? k}`).join("\n")}
   · media_image（生成插画）→ {chapterIndex: 第几章, count: 张数}；media_video（生成视频）→ {chapterIndex: 第几章}
   · autostart → {maxChapters: 章数}；gacha → {count: 张数}
   · 用户未指定具体章节时，**不要填 chapterIndex**（系统会自动用其当前选中的章节兜底）
-- 用户询问「有哪些角色推荐」「新角色提案」「角色提案」等 → intent 为 "read_proposals"
+- 「打开新角色提案」「新角色提案」「打开提案面板」等**打开类**表达（用户想直接看底部面板）→ intent 为 "open_proposals"，reply 用一句话说明已打开
+- 「有哪些角色推荐」「列出提案」「查看提案内容」等**查询列表**表达 → intent 为 "read_proposals"（在聊天中列提案卡）
 - intent 为 "chat" 时 params 为空对象，reply 直接回答用户问题
 - 无法确定具体操作时选 "chat"
 字符串值内部一律使用中文引号「」/『』，禁止英文双引号。`;
@@ -1034,6 +1037,23 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
     }
 
     const cards: BrainChatCard[] = [];
+
+    // 打开新角色提案：纯 UI 动作——只回复 + 发「已打开」result 卡（前端检测到该卡 → 恢复底部提案区），不列提案列表
+    if (intent === "open_proposals") {
+      const text = reply || meta.title;
+      if (text) {
+        updateMessageText(title, sessionId, messageId, text, true);
+        send({ type: "delta", messageId, text });
+      }
+      const card: BrainChatCard = {
+        kind: "result", title: "新角色提案", success: true,
+        detail: "已为你打开底部新角色提案面板，可在其中查看推荐原因与确认/拒绝。",
+      };
+      markMessageDone(title, sessionId, messageId, [card]);
+      send({ type: "card", messageId, card });
+      send({ type: "done", messageId });
+      return;
+    }
 
     // L0 查询类：直接执行 → BrowseCard/ResultCard
     if (meta.level === "L0" && !meta.action) {

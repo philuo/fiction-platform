@@ -3839,6 +3839,25 @@ html { scroll-behavior: smooth; }
 /* SSE 断线重连中：琥珀色提示 */
 .bc-context-status.bc-status-warn { color: var(--gold); }
 .bc-context-actions { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
+/* 媒体生成输入条（「帮我生成插画」→ 输入区上方：章节选择 + 张数 + 生成按钮） */
+.bc-media-bar {
+  display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+  padding: 0.35rem 0.6rem; margin: 0.2rem 0;
+  border: 1px dashed rgba(176, 58, 46, 0.35); border-radius: 6px;
+  background: rgba(176, 58, 46, 0.03); flex: 1;
+}
+.bc-media-bar .bc-media-field {
+  display: inline-flex; align-items: center; gap: 0.3rem; white-space: nowrap;
+  font-size: 0.66rem; color: var(--ink-soft);
+}
+.bc-media-bar select,
+.bc-media-bar input[type="number"] {
+  border: 1px solid var(--line); border-radius: 4px; background: var(--paper);
+  font-size: 0.68rem; color: var(--ink); padding: 0.1rem 0.3rem; max-width: 7rem;
+}
+.bc-media-bar select:disabled,
+.bc-media-bar input:disabled { opacity: 0.5; cursor: not-allowed; }
+.bc-media-bar .bc-ctx-btn.primary { margin-left: auto; }
 .bc-context-label { font-weight: 700; color: var(--seal); white-space: nowrap; }
 .bc-ctx-btn {
   border: 1px solid var(--line); background: var(--paper); color: var(--ink);
