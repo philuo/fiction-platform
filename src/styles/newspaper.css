@@ -3677,8 +3677,8 @@ html { scroll-behavior: smooth; }
 @keyframes bcSlideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
 .brain-cabin-head {
   position: relative;
-  padding: 1.1rem 2.4rem 1rem 1.1rem; border-bottom: 1px solid var(--line);
-  background: var(--paper-dark);
+  padding: 1.15rem 2.6rem 1.05rem 1.2rem; border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, var(--paper-dark), color-mix(in srgb, var(--paper-dark) 92%, var(--paper)));
 }
 /* 关闭按钮：独立于右上角角落，复用全局弹窗 modal-close 样式（圆形 + hover 旋转/朱红底），仅保留定位 */
 .bc-head-close {
@@ -3686,16 +3686,51 @@ html { scroll-behavior: smooth; }
 }
 .brain-cabin-head-row { display: flex; align-items: center; gap: 1rem; }
 .brain-cabin-head-row .brain-core { flex-shrink: 0; }
-.brain-cabin-status { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 0.4rem; }
-.brain-cabin-title { font-family: var(--serif); font-size: 1.05rem; color: var(--ink); display: flex; align-items: center; gap: 0.45rem; letter-spacing: 0.04em; }
-.bc-presence { font-weight: 700; font-size: 0.7rem; font-family: var(--sans); padding: 0.08rem 0.5rem; border-radius: 999px; border: 1px solid var(--line); letter-spacing: 0.05em; }
-.bc-presence-focused { color: var(--indigo); border-color: var(--indigo); background: rgba(59, 77, 143, 0.06); }
-.bc-presence-awake { color: var(--seal); border-color: var(--seal); background: rgba(176, 58, 46, 0.06); }
-.bc-presence-alert { color: var(--gold); border-color: var(--gold); background: rgba(166, 124, 46, 0.08); }
-.bc-presence-pondering { color: var(--azure); border-color: var(--azure); background: rgba(58, 109, 140, 0.06); }
-.bc-presence-weary { color: var(--muted); border-color: var(--muted); }
+/* 状态区：标题 + 状态徽章 + 副行；竖排、左对齐、间距舒适 */
+.brain-cabin-status { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 0.42rem; }
+/* 标题行：衬线大字 + 左侧朱红装饰短竖线 + 细分割线（报纸头版风） */
+.brain-cabin-title {
+  font-family: var(--serif); font-size: 1.12rem; color: var(--ink);
+  display: flex; align-items: center; gap: 0.5rem; letter-spacing: 0.08em;
+  position: relative;
+}
+.brain-cabin-title::before {
+  content: ""; width: 3px; height: 1.05em; border-radius: 2px;
+  background: var(--seal); opacity: 0.85;
+}
+.brain-cabin-title::after {
+  content: ""; flex: 1; height: 1px; margin-left: 0.2rem;
+  background: linear-gradient(to right, rgba(176, 58, 46, 0.35), transparent);
+}
+/* presence 徽章：实底胶囊 + 细描边 + 文字对比；状态色分别定义 */
+.bc-presence {
+  font-weight: 700; font-size: 0.68rem; font-family: var(--sans);
+  padding: 0.1rem 0.6rem; border-radius: 999px;
+  border: 1px solid; letter-spacing: 0.06em; line-height: 1;
+}
+.bc-presence-focused { color: #fff; background: var(--indigo); border-color: var(--indigo); box-shadow: 0 1px 4px rgba(59, 77, 143, 0.35); }
+.bc-presence-awake { color: #fff; background: var(--seal); border-color: var(--seal); box-shadow: 0 1px 4px rgba(176, 58, 46, 0.35); }
+.bc-presence-alert { color: #fff; background: var(--gold); border-color: var(--gold); box-shadow: 0 1px 4px rgba(166, 124, 46, 0.35); }
+.bc-presence-pondering { color: #fff; background: var(--azure); border-color: var(--azure); box-shadow: 0 1px 4px rgba(58, 109, 140, 0.35); }
+.bc-presence-dormant { color: var(--ink-soft); background: rgba(85, 80, 74, 0.12); border-color: rgba(85, 80, 74, 0.3); }
+.bc-presence-standby { color: var(--ink); background: rgba(25, 24, 23, 0.08); border-color: rgba(25, 24, 23, 0.25); }
+.bc-presence-weary { color: var(--muted); background: rgba(122, 111, 94, 0.1); border-color: rgba(122, 111, 94, 0.35); }
+/* 副行：活动态 + 治理标签；活动态带呼吸小圆点 */
 .brain-cabin-sub { font-size: 0.74rem; color: var(--ink-soft); display: flex; gap: 0.5rem; align-items: center; }
-.bc-activity { font-weight: 600; }
+.bc-activity {
+  font-weight: 600; display: inline-flex; align-items: center; gap: 0.35rem;
+}
+/* 活动小圆点：静态 + 忙碌时呼吸动画（JSX 无活动标识类，纯 CSS 兜底：默认圆点，无需 JS 改动） */
+.bc-activity::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--ink-soft); opacity: 0.5;
+}
+/* 治理标签：圆角胶囊 + 淡背景（保留原色系，仅提升观感） */
+.bc-gov-tag { font-size: 0.62rem; padding: 0.05rem 0.45rem; border-radius: 999px; border: 1px solid; font-weight: 700; letter-spacing: 0.03em; }
+.bc-gov-tag-revise { color: var(--gold); border-color: rgba(166, 124, 46, 0.5); background: rgba(166, 124, 46, 0.08); }
+.bc-gov-tag-rejected { color: var(--seal); border-color: rgba(176, 58, 46, 0.5); background: rgba(176, 58, 46, 0.08); }
+.bc-gov-tag-pendingIntervention { color: var(--seal); border-color: rgba(176, 58, 46, 0.5); background: rgba(176, 58, 46, 0.08); }
+.bc-gov-tag-degraded { color: var(--ink-soft); border-color: var(--line); background: rgba(0, 0, 0, 0.03); }
 .bc-gov-tag { font-size: 0.64rem; padding: 0.04rem 0.35rem; border-radius: 999px; border: 1px solid; font-weight: 700; }
 .bc-gov-tag-revise { color: var(--gold); border-color: var(--gold); }
 .bc-gov-tag-rejected { color: var(--seal); border-color: var(--seal); }
