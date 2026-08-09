@@ -3807,7 +3807,6 @@ html { scroll-behavior: smooth; }
   color: var(--ink-soft); cursor: pointer; display: inline-flex; align-items: center; gap: 0.25rem;
 }
 .bc-fold-toggle:hover { border-color: var(--seal); color: var(--seal); }
-.bc-send { flex-shrink: 0; }
 
 /* —— 中枢回复 Markdown 富文本（表格/图片/列表/代码块） —— */
 .bc-md { font-size: 0.82rem; line-height: 1.65; word-break: break-word; }
@@ -3873,15 +3872,23 @@ html { scroll-behavior: smooth; }
 
 .brain-cabin-input {
   position: relative;
-  display: flex; align-items: center; gap: 0.5rem; padding: 0.7rem 1rem; border-top: 1px solid var(--line); background: var(--paper-dark);
+  display: flex; align-items: flex-end; gap: 0.55rem; padding: 0.75rem 1rem 0.85rem;
+  border-top: 1px solid var(--line); background: var(--paper-dark);
 }
 .brain-cabin-input textarea {
-  flex: 1; resize: none; min-height: 3rem; max-height: 11rem;
-  border: 1px solid var(--line); border-radius: 0.4rem;
-  padding: 0.55rem 0.6rem; font-family: var(--serif); font-size: 0.82rem; background: var(--paper);
-  color: var(--ink);
+  flex: 1; resize: none; min-height: 2.8rem; max-height: 11rem;
+  border: 1px solid var(--line); border-radius: 0.8rem;
+  padding: 0.65rem 0.9rem; font-family: var(--serif); font-size: 0.84rem; background: var(--paper);
+  color: var(--ink); line-height: 1.5;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.03);
+  transition: border-color var(--transition), box-shadow var(--transition);
 }
-.brain-cabin-input textarea:focus { outline: none; border-color: var(--seal); }
+.brain-cabin-input textarea::placeholder { color: var(--ink-dim, #999); }
+.brain-cabin-input textarea:hover { border-color: rgba(176, 58, 46, 0.35); }
+.brain-cabin-input textarea:focus {
+  outline: none; border-color: var(--seal);
+  box-shadow: 0 0 0 3px rgba(176, 58, 46, 0.12);
+}
 /* 输入区上边界拖拽手柄：跨越边界线，拖动改变输入区高度（悬停显示小横杠提示） */
 .bc-input-resize {
   position: absolute; top: -6px; left: 0; right: 0; height: 12px;
@@ -3895,12 +3902,27 @@ html { scroll-behavior: smooth; }
 .brain-cabin-input:hover .bc-input-resize::after,
 .bc-input-resize:hover::after { opacity: 1; }
 .bc-input-resize:hover::after { background: var(--seal); }
+/* 发送/中断纯 icon 按钮：圆形胶囊，hover 提升；disabled 淡出 */
 .bc-send {
-  flex-shrink: 0; white-space: nowrap;
-  height: 2.1rem; padding: 0 0.9rem;
-  font-size: 0.8rem; letter-spacing: 0.08em;
-  display: inline-flex; align-items: center; justify-content: center; gap: 0.35em;
+  flex-shrink: 0;
+  width: 2.4rem; height: 2.4rem;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: all var(--transition);
 }
+.bc-send-go {
+  border: 1px solid var(--seal); background: var(--seal); color: var(--paper);
+  align-self: center;
+}
+.bc-send-go:hover:not(:disabled) { background: #9a2f25; transform: translateY(-1px); box-shadow: 0 3px 8px rgba(176, 58, 46, 0.3); }
+.bc-send-go:active:not(:disabled) { transform: translateY(0); box-shadow: none; }
+.bc-send-go:disabled { opacity: 0.35; cursor: not-allowed; }
+.bc-send-stop {
+  border: 1px solid rgba(176, 58, 46, 0.5); background: rgba(176, 58, 46, 0.08); color: var(--seal);
+}
+.bc-send-stop:hover { background: rgba(176, 58, 46, 0.16); transform: scale(1.05); }
+.bc-send-stop svg { fill: currentColor; } /* Square 实心方块更醒目 */
 
 /* —— 会话 tab 栏（独立区域，与头部上下分区；单行横滑 + 悬浮 ✕ 关闭窗口） —— */
 .bc-tabs {

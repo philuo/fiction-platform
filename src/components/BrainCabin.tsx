@@ -630,12 +630,12 @@ export const BrainCabin: React.FC<{
             rows={2}
           />
           {streaming ? (
-            <button className="btn btn-danger bc-send" onClick={stop} title="中断生成（保留已输出内容）">
-              <Square size={15} /> 中断
+            <button className="bc-send bc-send-stop" onClick={stop} title="中断生成（保留已输出内容）" aria-label="中断生成">
+              <Square size={16} />
             </button>
           ) : (
-            <button className="btn btn-primary bc-send" onClick={() => void doSend()} disabled={!input.trim() || executing} title="发送">
-              <Send size={15} /> 发送
+            <button className="bc-send bc-send-go" onClick={() => void doSend()} disabled={!input.trim() || executing} title="发送" aria-label="发送">
+              <Send size={16} />
             </button>
           )}
         </div>

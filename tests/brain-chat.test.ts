@@ -573,8 +573,9 @@ describe("brainChatStream（SSE 编排，事件协议 v2）", () => {
     expect(events[0].type).toBe("intent");
     const deltas = events.filter((e) => e.type === "delta");
     expect(deltas.length).toBeGreaterThan(0);
-    // 最后一个 delta 是完整文本
-    expect((deltas[deltas.length - 1].text as string).endsWith("!!!")).toBe(true);
+    // 增量语义：每个 delta 是新增块（append:true），前端拼接——拼接后等于完整文本
+    expect((deltas[0] as { append?: boolean }).append).toBe(true);
+    expect((deltas.map((d) => d.text as string).join("")).endsWith("!!!")).toBe(true);
     expect(events[events.length - 1].type).toBe("done");
   });
 
@@ -582,10 +583,12 @@ describe("brainChatStream（SSE 编排，事件协议 v2）", () => {
     mockWorld = mkWorld();
     nextChatContent = "中枢收到！";
     const events = await runTurn("你好", { sessionId: "chat-stream-session" });
-    const deltas = events.filter((e) => e.type === "delta").map((e) => e.text as string);
+    const rawDeltas = events.filter((e) => e.type === "delta");
+    const deltas = rawDeltas.map((e) => e.text as string);
     expect(deltas.length).toBeGreaterThan(1);
-    // 累积语义：text 是消息累计全文，最后一个即完整回复
-    expect(deltas[deltas.length - 1]).toBe("中枢收到！");
+    // 增量语义（append:true）：每个 delta 是新增块，前端拼接后等于完整回复——避免每块重传累积全文
+    expect((rawDeltas[0] as { append?: boolean }).append).toBe(true);
+    expect(deltas.join("")).toBe("中枢收到！");
     expect(deltas[0]).toBe("中");
     const done = events.find((e) => e.type === "done") as { messageId?: string } | undefined;
     expect(done?.messageId).toBeTruthy();

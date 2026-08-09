@@ -52,7 +52,8 @@ export type BrainSessionDetail = {
 
 type SSEEvents = {
   onIntent?: () => void;
-  onDelta?: (messageId: string, text: string) => void;
+  /** append=true：增量块（前端拼接）；缺省：替换（单次全量，如 plan/opinion 回复） */
+  onDelta?: (messageId: string, text: string, append?: boolean) => void;
   onCard?: (messageId: string, card: BrainCard) => void;
   onDone?: (messageId: string) => void;
   onInterrupted?: (messageId: string) => void;
@@ -183,9 +184,14 @@ export function useBrainSession(title: string) {
 
     const events: SSEEvents = {
       onIntent: () => setThinkingFor(sessionId, false),
-      onDelta: (messageId, text) => {
+      onDelta: (messageId, text, append) => {
         setThinkingFor(sessionId, false);
-        patchMsg(sessionId, alignMsgId(sessionId, messageId), { text, interrupted: false });
+        const mid = alignMsgId(sessionId, messageId);
+        const arr = cacheRef.current.get(sessionId);
+        if (!arr) return;
+        const next = arr.map((m) => (m.id === mid ? { ...m, text: append ? (m.text ?? "") + text : text, interrupted: false } : m));
+        cacheRef.current.set(sessionId, next);
+        if (sessionId === activeIdRef.current) setMessages(next);
       },
       onCard: (messageId, card) => {
         setThinkingFor(sessionId, false);
@@ -252,7 +258,7 @@ export function useBrainSession(title: string) {
             if (sessionId === activeIdRef.current) setReconnecting(false); // 收到任意事件 = 连接恢复
             switch (obj.type) {
               case "intent": events.onIntent?.(); break;
-              case "delta": if (obj.messageId && obj.text != null) events.onDelta?.(obj.messageId, obj.text); break;
+              case "delta": if (obj.messageId && obj.text != null) events.onDelta?.(obj.messageId, obj.text, obj.append === true); break;
               case "card": if (obj.messageId && obj.card) events.onCard?.(obj.messageId, obj.card); break;
               case "done": if (obj.messageId) events.onDone?.(obj.messageId); break;
               case "interrupted": if (obj.messageId) events.onInterrupted?.(obj.messageId); break;

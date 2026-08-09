@@ -173,10 +173,11 @@ describe("中枢聊天 e2e：会话生命周期", () => {
     expect(types).toContain("intent");
     expect(types).toContain("delta");
     expect(types).toContain("done");
-    // delta 应携带回复文本（真流式：每条 delta 是累计全文，最后一条含完整回复）
-    const deltas = events.filter((e) => e.type === "delta") as { text?: string }[];
+    // delta 真流式：每条是增量块（append:true），拼接后含完整回复（避免每块重传累积全文）
+    const deltas = events.filter((e) => e.type === "delta") as { text?: string; append?: boolean }[];
     expect(deltas.length).toBeGreaterThan(0);
-    expect(deltas[deltas.length - 1]?.text).toContain("墨枢");
+    expect(deltas.every((d) => d.append === true)).toBe(true);
+    expect(deltas.map((d) => d.text ?? "").join("")).toContain("墨枢");
 
     // 3) 列表含该会话（有消息）
     const list = await api("/api/brain/sessions", "POST", { title: "e2e-book" }, cookieA);

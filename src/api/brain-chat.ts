@@ -499,7 +499,8 @@ async function streamChatReply(ctx: BrainChatContext, messageId: string): Promis
     ],
     (delta) => {
       acc += delta;
-      send({ type: "delta", messageId, text: acc });
+      // 增量块（append:true）：前端拼接而非替换——避免每块重传累积全文导致传输体积线性膨胀（长文本后期卡顿）
+      send({ type: "delta", messageId, text: delta, append: true });
       const now = Date.now();
       if (now - lastFlush > 500) {
         lastFlush = now;
