@@ -44,17 +44,27 @@ const proposalCard = (): BrowseCard => ({
   },
 });
 
-test("browse(proposal) 卡：渲染推荐原因 + 确认/拒绝按钮", async () => {
+test("browse(proposal) 卡：默认折叠为标题行（可展开），展开后渲染推荐原因 + 确认/拒绝按钮", async () => {
   const mount = document.createElement("div");
   document.body.appendChild(mount);
   const root: Root = createRoot(mount);
   // 真实场景（BrainCabin）总传 onExecute；无回调时操作按钮不渲染
   root.render(React.createElement(BrainCardView, { card: proposalCard(), onExecute: () => {} }));
   await tick();
-  const t = mount.textContent ?? "";
+  // 默认折叠：标题 + 折叠提示可见，内容与操作隐藏
+  let t = mount.textContent ?? "";
   expect(t).toContain("新角色提案（1 项）");
+  expect(t).toContain("已折叠");
+  expect(t).not.toContain("推荐原因：与主角身世成谜呼应");
+  const toggle = mount.querySelector(".bc-fold-toggle") as HTMLButtonElement | null;
+  expect(toggle).toBeTruthy();
+  toggle!.dispatchEvent(new win.MouseEvent("click", { bubbles: true, cancelable: true }));
+  await tick();
+  // 展开后：内容 + 操作按钮可见，折叠提示消失
+  t = mount.textContent ?? "";
   expect(t).toContain("推荐原因：与主角身世成谜呼应");
   expect(t).toContain("动机：查清身世");
+  expect(t).not.toContain("已折叠");
   const buttons = [...mount.querySelectorAll("button")].map((b) => b.textContent ?? "");
   expect(buttons).toContain("确认入册");
   expect(buttons).toContain("拒绝");
@@ -73,6 +83,11 @@ test("点击「确认入册」→ onExecute 携带对应 action（endpoint + bod
     }),
   );
   await tick();
+  // 默认折叠：先展开再操作
+  const toggle = mount.querySelector(".bc-fold-toggle") as HTMLButtonElement | null;
+  expect(toggle).toBeTruthy();
+  toggle!.dispatchEvent(new win.MouseEvent("click", { bubbles: true, cancelable: true }));
+  await tick();
   const confirmBtn = [...mount.querySelectorAll("button")].find((b) => (b.textContent ?? "").includes("确认入册"));
   expect(confirmBtn).toBeTruthy();
   confirmBtn!.dispatchEvent(new win.MouseEvent("click", { bubbles: true, cancelable: true }));
@@ -80,6 +95,50 @@ test("点击「确认入册」→ onExecute 携带对应 action（endpoint + bod
   expect(calls.length).toBe(1);
   expect(calls[0].action?.endpoint).toBe("/api/novel/proposal");
   expect(calls[0].action?.body).toEqual({ proposalId: "cp1", action: "confirm" });
+  root.unmount();
+});
+
+test("browse(proposal) 卡 completedItems：已处理项按钮替换为 ✓ 已处理，未含项仍可操作", async () => {
+  const twoCard: BrowseCard = {
+    kind: "browse",
+    title: "新角色提案（2 项）",
+    browseType: "proposal",
+    data: {
+      list: [
+        { id: "cp1", name: "小翠", role: "掌柜", source: "writer", actions: [{ label: "确认入册", action: { endpoint: "/api/novel/proposal", method: "POST", body: { proposalId: "cp1", action: "confirm" } } }] },
+        { id: "cp2", name: "阿福", role: "马夫", source: "writer", actions: [{ label: "确认入册", action: { endpoint: "/api/novel/proposal", method: "POST", body: { proposalId: "cp2", action: "confirm" } } }] },
+      ],
+    },
+  };
+  const calls: { action?: { endpoint: string; method?: string; body: Record<string, unknown> } }[] = [];
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root: Root = createRoot(mount);
+  root.render(
+    React.createElement(BrainCardView, {
+      card: twoCard,
+      onExecute: (_c, a) => calls.push({ action: a }),
+      completedItems: new Set(["cp1"]),
+    }),
+  );
+  await tick();
+  // 默认折叠：先展开
+  const toggle = mount.querySelector(".bc-fold-toggle") as HTMLButtonElement | null;
+  expect(toggle).toBeTruthy();
+  toggle!.dispatchEvent(new win.MouseEvent("click", { bubbles: true, cancelable: true }));
+  await tick();
+  const t = mount.textContent ?? "";
+  // 已处理项就地反馈（✓ 已处理），cp2 按钮仍在
+  expect(t).toContain("已处理");
+  expect(mount.querySelector(".bc-done-tag")).toBeTruthy();
+  const confirmBtns = [...mount.querySelectorAll("button")].map((b) => b.textContent ?? "").filter((x) => x.includes("确认入册"));
+  expect(confirmBtns.length).toBe(1);
+  // 点击未处理项（cp2）仍触发 onExecute，body 携带对应 proposalId
+  const btn = [...mount.querySelectorAll("button")].find((b) => (b.textContent ?? "").includes("确认入册"))!;
+  btn.dispatchEvent(new win.MouseEvent("click", { bubbles: true, cancelable: true }));
+  await tick();
+  expect(calls.length).toBe(1);
+  expect(calls[0].action?.body).toEqual({ proposalId: "cp2", action: "confirm" });
   root.unmount();
 });
 
@@ -252,5 +311,94 @@ test("form 卡：无字段（纯确认操作）渲染说明文案", async () => 
   );
   await tick();
   expect(mount.textContent ?? "").toContain("无需填写字段");
+  root.unmount();
+});
+
+// —— Phase 3：卡片完成态（completed：preview/form/confirm 已执行后禁用并显示完成标记，防重复提交） ——
+
+test("preview 卡 completed：显示 ✓ 已执行，不再渲染执行按钮", async () => {
+  let executed = false;
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root: Root = createRoot(mount);
+  root.render(
+    React.createElement(BrainCardView, {
+      card: {
+        kind: "preview",
+        title: "推进剧情（写一章）",
+        commandId: "CMD-N02",
+        level: "L2",
+        summary: "将影响已写内容",
+        confirmRequired: true,
+        action: { endpoint: "/api/novel/step", method: "POST", body: {} },
+      },
+      onExecute: () => { executed = true; },
+      completed: true,
+    }),
+  );
+  await tick();
+  const t = mount.textContent ?? "";
+  expect(t).toContain("已执行");
+  // 原按钮文案「执行」不再出现，确认标记「需确认」也隐藏
+  const btns = [...mount.querySelectorAll("button")].map((b) => b.textContent ?? "");
+  expect(btns).not.toContain("执行");
+  expect(t).not.toContain("需确认");
+  // 完成态卡片点击不到执行按钮（无按钮可点）
+  expect(mount.querySelector("button")).toBeNull();
+  expect(executed).toBe(false);
+  root.unmount();
+});
+
+test("confirm 卡 completed：显示 ✓ 已处理，三选一按钮不再渲染", async () => {
+  let chosen = false;
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root: Root = createRoot(mount);
+  root.render(
+    React.createElement(BrainCardView, {
+      card: {
+        kind: "confirm",
+        title: "推进剧情 · 确认",
+        level: "L2",
+        impact: "影响 2 个已写章节",
+        options: ["merge", "rewrite", "abort"],
+      },
+      onConfirmChoose: () => { chosen = true; },
+      completed: true,
+    }),
+  );
+  await tick();
+  const t = mount.textContent ?? "";
+  expect(t).toContain("已处理");
+  expect(t).not.toContain("正向弥合");
+  expect(mount.querySelector("button")).toBeNull();
+  expect(chosen).toBe(false);
+  root.unmount();
+});
+
+test("form 卡 completed：提交按钮替换为 ✓ 已执行，无法再提交", async () => {
+  let submitted = false;
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root: Root = createRoot(mount);
+  root.render(
+    React.createElement(BrainCardView, {
+      card: {
+        kind: "form",
+        title: "编辑设定",
+        fields: [{ key: "premise", label: "梗概", type: "textarea" }],
+        action: { endpoint: "/api/novel/world", method: "POST", body: {} },
+        submitLabel: "保存",
+      },
+      onFormSubmit: () => { submitted = true; },
+      completed: true,
+    }),
+  );
+  await tick();
+  const t = mount.textContent ?? "";
+  expect(t).toContain("已执行");
+  expect(t).not.toContain("保存");
+  expect(mount.querySelector("button")).toBeNull();
+  expect(submitted).toBe(false);
   root.unmount();
 });

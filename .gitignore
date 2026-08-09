@@ -17,6 +17,9 @@ bunfig.toml
 # 构建产物
 dist/
 
+# 视觉验证截图（临时产物，不提交）
+shots/
+
 # Python
 __pycache__/
 *.pyc

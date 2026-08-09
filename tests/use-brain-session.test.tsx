@@ -25,6 +25,10 @@ const detailCalls: string[] = [];
 const chatBodies: Array<{ prompt?: string; sessionId?: string; resume?: boolean; ctx?: { chapterIndex?: number | null } }> = [];
 /** SSE 事件队列（由测试预置，逐条发射后关闭） */
 let chatEvents: Array<Record<string, unknown>> | null = null;
+/** detail 返回的 per-session completed（模拟服务端持久化的卡片完成标记） */
+const detailCompleted = new Map<string, string[]>();
+/** 记录 /api/brain/sessions/completed 调用（验证持久化请求） */
+const completedCalls: Array<{ id: string; key: string }> = [];
 
 beforeAll(() => {
   win = new Window({ url: "http://localhost/?title=brain-session-hook-test" });
@@ -36,6 +40,13 @@ beforeAll(() => {
   globalThis.getComputedStyle = win.getComputedStyle.bind(win);
   globalThis.fetch = async (url: unknown, init?: RequestInit) => {
     const u = String(url);
+    if (u.includes("/api/brain/sessions/completed")) {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { id: string; key: string };
+      completedCalls.push({ id: body.id, key: body.key });
+      const arr = detailCompleted.get(body.id) ?? [];
+      if (!arr.includes(body.key)) detailCompleted.set(body.id, [...arr, body.key]);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } }) as unknown as Response;
+    }
     if (u.includes("/api/brain/sessions/detail")) {
       const body = JSON.parse(String(init?.body ?? "{}")) as { id: string };
       detailCalls.push(body.id);
@@ -46,6 +57,7 @@ beforeAll(() => {
         updatedAt: 0,
         messages: created.get(body.id) ?? [],
         streaming: false,
+        completed: detailCompleted.get(body.id) ?? [],
       };
       return new Response(JSON.stringify({ session }), { status: 200, headers: { "Content-Type": "application/json" } }) as unknown as Response;
     }
@@ -104,9 +116,11 @@ const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 
 /** 复刻 BrainCabin.doSend 的发送入口（无 activeId → newSession → send） */
 function Harness() {
-  const { messages, activeId, newSession, openSession, send } = useBrainSession("brain-session-hook-test");
+  const { messages, activeId, newSession, openSession, send, completed, markCompleted } = useBrainSession("brain-session-hook-test");
   const msgRef = React.useRef(messages);
   msgRef.current = messages;
+  const completedRef = React.useRef(completed);
+  completedRef.current = completed;
   React.useEffect(() => {
     (win as unknown as { __harness?: unknown }).__harness = {
       doSend: async (prompt: string, ctx?: { chapterIndex?: number | null }) => {
@@ -118,6 +132,8 @@ function Harness() {
       openSession: (id: string) => openSession(id),
       getMessages: () => msgRef.current,
       getActiveId: () => activeId,
+      getCompleted: () => completedRef.current,
+      markCompleted: (key: string) => markCompleted(key),
     };
   });
   return <div>{messages.map((m) => `${m.role}:${m.text}`).join("|")}</div>;
@@ -130,6 +146,8 @@ async function mountHarness() {
   detailCalls.length = 0;
   chatBodies.length = 0;
   chatEvents = null;
+  detailCompleted.clear();
+  completedCalls.length = 0;
   const mount = document.createElement("div");
   document.body.appendChild(mount);
   const root: Root = createRoot(mount);
@@ -238,6 +256,36 @@ describe("useBrainSession 首次对话发送", () => {
     const shown = harness().getMessages();
     expect(shown.some((m) => m.role === "brain" && m.text === "部分生成" && m.interrupted)).toBe(true);
     globalThis.fetch = origFetch2;
+    await act(() => root.unmount());
+  });
+
+  test("markCompleted 持久化到服务端；openSession 恢复 completed（刷新后完成态不丢失）", async () => {
+    const { root } = await mountHarness();
+    await tick();
+    const sid = "persist-session-1";
+    // 预置会话（created 里有消息才被列表显示；直接构造）
+    created.set(sid, [{ id: "u1", role: "user", text: "你好", at: 0 }]);
+    // 模拟上次会话里已完成的卡片操作（服务端持久化）
+    detailCompleted.set(sid, ["m1:0", "m1:1:cp1"]);
+    // 打开会话 → completed 恢复
+    await harness().openSession(sid);
+    await tick();
+    expect(harness().getCompleted()).toEqual(new Set(["m1:0", "m1:1:cp1"]));
+    // 标记新操作 → 本地立即生效 + POST 持久化
+    await harness().markCompleted("m1:2:cp2");
+    await tick();
+    await tick();
+    expect(harness().getCompleted()).toEqual(new Set(["m1:0", "m1:1:cp1", "m1:2:cp2"]));
+    expect(completedCalls).toContainEqual({ id: sid, key: "m1:2:cp2" });
+    // 重复标记幂等：不再发请求
+    await harness().markCompleted("m1:0");
+    await tick();
+    await tick();
+    expect(completedCalls.filter((c) => c.id === sid && c.key === "m1:0").length).toBe(0);
+    // 切到空态（新建无输入）→ completed 清空
+    await harness().startNew();
+    await tick();
+    expect(harness().getCompleted()).toEqual(new Set());
     await act(() => root.unmount());
   });
 

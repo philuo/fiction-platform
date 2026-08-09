@@ -30,6 +30,7 @@ import {
   listSessions as listBrainSessions,
   registerSessionTask,
   truncateSession as truncateBrainSession,
+  markSessionCompleted as markBrainSessionCompleted,
 } from "./brain-sessions";
 import { startAdvanceTask, updateAdvanceTaskPhase, completeAdvanceTask, failAdvanceTask, getAdvanceTaskForClient, clearAdvanceTask } from "./advancetask";
 import { migrateChapterMedia, touchChapter, genOf, type WorldState, type Character as WorldCharacter, type ChapterMedia, type ConsistencyFinding, type PendingChapter } from "./world";
@@ -513,6 +514,18 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       return json({ session: s });
     }
 
+    case "/api/brain/sessions/completed": {
+      // 卡片操作完成标记（preview/form/confirm 卡级 / browse 项级）：服务端持久化，刷新后恢复完成态（防重复提交 + 就地反馈）
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const bcBody = await readBody(req);
+      const bcTitle = String(bcBody.title ?? "").trim();
+      const bcId = String(bcBody.id ?? "").trim();
+      const bcKey = String(bcBody.key ?? "").trim();
+      if (!bcTitle || !bcId || !bcKey) return json({ error: "缺少 title/id/key" }, 400);
+      const ok = markBrainSessionCompleted(bcTitle, bcId, bcKey);
+      return json({ ok });
+    }
+
     case "/api/brain/sessions/truncate": {
       // 编辑重发前置：删除 fromMessageId 及其后的消息（截断会话）
       if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
@@ -556,6 +569,8 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       const bcChatPrompt = String(bcChatBody.prompt ?? "").trim();
       const bcSessionId = String(bcChatBody.sessionId ?? "").trim();
       const bcResume = bcChatBody.resume === true;
+      // attach-only（断线自动重连用）：只挂到已在运行的任务，无任务则立即结束流——绝不发起新回合（防重复生成）
+      const bcAttach = bcChatBody.attach === true;
       // 前端上下文（左侧栏选中章等）：供意图识别参数提取兜底（需求 1/2）
       const bcCtx = (bcChatBody.ctx ?? null) as { chapterIndex?: number | null } | null;
       if (!bcChatTitle) return json({ error: "缺少 title" }, 400);
@@ -566,11 +581,13 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
         // 结束后补发最终状态（done/interrupted）——任务收尾期 attach 的新连接可能错过已广播的 done，
         // 否则前端消息永久 pending（一直 loading），需刷新才能看到最新状态（需求 3 修复）
         const attached = attachSessionTask(bcChatTitle, bcSessionId, send);
+        if (bcAttach && !attached) return; // attach-only 且任务已结束：直接收尾（前端查 detail 同步最终状态）
         if (attached) {
           const sess = getBrainSession(bcChatTitle, bcSessionId);
           const pending = sess ? lastPendingMessage(sess) : null;
           if (pending) send({ type: "reset", messageId: pending.id, text: pending.text });
-          while (isSessionRunning(bcChatTitle, bcSessionId)) await Bun.sleep(300);
+          // 客户端已断开（req.signal abort）时立即退出，避免空轮询悬挂
+          while (isSessionRunning(bcChatTitle, bcSessionId) && !req.signal.aborted) await Bun.sleep(300);
           // 收尾窗口兜底：任务已 done 但 running 仍 true 时 attach（无 pending 消息），
           // 或等待期结束时补发当前最后一条 assistant 消息的最终状态，防该连接错过 done 后永久 loading
           const sess2 = getBrainSession(bcChatTitle, bcSessionId);

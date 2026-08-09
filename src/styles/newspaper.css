@@ -329,7 +329,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   height: 0; /* 折叠：不占视觉（动画起点） */
   z-index: 15; /* 覆盖三栏（默认 z-index），低于底部控制条（20） */
   background: var(--paper-dark);
-  border-top: 1px dashed var(--line-strong);
   transition: height 200ms ease; /* 从底部缓慢向顶部展开 */
   overflow: hidden;
   display: flex;
@@ -3720,6 +3719,16 @@ html { scroll-behavior: smooth; }
 
 .brain-cabin-stream { flex: 1; overflow-y: auto; padding: 0.8rem 1rem; display: flex; flex-direction: column; gap: 0.7rem; }
 .brain-cabin-empty { text-align: center; color: var(--ink-soft); font-size: 0.82rem; margin: auto; padding: 2rem 1rem; }
+.bc-empty-title { font-size: 0.86rem; color: var(--ink); font-weight: 600; margin: 0 0 0.4rem; }
+/* 空态快捷提问 chips（点击即发送，降低首次使用门槛） */
+.bc-quick-row { display: flex; flex-wrap: wrap; gap: 0.4rem; justify-content: center; margin-bottom: 0.5rem; }
+.bc-quick-chip {
+  border: 1px solid var(--line); background: var(--paper-dark); color: var(--ink);
+  border-radius: 999px; padding: 0.28rem 0.7rem; font-size: 0.74rem; cursor: pointer;
+  transition: all var(--transition);
+}
+.bc-quick-chip:hover:not(:disabled) { border-color: var(--seal); color: var(--seal); background: rgba(176, 58, 46, 0.06); }
+.bc-quick-chip:disabled { opacity: 0.5; cursor: default; }
 .bc-hint { font-size: 0.72rem; color: var(--ink-soft); margin-top: 0.6rem; opacity: 0.8; }
 
 .bc-msg { display: flex; gap: 0.5rem; align-items: flex-start; }
@@ -3758,6 +3767,46 @@ html { scroll-behavior: smooth; }
 .bc-link-btn:hover { color: var(--ink); }
 .bc-link-btn:disabled { opacity: 0.4; cursor: default; }
 .bc-user-actions { display: flex; justify-content: flex-end; margin-top: 0.2rem; }
+/* —— 消息操作区：时间戳 + 复制/编辑（悬停渐显；时间戳常显） —— */
+.bc-msg-ops {
+  display: flex; align-items: center; gap: 0.5rem;
+  margin-top: 0.25rem; font-size: 0.68rem;
+}
+.bc-msg-user .bc-msg-ops { justify-content: flex-end; }
+.bc-msg-time { color: var(--ink-dim, #999); }
+.bc-msg-op {
+  background: none; border: none; color: var(--seal); font-size: 0.68rem;
+  cursor: pointer; padding: 0; text-decoration: underline;
+  opacity: 0; transition: opacity var(--transition);
+}
+.bc-msg-content:hover .bc-msg-op, .bc-msg-op:focus-visible { opacity: 1; }
+.bc-msg-op:disabled { opacity: 0.35; cursor: default; text-decoration: none; }
+.bc-msg-op:hover:not(:disabled) { color: var(--ink); }
+/* —— 消息级折叠（任务/指令类消息摘要行） —— */
+.bc-msg-fold {
+  display: flex; align-items: center; gap: 0.45rem; width: 100%;
+  background: var(--paper-dark); border: 1px solid var(--line);
+  border-radius: 0.4rem; padding: 0.45rem 0.6rem;
+  font-size: 0.78rem; color: var(--ink); cursor: pointer; text-align: left;
+  transition: all var(--transition);
+}
+.bc-msg-fold:hover { border-color: var(--seal); }
+.bc-msg-fold-mini {
+  width: auto; margin-top: 0.4rem; padding: 0.12rem 0.5rem; font-size: 0.7rem;
+  background: none; color: var(--ink-soft);
+}
+.bc-msg-fold-mini:hover { color: var(--seal); border-color: var(--seal); }
+.bc-fold-caret { color: var(--seal); font-size: 0.7rem; transition: transform 0.15s; }
+.bc-fold-caret.open { transform: rotate(90deg); }
+.bc-fold-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bc-fold-meta { font-size: 0.68rem; color: var(--ink-dim, #999); flex-shrink: 0; }
+/* —— 卡片级折叠（列表型浏览长卡） —— */
+.bc-fold-toggle {
+  margin-left: auto; background: none; border: 1px solid var(--line);
+  border-radius: 999px; padding: 0.08rem 0.5rem; font-size: 0.68rem;
+  color: var(--ink-soft); cursor: pointer; display: inline-flex; align-items: center; gap: 0.25rem;
+}
+.bc-fold-toggle:hover { border-color: var(--seal); color: var(--seal); }
 .bc-send { flex-shrink: 0; }
 
 /* —— 中枢回复 Markdown 富文本（表格/图片/列表/代码块） —— */
@@ -3787,6 +3836,8 @@ html { scroll-behavior: smooth; }
   font-weight: 600; color: var(--ink); letter-spacing: 0.02em;
 }
 .bc-context-status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55%; color: var(--seal); font-weight: 600; }
+/* SSE 断线重连中：琥珀色提示 */
+.bc-context-status.bc-status-warn { color: var(--gold); }
 .bc-context-actions { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
 .bc-context-label { font-weight: 700; color: var(--seal); white-space: nowrap; }
 .bc-ctx-btn {
@@ -3902,6 +3953,9 @@ html { scroll-behavior: smooth; }
 .bc-history-meta { font-size: 0.68rem; color: var(--ink-dim, #666); }
 .bc-history-del { border: 1px solid var(--line); background: none; color: #b00020; border-radius: 0.25rem; font-size: 0.7rem; padding: 0.15rem 0.4rem; cursor: pointer; flex-shrink: 0; }
 .bc-history-del:hover { background: #b00020; color: #fff; }
+/* 删除二次确认态：红色常驻 + 呼吸提示 */
+.bc-history-del.confirm { background: #b00020; color: #fff; font-weight: 700; animation: bcPulseDel 1s infinite; }
+@keyframes bcPulseDel { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
 
 /* —— 中枢对话卡片 ============ */
 .brain-card {
@@ -3911,6 +3965,35 @@ html { scroll-behavior: smooth; }
 }
 .brain-card-image-wrap { margin-top: 0.4rem; }
 .brain-card-image { display: block; max-width: 100%; max-height: 220px; object-fit: cover; border-radius: 0.3rem; border: 1px solid var(--line); }
+/* —— 卡片完成态（preview/form/confirm 已执行）：淡化 + 完成标记，防重复提交 —— */
+.bc-card-done { opacity: 0.72; }
+.bc-done-tag {
+  display: inline-block; font-size: 0.7rem; color: #4d7a4d;
+  border: 1px solid #4d7a4d; border-radius: 3px; padding: 0.12rem 0.5rem;
+}
+/* —— 写作进度卡（progress）：推进剧情/连载聊天内流式展示 —— */
+.brain-card-progress { border-left: 3px solid var(--azure, #3a6d8c); }
+.brain-card-progress.bc-progress-done { border-left-color: #4d7a4d; }
+.brain-card-progress.bc-progress-failed { border-left-color: var(--seal); }
+.bc-progress-pill {
+  font-size: 0.64rem; padding: 0.04rem 0.4rem; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--ink-soft); margin-left: auto;
+}
+.bc-progress-pill-running { color: var(--azure, #3a6d8c); border-color: var(--azure, #3a6d8c); }
+.bc-progress-pill-done { color: #4d7a4d; border-color: #4d7a4d; }
+.bc-progress-pill-failed { color: var(--seal); border-color: var(--seal); }
+.bc-progress-steps { display: flex; flex-wrap: wrap; gap: 0.25rem; margin: 0.3rem 0; }
+.bc-progress-step {
+  font-size: 0.62rem; color: var(--ink-soft); border: 1px solid var(--line);
+  border-radius: 999px; padding: 0.04rem 0.4rem; opacity: 0.6;
+}
+.bc-progress-step.active { color: var(--seal); border-color: var(--seal); opacity: 1; font-weight: 700; }
+.bc-progress-text {
+  font-family: var(--serif); font-size: 0.76rem; line-height: 1.65; color: var(--ink);
+  background: var(--paper-dark); border: 1px dashed var(--line); border-radius: 0.3rem;
+  padding: 0.45rem 0.55rem; margin: 0.3rem 0; white-space: pre-wrap; word-break: break-word;
+  max-height: 12rem; overflow-y: auto;
+}
 
 /* —— 计划/意见选项卡（plan/opinion） —— */
 .bc-choice-options { display: flex; flex-direction: column; gap: 0.35rem; margin-top: 0.4rem; }

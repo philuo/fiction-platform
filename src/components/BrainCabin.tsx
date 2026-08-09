@@ -4,7 +4,7 @@
 // 直接输入即开启首次对话（无需先点新建）；历史 icon 切换下方为历史列表
 // 接入 /api/brain/chat SSE（协议 v2）：intent/delta/card/done/interrupted/reset
 // 多会话：useBrainSession（服务端持久化 + 独立 SSE 连接，切换 tab 不打断；刷新自动续流）
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { BrainCore } from "./BrainCore";
 import { History, Plus, Send, Square, X } from "./icons";
 import { BrainCardView, type BrainCard, type PreviewCard, type ChoiceOption, type FormCard, type FormField } from "./brain-cards";
@@ -86,8 +86,85 @@ function fmtTime(ts: number): string {
 }
 
 /** 检测 messages 中第一条含「新角色提案」浏览卡的消息 id（供 onProposalTalk 触发；纯函数便于单测） */
+/** 从 completedCards 提取某卡已完成的 itemId 集合（key 形如 "msgId:cardIndex:itemId"） */
+export function completedItemIdsOf(completed: ReadonlySet<string>, msgId: string, cardIndex: number): ReadonlySet<string> {
+  const prefix = `${msgId}:${cardIndex}:`;
+  const out = new Set<string>();
+  for (const k of completed) if (k.startsWith(prefix)) out.add(k.slice(prefix.length));
+  return out;
+}
+
+/** browse 卡 item 操作的 body → itemId（proposal: proposalId；tasks: id；gacha 单卡: pick[0]；gacha 全部应用等无 item） */
+export function actionItemId(body: Record<string, unknown>): string | undefined {
+  if (typeof body.proposalId === "string") return body.proposalId;
+  if (typeof body.id === "string") return body.id;
+  if (Array.isArray(body.pick) && body.pick.length === 1 && typeof body.pick[0] === "string") return body.pick[0];
+  return undefined;
+}
+
 export function findProposalCardMessageId(messages: ChatMessage[]): string | undefined {
   return messages.find((m) => (m.cards ?? []).some((c) => c.kind === "browse" && c.browseType === "proposal"))?.id;
+}
+
+/** 任务/指令类卡片 kind：含这类卡的消息支持折叠（预览/确认/表单/计划/意见/进度/结果） */
+const COLLAPSIBLE_KINDS = new Set(["preview", "confirm", "form", "plan", "opinion", "progress", "result"]);
+
+/** 消息是否可折叠：中枢消息且含任务/指令类卡片（纯文本/纯浏览消息不折叠） */
+export function isCollapsibleMsg(msg: ChatMessage): boolean {
+  if (msg.role !== "brain") return false;
+  return (msg.cards ?? []).some((c) => COLLAPSIBLE_KINDS.has(c.kind));
+}
+
+/** 折叠摘要：优先取第一条卡 title，缺省回退卡片 kind / 文本首行 */
+export function msgCollapseSummary(msg: ChatMessage): string {
+  const card = (msg.cards ?? [])[0];
+  if (card) {
+    const t = (card as { title?: unknown }).title;
+    if (typeof t === "string" && t.trim()) return t.trim();
+    return card.kind;
+  }
+  return (msg.text ?? "").replace(/\s+/g, " ").trim().slice(0, 40) || "任务消息";
+}
+
+/** 空态快捷提问（点击即发送，降低首次使用门槛） */
+const QUICK_PROMPTS: { label: string; prompt: string }[] = [
+  { label: "再写一章", prompt: "再写一章" },
+  { label: "整书质量", prompt: "这本书整体质量怎么样？" },
+  { label: "生成插画", prompt: "给当前章节配张插画" },
+  { label: "查看任务", prompt: "看看有哪些待处理任务" },
+  { label: "检查一致性", prompt: "检查一下设定一致性" },
+  { label: "新角色提案", prompt: "看看有什么新角色提案" },
+];
+
+/** 复制文本到剪贴板（无权限/旧浏览器降级 textarea + execCommand，失败静默） */
+async function copyText(text: string): Promise<void> {
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch {
+    /* 降级 */
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/** 消息绝对时间（hover title 用）：MM-DD HH:MM */
+function fmtAbsTime(ts: string): string {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 export const BrainCabin: React.FC<{
@@ -102,8 +179,9 @@ export const BrainCabin: React.FC<{
   currentChapter?: { index: number } | null;
 }> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk, currentChapter }) => {
   const {
-    sessions, activeId, messages, streaming, thinking,
+    sessions, activeId, messages, streaming, thinking, reconnecting,
     openSession, newSession, removeSession, truncate, appendMsg, send, stop, isStreaming,
+    completed, markCompleted,
   } = useBrainSession(world.title);
 
   /** 前端上下文：当前选中章（供服务端意图识别参数提取兜底，需求 1/2） */
@@ -114,8 +192,21 @@ export const BrainCabin: React.FC<{
   const [showHistory, setShowHistory] = useState(false);
   /** 已关闭窗口的会话（仅从 tab 栏隐藏，不删除会话记录；历史中可重新打开） */
   const [closedTabs, setClosedTabs] = useState<Set<string>>(new Set());
+  /** 历史会话删除二次确认：pendingDelete 为等待确认的会话 id（3s 未确认自动恢复） */
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  /** 已执行完成的卡片 key（`消息id:卡片下标[:列表项id]`）：useBrainSession 管理，服务端持久化（刷新后恢复） */
+  // completed / markCompleted 来自 useBrainSession
+  /** 已手动展开的任务/指令类消息（默认折叠为摘要行，点击展开） */
+  const [expandedMsgs, setExpandedMsgs] = useState<Set<string>>(new Set());
+  /** 聊天内写作进度（推进剧情/连载）：流式显示阶段与正文，结束后追加结果卡 */
+  const [writing, setWriting] = useState<{ title: string; phase: string; text: string; status: "running" | "done" | "failed"; detail?: string } | null>(null);
+  const writingAbortRef = useRef<AbortController | null>(null);
+  const writingTimerRef = useRef<number | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  /** 是否停留在消息流底部（用户上翻查看历史时不强制拉回） */
+  const stickBottomRef = useRef(true);
+  const delTimerRef = useRef<number | null>(null);
 
   /** tab 栏可见会话（过滤已关闭窗口的） */
   const visibleSessions = sessions.filter((s) => !closedTabs.has(s.id));
@@ -130,6 +221,20 @@ export const BrainCabin: React.FC<{
     }
   }
 
+  /** 历史会话删除二次确认：首次点击进入确认态（3s 自动恢复），再点才删除 */
+  function confirmDeleteSession(id: string) {
+    if (pendingDelete === id) {
+      if (delTimerRef.current) window.clearTimeout(delTimerRef.current);
+      setPendingDelete(null);
+      setClosedTabs((prev) => { const n = new Set(prev); n.delete(id); return n; });
+      void removeSession(id);
+      return;
+    }
+    setPendingDelete(id);
+    if (delTimerRef.current) window.clearTimeout(delTimerRef.current);
+    delTimerRef.current = window.setTimeout(() => setPendingDelete(null), 3000);
+  }
+
   // 用户与中枢聊「新角色提案」话题（返回提案浏览卡）→ 通知 Home 恢复底部提案区显示；
   // 同一消息只通知一次（历史会话加载旧提案卡也视为浏览过提案，可接受）
   const proposalNotifiedRef = useRef<string>("");
@@ -142,9 +247,26 @@ export const BrainCabin: React.FC<{
     }
   }, [messages, onProposalTalk]);
 
-  // 滚动到底部（消息/thinking 变化时）
-  const scrollKey = useMemo(() => `${messages.length}:${messages[messages.length - 1]?.text?.length ?? 0}`, [messages]);
-  useMemo(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [scrollKey, thinking, open]);
+  // 智能滚动：仅当用户停留在底部时才跟随新内容（上翻查看历史不被打断）；发送/切换会话强制回到底部
+  const stickToBottom = () => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  };
+  const onStreamScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
+  const lastScrollKeyRef = useRef("");
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const key = `${messages.length}:${messages[messages.length - 1]?.text?.length ?? 0}:${thinking}`;
+    if (key === lastScrollKeyRef.current) return;
+    lastScrollKeyRef.current = key;
+    if (stickBottomRef.current) el.scrollTop = el.scrollHeight;
+  }, [messages, thinking]);
+  useEffect(() => { if (open) stickToBottom(); }, [open, activeId]);
 
   function appendBrainMsg(cards: BrainCard[]) {
     if (!activeId) return;
@@ -164,8 +286,12 @@ export const BrainCabin: React.FC<{
   const ctxCard = lastCards.find(
     (c) => c.kind === "confirm" || c.kind === "plan" || c.kind === "opinion" || (c.kind === "preview" && (c as PreviewCard).confirmRequired)
   ) as (BrainCard & { options?: ChoiceOption[] }) | undefined;
+  const ctxCardIdx = ctxCard ? lastCards.indexOf(ctxCard) : -1;
+  /** ctx-bar 对应卡片是否已完成（confirm 已处理 / preview 已执行）：完成则禁用，防重复触发后端操作 */
+  const ctxCardDone = ctxCardIdx >= 0 && !!lastBrainMsg && completed.has(`${lastBrainMsg.id}:${ctxCardIdx}`);
   const ctxBusy = streaming || executing;
   const runningStatus = (() => {
+    if (reconnecting) return "连接已断开，正在重连…";
     if (streaming) return "中枢正在生成回复…";
     if (thinking) return "中枢正在思考…";
     if (activity !== "idle") return `中枢正在${ACTIVITY_LABEL[activity]}`;
@@ -254,10 +380,10 @@ export const BrainCabin: React.FC<{
                     <span className="bc-history-meta">{fmtTime(s.updatedAt)} · {s.messageCount} 条消息</span>
                   </div>
                   <button
-                    className="bc-history-del"
-                    title="删除会话"
-                    onClick={(e) => { e.stopPropagation(); setClosedTabs((prev) => { const n = new Set(prev); n.delete(s.id); return n; }); void removeSession(s.id); }}
-                  >删除</button>
+                    className={`bc-history-del${pendingDelete === s.id ? " confirm" : ""}`}
+                    title={pendingDelete === s.id ? "再次点击确认删除" : "删除会话"}
+                    onClick={(e) => { e.stopPropagation(); confirmDeleteSession(s.id); }}
+                  >{pendingDelete === s.id ? "确认删除？" : "删除"}</button>
                 </div>
               ))}
             </div>
@@ -266,16 +392,37 @@ export const BrainCabin: React.FC<{
 
         {/* 中部：对话流 */}
         {!showHistory && (
-        <div className="brain-cabin-stream" ref={scrollRef}>
+        <div className="brain-cabin-stream" ref={scrollRef} onScroll={onStreamScroll}>
           {messages.length === 0 && (
             <div className="brain-cabin-empty">
-              <p className="bc-hint">试一试：「再写一章」「这本书质量怎么样」「给第三章配张插画」</p>
+              <p className="bc-empty-title">直接输入，开启与中枢的对话</p>
+              <div className="bc-quick-row">
+                {QUICK_PROMPTS.map((q) => (
+                  <button key={q.label} className="bc-quick-chip" disabled={streaming} onClick={() => void doSend(q.prompt)} title={q.prompt}>
+                    {q.label}
+                  </button>
+                ))}
+              </div>
+              <p className="bc-hint">也可以直接输入，如：「再写一章」「这本书质量怎么样」「给第三章配张插画」</p>
             </div>
           )}
-          {messages.map((msg) => (
+          {messages.map((msg) => {
+            // 任务/指令类消息默认折叠为摘要行；未决确认（confirm 卡）与生成中强制展开
+            const collapsible = isCollapsibleMsg(msg);
+            const hasConfirm = (msg.cards ?? []).some((c) => c.kind === "confirm");
+            const folded = collapsible && !msg.pending && !hasConfirm && !expandedMsgs.has(msg.id);
+            return (
             <div key={msg.id} className={`bc-msg bc-msg-${msg.role}`}>
               {msg.role === "brain" && <BrainCore presence={presence} activity={activity} size="mini" />}
               <div className="bc-msg-content">
+                {folded ? (
+                  <button className="bc-msg-fold" onClick={() => setExpandedMsgs((prev) => { const n = new Set(prev); n.add(msg.id); return n; })} title="展开查看详情">
+                    <span className="bc-fold-caret">▸</span>
+                    <span className="bc-fold-text">{msgCollapseSummary(msg)}</span>
+                    <span className="bc-fold-meta">{(msg.cards?.length ?? 0) > 1 ? `卡片 ×${msg.cards?.length}` : ""}</span>
+                  </button>
+                ) : (
+                  <>
                 {msg.role === "brain" && msg.pending && !msg.text && (
                   <ThinkingSkeleton />
                 )}
@@ -297,20 +444,39 @@ export const BrainCabin: React.FC<{
                     key={i}
                     card={card}
                     busy={streaming || executing}
-                    onExecute={executeCard}
-                    onConfirmChoose={(opt) => confirmChoose(opt, msg.cards)}
+                    completed={completed.has(`${msg.id}:${i}`)}
+                    completedItems={card.kind === "browse" ? completedItemIdsOf(completed, msg.id, i) : undefined}
+                    onExecute={(card2, action) => executeCard(card2, action, msg.id, i)}
+                    onConfirmChoose={(opt) => confirmChoose(opt, msg, i)}
                     onOption={handleOption}
-                    onFormSubmit={submitForm}
+                    onFormSubmit={(card2, values) => submitForm(card2, values, msg.id, i)}
                   />
                 ))}
+                {collapsible && !msg.pending && (
+                  <button className="bc-msg-fold bc-msg-fold-mini" onClick={() => setExpandedMsgs((prev) => { const n = new Set(prev); n.delete(msg.id); return n; })} title="折叠此消息">▾ 收起</button>
+                )}
+                {/* 消息操作区：时间戳 + 复制（user 额外编辑）；pending 时不显示 */}
+                {!msg.pending && (msg.text || (msg.cards?.length ?? 0) > 0) && (
+                  <div className="bc-msg-ops">
+                    <span className="bc-msg-time" title={fmtAbsTime(msg.at)}>{fmtTime(new Date(msg.at).getTime())}</span>
+                    {msg.role === "user" && (
+                      <button className="bc-msg-op" onClick={() => editPrompt(msg)} disabled={streaming || thinking} title="编辑并重发（截断后续对话）">✎ 编辑</button>
+                    )}
+                    <button className="bc-msg-op" onClick={() => void copyText(msg.text ?? "")} disabled={!msg.text} title="复制消息内容">⧉ 复制</button>
+                  </div>
+                )}
+                  </>
+                )}
               </div>
-              {msg.role === "user" && (
-                <div className="bc-user-actions">
-                  <button className="bc-link-btn" onClick={() => editPrompt(msg)} disabled={streaming || thinking} title="编辑并重发（截断后续对话）">✎ 编辑</button>
-                </div>
-              )}
-            </div>
-          ))}
+            </div>);
+          })}
+          {/* 聊天内写作进度（推进剧情/连载）：流式显示阶段与正文 */}
+          {writing && (
+            <BrainCardView
+              card={{ kind: "progress", title: writing.title, phase: writing.phase, text: writing.text, status: writing.status, detail: writing.detail }}
+              onCancelProgress={writing.status === "running" ? stopWriting : undefined}
+            />
+          )}
         </div>
         )}
 
@@ -319,16 +485,16 @@ export const BrainCabin: React.FC<{
           <div className="bc-context-bar">
             <div className="bc-context-main">
               {activeSessionTitle && <span className="bc-context-session" title="当前会话">{activeSessionTitle}</span>}
-              {runningStatus && <span className="bc-context-status">{runningStatus}</span>}
+              {runningStatus && <span className={`bc-context-status${reconnecting ? " bc-status-warn" : ""}`}>{runningStatus}</span>}
             </div>
             {ctxCard && (
               <div className="bc-context-actions">
                 {ctxCard.kind === "confirm" && (
                   <>
-                    <span className="bc-context-label">待确认</span>
-                    <button className="bc-ctx-btn" disabled={ctxBusy} onClick={() => confirmChoose("merge", lastBrainMsg?.cards)} title="合并本次改动">合并</button>
-                    <button className="bc-ctx-btn" disabled={ctxBusy} onClick={() => confirmChoose("rewrite", lastBrainMsg?.cards)} title="按计划重写受影响章节">重写</button>
-                    <button className="bc-ctx-btn danger" disabled={ctxBusy} onClick={() => confirmChoose("abort")} title="放弃本次操作">放弃</button>
+                    <span className="bc-context-label">{ctxCardDone ? "已处理" : "待确认"}</span>
+                    <button className="bc-ctx-btn" disabled={ctxBusy || ctxCardDone} onClick={() => confirmChoose("merge", lastBrainMsg)} title="合并本次改动">合并</button>
+                    <button className="bc-ctx-btn" disabled={ctxBusy || ctxCardDone} onClick={() => confirmChoose("rewrite", lastBrainMsg)} title="按计划重写受影响章节">重写</button>
+                    <button className="bc-ctx-btn danger" disabled={ctxBusy || ctxCardDone} onClick={() => confirmChoose("abort", lastBrainMsg)} title="放弃本次操作">放弃</button>
                   </>
                 )}
                 {(ctxCard.kind === "plan" || ctxCard.kind === "opinion") && (
@@ -340,7 +506,7 @@ export const BrainCabin: React.FC<{
                   </>
                 )}
                 {ctxCard.kind === "preview" && (
-                  <button className="bc-ctx-btn primary" disabled={ctxBusy} onClick={() => executeCard(ctxCard)} title="执行此操作">执行操作</button>
+                  <button className="bc-ctx-btn primary" disabled={ctxBusy || ctxCardDone} onClick={() => executeCard(ctxCard, undefined, lastBrainMsg?.id, ctxCardIdx >= 0 ? ctxCardIdx : undefined)} title="执行此操作">{ctxCardDone ? "✓ 已执行" : "执行操作"}</button>
                 )}
               </div>
             )}
@@ -358,16 +524,15 @@ export const BrainCabin: React.FC<{
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void doSend(); }
             }}
-            placeholder="对中枢说点什么…（Enter 发送，Shift+Enter 换行）"
+            placeholder={streaming ? "中枢正在回复…（可继续输入，生成结束后发送）" : "对中枢说点什么…（Enter 发送，Shift+Enter 换行）"}
             rows={2}
-            disabled={streaming}
           />
           {streaming ? (
             <button className="btn btn-danger bc-send" onClick={stop} title="中断生成（保留已输出内容）">
               <Square size={15} /> 中断
             </button>
           ) : (
-            <button className="btn btn-primary bc-send" onClick={() => void doSend()} disabled={!input.trim()} title="发送">
+            <button className="btn btn-primary bc-send" onClick={() => void doSend()} disabled={!input.trim() || executing} title="发送">
               <Send size={15} /> 发送
             </button>
           )}
@@ -406,11 +571,12 @@ export const BrainCabin: React.FC<{
     document.body.style.userSelect = "none";
   }
 
-  /** 发送：无 activeId 时自动新建会话（直接输入即首次对话） */
-  async function doSend() {
-    const prompt = input.trim();
-    if (!prompt || streaming) return;
+  /** 发送：无 activeId 时自动新建会话（直接输入即首次对话）；text 参数供空态快捷提问复用 */
+  async function doSend(text?: string) {
+    const prompt = (text ?? input).trim();
+    if (!prompt || streaming || executing) return;
     setInput("");
+    stickToBottom(); // 发送后新消息滚动跟随
     let sid = activeId;
     if (!sid) sid = await newSession(prompt);
     await send({ prompt, sessionId: sid, ctx: chatCtx });
@@ -468,13 +634,120 @@ export const BrainCabin: React.FC<{
     }
   }
 
-  /** 执行卡片操作 */
-  async function executeCard(card: BrainCard, action?: { endpoint: string; method?: string; body: Record<string, unknown> }) {
+  /** 标记消息内某张卡片已执行完成（preview/form/confirm：按钮替换为完成标记；browse 卡按 itemId 标记列表项）。
+   *  经 useBrainSession.markCompleted 持久化到服务端——刷新页面后完成态不丢失。 */
+  function markCardDone(msgId?: string, cardIndex?: number, itemId?: string) {
+    if (!msgId || cardIndex == null) return;
+    const key = itemId ? `${msgId}:${cardIndex}:${itemId}` : `${msgId}:${cardIndex}`;
+    void markCompleted(key);
+  }
+
+  /** 中断聊天内写作任务（abort SSE，服务端经 req.signal 在阶段边界丢弃草稿） */
+  function stopWriting() {
+    writingAbortRef.current?.abort();
+  }
+
+  /**
+   * 推进剧情 / 自动连载聊天内流式执行：POST SSE 读取写作过程，实时更新 progress 卡
+   * （阶段步骤 + delta 正文），终态（result/pending-commit/auto-done/interrupted）落定后
+   * 追加 result 卡到会话并刷新世界。
+   */
+  /** 返回是否成功：中断/失败为 false（调用方不标记卡片完成态，用户可重试） */
+  async function streamWritingTask(title: string, act: { endpoint: string; method?: string; body: Record<string, unknown> }, cardTitle: string): Promise<boolean> {
+    const ctrl = new AbortController();
+    writingAbortRef.current = ctrl;
+    // 清掉上一次任务的收起定时器，避免任务 A 结束后 2.5s 内启动任务 B 时把 B 的进度卡提前收起
+    if (writingTimerRef.current) window.clearTimeout(writingTimerRef.current);
+    setWriting({ title: cardTitle, phase: "start", text: "", status: "running" });
+    let finalText = "";
+    let ended: "done" | "failed" | "running" = "running"; // 流式终态跟踪
+    type W = { title: string; phase: string; text: string; status: "running" | "done" | "failed"; detail?: string };
+    const patch = (p: Partial<W> | ((w: W) => Partial<W>)) =>
+      setWriting((w) => (w ? { ...w, ...(typeof p === "function" ? p(w) : p) } : w));
+    try {
+      const res = await apiFetch(act.endpoint, {
+        method: act.method ?? "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...act.body, title }),
+        signal: ctrl.signal,
+      });
+      if (!res.ok || !res.body) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string };
+        const msg = String(err.error ?? `HTTP ${res.status}`);
+        ended = "failed";
+        patch({ status: "failed", detail: msg });
+        appendBrainMsg([{ kind: "result", title: cardTitle, success: false, detail: msg }]);
+        return false;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          let obj: Record<string, unknown>;
+          try { obj = JSON.parse(line.slice(6)); } catch { continue; }
+          const phase = String(obj.phase ?? "");
+          if (phase === "delta") {
+            finalText += String(obj.delta ?? "");
+            patch({ phase, text: finalText });
+          } else if (phase === "result") {
+            ended = "done";
+            const r = (obj.result ?? {}) as { chapter?: { index?: number; title?: string } };
+            patch({ phase, status: "done", text: finalText, detail: `第 ${r.chapter?.index ?? ""} 章《${r.chapter?.title ?? ""}》已完成` });
+          } else if (phase === "auto-done") {
+            ended = "done";
+            const r = (obj.report ?? {}) as { written?: number; target?: number; reason?: string };
+            patch({ phase, status: "done", text: finalText, detail: `连载完成：${r.written ?? 0}/${r.target ?? 0} 章（${String(r.reason ?? "")}）` });
+          } else if (phase === "pending-commit") {
+            ended = "done";
+            patch({ phase, status: "done", text: finalText, detail: `第 ${String(obj.chapterIndex ?? "")} 章审查已通过，等待确认入册` });
+          } else if (phase === "interrupted") {
+            ended = "failed";
+            patch({ phase, status: "failed", text: finalText, detail: "写作已中断（阶段边界丢弃草稿）" });
+          } else if (phase === "start" || phase === "writing" || phase === "selfcheck" || phase === "reviewing" || phase === "patching" || phase === "settling" || phase === "saving" || phase === "auto-status") {
+            patch({ phase, text: finalText });
+          }
+        }
+      }
+      // 流正常关闭但未收到终态：任务已完成（SSE 在 result 后关闭）；兜底收尾
+      if (ended === "running") ended = "done";
+      patch((w) => (w!.status === "running" ? { status: "done", detail: "任务已结束" } : {}));
+      appendBrainMsg([{ kind: "result", title: cardTitle, success: ended === "done", detail: ended === "done" ? "写作已完成，正文已更新" : "写作未完成" }]);
+      return ended === "done";
+    } catch (e) {
+      const aborted = (e as Error).name === "AbortError";
+      ended = "failed";
+      patch(aborted ? { status: "failed", detail: "写作已中断" } : { status: "failed", detail: (e as Error).message });
+      if (!aborted) appendBrainMsg([{ kind: "result", title: cardTitle, success: false, detail: (e as Error).message }]);
+      return false;
+    } finally {
+      writingAbortRef.current = null;
+      // 保留 progress 卡 2.5s 展示终态后收起（result 卡已入会话）
+      writingTimerRef.current = window.setTimeout(() => setWriting(null), 2500);
+    }
+  }
+
+  /** 执行卡片操作（msgId/cardIndex 供成功后标记完成态） */
+  async function executeCard(card: BrainCard, action?: { endpoint: string; method?: string; body: Record<string, unknown> }, msgId?: string, cardIndex?: number) {
     if (executing || streaming) return;
     const act = action ?? (card.kind === "preview" ? card.action : undefined);
     if (!act) return;
     setExecuting(true);
     try {
+      // 推进剧情 / 自动连载：聊天内流式显示写作过程（progress 卡实时阶段+正文），结束后 result 卡回执；
+      // 仅成功才标记卡片完成（中断/失败保留按钮，用户可重试）
+      if (act.endpoint === "/api/novel/step" || act.endpoint === "/api/novel/auto/start") {
+        const ok = await streamWritingTask(world.title, act, card.title);
+        if (ok) markCardDone(msgId, cardIndex);
+        onWorldUpdate?.();
+        return;
+      }
       // 媒体生成（插画/视频）：image 为异步任务，提交后轮询 /media/status，完成后刷新世界并回执
       if (act.endpoint === "/api/novel/media/generate") {
         const res = await apiFetch(act.endpoint, {
@@ -495,12 +768,21 @@ export const BrainCabin: React.FC<{
         } else {
           appendBrainMsg([{ kind: "result", title: card.title, success: true, detail: "已提交生成任务" }]);
         }
+        markCardDone(msgId, cardIndex);
         onWorldUpdate?.();
         return;
       }
       const r = await fetchAction(act.endpoint, act.method ?? "POST", act.body);
       appendBrainMsg([{ kind: "result", title: card.title, success: r.success, detail: r.detail }]);
-      if (r.success) onWorldUpdate?.();
+      if (r.success) {
+        // gacha 全部应用（auto:true）：pendingCards 一次性消耗，标记本卡全部列表项完成（刷新后保持「已处理」）
+        if (act.endpoint === "/api/novel/gacha" && act.body.action === "apply" && act.body.auto === true && card.kind === "browse") {
+          const list = (card.data as { list?: { id?: unknown }[] } | null)?.list ?? [];
+          for (const c of list) if (c?.id) markCardDone(msgId, cardIndex, String(c.id));
+        }
+        markCardDone(msgId, cardIndex, card.kind === "browse" ? actionItemId(act.body) : undefined);
+        onWorldUpdate?.();
+      }
     } catch (e) {
       appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: (e as Error).message }]);
     } finally {
@@ -534,13 +816,20 @@ export const BrainCabin: React.FC<{
     }, 3000);
   }
 
-  /** ConfirmCard 确认（L2/L3 三选一） */
-  async function confirmChoose(opt: "merge" | "rewrite" | "abort", cards?: BrainCard[]) {
+  /** ConfirmCard 确认（L2/L3 三选一；msg/cardIndex 供成功后标记 confirm 与 preview 卡完成态） */
+  async function confirmChoose(opt: "merge" | "rewrite" | "abort", msg?: ChatMessage, cardIndex?: number) {
     if (opt === "abort") {
       appendBrainMsg([{ kind: "result", title: "已放弃", success: true, detail: "用户选择放弃本次操作" }]);
+      // 放弃同样标记 confirm/preview 卡完成，防 ctx-bar 与消息内按钮重复触发
+      const cards = msg?.cards ?? [];
+      const confirmIdx = cardIndex ?? cards.findIndex((c) => c.kind === "confirm");
+      if (msg && confirmIdx >= 0) markCardDone(msg.id, confirmIdx);
+      const pIdx = cards.findIndex((c) => c.kind === "preview");
+      if (pIdx >= 0) markCardDone(msg?.id, pIdx);
       return;
     }
     if (executing || streaming) return;
+    const cards = msg?.cards;
     const action = findPreviewAction(cards);
     if (!action) {
       appendBrainMsg([{ kind: "result", title: "无法执行", success: false, detail: "未找到操作端点" }]);
@@ -551,7 +840,14 @@ export const BrainCabin: React.FC<{
       const body = { ...action.body, strategy: opt };
       const r = await fetchAction(action.endpoint, action.method ?? "POST", body);
       appendBrainMsg([{ kind: "result", title: `已执行（${opt}）`, success: r.success, detail: r.detail }]);
-      if (r.success) onWorldUpdate?.();
+      if (r.success) {
+        // 自动定位 confirm 卡下标（ctx-bar 调用未传 cardIndex 时也能标记完成态，防重复提交）
+        const confirmIdx = cardIndex ?? (cards ?? []).findIndex((c) => c.kind === "confirm");
+        if (confirmIdx >= 0) markCardDone(msg?.id, confirmIdx); // confirm 卡完成
+        const pIdx = (cards ?? []).findIndex((c) => c.kind === "preview");
+        if (pIdx >= 0) markCardDone(msg?.id, pIdx); // 连带 preview 卡完成（防重复执行）
+        onWorldUpdate?.();
+      }
     } catch (e) {
       appendBrainMsg([{ kind: "result", title: `执行失败（${opt}）`, success: false, detail: (e as Error).message }]);
     } finally {
@@ -564,7 +860,7 @@ export const BrainCabin: React.FC<{
    * 端点返回 needIntervention（L2 干预）时本地追加 preview+confirm 卡（三选一），
    * 否则结果回执 + 刷新世界。confirmRequired 卡（如删除伏笔）由按钮文案承担确认语义。
    */
-  async function submitForm(card: FormCard, values: Record<string, unknown>) {
+  async function submitForm(card: FormCard, values: Record<string, unknown>, msgId?: string, cardIndex?: number) {
     if (executing || streaming) return;
     const flat = flattenFormValues(card.fields ?? [], values);
     const body: Record<string, unknown> = { ...(card.action.body ?? {}), ...flat, title: world.title };
@@ -600,6 +896,7 @@ export const BrainCabin: React.FC<{
             : `已从第 ${chapterIndex} 章正文挑选 1 个关键场景，确认后开始生成视频。`,
           action: { endpoint: "/api/novel/media/generate", method: "POST", body: { title: world.title, chapterIndex, kind, scenes } },
         };
+        markCardDone(msgId, cardIndex); // 表单已完成，追加 preview 卡
         appendBrainMsg([preview]);
         return;
       }
@@ -623,9 +920,11 @@ export const BrainCabin: React.FC<{
           impact: `影响 ${(rp.affectedChapters ?? []).length} 个已写章节，请选择处理策略`,
           options: ["merge", "rewrite", "abort"],
         };
+        markCardDone(msgId, cardIndex); // 表单已完成，进入确认阶段
         appendBrainMsg([preview, confirm]);
         return;
       }
+      markCardDone(msgId, cardIndex);
       appendBrainMsg([{ kind: "result", title: card.title, success: true, detail: "已保存" }]);
       onWorldUpdate?.();
     } catch (e) {

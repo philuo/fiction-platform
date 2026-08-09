@@ -820,8 +820,18 @@ const Home: React.FC<HomeProps> = (props) => {
         // 纯 POST 无进度推送，最坏场景（重试+重写轮+续写）可达 10+ 分钟：15 分钟超时兜底，防请求永久挂起
         signal: AbortSignal.timeout(15 * 60 * 1000),
       });
-      const data = (await res.json()) as { ok?: boolean; world?: WorldState; review?: ReviewResult; report?: IntegrityReportView; error?: string };
-      if (!data.ok || !data.world) throw new Error(data.error ?? "重写失败");
+      const raw = await res.text();
+      let data: { ok?: boolean; world?: WorldState; review?: ReviewResult; report?: IntegrityReportView; error?: string; interrupted?: boolean };
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        // 响应非 JSON（网关/代理错误页、连接中断残片等）：透出状态码与响应开头，便于定位真实原因
+        throw new Error(`服务端返回异常（HTTP ${res.status}，响应非 JSON）：${raw.slice(0, 300)}`);
+      }
+      if (!data.ok || !data.world) {
+        // 被干预打断：服务端已安全回滚（未保存），明确提示而非当成普通失败
+        throw new Error(data.interrupted ? "重写被干预打断（未保存）" : (data.error ?? `重写失败（HTTP ${res.status}）`));
+      }
       setWorld(data.world);
       setEditing(false);
       showChangeReport(data.report, c.index);
@@ -2077,29 +2087,9 @@ const Home: React.FC<HomeProps> = (props) => {
 
             {/* 右栏：进度 + 状态面板（人物/伏笔账随当前选中章节联动，只读；头像点击仅只读预览立绘） */}
             <StatusPanel world={world} busyPhase={busyPhase} currentChapter={shownChapter?.index ?? null} onViewPortrait={(c) => openPortrait(c, true)} />
-          </div>
 
-          {/* P3.5 新角色提案横幅：确认前不入册、不写入正文；折叠单行 + 可关闭 + 展开抽屉（200ms 自底部向上覆盖三栏） */}
-          {pendingProposals.length > 0 && !proposalClosed && (
-            <>
-              {/* 折叠态：单行（不折行），超长省略，操作入口在展开抽屉 */}
-              {!proposalExpanded && (
-                <div className="proposal-bar">
-                  <b className="proposal-bar-title">新角色提案（{pendingProposals.length}）：</b>
-                  <span
-                    className="proposal-bar-items"
-                    title={pendingProposals.map((p) => `「${p.name}」${p.role}${p.reason ? "：推荐原因 " + p.reason : ""}`).join("\n")}
-                  >
-                    {pendingProposals.slice(0, 3).map((p) => `「${p.name}」${p.role}（${p.source === "gacha" ? "抽卡" : "剧情"}）`).join(" · ")}
-                    {pendingProposals.length > 3 ? ` …等 ${pendingProposals.length} 项` : ""}
-                  </span>
-                  <span className="proposal-bar-actions">
-                    <button className="proposal-bar-icon" onClick={() => setProposalExpanded(true)} title="展开查看推荐原因与动机，可确认/拒绝"><ChevronDown size={15} /></button>
-                    <button className="proposal-bar-icon" onClick={() => savePropClosed(true)} title="关闭新角色提案提示"><X size={15} /></button>
-                  </span>
-                </div>
-              )}
-              {/* 展开态：绝对定位于 game-grid 区域，height 0→100% 200ms 从底部向顶部覆盖三栏（顶部不超过 game-grid 顶） */}
+            {/* P3.5 新角色提案抽屉：绝对定位于 game-grid（position: relative）内，left/right/bottom 精确覆盖三栏宽度；height 0→100% 200ms 自底部向上（顶部不超过 game-grid 顶） */}
+            {pendingProposals.length > 0 && !proposalClosed && (
               <div className={`proposal-drawer${proposalExpanded ? " open" : ""}`}>
                 <div className="proposal-drawer-head">
                   <b>新角色提案（{pendingProposals.length}）</b>
@@ -2124,6 +2114,29 @@ const Home: React.FC<HomeProps> = (props) => {
                   ))}
                 </div>
               </div>
+            )}
+          </div>
+
+          {/* P3.5 新角色提案横幅：确认前不入册、不写入正文；折叠单行 + 可关闭 + 展开抽屉（200ms 自底部向上覆盖三栏） */}
+          {pendingProposals.length > 0 && !proposalClosed && (
+            <>
+              {/* 折叠态：单行（不折行），超长省略，操作入口在展开抽屉 */}
+              {!proposalExpanded && (
+                <div className="proposal-bar">
+                  <b className="proposal-bar-title">新角色提案（{pendingProposals.length}）：</b>
+                  <span
+                    className="proposal-bar-items"
+                    title={pendingProposals.map((p) => `「${p.name}」${p.role}${p.reason ? "：推荐原因 " + p.reason : ""}`).join("\n")}
+                  >
+                    {pendingProposals.slice(0, 3).map((p) => `「${p.name}」${p.role}（${p.source === "gacha" ? "抽卡" : "剧情"}）`).join(" · ")}
+                    {pendingProposals.length > 3 ? ` …等 ${pendingProposals.length} 项` : ""}
+                  </span>
+                  <span className="proposal-bar-actions">
+                    <button className="proposal-bar-icon" onClick={() => setProposalExpanded(true)} title="展开查看推荐原因与动机，可确认/拒绝"><ChevronDown size={15} /></button>
+                    <button className="proposal-bar-icon" onClick={() => savePropClosed(true)} title="关闭新角色提案提示"><X size={15} /></button>
+                  </span>
+                </div>
+              )}
             </>
           )}
 

@@ -117,7 +117,19 @@ export type FormCard = {
   image?: CardImage;
 };
 
-export type BrainCard = PreviewCard | ConfirmCard | ResultCard | BrowseCard | ChoiceCard | FormCard;
+/** 写作进度卡（推进剧情/自动连载聊天内流式展示）：阶段步骤条 + 流式正文 + 状态 */
+export type ProgressCard = {
+  kind: "progress";
+  title: string;
+  /** 当前阶段（start/writing/reviewing/settling/saving/result/pending-commit/auto-status/auto-done…） */
+  phase?: string;
+  /** 流式正文（写作 delta 累积；运行中实时更新） */
+  text?: string;
+  status: "running" | "done" | "failed";
+  detail?: string;
+};
+
+export type BrainCard = PreviewCard | ConfirmCard | ResultCard | BrowseCard | ChoiceCard | FormCard | ProgressCard;
 
 // ============ 级别徽章 ============
 
@@ -137,18 +149,22 @@ function CommandBadge({ commandId }: { commandId?: string }) {
 
 // ============ PreviewCard 操作预览卡 ============
 
-export const PreviewCardView: React.FC<{ card: PreviewCard; onExecute?: () => void; busy?: boolean }> = ({ card, onExecute, busy }) => (
-  <div className="brain-card brain-card-preview">
+export const PreviewCardView: React.FC<{ card: PreviewCard; onExecute?: () => void; busy?: boolean; completed?: boolean }> = ({ card, onExecute, busy, completed }) => (
+  <div className={`brain-card brain-card-preview${completed ? " bc-card-done" : ""}`}>
     <div className="brain-card-head">
-      <span className="brain-card-title">{card.title}</span>
+      <span className="brain-card-title">{completed ? "✓ " : ""}{card.title}</span>
       <CommandBadge commandId={card.commandId} />
       <LevelBadge level={card.level} />
-      {card.confirmRequired && <span className="bc-confirm-tag">需确认</span>}
+      {card.confirmRequired && !completed && <span className="bc-confirm-tag">需确认</span>}
     </div>
     <p className="brain-card-body">{card.summary}</p>
     {card.action && onExecute && (
       <div className="brain-card-actions">
-        <button className="btn-save btn-xs" disabled={busy} onClick={onExecute}>执行</button>
+        {completed ? (
+          <span className="bc-done-tag">✓ 已执行</span>
+        ) : (
+          <button className="btn-save btn-xs" disabled={busy} onClick={onExecute}>执行</button>
+        )}
       </div>
     )}
   </div>
@@ -160,23 +176,28 @@ export const ConfirmCardView: React.FC<{
   card: ConfirmCard;
   onChoose?: (opt: "merge" | "rewrite" | "abort") => void;
   busy?: boolean;
-}> = ({ card, onChoose, busy }) => {
+  completed?: boolean;
+}> = ({ card, onChoose, busy, completed }) => {
   const optLabel: Record<string, string> = { merge: "① 正向弥合", rewrite: "② 回溯重写", abort: "③ 放弃" };
   return (
-    <div className="brain-card brain-card-confirm">
+    <div className={`brain-card brain-card-confirm${completed ? " bc-card-done" : ""}`}>
       <div className="brain-card-head">
-        <span className="brain-card-title">{card.title}</span>
+        <span className="brain-card-title">{completed ? "✓ " : ""}{card.title}</span>
         <CommandBadge commandId={card.commandId} />
         <LevelBadge level={card.level} />
       </div>
       {card.impact && <p className="brain-card-impact">{card.impact}</p>}
       {card.verdict && <p className="brain-card-verdict">闸门裁决：{card.verdict}</p>}
       <div className="brain-card-actions">
-        {card.options.map((opt) => (
-          <button key={opt} className="btn-save btn-xs" disabled={busy} onClick={() => onChoose?.(opt)}>
-            {optLabel[opt]}
-          </button>
-        ))}
+        {completed ? (
+          <span className="bc-done-tag">✓ 已处理</span>
+        ) : (
+          card.options.map((opt) => (
+            <button key={opt} className="btn-save btn-xs" disabled={busy} onClick={() => onChoose?.(opt)}>
+              {optLabel[opt]}
+            </button>
+          ))
+        )}
       </div>
     </div>
   );
@@ -246,27 +267,33 @@ function CardScore({ score }: { score?: unknown }) {
 
 /** 列表项内嵌操作按钮（proposal/tasks 共用） */
 function CardItemActions({
-  item, busy, onAction,
+  item, busy, onAction, completed,
 }: {
   item: Record<string, unknown>;
   busy?: boolean;
   onAction?: (action: BrowseCardAction["action"]) => void;
+  /** 该列表项操作已成功执行：按钮替换为完成标记（防重复提交 + 就地反馈） */
+  completed?: boolean;
 }) {
   const actions = item.actions as ProposalListItem["actions"] | undefined;
   if (!Array.isArray(actions) || actions.length === 0 || !onAction) return null;
   return (
     <div className="bc-browse-actions">
-      {actions.map((a, j) =>
-        a.action ? (
-          <button
-            key={j}
-            className={`btn-save btn-xs${a.danger ? " btn-danger-sm" : ""}`}
-            disabled={busy}
-            onClick={() => onAction(a.action!)}
-          >
-            {a.label ?? "执行"}
-          </button>
-        ) : null,
+      {completed ? (
+        <span className="bc-done-tag">✓ 已处理</span>
+      ) : (
+        actions.map((a, j) =>
+          a.action ? (
+            <button
+              key={j}
+              className={`btn-save btn-xs${a.danger ? " btn-danger-sm" : ""}`}
+              disabled={busy}
+              onClick={() => onAction(a.action!)}
+            >
+              {a.label ?? "执行"}
+            </button>
+          ) : null,
+        )
       )}
     </div>
   );
@@ -296,25 +323,32 @@ function CardListItem({ item, title, meta, status, statusLevel, score }: {
 }
 
 /** 内嵌操作注入：给已渲染列表项追加操作按钮（与渲染体共享 item 数据） */
-function WithItemActions({ item, busy, onAction, children }: {
+function WithItemActions({ item, busy, onAction, completed, children }: {
   item: Record<string, unknown>;
   busy?: boolean;
   onAction?: (action: BrowseCardAction["action"]) => void;
+  completed?: boolean;
   children: ReactNode;
 }) {
   return (
     <>
       {children}
-      <CardItemActions item={item} busy={busy} onAction={onAction} />
+      <CardItemActions item={item} busy={busy} onAction={onAction} completed={completed} />
     </>
   );
 }
+
+/** 列表型浏览卡（长内容）默认折叠为标题行，点击展开——避免任务/查询消息淹没对话流 */
+const FOLD_BROWSE_TYPES = new Set(["chapters", "characters", "plans", "tasks", "logs", "worldbook", "media", "review", "gacha", "proposal"]);
 
 export const BrowseCardView: React.FC<{
   card: BrowseCard;
   onAction?: (action: BrowseCardAction["action"]) => void;
   busy?: boolean;
-}> = ({ card, onAction, busy }) => {
+  /** 已成功执行操作的列表项 id 集合（对应项按钮替换为完成标记） */
+  completedItems?: ReadonlySet<string>;
+}> = ({ card, onAction, busy, completedItems }) => {
+  const [open, setOpen] = useState(() => !FOLD_BROWSE_TYPES.has(card.browseType));
   let body: ReactNode = null;
   const d = card.data as Record<string, unknown> | null;
   if (card.browseType === "chapter" && d) {
@@ -357,7 +391,7 @@ export const BrowseCardView: React.FC<{
             </div>
             {p.reason ? <p className="bc-proposal-reason">推荐原因：{String(p.reason)}</p> : null}
             {p.motivation ? <p className="bc-browse-meta">动机：{String(p.motivation)}</p> : null}
-            <CardItemActions item={p} busy={busy} onAction={onAction} />
+            <CardItemActions item={p} busy={busy} onAction={onAction} completed={completedItems?.has(String(p.id ?? i))} />
           </div>
         ))}
       </div>
@@ -385,7 +419,7 @@ export const BrowseCardView: React.FC<{
                   {((c.character as Record<string, unknown>).traits as unknown[])?.length ? ` · ${((c.character as Record<string, unknown>).traits as unknown[]).map(String).join("/")}` : ""}
                 </p>
               )}
-              <CardItemActions item={c} busy={busy} onAction={onAction} />
+              <CardItemActions item={c} busy={busy} onAction={onAction} completed={completedItems?.has(String(c.id ?? ""))} />
             </div>
           ))}
         </div>
@@ -498,7 +532,7 @@ export const BrowseCardView: React.FC<{
           <div className="bc-browse-list">
             <div className="bc-browse-sec">质量债</div>
             {debt.map((t) => (
-              <WithItemActions key={String(t.id ?? "")} item={t} busy={busy} onAction={onAction}>
+              <WithItemActions key={String(t.id ?? "")} item={t} busy={busy} onAction={onAction} completed={completedItems?.has(String(t.id ?? ""))}>
                 <div className="bc-browse-item">
                   <div className="bc-browse-item-head">
                     <span className="bc-browse-item-title">第 {String(t.chapterIndex ?? "")} 章 · {String(t.lens ?? "")}</span>
@@ -632,8 +666,17 @@ export const BrowseCardView: React.FC<{
   }
   return (
     <div className="brain-card brain-card-browse">
-      <div className="brain-card-head"><span className="brain-card-title">{card.title}</span></div>
-      {body}
+      <div className="brain-card-head">
+        <span className="brain-card-title">{card.title}</span>
+        {FOLD_BROWSE_TYPES.has(card.browseType) && (
+          <button className="bc-fold-toggle" onClick={() => setOpen((v) => !v)} title={open ? "折叠内容" : "展开内容"}>
+            <span className={`bc-fold-caret${open ? " open" : ""}`}>▸</span>{open ? " 收起" : " 展开"}
+          </button>
+        )}
+      </div>
+      {open ? body : (
+        <p className="bc-browse-meta">已折叠 · 点击「展开」查看 {card.browseType === "gacha" ? "卡池" : card.browseType === "proposal" ? "提案" : "详情"}</p>
+      )}
     </div>
   );
 };
@@ -669,6 +712,59 @@ export const ChoiceCardView: React.FC<{
   </div>
 );
 
+// ============ ProgressCard 写作进度卡（推进剧情/自动连载聊天内流式展示） ============
+
+/** 阶段 → 步骤名（与 TaskCenterModal 的 STEP_NAMES 对齐；未匹配显示原始 phase） */
+const PROGRESS_STEPS: [RegExp, string][] = [
+  [/考据/, "考据"],
+  [/计划|大纲/, "本章计划"],
+  [/写作|writing|delta/i, "写作"],
+  [/自查|selfcheck/i, "自查"],
+  [/审查|review/i, "审查"],
+  [/修补|patch/i, "修补"],
+  [/结算|settle/i, "结算"],
+  [/存档|saving/i, "存档"],
+  [/result|完成/, "完成"],
+];
+
+function progressStepName(phase?: string): string {
+  if (!phase) return "准备";
+  for (const [re, name] of PROGRESS_STEPS) if (re.test(phase)) return name;
+  return phase;
+}
+
+export const ProgressCardView: React.FC<{
+  card: ProgressCard;
+  onCancel?: () => void;
+}> = ({ card, onCancel }) => {
+  const running = card.status === "running";
+  const step = progressStepName(card.phase);
+  return (
+    <div className={`brain-card brain-card-progress bc-progress-${card.status}`}>
+      <div className="brain-card-head">
+        <span className="brain-card-title">{running ? "⚙ " : card.status === "done" ? "✓ " : "✗ "}{card.title}</span>
+        <span className={`bc-progress-pill bc-progress-pill-${card.status}`}>
+          {running ? (card.phase === "delta" ? "写作中…" : progressStepName(card.phase)) : card.status === "done" ? "已完成" : "失败"}
+        </span>
+      </div>
+      <div className="bc-progress-steps">
+        {["准备", "考据", "本章计划", "写作", "自查", "审查", "修补", "结算", "存档"].map((s) => (
+          <span key={s} className={`bc-progress-step${s === step ? " active" : ""}`}>{s}</span>
+        ))}
+      </div>
+      {running && card.phase === "delta" && card.text ? (
+        <pre className="bc-progress-text">{card.text}</pre>
+      ) : null}
+      {card.detail && <p className="brain-card-body">{card.detail}</p>}
+      {running && onCancel && (
+        <div className="brain-card-actions">
+          <button className="btn btn-danger-sm btn-xs" onClick={onCancel} title="中断本次写作（阶段边界丢弃草稿）">中断写作</button>
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ============ 卡片分发器 ============
 
 /** 卡片附图：渲染在卡片内容上方（data URI / URL 均可） */
@@ -683,7 +779,8 @@ export const FormCardView: React.FC<{
   card: FormCard;
   onSubmit?: (card: FormCard, values: Record<string, unknown>) => void;
   busy?: boolean;
-}> = ({ card, onSubmit, busy }) => {
+  completed?: boolean;
+}> = ({ card, onSubmit, busy, completed }) => {
   const [values, setValues] = useState<Record<string, unknown>>(() => {
     const init: Record<string, unknown> = {};
     for (const f of card.fields ?? []) init[f.key] = f.value ?? (f.type === "number" ? "" : f.type === "multiselect" ? [] : "");
@@ -704,7 +801,7 @@ export const FormCardView: React.FC<{
   };
 
   return (
-    <div className={`brain-card brain-card-form${card.confirmRequired ? " bc-form-confirm" : ""}`}>
+    <div className={`brain-card brain-card-form${card.confirmRequired ? " bc-form-confirm" : ""}${completed ? " bc-card-done" : ""}`}>
       <div className="brain-card-head">
         <span className="brain-card-title">{card.title}</span>
         <CommandBadge commandId={card.commandId} />
@@ -765,9 +862,13 @@ export const FormCardView: React.FC<{
       )}
       <div className="brain-card-actions">
         {onSubmit && (
-          <button className="btn-save btn-xs" disabled={busy} onClick={submit}>
-            {card.submitLabel ?? "提交"}
-          </button>
+          completed ? (
+            <span className="bc-done-tag">✓ 已执行</span>
+          ) : (
+            <button className="btn-save btn-xs" disabled={busy} onClick={submit}>
+              {card.submitLabel ?? "提交"}
+            </button>
+          )
         )}
       </div>
     </div>
@@ -781,16 +882,23 @@ export const BrainCardView: React.FC<{
   onOption?: (option: ChoiceOption) => void;
   onFormSubmit?: (card: FormCard, values: Record<string, unknown>) => void;
   busy?: boolean;
-}> = ({ card, onExecute, onConfirmChoose, onOption, onFormSubmit, busy }) => {
+  /** 已执行完成（preview/form 卡：按钮替换为完成标记，防重复提交） */
+  completed?: boolean;
+  /** browse 卡：已成功执行操作的列表项 id 集合 */
+  completedItems?: ReadonlySet<string>;
+  /** 写作进度卡运行中取消（仅 kind=progress 使用） */
+  onCancelProgress?: () => void;
+}> = ({ card, onExecute, onConfirmChoose, onOption, onFormSubmit, busy, completed, completedItems, onCancelProgress }) => {
   const inner = (() => {
     switch (card.kind) {
-      case "preview": return <PreviewCardView card={card} onExecute={onExecute ? () => onExecute(card) : undefined} busy={busy} />;
-      case "confirm": return <ConfirmCardView card={card} onChoose={onConfirmChoose} busy={busy} />;
+      case "preview": return <PreviewCardView card={card} onExecute={onExecute ? () => onExecute(card) : undefined} busy={busy} completed={completed} />;
+      case "confirm": return <ConfirmCardView card={card} onChoose={onConfirmChoose} busy={busy} completed={completed} />;
       case "result": return <ResultCardView card={card} />;
-      case "browse": return <BrowseCardView card={card} onAction={onExecute ? (action) => onExecute(card, action) : undefined} busy={busy} />;
+      case "browse": return <BrowseCardView card={card} onAction={onExecute ? (action) => onExecute(card, action) : undefined} busy={busy} completedItems={completedItems} />;
       case "plan":
       case "opinion": return <ChoiceCardView card={card} onOption={onOption} busy={busy} />;
-      case "form": return <FormCardView card={card} onSubmit={onFormSubmit} busy={busy} />;
+      case "form": return <FormCardView card={card} onSubmit={onFormSubmit} busy={busy} completed={completed} />;
+      case "progress": return <ProgressCardView card={card} onCancel={onCancelProgress} />;
     }
   })();
   const image = (card as { image?: CardImage }).image;

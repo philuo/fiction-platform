@@ -125,6 +125,36 @@ async function readSSE(body: ReadableStream<Uint8Array> | null): Promise<Record<
 }
 
 describe("中枢聊天 e2e：会话生命周期", () => {
+  test("卡片操作完成标记持久化：POST /completed → detail 返回 completed（刷新恢复完成态）", async () => {
+    cookieA = await register("e2e_user_" + Math.random().toString(36).slice(2, 8));
+    const sid = "e2e-completed-" + Math.random().toString(36).slice(2, 8);
+    const create = await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "看看提案" }, cookieA);
+    expect(create.status).toBe(201);
+
+    // 标记卡级完成（preview/form/confirm）与项级完成（browse 列表项）
+    const mark1 = await api("/api/brain/sessions/completed", "POST", { title: "e2e-book", id: sid, key: "m1:0" }, cookieA);
+    expect(mark1.status).toBe(200);
+    expect(((await mark1.json()) as { ok: boolean }).ok).toBe(true);
+    const mark2 = await api("/api/brain/sessions/completed", "POST", { title: "e2e-book", id: sid, key: "m1:1:cp1" }, cookieA);
+    expect(((await mark2.json()) as { ok: boolean }).ok).toBe(true);
+
+    // detail 返回 completed（刷新后前端据此恢复完成态）
+    const detail = await api("/api/brain/sessions/detail", "POST", { title: "e2e-book", id: sid }, cookieA);
+    const d = (await detail.json()) as { session: { completed?: string[] } };
+    expect(d.session.completed).toContain("m1:0");
+    expect(d.session.completed).toContain("m1:1:cp1");
+
+    // 幂等：重复标记不重复存储
+    await api("/api/brain/sessions/completed", "POST", { title: "e2e-book", id: sid, key: "m1:0" }, cookieA);
+    const detail2 = await api("/api/brain/sessions/detail", "POST", { title: "e2e-book", id: sid }, cookieA);
+    const d2 = (await detail2.json()) as { session: { completed?: string[] } };
+    expect(d2.session.completed!.filter((k) => k === "m1:0").length).toBe(1);
+
+    // 缺 key → 400
+    const bad = await api("/api/brain/sessions/completed", "POST", { title: "e2e-book", id: sid }, cookieA);
+    expect(bad.status).toBe(400);
+  });
+
   test("创建 → chat SSE(intent→delta→done) → 列表 → detail → truncate → delete 全链路", async () => {
     cookieA = await register("e2e_user_" + Math.random().toString(36).slice(2, 8));
     const sid = "e2e-session-1";

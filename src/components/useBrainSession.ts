@@ -46,6 +46,8 @@ export type BrainSessionDetail = {
     at: number;
   }[];
   streaming: boolean;
+  /** 已执行的卡片操作 key（`消息id:卡片下标[:列表项id]`）：刷新后恢复完成态（防重复提交） */
+  completed?: string[];
 };
 
 type SSEEvents = {
@@ -56,7 +58,8 @@ type SSEEvents = {
   onInterrupted?: (messageId: string) => void;
   /** text：服务端重放已生成文本（attach 恢复时携带，前端保留而非清空，避免已回复内容闪没） */
   onReset?: (messageId: string, text?: string) => void;
-  onError?: (msg: string) => void;
+  /** messageId：服务端 error 事件携带时精确落到对应消息；缺省回退会话最后一条消息 */
+  onError?: (msg: string, messageId?: string) => void;
 };
 
 /** 会话内消息 → 展示消息（assistant → brain） */
@@ -78,12 +81,16 @@ export function useBrainSession(title: string) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [streaming, setStreaming] = useState(false); // active 会话是否在生成
   const [thinking, setThinking] = useState(false);   // intent 阶段 loading
+  const [reconnecting, setReconnecting] = useState(false); // SSE 断线自动重连中（UI 显示重连徽章）
   const cacheRef = useRef<Map<string, ChatMessage[]>>(new Map());
   // 各会话独立 AbortController：切换 tab 不打断（仅「停止」/卸载/删除 abort）
   const abortRef = useRef<Map<string, AbortController>>(new Map());
   const loadedTitleRef = useRef("");
   // 最新 activeId 镜像：async 流程（newSession→send 首次对话）中旧渲染闭包也能读到当前值
   const activeIdRef = useRef("");
+  /** 各会话已执行的卡片操作 key（`消息id:卡片下标[:列表项id]`）——服务端持久化，刷新后恢复完成态 */
+  const completedRef = useRef<Map<string, Set<string>>>(new Map());
+  const [completed, setCompleted] = useState<ReadonlySet<string>>(new Set());
 
   /** 设置当前会话：同步 state + ref（ref 供陈旧闭包内的「是否当前」判断） */
   function setActive(id: string) {
@@ -162,6 +169,7 @@ export function useBrainSession(title: string) {
     abortRef.current.set(sessionId, ctrl);
     patchStreaming(sessionId, true);
     setThinkingFor(sessionId, true);
+    if (sessionId === activeIdRef.current) setReconnecting(false); // 新回合起步清重连态
 
     if (!resume) {
       const userMsg: ChatMessage = { id: crypto.randomUUID(), role: "user", text: prompt, at: new Date().toISOString() };
@@ -195,17 +203,27 @@ export function useBrainSession(title: string) {
         setThinkingFor(sessionId, false);
         patchMsg(sessionId, alignMsgId(sessionId, messageId), { text: text ?? "", cards: [], interrupted: false, pending: true });
       },
-      onError: (msg) => {
+      // error 优先按服务端 messageId 精确定位（并发/attach 多连接场景不错标到别的消息）；缺省回退最后一条
+      onError: (msg, messageId) => {
+        if (messageId) {
+          patchMsg(sessionId, alignMsgId(sessionId, messageId), { text: `（${msg}）`, pending: false, interrupted: true });
+          return;
+        }
         const last = lastMsgOf(sessionId);
         if (last) patchMsg(sessionId, last.id, { text: `（${msg}）`, pending: false, interrupted: true });
       },
     };
 
-    try {
+    /** 单次连接：POST /api/brain/chat 并读完整条 SSE 流；正常读到 EOF 返回 true */
+    const connectOnce = async (attempt: number): Promise<{ events: number }> => {
+      // attempt>0 为断线重连：attach-only（只挂已运行任务，任务结束则快速 EOF），绝不发起新回合（防重复生成）
+      const isRetry = attempt > 0;
+      if (isRetry && sessionId === activeIdRef.current) setReconnecting(true);
+      let eventCount = 0; // 收到的事件数：attach 若 0 事件即 EOF = 服务端无运行中任务
       const res = await apiFetch("/api/brain/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, prompt, sessionId, resume: resume ?? false, ctx: opts.ctx }),
+        body: JSON.stringify({ title, prompt, sessionId, resume: resume ?? false, attach: isRetry, ctx: opts.ctx }),
         signal: ctrl.signal,
       });
       if (!res.ok || !res.body) throw new Error("对话失败");
@@ -229,7 +247,9 @@ export function useBrainSession(title: string) {
             lastEventAt = Date.now(); // ping 等任意事件均视为连接存活
             let obj: { type?: string; messageId?: string; text?: string; card?: BrainCard; error?: string };
             try { obj = JSON.parse(line.slice(6)); } catch { continue; }
-            if (obj.error) { events.onError?.(obj.error); continue; }
+            eventCount++;
+            if (obj.error) { events.onError?.(obj.error, obj.messageId); continue; }
+            if (sessionId === activeIdRef.current) setReconnecting(false); // 收到任意事件 = 连接恢复
             switch (obj.type) {
               case "intent": events.onIntent?.(); break;
               case "delta": if (obj.messageId && obj.text != null) events.onDelta?.(obj.messageId, obj.text); break;
@@ -241,20 +261,52 @@ export function useBrainSession(title: string) {
             }
           }
         }
+        return { events: eventCount };
       } finally {
         clearInterval(idleTimer);
         reader.cancel().catch(() => {});
       }
-    } catch (e) {
-      const last = lastMsgOf(sessionId);
-      if (last) {
-        if ((e as Error).name === "AbortError") patchMsg(sessionId, last.id, { pending: false, interrupted: true });
-        else patchMsg(sessionId, last.id, { text: `（${(e as Error).message}）`, pending: false, interrupted: true });
+    };
+
+    // 断线自动重连（网络瞬时抖动）：非用户中断的错误 → 以 attach 模式重试（最多 MAX_ATTACH_RETRY 次，间隔递增）。
+    // 服务端任务不因连接断开而终止，重连即续收剩余 delta；任务已结束则 attach 快速 EOF → finally 查 detail 兜底同步
+    const MAX_ATTACH_RETRY = 2;
+    try {
+      let attempt = 0;
+      for (;;) {
+        try {
+          const r = await connectOnce(attempt);
+          // attach 连接成功但服务端无运行中任务（0 事件即 EOF）且最后消息仍 pending：
+          // 首连很可能在请求到达服务端前就失败、任务从未创建 → 明确回显错误，避免永久 loading
+          if (attempt > 0 && r.events === 0) {
+            const last = lastMsgOf(sessionId);
+            if (last && last.pending) patchMsg(sessionId, last.id, { text: "（连接中断，未完成恢复，请重试）", pending: false, interrupted: true });
+          }
+          break; // 正常读完（含 attach EOF）：交给 finally 兜底核对最终状态
+        } catch (e) {
+          const aborted = ctrl.signal.aborted || (e as Error).name === "AbortError";
+          if (aborted) {
+            // 用户停止 / 空闲超时：标记中断（保留已生成文本）
+            const last = lastMsgOf(sessionId);
+            if (last) patchMsg(sessionId, last.id, { pending: false, interrupted: true });
+            break;
+          }
+          if (attempt >= MAX_ATTACH_RETRY) {
+            // 重试耗尽：保留已生成文本并标记中断，回显错误
+            const last = lastMsgOf(sessionId);
+            if (last) patchMsg(sessionId, last.id, { text: `（${(e as Error).message}）`, pending: false, interrupted: true });
+            break;
+          }
+          attempt++;
+          if (ctrl.signal.aborted) break; // 等待退避期间用户停止：立即退出
+          await new Promise<void>((r) => setTimeout(r, 800 * attempt)); // 1s、2s 递增退避
+        }
       }
     } finally {
       abortRef.current.delete(sessionId);
       patchStreaming(sessionId, false);
       setThinkingFor(sessionId, false);
+      if (sessionId === activeIdRef.current) setReconnecting(false);
       // 兜底：流已结束但本地缓存仍 pending（done 事件在连接收尾期丢失/未送达）
       // → 查服务端最终状态并同步，避免"AI 已回复但一直 loading，需刷新才可见"（需求 3）
       const last = lastMsgOf(sessionId);
@@ -287,6 +339,7 @@ export function useBrainSession(title: string) {
     setActive(id);
     setMessages(cacheRef.current.get(id) ?? []);
     setStreaming(abortRef.current.has(id));
+    setCompleted(completedRef.current.get(id) ?? new Set()); // 本会话已有完成记录：立即恢复
     if (cacheRef.current.has(id)) return; // 已有缓存：即时展示，不重复拉取/续流
     try {
       const res = await apiFetch("/api/brain/sessions/detail", {
@@ -299,6 +352,9 @@ export function useBrainSession(title: string) {
       if (!data.session) return;
       const msgs = data.session.messages.map(toDisplayMsg);
       cacheRef.current.set(id, msgs);
+      // 刷新恢复：completed 来自服务端持久化（卡片操作完成态跨刷新保持）
+      completedRef.current.set(id, new Set(data.session.completed ?? []));
+      setCompleted(completedRef.current.get(id) ?? new Set());
       setMessages(msgs);
       const running = data.session.streaming || abortRef.current.has(id);
       setStreaming(running);
@@ -324,6 +380,7 @@ export function useBrainSession(title: string) {
       setMessages([]);
       setStreaming(false);
       setThinking(false);
+      setCompleted(new Set());
       return "";
     }
     const id = crypto.randomUUID();
@@ -345,6 +402,7 @@ export function useBrainSession(title: string) {
     abortRef.current.get(id)?.abort();
     abortRef.current.delete(id);
     cacheRef.current.delete(id);
+    completedRef.current.delete(id);
     try {
       await apiFetch("/api/brain/sessions/delete", {
         method: "POST",
@@ -357,6 +415,7 @@ export function useBrainSession(title: string) {
       setActive("");
       setMessages([]);
       setStreaming(false);
+      setCompleted(new Set());
     }
   }, [title, refreshList]);
 
@@ -390,6 +449,26 @@ export function useBrainSession(title: string) {
     cacheRef.current.set(id, arr);
     if (id === activeIdRef.current) setMessages([...arr]);
   }, []);
+
+  /** 标记当前会话某卡片操作已完成（key：`消息id:卡片下标[:列表项id]`）。
+   *  本地乐观更新（按钮即时反馈）+ 服务端持久化（刷新后恢复完成态）；POST 失败静默——仅影响刷新恢复，不阻塞操作。 */
+  const markCompleted = useCallback(async (key: string) => {
+    const sid = activeIdRef.current;
+    if (!sid || !key) return;
+    const cur = completedRef.current.get(sid) ?? new Set<string>();
+    if (cur.has(key)) return; // 幂等：重复标记不重复发请求
+    const next = new Set(cur);
+    next.add(key);
+    completedRef.current.set(sid, next);
+    setCompleted(next);
+    try {
+      await apiFetch("/api/brain/sessions/completed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, id: sid, key }),
+      });
+    } catch { /* 静默：下次标记/打开会话时从服务端补齐 */ }
+  }, [title]);
 
   /** 停止 active 会话生成 */
   const stop = useCallback(() => {
@@ -427,6 +506,9 @@ export function useBrainSession(title: string) {
     send,
     stop,
     refreshList,
+    reconnecting,
+    completed,
+    markCompleted,
     isStreaming: (id: string) => abortRef.current.has(id),
   };
 }

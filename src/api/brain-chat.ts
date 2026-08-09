@@ -567,14 +567,33 @@ async function buildChoiceOptions(w: WorldState, prompt: string, kind: "plan" | 
   }
 }
 
-/**
- * 表单卡构建：edit_world（角色/设定）、foreshadow_edit（伏笔增删改）走结构化表单，
+/** 从最近对话历史中提取角色名（用户刚提到过的角色，最长名优先），供表单参数预填（需求：信息可从对话收集） */
+export function extractNameFromHistory(w: WorldState, userHist?: string[]): string {
+  if (!userHist?.length) return "";
+  const names = w.characters
+    .map((c) => c.name)
+    .filter((n): n is string => !!n && n.length >= 2)
+    .sort((a, b) => b.length - a.length);
+  for (let i = userHist.length - 1; i >= 0; i--) {
+    const text = userHist[i] ?? "";
+    for (const n of names) {
+      if (text.includes(n)) return n;
+    }
+  }
+  return "";
+}
+
+/** 表单卡构建：edit_world（角色/设定）、foreshadow_edit（伏笔增删改）走结构化表单，
  * 前端填写 → 提交 → 结果回执（L2/L3 端点返回 needIntervention 时自动衔接确认卡）。
- */
-export function buildFormCard(w: WorldState, intent: string, params: Record<string, unknown>, summary?: string): FormCardData | null {
+ * opts.userHist：最近用户对话原文（表单参数可从对话历史收集预填，如角色名）；
+ * opts.prompt：本次用户输入（用于判断是否该主动询问补充信息）。 */
+export function buildFormCard(w: WorldState, intent: string, params: Record<string, unknown>, summary?: string, opts?: { userHist?: string[]; prompt?: string }): FormCardData | null {
   if (intent === "edit_world") {
     // 角色编辑：params.name 定位角色 → 结构化字段（只读标识 + 可编辑字段）
-    const name = String(params.name ?? "").trim();
+    // 缺名时先从最近对话历史收集（用户刚提过哪个角色，需求：信息可从对话收集）
+    let name = String(params.name ?? "").trim();
+    const fromHistory = !name ? extractNameFromHistory(w, opts?.userHist) : "";
+    if (!name && fromHistory) name = fromHistory;
     if (name) {
       const c = w.characters.find((x) => x.name === name || name.includes(x.name));
       if (!c) {
@@ -595,14 +614,18 @@ export function buildFormCard(w: WorldState, intent: string, params: Record<stri
       ];
       return {
         kind: "form", title: `编辑角色「${c.name}」`, commandId: "CMD-W12", level: "L2",
-        summary: summary || `修改「${c.name}」的信息，提交后写入世界（L2 回溯变更，影响已写章节时将请求确认）`,
+        summary: summary || (fromHistory
+          ? `已从对话中识别出角色「${c.name}」，可直接修改下方信息。`
+          : `修改「${c.name}」的信息，提交后写入世界（L2 回溯变更，影响已写章节时将请求确认）`),
         fields,
         action: { endpoint: "/api/novel/world", method: "POST", body: { characters: [{ id: c.id }] } },
         submitLabel: "保存角色",
         confirmRequired: true,
       };
     }
-    // 设定/全局编辑（无 name 参数 → 设定表单）
+    // 用户明确要编辑角色但说不清是谁 → 返回 null，由中枢主动询问补充（而非误弹设定表单）
+    if (/角色/.test(opts?.prompt ?? "")) return null;
+    // 设定/全局编辑（无角色语境 → 设定表单）
     return {
       kind: "form", title: "编辑设定与全局信息", commandId: "CMD-W12", level: "L0",
       summary: summary || "修改故事设定/梗概/当前状态（L0 前瞻，不回溯已写章节）",
@@ -960,7 +983,7 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
         send({ type: "card", messageId, card });
       } catch (e) {
         markMessageDone(title, sessionId, messageId, []);
-        send({ error: `抽卡失败：${(e as Error).message}` });
+        send({ error: `抽卡失败：${(e as Error).message}`, messageId });
       }
       send({ type: "done", messageId });
       return;
@@ -988,14 +1011,18 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
         updateMessageText(title, sessionId, messageId, text, true);
         send({ type: "delta", messageId, text });
       }
-      const card = buildFormCard(w, intent, params, reply);
+      // 从对话历史收集表单参数：最近用户消息原文（供 buildFormCard 预填角色名等，需求：信息可从对话收集）
+      const userHist = (session?.messages ?? []).filter((m) => m.role === "user").slice(-5).map((m) => m.text ?? "");
+      const card = buildFormCard(w, intent, params, reply, { userHist, prompt: activePrompt });
       if (card) {
         markMessageDone(title, sessionId, messageId, [card]);
         send({ type: "card", messageId, card });
       } else {
-        markMessageDone(title, sessionId, messageId, []);
+        // 信息不足：中枢主动询问补充（自然对话流，不弹误导表单）
+        await streamChatReply({ ...ctx, prompt: `用户想要「${meta.title}」，但缺少必要信息（如具体要编辑哪个角色、哪条伏笔）。请用一到两句自然的中文，询问用户需要补充的具体信息。不要执行任何操作。` }, messageId);
+        markMessageDone(title, sessionId, messageId);
       }
-      send({ type: "done", messageId });
+      send({ type: "done", messageId }); // card 分支与询问分支共用一次 done
       return;
     }
 
@@ -1057,10 +1084,10 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
       send({ type: "interrupted", messageId });
       return;
     }
-    // 其他错误：保留已生成文本并标记中断，同时回显错误
+    // 其他错误：保留已生成文本并标记中断，同时回显错误（带 messageId，前端精确落到对应消息）
     console.error("[brain-chat] 回合失败:", e);
     markMessageInterrupted(title, sessionId, messageId);
-    send({ error: e instanceof Error ? e.message : "内部错误，请稍后重试" });
+    send({ error: e instanceof Error ? e.message : "内部错误，请稍后重试", messageId });
     send({ type: "interrupted", messageId });
   }
 }

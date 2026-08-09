@@ -41,6 +41,8 @@ export type BrainSession = {
   messages: BrainChatMsg[];
   /** 当前是否有进行中的生成回合（供前端渲染运行中波纹） */
   streaming: boolean;
+  /** 已执行的卡片操作 key（`消息id:卡片下标[:列表项id]`）：服务端持久化，刷新后随详情返回，前端恢复完成态 */
+  completed?: string[];
 };
 
 /** 单会话消息条数上限（防文件膨胀；超出丢最旧） */
@@ -179,6 +181,19 @@ export function updateMessageText(title: string, sessionId: string, messageId: s
     },
     persist,
   );
+}
+
+/** 记录会话内已执行的卡片操作 key（幂等去重 + 落盘）；刷新后随详情返回，前端恢复完成态 */
+export function markSessionCompleted(title: string, sessionId: string, key: string): boolean {
+  let hit = false;
+  mutateSession(title, sessionId, (s) => {
+    const arr = s.completed ?? (s.completed = []);
+    if (!arr.includes(key)) {
+      arr.push(key);
+      hit = true;
+    }
+  });
+  return hit;
 }
 
 /** 回合完成：清 pending，附卡片，streaming=false，落盘 */

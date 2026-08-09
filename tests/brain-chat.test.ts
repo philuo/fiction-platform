@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { emptyWorld, type WorldState } from "../src/api/world";
 import type { Card as WorldCard } from "../src/api/world";
-import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt } from "../src/api/brain-chat";
+import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, extractNameFromHistory } from "../src/api/brain-chat";
 import { getSession as sessGet, lastPendingMessage as sessLastPending } from "../src/api/brain-sessions";
 import type { ChatMessage } from "../src/api/agnes";
 
@@ -413,6 +413,30 @@ describe("buildFormCard（表单卡构建）", () => {
     const fields = card!.fields as { key: string; array?: boolean }[];
     expect(fields.find((f) => f.key === "setting.rules")?.array).toBe(true);
     expect(fields.map((f) => f.key)).toContain("setting.time");
+  });
+
+  test("edit_world 无 name 但对话历史提到角色 → 从历史收集角色名并预填（信息可从对话收集）", () => {
+    const w = mkWorld();
+    const card = buildFormCard(w, "edit_world", {}, "编辑角色", { userHist: ["昨天写的林墨不太对", "帮他改改"], prompt: "帮我改一下林墨" });
+    expect(card?.kind).toBe("form");
+    expect(card?.level).toBe("L2");
+    expect(String(card!.title)).toContain("林墨");
+    expect((card!.action.body.characters as { id: string }[])[0].id).toBe("c1");
+  });
+
+  test("edit_world 无 name 且 prompt 含「角色」→ 返回 null（中枢主动询问补充信息，而非误弹设定表单）", () => {
+    const w = mkWorld();
+    const card = buildFormCard(w, "edit_world", {}, "编辑角色", { prompt: "帮我把那个角色改一下" });
+    expect(card).toBeNull();
+  });
+
+  test("extractNameFromHistory：最近消息优先、最长名优先、无命中/空历史返回空串", () => {
+    const w = mkWorld();
+    w.characters.push({ id: "c2", name: "沈夜", role: "反派", traits: [], motivation: "", status: "", introducedAt: 1 });
+    expect(extractNameFromHistory(w, ["他叫林墨", "把沈夜的动机改掉"])).toBe("沈夜"); // 最近消息优先
+    expect(extractNameFromHistory(w, ["完全没提角色的对话"])).toBe("");
+    expect(extractNameFromHistory(w, undefined)).toBe("");
+    expect(extractNameFromHistory(w, [])).toBe("");
   });
 
   test("foreshadow_edit add → 新增表单（required text + plantedAt）", () => {
