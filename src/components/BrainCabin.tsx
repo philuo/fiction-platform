@@ -7,13 +7,13 @@
 import { useEffect, useRef, useState } from "react";
 import { BrainCore } from "./BrainCore";
 import { History, Plus, Send, Square, X } from "./icons";
-import { BrainCardView, type BrainCard, type PreviewCard, type ChoiceOption, type FormCard, type FormField } from "./brain-cards";
+import { BrainCardView, type BrainCard, type PreviewCard, type ChoiceOption, type FormCard, type FormField, type AskCard } from "./brain-cards";
 import { MarkdownView } from "./MarkdownView";
 import { useBrainSession, type ChatMessage } from "./useBrainSession";
 import { apiFetch } from "../api/client";
 import {
   PRESENCE_LABEL, ACTIVITY_LABEL, GOVERNANCE_LABEL,
-  type BrainState,
+  type BrainState, type Presence, type Activity,
 } from "../api/brain-state";
 import type { WorldState } from "../api/world";
 
@@ -62,6 +62,24 @@ async function fetchAction(endpoint: string, method: string, body: Record<string
   }
   const data = await res.json().catch(() => ({})) as Record<string, unknown>;
   return { success: !data.error, detail: data.error ? String(data.error) : "执行成功" };
+}
+
+// —— Phase 3：中枢本地偏好（localStorage，纯用户体验增强；服务端始终权威） ——
+const CABIN_PREFS_KEY = "fp_cabin_prefs";
+type CabinPrefs = { mediaCount?: number; inputHeight?: number };
+
+function readCabinPrefs(): CabinPrefs {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(CABIN_PREFS_KEY);
+    return raw ? (JSON.parse(raw) as CabinPrefs) : {};
+  } catch { return {}; }
+}
+function writeCabinPrefs(patch: CabinPrefs) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(CABIN_PREFS_KEY, JSON.stringify({ ...readCabinPrefs(), ...patch }));
+  } catch { /* 配额满/隐私模式：静默 */ }
 }
 
 /** 生成中 loading 骨架（intent 阶段/等待首块） */
@@ -151,9 +169,37 @@ export function findProposalCardMessageId(messages: ChatMessage[]): string | und
   return messages.find((m) =>
     (m.cards ?? []).some((c) =>
       (c.kind === "browse" && c.browseType === "proposal") || // 提案浏览卡（read_proposals 查询）
-      (c.kind === "result" && c.title === "新角色提案"), // 「打开新角色提案」已打开 result 卡（open_proposals 意图）
+      (c.kind === "result" && c.title === "新角色提案"), // 「打开新角色提案」已打开 result 卡（open_proposals 意图，兼容旧协议）
     ),
   )?.id;
+}
+
+/** 追问选择面板恢复：返回最后一条含未答 ask 卡的中枢消息（ask 卡不渲染进聊天流，显示在输入框上方；
+ *  刷新后从消息历史恢复未选择的面板；已选择（answeredIds）不再恢复） */
+export function findPendingAskCard(messages: ChatMessage[], answeredIds?: ReadonlySet<string>): { msgId: string; ask: AskCard } | null {
+  if (!messages.length) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== "brain") continue;
+    const ask = (m.cards ?? []).find((c) => c.kind === "ask") as AskCard | undefined;
+    if (ask && !(answeredIds?.has(m.id))) return { msgId: m.id, ask };
+  }
+  return null;
+}
+
+/** 打开面板卡（open_* 意图 result 卡带 open 字段，显式协议）：返回面板目标与定位参数 */
+export function findOpenPanelCard(messages: ChatMessage[]): { messageId: string; target: string; opts?: Record<string, unknown> } | null {
+  for (const m of messages) {
+    const card = (m.cards ?? []).find((c) => {
+      const o = (c as { open?: { target?: unknown } }).open;
+      return !!o && typeof o.target === "string";
+    });
+    if (card) {
+      const open = (card as { open: { target: string; opts?: Record<string, unknown> } }).open;
+      return { messageId: m.id, target: open.target, opts: open.opts };
+    }
+  }
+  return null;
 }
 
 /** 任务/指令类卡片 kind：含这类卡的消息支持折叠（预览/确认/表单/计划/意见/进度/结果） */
@@ -173,7 +219,26 @@ export function msgCollapseSummary(msg: ChatMessage): string {
     if (typeof t === "string" && t.trim()) return t.trim();
     return card.kind;
   }
-  return (msg.text ?? "").replace(/\s+/g, " ").trim().slice(0, 40) || "任务消息";
+  return longTextSummary(msg.text ?? "", 40) || "任务消息";
+}
+
+/** 长文本折叠阈值（字符）：中枢纯文本回复超过该长度默认折叠为摘要行 */
+export const FOLD_TEXT_THRESHOLD = 320;
+
+/** 纯文本长回复是否折叠：中枢消息、无卡片、文本超阈值、且非生成中/中断 */
+export function shouldFoldLongText(msg: ChatMessage, threshold = FOLD_TEXT_THRESHOLD): boolean {
+  return msg.role === "brain"
+    && !msg.pending
+    && !msg.interrupted
+    && (msg.cards ?? []).length === 0
+    && (msg.text ?? "").length > threshold;
+}
+
+/** 长文本摘要：首 max 字 + 省略号 + （总字数） */
+export function longTextSummary(text: string, max = 60): string {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (!t) return "";
+  return t.length > max ? t.slice(0, max) + "…" : t;
 }
 
 /** 空态快捷提问（点击即发送，降低首次使用门槛） */
@@ -225,17 +290,25 @@ export const BrainCabin: React.FC<{
   onWorldUpdate?: () => void;
   /** 用户与中枢沟通「新角色提案」相关话题（返回提案浏览卡）→ 通知 Home 恢复底部提案区显示 */
   onProposalTalk?: () => void;
-  /** 左侧栏当前选中章节（未指定章的操作（如生成插画）默认用此章；null=未选中） */
-  currentChapter?: { index: number } | null;
-}> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk, currentChapter }) => {
+  /** 中枢打开系统面板/弹窗（open_* 意图 result 卡带 open 字段）：target 为面板键，opts 为定位参数（如 settings tab / 角色 id） */
+  onOpenPanel?: (target: string, opts?: Record<string, unknown>) => void;
+  /** 左侧栏当前选中章节详情（未指定章的操作（如生成插画）默认用此章；供中枢感知选中章上下文） */
+  currentChapter?: {
+    index: number;
+    title?: string;
+    /** 审查状态（pass/revise/…，null=未审查） */
+    status?: string | null;
+    words?: number;
+    versionCount?: number;
+  } | null;
+  /** 自动连载是否运行中（服务端定时任务；中枢感知系统时机，冲突时拒绝写操作） */
+  autoRunning?: boolean;
+}> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk, onOpenPanel, currentChapter, autoRunning }) => {
   const {
     sessions, activeId, messages, streaming, thinking, reconnecting,
     openSession, newSession, removeSession, truncate, appendMsg, send, stop, isStreaming,
     completed, markCompleted,
   } = useBrainSession(world.title);
-
-  /** 前端上下文：当前选中章（供服务端意图识别参数提取兜底，需求 1/2） */
-  const chatCtx = { chapterIndex: currentChapter?.index ?? null };
 
   const [input, setInput] = useState("");
   const [executing, setExecuting] = useState(false);
@@ -246,9 +319,36 @@ export const BrainCabin: React.FC<{
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   /** 已执行完成的卡片 key（`消息id:卡片下标[:列表项id]`）：useBrainSession 管理，服务端持久化（刷新后恢复） */
   // completed / markCompleted 来自 useBrainSession
-  /** 媒体生成输入条：所选章节 / 张数（默认取 form 卡默认值：当前选中章 / 1 张） */
+  /** 媒体生成输入条：所选章节 / 张数（默认当前选中章 / 1 张；张数偏好持久化到 localStorage） */
   const [mediaChapter, setMediaChapter] = useState<string>("");
-  const [mediaCount, setMediaCount] = useState<number>(1);
+  const [mediaCount, setMediaCount] = useState<number>(() => {
+    const p = readCabinPrefs().mediaCount;
+    return p && Number.isInteger(p) ? Math.min(4, Math.max(1, p)) : 1;
+  });
+  /** 服务端系统状态快照（/api/brain/context 按需拉取）：自动连载/写作任务/媒体生成/视觉任务/待办——中枢全知的服务端权威部分 */
+  const [serverCtx, setServerCtx] = useState<{
+    autoRunning?: boolean; autoPhase?: string; pendingCommit?: { index: number | null; title: string } | null;
+    advanceTaskRunning?: boolean; advancePhase?: string; mediaGenerating?: boolean; visualRunning?: boolean;
+    pendingProposals?: number; pendingCards?: number; openDebt?: number; reviseChapters?: number[];
+  }>({});
+  // 打开面板时拉取服务端状态快照（索引式全知：按需，不每轮注入 LLM）
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await apiFetch("/api/brain/context", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: world.title }),
+        });
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as { context?: typeof serverCtx };
+        if (!cancelled && data.context) setServerCtx(data.context);
+      } catch { /* 静默：快照拉取失败不阻塞聊天 */ }
+    })();
+    return () => { cancelled = true; };
+  }, [open, world.title]);
   /** 已手动展开的任务/指令类消息（默认折叠为摘要行，点击展开） */
   const [expandedMsgs, setExpandedMsgs] = useState<Set<string>>(new Set());
   /** 聊天内写作进度（推进剧情/连载）：流式显示阶段与正文，结束后追加结果卡 */
@@ -257,6 +357,14 @@ export const BrainCabin: React.FC<{
   const writingTimerRef = useRef<number | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // 挂载后恢复上次拖拽的输入区高度（localStorage 偏好；CSS min/max 已钳制）
+  useEffect(() => {
+    const h = readCabinPrefs().inputHeight;
+    if (h && inputRef.current) {
+      const MIN = 48, MAX = 176;
+      inputRef.current.style.height = `${Math.min(MAX, Math.max(MIN, h))}px`;
+    }
+  }, []);
   /** 是否停留在消息流底部（用户上翻查看历史时不强制拉回） */
   const stickBottomRef = useRef(true);
   const delTimerRef = useRef<number | null>(null);
@@ -288,17 +396,29 @@ export const BrainCabin: React.FC<{
     delTimerRef.current = window.setTimeout(() => setPendingDelete(null), 3000);
   }
 
-  // 用户与中枢聊「新角色提案」话题（返回提案浏览卡）→ 通知 Home 恢复底部提案区显示；
-  // 同一消息只通知一次（历史会话加载旧提案卡也视为浏览过提案，可接受）
-  const proposalNotifiedRef = useRef<string>("");
+  // 打开面板卡（open_* 显式协议）→ onOpenPanel 统一分发触发对应弹窗；
+  // 用户与中枢聊「新角色提案」话题（返回提案浏览卡）→ 通知 Home 恢复底部提案区显示（无 onOpenPanel 时兼容旧回调）；
+  // 同一消息只通知一次（历史会话加载旧卡片也视为已浏览，可接受）
+  const panelNotifiedRef = useRef<string>("");
   useEffect(() => {
-    if (!onProposalTalk) return;
-    const id = findProposalCardMessageId(messages);
-    if (id && id !== proposalNotifiedRef.current) {
-      proposalNotifiedRef.current = id;
-      onProposalTalk();
+    if (!onOpenPanel && !onProposalTalk) return;
+    const open = findOpenPanelCard(messages);
+    const key = open ? `${open.messageId}:${open.target}` : "";
+    if (open && key && key !== panelNotifiedRef.current) {
+      panelNotifiedRef.current = key;
+      if (onOpenPanel) onOpenPanel(open.target, open.opts);
+      else if (open.target === "proposals" && onProposalTalk) onProposalTalk();
+      return;
     }
-  }, [messages, onProposalTalk]);
+    // 兼容旧协议：open_proposals 老卡（无 open 字段，仅 title 约定）
+    if (!open && onProposalTalk) {
+      const id = findProposalCardMessageId(messages);
+      if (id && id !== panelNotifiedRef.current) {
+        panelNotifiedRef.current = id;
+        onProposalTalk();
+      }
+    }
+  }, [messages, onOpenPanel, onProposalTalk]);
 
   // 智能滚动：仅当用户停留在底部时才跟随新内容（上翻查看历史不被打断）；发送/切换会话强制回到底部
   const stickToBottom = () => {
@@ -328,8 +448,15 @@ export const BrainCabin: React.FC<{
 
   if (!open) return null;
 
-  const presence = brainState?.presence ?? "standby";
-  const activity = brainState?.activity ?? "idle";
+  // presence/activity：服务端轮询有延迟，前端在生成/思考/写作/重连时即时覆盖（与运行状态同步，避免「正在生成却显示待命」）
+  const liveActivity: Activity = streaming || thinking || writing?.status === "running"
+    ? "directing"
+    : (brainState?.activity ?? "idle");
+  const livePresence: Presence = reconnecting ? "alert"
+    : (streaming || thinking || writing?.status === "running") ? "focused"
+    : (brainState?.presence ?? "standby");
+  const presence = livePresence;
+  const activity = liveActivity;
   const governance = brainState?.governance ?? "passthrough";
 
   // —— 输入框上方上下文操作区：当前会话话题 + 未决交互（二次确认/意见征询/待执行）+ 连载进度 ——
@@ -359,6 +486,19 @@ export const BrainCabin: React.FC<{
     }
   }, [mediaCtxCard?.title, mediaCtxCard?.fields?.[0]?.value, mediaCtxCard?.fields?.[1]?.value]);
   const ctxBusy = streaming || executing;
+  /** 追问选择面板：最后一条含 ask 卡（未选择）的中枢消息 → 输入框上方询问；选择后作为新输入继续（sessionStorage 持久化已答，刷新恢复未答） */
+  const [askAnswered, setAskAnswered] = useState<Set<string>>(() => {
+    try { return new Set(JSON.parse(sessionStorage.getItem(`brain-ask-answered-${activeId ?? ""}`) ?? "[]")); } catch { return new Set(); }
+  });
+  const pendingAsk = findPendingAskCard(messages, askAnswered);
+  /** 选择 ask 选项：记入已答（sessionStorage，刷新不恢复）并以选项文本继续对话 */
+  function answerAsk(label: string, msgId: string) {
+    const next = new Set(askAnswered);
+    next.add(msgId);
+    setAskAnswered(next);
+    try { sessionStorage.setItem(`brain-ask-answered-${activeId ?? ""}`, JSON.stringify([...next])); } catch { /* 隐私模式等忽略 */ }
+    void doSend(label);
+  }
   const runningStatus = (() => {
     if (reconnecting) return "连接已断开，正在重连…";
     if (streaming) return "中枢正在生成回复…";
@@ -366,6 +506,22 @@ export const BrainCabin: React.FC<{
     if (activity !== "idle") return `中枢正在${ACTIVITY_LABEL[activity]}`;
     return "";
   })();
+
+  /** 前端系统快照（注入 /api/brain/chat ctx）：选中章详情 + 系统时机 + presence/activity + 自动连载。
+   *  中枢据此感知「系统正在做什么/处于什么时机/是否冲突」，生成更准确的操作。 */
+  const chatCtx = {
+    chapterIndex: currentChapter?.index ?? null,
+    chapterTitle: currentChapter?.title ?? null,
+    chapterStatus: currentChapter?.status ?? null,
+    chapterWords: currentChapter?.words ?? null,
+    versionCount: currentChapter?.versionCount ?? null,
+    systemStatus: runningStatus || null,
+    writingRunning: writing?.status === "running",
+    presence: brainState?.presence ?? null,
+    activity: brainState?.activity ?? null,
+    autoRunning: autoRunning ?? false,
+    server: serverCtx,
+  };
 
   return (
     <div className="brain-cabin-mask" onClick={onClose}>
@@ -476,13 +632,14 @@ export const BrainCabin: React.FC<{
             </div>
           )}
           {messages.map((msg) => {
-            // 任务/指令类消息默认折叠为摘要行；未决确认（confirm 卡）与生成中强制展开
+            // 任务/指令类消息默认折叠为摘要行；纯文本超长回复（>FOLD_TEXT_THRESHOLD）也折叠；未决确认（confirm 卡）与生成中强制展开
             const collapsible = isCollapsibleMsg(msg);
+            const longText = shouldFoldLongText(msg);
             const hasConfirm = (msg.cards ?? []).some((c) => c.kind === "confirm");
-            const folded = collapsible && !msg.pending && !hasConfirm && !expandedMsgs.has(msg.id);
+            const folded = (collapsible || longText) && !msg.pending && !hasConfirm && !expandedMsgs.has(msg.id);
             return (
             <div key={msg.id} className={`bc-msg bc-msg-${msg.role}`}>
-              {msg.role === "brain" && <BrainCore presence={presence} activity={activity} size="mini" />}
+              {msg.role === "brain" && <BrainCore presence={presence} activity={activity} size="mini" animated={false} />}
               <div className="bc-msg-content">
                 {folded ? (
                   <button className="bc-msg-fold" onClick={() => setExpandedMsgs((prev) => { const n = new Set(prev); n.add(msg.id); return n; })} title="展开查看详情">
@@ -508,7 +665,7 @@ export const BrainCabin: React.FC<{
                     <button className="bc-link-btn" onClick={retryInInput} disabled={streaming} title="把最后一个问题移到底部输入框，并从记录中移除本回合">移至输入 · 移除本回合</button>
                   </div>
                 )}
-                {msg.cards?.map((card, i) => (
+                {msg.cards?.filter((c) => c.kind !== "ask").map((card, i) => (
                   <BrainCardView
                     key={i}
                     card={card}
@@ -521,7 +678,7 @@ export const BrainCabin: React.FC<{
                     onFormSubmit={(card2, values) => submitForm(card2, values, msg.id, i)}
                   />
                 ))}
-                {collapsible && !msg.pending && (
+                {(collapsible || longText) && !msg.pending && !hasConfirm && (
                   <button className="bc-msg-fold bc-msg-fold-mini" onClick={() => setExpandedMsgs((prev) => { const n = new Set(prev); n.delete(msg.id); return n; })} title="折叠此消息">▾ 收起</button>
                 )}
                 {/* 消息操作区：时间戳 + 复制（user 额外编辑）；pending 时不显示 */}
@@ -575,7 +732,11 @@ export const BrainCabin: React.FC<{
                   <input
                     type="number" min={1} max={4} value={mediaCount}
                     disabled={ctxBusy || mediaCtxDone}
-                    onChange={(e) => setMediaCount(Math.max(1, Math.min(4, Number(e.target.value) || 1)))}
+                    onChange={(e) => {
+                      const v = Math.max(1, Math.min(4, Number(e.target.value) || 1));
+                      setMediaCount(v);
+                      writeCabinPrefs({ mediaCount: v }); // 偏好持久化（纯本地，服务端不受影响）
+                    }}
                     title="生成张数（1-4）"
                   />
                 </label>
@@ -587,6 +748,17 @@ export const BrainCabin: React.FC<{
                 >
                   生成
                 </button>
+              </div>
+            )}
+            {pendingAsk && (
+              <div className="bc-ask-bar">
+                <span className="bc-context-label">需要确认</span>
+                <span className="bc-ask-question">{pendingAsk.ask.question}</span>
+                <div className="bc-ask-options">
+                  {pendingAsk.ask.options?.map((o, i) => (
+                    <button key={i} className="bc-ctx-btn" disabled={ctxBusy} onClick={() => answerAsk(o.label, pendingAsk.msgId)} title={o.description}>{o.label}</button>
+                  ))}
+                </div>
               </div>
             )}
             {ctxCard && (
@@ -666,6 +838,9 @@ export const BrainCabin: React.FC<{
       window.removeEventListener("pointerup", onUp);
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
+      // 拖拽结束：保存输入区高度偏好（纯本地；服务端不感知，无一致性风险）
+      const h = ta.getBoundingClientRect().height;
+      writeCabinPrefs({ inputHeight: Math.round(h) });
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
@@ -677,6 +852,13 @@ export const BrainCabin: React.FC<{
   async function doSend(text?: string) {
     const prompt = (text ?? input).trim();
     if (!prompt || streaming || executing) return;
+    // 用户直接输入新消息（而非点选 ask 选项）→ 视为已回答待决追问，避免面板永久残留
+    if (!text && pendingAsk) {
+      const next = new Set(askAnswered);
+      next.add(pendingAsk.msgId);
+      setAskAnswered(next);
+      try { sessionStorage.setItem(`brain-ask-answered-${activeId ?? ""}`, JSON.stringify([...next])); } catch { /* 忽略 */ }
+    }
     setInput("");
     stickToBottom(); // 发送后新消息滚动跟随
     let sid = activeId;

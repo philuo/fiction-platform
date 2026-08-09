@@ -452,6 +452,18 @@ export function isPendingForeshadow(w: WorldState, f: Foreshadow): boolean {
   return f.status !== "resolved" && f.plantedAt >= w.nextChapter;
 }
 
+/** 目标章数（全书统一口径，worldSummary / executeQuery / brain-state vitals 共用）：
+ * goal 显式 > 弧线估算合计 > 章纲总数；无则 null（前端不显示进度条/目标章数）。
+ * 注意：goal.structure.targetChapters 常缺省，真实目标来自蓝图弧线 estChapters 汇总。 */
+export function targetChapterCount(w: WorldState): number | null {
+  const t = w.goal?.structure?.targetChapters;
+  if (t != null && t > 0) return t;
+  const est = (w.storyArcs ?? []).reduce((n, a) => n + (a.estChapters || 0), 0);
+  if (est > 0) return est;
+  const plans = (w.chapterPlans ?? []).length;
+  return plans > 0 ? plans : null;
+}
+
 /** 迁移旧章节级媒体（image/images/video）为段落锚定 media[]，转换后清空旧字段。
  * 旧媒体无场景信息，按顺序分散锚定到章节不同段落（避免全堆在开头）；并对已迁移但全堆在首段的旧数据自愈重分布。返回是否有变更。 */
 export function migrateChapterMedia(w: WorldState): boolean {

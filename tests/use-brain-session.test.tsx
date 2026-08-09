@@ -123,7 +123,18 @@ function Harness() {
   completedRef.current = completed;
   React.useEffect(() => {
     (win as unknown as { __harness?: unknown }).__harness = {
-      doSend: async (prompt: string, ctx?: { chapterIndex?: number | null }) => {
+      doSend: async (prompt: string, ctx?: {
+        chapterIndex?: number | null;
+        chapterTitle?: string | null;
+        chapterStatus?: string | null;
+        chapterWords?: number | null;
+        versionCount?: number | null;
+        systemStatus?: string | null;
+        writingRunning?: boolean;
+        presence?: string | null;
+        activity?: string | null;
+        autoRunning?: boolean;
+      }) => {
         let sid = activeId;
         if (!sid) sid = await newSession(prompt);
         await send({ prompt, sessionId: sid, ctx });
@@ -286,6 +297,42 @@ describe("useBrainSession 首次对话发送", () => {
     await harness().startNew();
     await tick();
     expect(harness().getCompleted()).toEqual(new Set());
+    await act(() => root.unmount());
+  });
+
+  test("send 透传完整系统快照 ctx（选中章详情 + 时机 + 自动连载）到 /api/brain/chat 请求体（中枢全知）", async () => {
+    const { root } = await mountHarness();
+    await tick();
+    const p = harness().doSend("帮我生成插画", {
+      chapterIndex: 3,
+      chapterTitle: "雨夜",
+      chapterStatus: "revise",
+      chapterWords: 1250,
+      versionCount: 2,
+      systemStatus: "中枢正在生成回复…",
+      writingRunning: false,
+      presence: "awake",
+      activity: "idle",
+      autoRunning: true,
+    });
+    await tick();
+    await tick();
+    // 释放 SSE 完成流（doSend 内部 await send 需要它结束）
+    releaseChat?.();
+    await p;
+    const lastBody = chatBodies[chatBodies.length - 1] as Record<string, unknown>;
+    expect(lastBody.ctx).toMatchObject({
+      chapterIndex: 3,
+      chapterTitle: "雨夜",
+      chapterStatus: "revise",
+      chapterWords: 1250,
+      versionCount: 2,
+      systemStatus: "中枢正在生成回复…",
+      writingRunning: false,
+      presence: "awake",
+      activity: "idle",
+      autoRunning: true,
+    });
     await act(() => root.unmount());
   });
 

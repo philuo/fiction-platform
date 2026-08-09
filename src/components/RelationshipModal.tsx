@@ -17,7 +17,8 @@ const ROLE_COLORS: Record<string, string> = {
 
 function buildGraphData(chars: { id: string; name: string; role: string; relations?: Record<string, string> }[], w: number, h: number) {
   const cx = w / 2, cy = h / 2;
-  const radius = Math.min(180, 40 + chars.length * 30);
+  // 半径自适应画布尺寸：窄屏（移动端）按 min(w,h) 收缩，保证全部节点首屏可见
+  const radius = Math.max(60, Math.min(Math.min(w, h) / 2 - 30, 40 + chars.length * 30));
   const nodes: GNode[] = chars.map((c, i) => ({
     id: c.id,
     name: c.name,
@@ -90,6 +91,11 @@ export const RelationshipModal: React.FC<{
     selEdge: null as number | null,
     animFrame: 0,
     initialized: false,
+    /** 当前布局对应的画布尺寸（clientWidth/clientHeight）：画布尺寸变化时按新尺寸重建布局 */
+    layoutW: 0,
+    layoutH: 0,
+    /** 双指捏合状态：起始指距 / 起始 scale / 起始两指中心（canvas 相对坐标及其世界坐标） */
+    pinch: null as null | { dist: number; scale: number; cx: number; cy: number; wx: number; wy: number },
   }).current;
 
   // === UI 状态 ===
@@ -158,37 +164,37 @@ export const RelationshipModal: React.FC<{
     scheduleRedraw();
   }, [selectedId, p.readOnly]);
 
-  // === 实时同步：监听 world.characters 变化，重建图数据 ===
+  /** 按画布尺寸重建图数据：保留已有节点位置（增删角色/改尺寸时位置稳定）与边标签 */
+  function rebuildGraph(w: number, h: number) {
+    const { nodes, edges } = buildGraphData(p.world.characters, w, h);
+    const oldPosMap = new Map(g.nodes.map((n) => [n.id, { x: n.x, y: n.y }]));
+    g.nodes = nodes.map((n) => {
+      const old = oldPosMap.get(n.id);
+      return old ? { ...n, x: old.x, y: old.y } : n;
+    });
+    const oldEdgeMap = new Map(g.edges.map((e) => [`${e.from}-${e.to}`, e.label]));
+    g.edges = edges.map((e) => {
+      const key1 = `${e.from}-${e.to}`;
+      const key2 = `${e.to}-${e.from}`;
+      const oldLabel = oldEdgeMap.get(key1) || oldEdgeMap.get(key2);
+      return oldLabel ? { ...e, label: oldLabel } : e;
+    });
+    setNodeList([...g.nodes]);
+  }
+
+  // === 实时同步：监听 world.characters 变化，重建图数据（保留位置/标签） ===
   useEffect(() => {
     const chars = p.world.characters;
     if (!chars || chars.length === 0) return;
     const canvas = canvasRef.current;
     const w = canvas ? canvas.clientWidth || 600 : 600;
     const h = canvas ? canvas.clientHeight || 400 : 400;
-    const { nodes, edges } = buildGraphData(chars, w, h);
-
     if (!g.initialized) {
-      // 首次初始化
-      g.nodes = nodes;
-      g.edges = edges;
       g.initialized = true;
-    } else {
-      // 增量同步：保留已有节点位置，新增节点放圆周，删除节点移除
-      const oldPosMap = new Map(g.nodes.map((n) => [n.id, { x: n.x, y: n.y }]));
-      g.nodes = nodes.map((n) => {
-        const old = oldPosMap.get(n.id);
-        return old ? { ...n, x: old.x, y: old.y } : n;
-      });
-      // 重建边（保留标签如果已存在）
-      const oldEdgeMap = new Map(g.edges.map((e) => [`${e.from}-${e.to}`, e.label]));
-      g.edges = edges.map((e) => {
-        const key1 = `${e.from}-${e.to}`;
-        const key2 = `${e.to}-${e.from}`;
-        const oldLabel = oldEdgeMap.get(key1) || oldEdgeMap.get(key2);
-        return oldLabel ? { ...e, label: oldLabel } : e;
-      });
+      g.layoutW = w;
+      g.layoutH = h;
     }
-    setNodeList([...g.nodes]);
+    rebuildGraph(w, h);
     scheduleRedraw();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [p.world.characters]);
@@ -327,7 +333,9 @@ export const RelationshipModal: React.FC<{
     for (let i = g.nodes.length - 1; i >= 0; i--) {
       const n = g.nodes[i];
       const dx = wx - n.x, dy = wy - n.y;
-      if (dx * dx + dy * dy <= 26 * 26) return n;
+      // 命中半径按屏幕像素（26px）换算成世界坐标，缩放后手指/鼠标命中范围一致
+      const hitR = 26 / g.scale;
+      if (dx * dx + dy * dy <= hitR * hitR) return n;
     }
     return null;
   }
@@ -345,16 +353,14 @@ export const RelationshipModal: React.FC<{
       t = Math.max(0, Math.min(1, t));
       const px = from.x + t * dx, py = from.y + t * dy;
       const dist = Math.sqrt((wx - px) ** 2 + (wy - py) ** 2);
-      if (dist < 8) return i;
+      // 阈值按屏幕像素（8px）换算成世界坐标，缩小后依然易点中
+      if (dist < 8 / g.scale) return i;
     }
     return null;
   }
 
-  function onMouseDown(e: MouseEvent) {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+  /** 触点按下（鼠标/单指触摸共用）：命中节点→拖拽；只读模式空白→平移；编辑模式命中连线→选中，空白→平移 */
+  function beginPointer(sx: number, sy: number, clientX: number, clientY: number) {
     const { x: wx, y: wy } = screenToWorld(sx, sy);
     const node = hitNode(wx, wy);
     if (node) {
@@ -373,7 +379,7 @@ export const RelationshipModal: React.FC<{
     // 只读模式：非节点区域仅平移，不支持连线编辑
     if (p.readOnly) {
       g.panning = true;
-      g.panStart = { x: e.clientX - g.offsetX, y: e.clientY - g.offsetY };
+      g.panStart = { x: clientX - g.offsetX, y: clientY - g.offsetY };
       scheduleRedraw();
       return;
     }
@@ -385,7 +391,7 @@ export const RelationshipModal: React.FC<{
       setEditLabel(g.edges[edgeIdx].label);
     } else {
       g.panning = true;
-      g.panStart = { x: e.clientX - g.offsetX, y: e.clientY - g.offsetY };
+      g.panStart = { x: clientX - g.offsetX, y: clientY - g.offsetY };
       g.selNode = null;
       g.selEdge = null;
       setUiSelEdge(null);
@@ -393,24 +399,93 @@ export const RelationshipModal: React.FC<{
     scheduleRedraw();
   }
 
-  function onMouseMove(e: MouseEvent) {
+  function onMouseDown(e: MouseEvent) {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
-    const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+    beginPointer(e.clientX - rect.left, e.clientY - rect.top, e.clientX, e.clientY);
+  }
+
+  /** 触点移动（鼠标/单指触摸共用）：拖拽节点或平移画板 */
+  function movePointer(sx: number, sy: number, clientX: number, clientY: number) {
     if (g.dragging) {
       const { x: wx, y: wy } = screenToWorld(sx, sy);
       const n = g.nodes.find((nd) => nd.id === g.dragging);
       if (n) { n.x = wx; n.y = wy; }
       scheduleRedraw();
     } else if (g.panning) {
-      g.offsetX = e.clientX - g.panStart.x;
-      g.offsetY = e.clientY - g.panStart.y;
+      g.offsetX = clientX - g.panStart.x;
+      g.offsetY = clientY - g.panStart.y;
       scheduleRedraw();
     }
   }
 
+  function onMouseMove(e: MouseEvent) {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    movePointer(e.clientX - rect.left, e.clientY - rect.top, e.clientX, e.clientY);
+  }
+
   function onMouseUp() {
+    g.dragging = null;
+    g.panning = false;
+  }
+
+  // === 移动端触摸：单指=点击/拖节点/平移，双指=以两指中心为锚点捏合缩放（附带平移） ===
+  function onTouchStart(e: TouchEvent) {
+    // 阻止浏览器默认滚动/双击缩放，同时避免合成 mousedown 导致双重触发
+    e.preventDefault();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const ts = e.touches;
+    if (ts.length === 2) {
+      // 双指：取消其他交互，记录捏合起点（指距/scale/中心的世界坐标）
+      g.dragging = null;
+      g.panning = false;
+      const dx = ts[0].clientX - ts[1].clientX;
+      const dy = ts[0].clientY - ts[1].clientY;
+      const cx = (ts[0].clientX + ts[1].clientX) / 2 - rect.left;
+      const cy = (ts[0].clientY + ts[1].clientY) / 2 - rect.top;
+      const { x: wx, y: wy } = screenToWorld(cx, cy);
+      g.pinch = { dist: Math.max(1, Math.hypot(dx, dy)), scale: g.scale, cx, cy, wx, wy };
+      scheduleRedraw();
+      return;
+    }
+    if (ts.length !== 1) return;
+    const t = ts[0];
+    beginPointer(t.clientX - rect.left, t.clientY - rect.top, t.clientX, t.clientY);
+  }
+
+  function onTouchMove(e: TouchEvent) {
+    e.preventDefault();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const ts = e.touches;
+    if (ts.length === 2 && g.pinch) {
+      const dx = ts[0].clientX - ts[1].clientX;
+      const dy = ts[0].clientY - ts[1].clientY;
+      const curDist = Math.max(1, Math.hypot(dx, dy));
+      const curCx = (ts[0].clientX + ts[1].clientX) / 2 - rect.left;
+      const curCy = (ts[0].clientY + ts[1].clientY) / 2 - rect.top;
+      const newScale = Math.max(0.3, Math.min(3, g.pinch.scale * (curDist / g.pinch.dist)));
+      // 以两指中心为锚：捏合起点中心对应的世界坐标始终保持在当前两指中心处（缩放+平移一体）
+      g.scale = newScale;
+      g.offsetX = curCx - g.pinch.wx * newScale;
+      g.offsetY = curCy - g.pinch.wy * newScale;
+      scheduleRedraw();
+      return;
+    }
+    if (ts.length === 1) {
+      const t = ts[0];
+      movePointer(t.clientX - rect.left, t.clientY - rect.top, t.clientX, t.clientY);
+    }
+  }
+
+  function onTouchEnd() {
+    g.pinch = null;
     g.dragging = null;
     g.panning = false;
   }
@@ -436,6 +511,16 @@ export const RelationshipModal: React.FC<{
     if (tab !== "关系图") return;
     const canvas = canvasRef.current;
     if (!canvas) return;
+    const w = canvas.clientWidth || 600;
+    const h = canvas.clientHeight || 400;
+    // 首帧布局必须按真实画布尺寸：chars effect 在 canvas 未渲染时可能用 600×400 兜底，
+    // 窄屏移动端会超出画布 → 检测到尺寸不匹配时按实际尺寸重建
+    if (!g.initialized || g.layoutW !== w || g.layoutH !== h) {
+      g.initialized = true;
+      g.layoutW = w;
+      g.layoutH = h;
+      rebuildGraph(w, h);
+    }
     // 同步直绘首帧：不依赖 rAF 调度（后台标签页 rAF 会被浏览器挂起）
     draw();
     canvas.addEventListener("mousedown", onMouseDown);
@@ -443,6 +528,24 @@ export const RelationshipModal: React.FC<{
     canvas.addEventListener("mouseup", onMouseUp);
     canvas.addEventListener("mouseleave", onMouseUp);
     canvas.addEventListener("wheel", onWheel, { passive: false });
+    canvas.addEventListener("touchstart", onTouchStart, { passive: false });
+    canvas.addEventListener("touchmove", onTouchMove, { passive: false });
+    canvas.addEventListener("touchend", onTouchEnd);
+    canvas.addEventListener("touchcancel", onTouchEnd);
+    // 旋转屏幕 / 窗口尺寸变化：按新尺寸重建布局（保留已拖拽节点位置）
+    const onResize = () => {
+      const cv = canvasRef.current;
+      if (!cv) return;
+      const nw = cv.clientWidth || 600;
+      const nh = cv.clientHeight || 400;
+      if (g.layoutW !== nw || g.layoutH !== nh) {
+        g.layoutW = nw;
+        g.layoutH = nh;
+        rebuildGraph(nw, nh);
+      }
+      draw();
+    };
+    window.addEventListener("resize", onResize);
     return () => {
       if (g.animFrame) cancelAnimationFrame(g.animFrame);
       canvas.removeEventListener("mousedown", onMouseDown);
@@ -450,6 +553,11 @@ export const RelationshipModal: React.FC<{
       canvas.removeEventListener("mouseup", onMouseUp);
       canvas.removeEventListener("mouseleave", onMouseUp);
       canvas.removeEventListener("wheel", onWheel);
+      canvas.removeEventListener("touchstart", onTouchStart);
+      canvas.removeEventListener("touchmove", onTouchMove);
+      canvas.removeEventListener("touchend", onTouchEnd);
+      canvas.removeEventListener("touchcancel", onTouchEnd);
+      window.removeEventListener("resize", onResize);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab]);
@@ -633,7 +741,7 @@ export const RelationshipModal: React.FC<{
           {uiSelEdge !== null && (
             <button className="btn-save btn-danger-sm" onClick={deleteEdge}><Trash2 size={13} /> 删除选中连线</button>
           )}
-          <span style={{ fontSize: "0.7rem", color: "var(--ink-soft)" }}>滚轮缩放 · 拖拽节点 · 点击连线编辑</span>
+          <span style={{ fontSize: "0.7rem", color: "var(--ink-soft)" }}>滚轮/双指缩放 · 拖拽节点 · 空白拖动平移 · 点击连线编辑</span>
           </div>
         )}
         {!p.readOnly && showAddEdge && (
@@ -661,7 +769,7 @@ export const RelationshipModal: React.FC<{
         <div className="rel-canvas-wrap">
           <canvas
             ref={canvasRef}
-            style={{ width: "100%", height: "400px", cursor: "default" }}
+            style={{ width: "100%", height: "clamp(240px, 55vh, 400px)", cursor: "default", touchAction: "none" }}
           />
         </div>
           </>

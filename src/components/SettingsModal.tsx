@@ -8,11 +8,13 @@ import { IntegrityModal, type IntegrityReportView } from "./IntegrityModal";
 import { formatChapterRange } from "../shared/appearance";
 import { apiFetch } from "../api/client";
 
-type Tab = "全局" | "章节" | "设定" | "角色" | "大纲" | "导出";
+export type Tab = "全局" | "章节" | "设定" | "角色" | "大纲" | "导出";
 
 const TABS: Tab[] = ["全局", "章节", "设定", "角色", "大纲", "导出"];
 
 type Props = {
+  /** 初始 tab（如中枢「打开设置-角色页」定位；缺省「全局」） */
+  initialTab?: Tab;
   world: WorldState;
   onSave: (patch: WorldPatch) => Promise<boolean>;
   onImage: (kind: "cover" | "character" | "chapter", args?: Record<string, unknown>) => Promise<{ path?: string } | null>;
@@ -41,7 +43,7 @@ const radio = (name: string, opts: string[], cur: string, set: (v: never) => voi
 );
 
 export const SettingsModal: React.FC<Props> = (p) => {
-  const [tab, setTab] = useState<Tab>("全局");
+  const [tab, setTab] = useState<Tab>(p.initialTab ?? "全局");
 
   return (
     <div className="modal-mask" onClick={p.onClose}>

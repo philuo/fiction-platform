@@ -3767,7 +3767,14 @@ html { scroll-behavior: smooth; }
 .bc-hint { font-size: 0.72rem; color: var(--ink-soft); margin-top: 0.6rem; opacity: 0.8; }
 
 .bc-msg { display: flex; gap: 0.5rem; align-items: flex-start; }
-.bc-msg-user { flex-direction: row-reverse; }
+.bc-msg-user {
+  flex-direction: row-reverse;
+  /* 滚动吸附：问题消息在滚动经过时固定在面板顶部（sticky 相对 .brain-cabin-stream 滚动容器），
+     背景与面板同色保证不透视下方内容，底部微渐变过渡标示吸附状态 */
+  position: sticky; top: 0; z-index: 2;
+  padding: 0.4rem 0 0.5rem;
+  background: linear-gradient(180deg, var(--paper) 84%, rgba(0, 0, 0, 0));
+}
 .bc-msg-content { max-width: 82%; }
 .bc-msg-user .bc-msg-content { text-align: right; }
 .bc-msg-text {
@@ -3834,7 +3841,7 @@ html { scroll-behavior: smooth; }
 .bc-fold-caret { color: var(--seal); font-size: 0.7rem; transition: transform 0.15s; }
 .bc-fold-caret.open { transform: rotate(90deg); }
 .bc-fold-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.bc-fold-meta { font-size: 0.68rem; color: var(--ink-dim, #999); flex-shrink: 0; }
+.bc-fold-meta { font-size: 0.68rem; color: var(--ink-dim, #999); flex-shrink: 0; white-space: nowrap; }
 /* —— 卡片级折叠（列表型浏览长卡） —— */
 .bc-fold-toggle {
   margin-left: auto; background: none; border: 1px solid var(--line);
@@ -3875,10 +3882,14 @@ html { scroll-behavior: smooth; }
 .bc-context-actions { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
 /* 媒体生成输入条（「帮我生成插画」→ 输入区上方：章节选择 + 张数 + 生成按钮） */
 .bc-media-bar {
-  display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
-  padding: 0.35rem 0.6rem; margin: 0.2rem 0;
-  border: 1px dashed rgba(176, 58, 46, 0.35); border-radius: 6px;
-  background: rgba(176, 58, 46, 0.03); flex: 1;
+  display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;
+  padding: 0.5rem 0.7rem; margin: 0.15rem 0;
+  border: 1px dashed rgba(176, 58, 46, 0.35); border-radius: 8px;
+  background: rgba(176, 58, 46, 0.03);
+  /* 独占一行（不与会话话题/快捷入口挤行）；且 media 行存在时整条 ctx-bar 换行排列 */
+  flex-basis: 100%;
+  flex-grow: 1;
+  box-shadow: inset 0 0 0 1px rgba(176, 58, 46, 0.04);
 }
 .bc-media-bar .bc-media-field {
   display: inline-flex; align-items: center; gap: 0.3rem; white-space: nowrap;
@@ -4040,7 +4051,7 @@ html { scroll-behavior: smooth; }
   text-align: left;
 }
 .brain-card-image-wrap { margin-top: 0.4rem; }
-.brain-card-image { display: block; max-width: 100%; max-height: 220px; object-fit: cover; border-radius: 0.3rem; border: 1px solid var(--line); }
+.brain-card-image { display: block; max-width: 100%; max-height: 280px; object-fit: cover; border-radius: 0.3rem; border: 1px solid var(--line); }
 /* —— 卡片完成态（preview/form/confirm 已执行）：淡化 + 完成标记，防重复提交 —— */
 .bc-card-done { opacity: 0.72; }
 .bc-done-tag {
@@ -4100,7 +4111,14 @@ html { scroll-behavior: smooth; }
 .brain-card-browse .bc-browse-title { font-weight: 700; font-size: 0.78rem; margin-bottom: 0.2rem; }
 .brain-card-browse .bc-browse-text { font-size: 0.76rem; color: var(--ink-soft); line-height: 1.55; margin: 0; }
 .brain-card-browse .bc-browse-meta { font-size: 0.68rem; color: var(--ink-soft); display: block; margin-top: 0.2rem; }
-.bc-browse-list { display: flex; flex-direction: column; gap: 0.5rem; }
+.bc-browse-list {
+  display: flex; flex-direction: column; gap: 0.5rem;
+  max-height: 320px; overflow-y: auto; overscroll-behavior: contain;
+  scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent;
+  padding-right: 0.2rem;
+}
+.bc-browse-list::-webkit-scrollbar { width: 5px; }
+.bc-browse-list::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 3px; }
 .bc-browse-item { border-top: 1px dashed var(--line); padding-top: 0.4rem; }
 .bc-browse-item:first-child { border-top: none; padding-top: 0; }
 .bc-browse-item-id { font-size: 0.7rem; color: var(--ink); font-weight: 700; }
@@ -4170,6 +4188,22 @@ html { scroll-behavior: smooth; }
   border-radius: 999px; padding: 0.12rem 0.5rem;
 }
 .bc-next .bc-browse-item-title { color: var(--seal); }
+/* 追问选择面板（ask 卡）：输入框上方询问，不混入聊天流 */
+.bc-ask-bar {
+  display: flex; flex-direction: column; gap: 0.35rem;
+  padding: 0.45rem 0.6rem; margin: 0 0.5rem 0.4rem;
+  background: rgba(176, 58, 46, 0.05); border: 1px dashed var(--line-strong);
+  border-radius: 0.5rem;
+}
+.bc-ask-question { font-size: 0.78rem; color: var(--ink-strong); }
+.bc-ask-options { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+/* 长列表截断：「还有 N 条 · 展开全部」按钮 */
+.bc-list-more {
+  align-self: flex-start; background: none; border: 1px dashed var(--line-strong);
+  border-radius: 999px; padding: 0.15rem 0.6rem; font-size: 0.7rem;
+  color: var(--seal); cursor: pointer; margin-top: 0.15rem;
+}
+.bc-list-more:hover { border-color: var(--seal); background: rgba(176, 58, 46, 0.06); }
 .bc-next::after { content: "← 下一章"; font-family: var(--sans); font-size: 0.6rem; color: var(--seal); margin-left: 0.4rem; }
 .bc-log-item .bc-browse-text { font-size: 0.72rem; }
 

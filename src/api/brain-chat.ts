@@ -14,9 +14,10 @@
 import { chatJson } from "./jsonutil";
 import { chatStream } from "./agnes";
 import { taskOpts } from "./modelconfig";
-import { loadWorld } from "./storage";
+import { loadWorld, saveWorld } from "./storage";
+import { logChange } from "./steering";
 import { readEvalReport } from "./eval";
-import { isPendingForeshadow } from "./world";
+import { isPendingForeshadow, targetChapterCount } from "./world";
 import { mediaDataUri } from "./media";
 import { gachaGenerate as directorGachaGenerate } from "./director";
 import type { CardType } from "./cards";
@@ -103,10 +104,18 @@ export const INTENTS: Record<string, IntentMeta> = {
   read_logs: { commandId: "CMD-Q01", level: "L0", title: "查看台账/操作日志" },
   read_worldbook: { commandId: "CMD-Q01", level: "L0", title: "查看设定/世界书" },
   read_media: { commandId: "CMD-Q01", level: "L0", title: "查看媒体资源" },
+  read_appearances: { commandId: "CMD-Q01", level: "L0", title: "查看出场角色" },
+  read_relationships: { commandId: "CMD-Q01", level: "L0", title: "查看人物关系" },
+  read_outline: { commandId: "CMD-Q01", level: "L0", title: "查看大纲/蓝图" },
+  read_timeline: { commandId: "CMD-Q01", level: "L0", title: "查看脉络/时间线" },
   read_review: { commandId: "CMD-Q01", level: "L0", title: "查看审查报告" },
   read_gacha: { commandId: "CMD-Q01", level: "L0", title: "查看卡池（抽到的卡）" },
   eval: { commandId: "CMD-S09", level: "L0", title: "整书质量评估", action: { endpoint: "/api/novel/eval", method: "POST", body: {} } },
   edit_world: { commandId: "CMD-W12", level: "L2", title: "编辑设定/角色", action: { endpoint: "/api/novel/world", method: "POST", body: {} } },
+  relationship_edit: { commandId: "CMD-W12", level: "L2", title: "建立/解除人物关系" },
+  create_character: { commandId: "CMD-W12", level: "L2", title: "新建角色" },
+  edit_character: { commandId: "CMD-W12", level: "L2", title: "修改角色" },
+  delete_character: { commandId: "CMD-W12", level: "L3", title: "删除角色" },
   delete_chapter: { commandId: "CMD-N08", level: "L3", title: "删除章节", action: { endpoint: "/api/novel/chapter/delete", method: "POST", body: { phase: "preview" } } },
   regenerate: { commandId: "CMD-N05", level: "L2", title: "AI 重写章节", action: { endpoint: "/api/novel/chapter/regenerate", method: "POST", body: {} } },
   rewrite: { commandId: "CMD-G06", level: "L2", title: "回溯重写（消费重写队列）", action: { endpoint: "/api/novel/rewrite", method: "POST", body: { action: "start" } } },
@@ -123,19 +132,39 @@ export const INTENTS: Record<string, IntentMeta> = {
   settings: { commandId: "CMD-W12", level: "L0", title: "调整生成参数" },
   plan: { commandId: "CMD-W01", level: "L0", title: "制定计划/给方案" },
   opinion: { commandId: "CMD-Q09", level: "L0", title: "征求/给出意见" },
+  read_help: { commandId: "CMD-Q01", level: "L0", title: "中枢能力与支持指令" },
+  open_settings: { commandId: "CMD-W12", level: "L0", title: "打开设置" },
+  open_relationships: { commandId: "CMD-Q01", level: "L0", title: "打开关系图" },
+  open_taskcenter: { commandId: "CMD-G06", level: "L0", title: "打开任务中心" },
+  open_foreshadow: { commandId: "CMD-Q01", level: "L0", title: "打开伏笔账" },
+  open_review: { commandId: "CMD-Q01", level: "L0", title: "打开审查面板" },
+  open_eval: { commandId: "CMD-S09", level: "L0", title: "打开整书评估" },
+  open_gacha: { commandId: "CMD-W17", level: "L0", title: "打开卡池" },
+  open_autostart: { commandId: "CMD-N03", level: "L0", title: "打开自动连载" },
+  open_memory: { commandId: "CMD-Q01", level: "L0", title: "打开记忆·台账" },
   chat: { commandId: "CMD-Q09", level: "L0", title: "对话" },
 };
 
 const INTENT_ENUM = Object.keys(INTENTS);
 
-/** 简短世界摘要（供意图识别上下文） */
+/** 简短世界摘要（供意图识别上下文）：世界静态快照 + 待办/状态（中枢全知的基础） */
 function worldSummary(w: WorldState): string {
-  return [
+  const lines = [
     `《${w.title}》(${w.genre})，已写 ${w.chapters.length} 章`,
     `角色 ${w.characters.length} 个：${w.characters.slice(0, 6).map((c) => c.name).join("、")}`,
     `伏笔 ${w.foreshadowing.length} 条（活跃 ${w.foreshadowing.filter((f) => f.status !== "resolved").length}）`,
-    `梗概：${w.premise.slice(0, 80)}`,
-  ].join("\n");
+  ];
+  const target = targetChapterCount(w);
+  if (target != null) lines.push(`全书目标 ${target} 章（写作进度 ${w.chapters.length}/${target}，界面进度条分母即此目标章数）`);
+  const props = (w.characterProposals ?? []).filter((p) => p.status === "pending");
+  if (props.length) lines.push(`待确认新角色提案 ${props.length} 项：${props.map((p) => p.name).join("、")}`);
+  if ((w.pendingCards ?? []).length) lines.push(`待应用卡池 ${w.pendingCards!.length} 张`);
+  const debt = (w.qualityDebt ?? []).filter((d) => d.status === "open");
+  if (debt.length) lines.push(`未处理质量债 ${debt.length} 项`);
+  const revise = w.chapters.filter((c) => c.review?.verdict === "revise");
+  if (revise.length) lines.push(`需修订章节 ${revise.length} 章：第 ${revise.map((c) => c.index).join("、")} 章`);
+  lines.push(`梗概：${w.premise.slice(0, 80)}`);
+  return lines.join("\n");
 }
 
 /** 意图 → 中文语义提示（供意图识别参考，提升中文口语命中率） */
@@ -157,10 +186,18 @@ const INTENT_HINT: Record<string, string> = {
   read_logs: "查看台账/操作日志/变更记录/最近做了什么",
   read_worldbook: "查看设定/世界书/世界观/规则",
   read_media: "查看媒体资源/插画/视频/立绘/配图",
+  read_appearances: "查看某章出场角色/这章出场了谁/第几章有哪些角色/本章出场角色",
+  read_relationships: "查看人物关系/谁和谁什么关系/关系列表/张三的关系/关系网",
+  read_outline: "查看大纲/全书结构/蓝图/卷章规划/故事结构",
+  read_timeline: "查看脉络/时间线/故事进展/写到哪了的发展脉络",
   read_review: "查看审查报告/评分/审查意见/这章评价",
   read_gacha: "查看抽到的卡/查看卡池/应用卡牌/抽卡结果/看看抽到了什么/卡池里有什么",
   eval: "整书质量评估",
   edit_world: "编辑设定/角色",
+  relationship_edit: "建立关系/结仇/成为盟友/师徒/解除关系/给A和B建立C关系/让A和B成为C",
+  create_character: "新建角色/添加角色/新角色叫X/加一个角色",
+  edit_character: "修改角色/把X的定位改成Y/X的年龄改成Y/更新X的信息",
+  delete_character: "删除角色/移除角色/不要X这个角色了/删掉X",
   delete_chapter: "删除章节",
   regenerate: "AI 重写章节",
   rewrite: "回溯重写/重写队列/按计划重写/处理重写任务/重新写那几章",
@@ -177,6 +214,16 @@ const INTENT_HINT: Record<string, string> = {
   settings: "调整生成参数/修改设置/字数/温度/视角/审查严格度",
   plan: "制定计划/给几个方案/接下来怎么写/规划下一步/给点建议",
   opinion: "征求意见/你觉得呢/要不要继续/这个方案行不行/选哪个好",
+  read_help: "查看支持哪些指令/你能做什么/有什么功能/帮助/能力清单/你会什么",
+  open_settings: "打开设置/设置面板/调整设置/打开设置弹窗（添加角色/新建人物/用户页面/人物页面 → tab=角色；本系统无独立用户资料页）",
+  open_relationships: "打开关系图/人物关系/角色关系图/查看角色关系",
+  open_taskcenter: "打开任务中心/任务面板/任务进度/任务列表",
+  open_foreshadow: "打开伏笔账/伏笔面板/伏笔管理",
+  open_review: "打开审查报告/审查面板/这章的审查/看审查",
+  open_eval: "打开评估/整书评估/质量评估面板",
+  open_gacha: "打开卡池/抽卡面板/卡池面板",
+  open_autostart: "打开自动连载/开始自动连载设置/连载设置",
+  open_memory: "打开记忆台账/台账面板/操作日志面板",
   chat: "纯对话（无操作）",
 };
 
@@ -184,11 +231,19 @@ const INTENT_SYSTEM = `你是小说创作引擎「墨枢」的中枢对话编排
 ${INTENT_ENUM.map((k) => `- ${k}：${INTENT_HINT[k] ?? k}`).join("\n")}
 
 输出合法 JSON：{"intent":"动作名","params":{...},"reply":"一句话自然语言回复（中文）"}
+- reply 必须有实质内容：查询类意图直接点出关键信息（如角色的形象/状态/关系要点、章节/任务概况），禁止「这就为您调出/调取」等空话开场；确无内容可概括时才用一句话说明将展示什么卡片
 - params：从用户输入中提取动作参数（需求 2：自动提取工具参数）：
-  · read_chapter / read_review / regenerate / delete_chapter → {index: 第几章}（数字）
+  · read_chapter / read_review / regenerate / delete_chapter / read_appearances → {index: 第几章}（数字）
   · read_character → {name:"角色名"}
+  · read_relationships → {name:"角色名"}（可选；缺省 = 全部关系）
   · media_image（生成插画）→ {chapterIndex: 第几章, count: 张数}；media_video（生成视频）→ {chapterIndex: 第几章}
   · autostart → {maxChapters: 章数}；gacha → {count: 张数}
+  · open_settings → {tab: "全局"|"章节"|"设定"|"角色"|"大纲"|"导出"}（用户说「添加角色」「新建人物」「用户/人物页面」→ tab="角色"；本系统无独立用户资料页，人物即角色）
+  · open_review → {index: 第几章}（缺省用当前选中章）
+  · relationship_edit（建立/解除人物关系）→ {nameA:"角色A", nameB:"角色B", relation:"关系词"}；解除时 {remove:true}
+  · create_character（新建角色）→ {name:"角色名", role:"定位（主角/反派/配角/关键人物，可省略）"}
+  · edit_character（修改角色）→ {name:"角色名", role|status|age|identity|motivation|look|voice: "修改后的值"}
+  · delete_character（删除角色）→ {name:"角色名"}
   · 用户未指定具体章节时，**不要填 chapterIndex**（系统会自动用其当前选中的章节兜底）
 - 「打开新角色提案」「新角色提案」「打开提案面板」等**打开类**表达（用户想直接看底部面板）→ intent 为 "open_proposals"，reply 用一句话说明已打开
 - 「有哪些角色推荐」「列出提案」「查看提案内容」等**查询列表**表达 → intent 为 "read_proposals"（在聊天中列提案卡）
@@ -205,9 +260,29 @@ async function recognizeIntent(w: WorldState, prompt: string, ctx?: { chapterInd
   try {
     const ctxLines: string[] = [];
     if (history?.length) ctxLines.push(`最近对话：\n${history.join("\n")}`);
+    // —— 系统全知上下文：选中章详情 + 系统时机 + 状态（前端快照注入） ——
     if (typeof ctx?.chapterIndex === "number" && Number.isInteger(ctx.chapterIndex)) {
-      ctxLines.push(`用户当前选中的章节：第 ${ctx.chapterIndex} 章（用户未指定章节的操作默认作用于该章）`);
+      const parts = [`用户当前选中的章节：第 ${ctx.chapterIndex} 章`];
+      if (ctx.chapterTitle) parts.push(`标题「${ctx.chapterTitle}」`);
+      if (ctx.chapterStatus) parts.push(`审查状态：${ctx.chapterStatus === "revise" ? "需修订" : ctx.chapterStatus}`);
+      if (typeof ctx.chapterWords === "number" && ctx.chapterWords > 0) parts.push(`约 ${ctx.chapterWords} 字`);
+      if (typeof ctx.versionCount === "number" && ctx.versionCount > 1) parts.push(`有 ${ctx.versionCount} 个历史版本（可回滚）`);
+      ctxLines.push(parts.join("，") + "（用户未指定章节的操作默认作用于该章）");
     }
+    const sysState: string[] = [];
+    if (ctx?.autoRunning) sysState.push("自动连载正在运行中");
+    if (ctx?.writingRunning) sysState.push("写作任务进行中");
+    if (ctx?.systemStatus) sysState.push(ctx.systemStatus);
+    if (ctx?.activity && ctx.activity !== "idle") sysState.push(`中枢活动：${ctx.activity}`);
+    // 服务端权威快照（/api/brain/context）：写作任务/媒体生成/视觉任务/待办——中枢知道系统正在做什么
+    const sv = ctx?.server;
+    if (sv) {
+      if (sv.advanceTaskRunning) sysState.push(`推进任务进行中${sv.advancePhase ? `（${sv.advancePhase}）` : ""}`);
+      if (sv.mediaGenerating) sysState.push("插画/视频生成中");
+      if (sv.visualRunning) sysState.push("角色视觉生成中");
+      if (sv.pendingCommit) sysState.push(`有第 ${sv.pendingCommit.index ?? "?"} 章待确认入册`);
+    }
+    if (sysState.length) ctxLines.push(`系统当前状态：${sysState.join("；")}（写操作需与运行中任务冲突时谨慎）`);
     const ctxBlock = ctxLines.length ? `\n\n${ctxLines.join("\n\n")}` : "";
     const out = await brainChatDeps.chatJson<{ intent?: string; params?: Record<string, unknown>; reply?: string }>(
       [
@@ -275,17 +350,44 @@ function gachaBrowseCard(pool: WorldCard[], title: string): Record<string, unkno
   };
 }
 
+/** 空话开场回复检测：仅「这就为您调出/调取/调阅/拉取 XX」之类的短句，无实质内容 */
+export function isHollowReply(text: string | undefined | null): boolean {
+  const t = (text ?? "").trim();
+  if (!t || t.length > 30) return false;
+  return /(调出|调取|调阅|拉取|为您加载|为您展示|为您列出|为您查询)/.test(t);
+}
+
+/** L0 查询开场文本：LLM reply 若非空话直接采用；read_character 按用户问法侧重
+ *  （形象/状态/关系），避免不同问法得到雷同的空话；其余空话回退为卡片标题。 */
+export function l0QueryReply(intent: string, card: Record<string, unknown>, prompt: string, llmReply: string | undefined | null): string {
+  const p = prompt ?? "";
+  if (intent === "read_character" && card.kind === "browse") {
+    const d = (card.data ?? {}) as Record<string, unknown>;
+    const name = String(d.name ?? "该角色");
+    const role = String(d.role ?? "");
+    if (/状态|近况|最新|现在|目前|处境/.test(p)) {
+      return `「${name}」当前状态：${String(d.status ?? "—")}`;
+    }
+    if (/形象|样子|长什么样|什么样|外貌|穿着|长相/.test(p)) {
+      const look = String(d.look ?? "").trim();
+      return look ? `「${name}」的形象：${look}` : `「${name}」：${role}。暂未登记形象细节，其余资料已为你列出。`;
+    }
+    if (/关系|认识谁|和谁|跟谁/.test(p)) {
+      const rels = (Array.isArray(d.relations) ? d.relations : []) as { name?: unknown; relation?: unknown }[];
+      return rels.length
+        ? `「${name}」的人物关系：${rels.map((r) => `${String(r.name)}（${String(r.relation)}）`).join("、")}。`
+        : `「${name}」暂无记录在案的人物关系，其余资料已为你列出。`;
+    }
+    return `「${name}」：${role}。当前状态：${String(d.status ?? "—")}`;
+  }
+  const t = (llmReply ?? "").trim();
+  if (t && !isHollowReply(t)) return t;
+  return String(card.title ?? "");
+}
+
 /** L0 查询直接执行 → BrowseCard / ResultCard */
 export function executeQuery(w: WorldState, intent: string, params: Record<string, unknown>): Record<string, unknown> | null {
-  /** 目标章数：goal 显式目标 > 弧线估计合计 > 章纲总数；无则 null（前端不显示进度条） */
-  const targetChapters = (): number | null => {
-    const t = w.goal?.structure?.targetChapters;
-    if (t != null && t > 0) return t;
-    const est = (w.storyArcs ?? []).reduce((n, a) => n + (a.estChapters || 0), 0);
-    if (est > 0) return est;
-    const plans = (w.chapterPlans ?? []).length;
-    return plans > 0 ? plans : null;
-  };
+  
   if (intent === "read_chapter") {    const idx = Number(params.index);
     const ch = w.chapters.find((c) => c.index === idx);
     if (!ch) return { kind: "result", title: "未找到章节", success: false, detail: `第 ${idx} 章不存在` };
@@ -295,9 +397,31 @@ export function executeQuery(w: WorldState, intent: string, params: Record<strin
     const name = String(params.name ?? "");
     const c = w.characters.find((x) => x.name.includes(name) || name.includes(x.name));
     if (!c) return { kind: "result", title: "未找到角色", success: false, detail: `没有叫「${name}」的角色` };
+    // 关系：该角色全部 relations（name → 关系词），展开为 [{name, relation}]
+    const relations = Object.entries(c.relations ?? {}).map(([n, relation]) => ({ name: n, relation }));
+    // 出场：appearedIn 章节 + 正文提及但未登记（appearedIn 可能滞后）
+    const appeared = [...new Set([...(c.appearedIn ?? []), ...w.chapters.filter((ch) => ch.text.includes(c.name)).map((ch) => ch.index)])].sort((a, b) => a - b);
+    // 后续安排：未完成章纲计划 / 相关弧线 / 待处理任务中提及该角色的条目
+    const arrangement: string[] = [];
+    for (const p of w.chapterPlans ?? []) {
+      if (p.status !== "done" && (p.goal ?? "").includes(c.name)) arrangement.push(`第 ${p.index} 章计划：${(p.goal ?? "").slice(0, 60)}`);
+    }
+    for (const a of w.storyArcs ?? []) {
+      if (a.status !== "done" && (a.goal ?? "").includes(c.name)) arrangement.push(`弧线「${a.title}」：${(a.goal ?? "").slice(0, 60)}`);
+    }
+    for (const d of w.qualityDebt ?? []) {
+      if (d.status === "open" && (d.issue ?? "").includes(c.name)) arrangement.push(`待处理质量债 第 ${d.chapterIndex} 章：${(d.issue ?? "").slice(0, 50)}`);
+    }
     const card: Record<string, unknown> = {
       kind: "browse", title: `${c.name} · ${c.role}`, browseType: "character",
-      data: { name: c.name, role: c.role, motivation: c.motivation, status: c.status },
+      data: {
+        name: c.name, role: c.role, status: c.status, gender: c.gender, age: c.age, identity: c.identity,
+        look: c.look, voice: c.voice, motivation: c.motivation,
+        relations, appeared, appearedCount: appeared.length,
+        exit: c.exit ? { chapter: c.exit.chapter, reason: c.exit.reason } : null,
+        arrangement: arrangement.slice(0, 5),
+        portrait: !!(c.portrait?.path || c.image),
+      },
     };
     // 附图：角色立绘（portrait）优先，其次头像（image）——data URI 直接可显示
     const mediaPath = c.portrait?.path ?? c.image;
@@ -312,6 +436,72 @@ export function executeQuery(w: WorldState, intent: string, params: Record<strin
       pending: isPendingForeshadow(w, f),
     }));
     return { kind: "browse", title: `伏笔账本（${list.length} 条）`, browseType: "foreshadow", data: { list } };
+  }
+  if (intent === "read_appearances") {
+    const idx = params.index != null && params.index !== "" ? Number(params.index) : w.chapters.length;
+    const ch = w.chapters.find((c) => c.index === idx);
+    if (!ch) return { kind: "result", title: "未找到章节", success: false, detail: `第 ${idx} 章不存在` };
+    const appeared = w.characters
+      .filter((c) => (c.appearedIn ?? []).includes(idx) || ch.text.includes(c.name))
+      .map((c) => ({ name: c.name, role: c.role, status: c.status, portrait: !!(c.portrait?.path || c.image) }));
+    return {
+      kind: "browse", title: `第${idx}章 · 出场角色（${appeared.length} 个）`, browseType: "appearances",
+      data: { chapter: idx, chapterTitle: ch.title, list: appeared },
+    };
+  }
+  if (intent === "read_relationships") {
+    // 全部关系（去重：a-(rel)-b 与 b-(rel)-a 同值只留一条，方向按名字排序）；params.name 限定某角色局部
+    const filterName = String(params.name ?? "").trim();
+    const seen = new Set<string>();
+    const list: Record<string, unknown>[] = [];
+    for (const c of w.characters) {
+      for (const [b, relation] of Object.entries(c.relations ?? {})) {
+        const key = [c.name, b].sort().join("|") + "|" + relation;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (filterName && c.name !== filterName && b !== filterName) continue;
+        list.push({ a: c.name, relation, b });
+      }
+    }
+    if (filterName) {
+      const c = w.characters.find((x) => x.name.includes(filterName) || filterName.includes(x.name));
+      if (!c) return { kind: "result", title: "未找到角色", success: false, detail: `没有叫「${filterName}」的角色` };
+      return { kind: "browse", title: `${c.name} · 关系网（${list.length} 条）`, browseType: "relationships", data: { name: c.name, list } };
+    }
+    return { kind: "browse", title: `人物关系图（${list.length} 条）`, browseType: "relationships", data: { list } };
+  }
+  if (intent === "read_outline") {
+    // 大纲/蓝图：主题 + 指南针 + 卷 + 弧线
+    const volumes = (w.blueprint?.volumes ?? []).map((v) => ({ title: v.title, status: v.status, goal: v.goal, range: v.chapterRange ?? null }));
+    const arcs = (w.storyArcs ?? []).map((a) => ({ title: a.title, status: a.status, estChapters: a.estChapters, goal: a.goal }));
+    return {
+      kind: "browse", title: "全书大纲", browseType: "outline",
+      data: {
+        premise: w.premise, genre: w.genre,
+        compass: w.blueprint?.compass, progressContract: w.blueprint?.progressContract,
+        volumes, arcs, done: w.chapters.length, target: targetChapterCount(w),
+      },
+    };
+  }
+  if (intent === "read_timeline") {
+    // 脉络：卷 → 弧 → 章 进展链
+    const arcsByVol = new Map<string, NonNullable<typeof w.storyArcs>>();
+    for (const a of w.storyArcs ?? []) {
+      const v = a.volume ?? "";
+      if (!arcsByVol.has(v)) arcsByVol.set(v, []);
+      arcsByVol.get(v)!.push(a);
+    }
+    const volumes = (w.blueprint?.volumes ?? []).map((v) => ({
+      title: v.title, status: v.status, goal: v.goal,
+      arcs: (arcsByVol.get(v.title) ?? []).map((a) => ({ title: a.title, status: a.status, estChapters: a.estChapters })),
+      chapters: w.chapters
+        .filter((ch) => (v.chapterRange?.[0] ?? 0) <= ch.index && ch.index <= (v.chapterRange?.[1] ?? Number.MAX_SAFE_INTEGER))
+        .map((ch) => ({ index: ch.index, title: ch.title, status: ch.review?.verdict === "revise" ? "需修订" : "已入册", words: ch.text.length })),
+    }));
+    return {
+      kind: "browse", title: "故事脉络", browseType: "timeline",
+      data: { volumes, next: w.nextChapter ?? w.chapters.length + 1, target: targetChapterCount(w), premise: w.premise },
+    };
   }
   if (intent === "read_proposals") {
     // 新角色提案：pending 列表 + 每项内嵌确认/拒绝操作（卡片可交互，允许操作）
@@ -350,7 +540,7 @@ export function executeQuery(w: WorldState, intent: string, params: Record<strin
       words: ch.text.length,
       media: (ch.media ?? []).length,
     }));
-    return { kind: "browse", title: `章节目录（${w.chapters.length} 章）`, browseType: "chapters", data: { done: w.chapters.length, target: targetChapters(), list } };
+    return { kind: "browse", title: `章节目录（${w.chapters.length} 章）`, browseType: "chapters", data: { done: w.chapters.length, target: targetChapterCount(w), list } };
   }
   if (intent === "read_characters") {
     // 角色列表：定位/状态/形象/出场次数 + 统计网格
@@ -397,7 +587,7 @@ export function executeQuery(w: WorldState, intent: string, params: Record<strin
       data: {
         debt: list, major: list.filter((d) => d.severity === "major").length,
         rewriteQueue: w.rewriteQueue ?? [], mergeTasks,
-        goal: { disposition: brainDisposition(w), chapterCount: w.chapters.length, target: targetChapters() },
+        goal: { disposition: brainDisposition(w), chapterCount: w.chapters.length, target: targetChapterCount(w) },
       },
     };
   }
@@ -465,8 +655,22 @@ export type BrainChatContext = {
   signal?: AbortSignal;
   /** resume 模式：复用最后一条未完成 assistant 消息重新生成（不重复写用户消息，前端先 reset 再收 delta） */
   resume?: boolean;
-  /** 前端上下文（左侧栏选中章等）：意图识别/参数提取兜底（需求 1/2：未指定章节的操作默认用选中章） */
-  ctx?: { chapterIndex?: number | null };
+  /** 前端系统快照（左侧栏选中章详情 + 系统时机 + presence/activity + 自动连载）：中枢全知上下文。
+   *  用于意图识别/参数提取兜底（未指定章节的操作默认用选中章），并感知「系统正在做什么/是否冲突」。 */
+  ctx?: {
+    chapterIndex?: number | null;
+    chapterTitle?: string | null;
+    chapterStatus?: string | null;
+    chapterWords?: number | null;
+    versionCount?: number | null;
+    systemStatus?: string | null;
+    writingRunning?: boolean;
+    presence?: string | null;
+    activity?: string | null;
+    autoRunning?: boolean;
+    /** 服务端状态快照（/api/brain/context）：自动连载/写作任务/媒体生成/视觉任务/待办——索引式全知 */
+    server?: Record<string, unknown>;
+  };
 };
 
 /** 纯对话系统提示：中枢以「墨枢」身份自然回答，允许 Markdown 富文本 */
@@ -487,15 +691,35 @@ export const brainChatDeps = {
   gachaGenerate: directorGachaGenerate,
 };
 
-/** 纯对话回复：真流式（chatStream 逐 delta），每 500ms 节流落盘一次 */
+/** 纯对话回复：真流式（chatStream 逐 delta），每 500ms 节流落盘一次。
+ *  注入世界摘要 + 系统快照：纯对话也能感知当前世界状态与系统时机（中枢全知）。 */
 async function streamChatReply(ctx: BrainChatContext, messageId: string): Promise<void> {
-  const { title, sessionId, prompt, send, signal } = ctx;
+  const { title, sessionId, prompt, send, signal, ctx: snap } = ctx;
   let acc = "";
   let lastFlush = 0;
+  // 世界摘要（动态读取，避免过期）；失败静默降级为仅 prompt
+  let worldCtx = "";
+  try {
+    const w = brainChatDeps.loadWorld(title);
+    if (w) {
+      const lines = [worldSummary(w)];
+      if (typeof snap?.chapterIndex === "number" && Number.isInteger(snap.chapterIndex)) {
+        const ch = w.chapters.find((c) => c.index === snap.chapterIndex);
+        if (ch) lines.push(`用户当前选中章节：第 ${ch.index} 章「${ch.title}」${ch.review?.verdict === "revise" ? "（需修订）" : ""}`);
+      }
+      const sys: string[] = [];
+      if (snap?.autoRunning) sys.push("自动连载运行中");
+      if (snap?.writingRunning) sys.push("写作任务进行中");
+      if (snap?.systemStatus) sys.push(snap.systemStatus);
+      if (sys.length) lines.push(`系统状态：${sys.join("；")}`);
+      worldCtx = lines.join("\n");
+    }
+  } catch { /* 世界读取失败：仅用 prompt 兜底 */ }
+  const userContent = worldCtx ? `当前世界与系统状态：\n${worldCtx}\n\n用户问题：${prompt}` : prompt;
   await brainChatDeps.chatStream(
     [
       { role: "system", content: CHAT_SYSTEM },
-      { role: "user", content: prompt },
+      { role: "user", content: userContent },
     ],
     (delta) => {
       acc += delta;
@@ -585,6 +809,45 @@ export function extractNameFromHistory(w: WorldState, userHist?: string[]): stri
     }
   }
   return "";
+}
+
+/** 追问选择卡（ask）构建：信息不足时给结构化候选选项（输入框上方询问面板，不混入聊天流），
+ * 无法生成候选时返回 null（调用方降级为自然追问）。
+ * 用户选完后把选项 label 作为新输入继续，AI 据此补全参数。 */
+export function buildAskCard(w: WorldState, intent: string, params: Record<string, unknown>): { kind: "ask"; question: string; options: { label: string; description?: string }[] } | null {
+  if (intent === "edit_world") {
+    const name = String(params.name ?? "").trim();
+    if (!name) {
+      const candidates = w.characters.slice(0, 4).map((c) => ({ label: c.name, description: `${c.role} · 可修改定位/状态/年龄/身份/动机/形象` }));
+      if (candidates.length) return { kind: "ask", question: "你想编辑哪个角色？", options: candidates };
+      return { kind: "ask", question: "你想编辑什么？", options: [{ label: "故事设定", description: "修改梗概/世界观/当前状态" }, { label: "新增角色", description: "添加一个新角色（如「新建角色 林墨」）" }] };
+    }
+  }
+  if (intent === "create_character") {
+    const name = String(params.name ?? "").trim();
+    if (!name) {
+      const props = (w.characterProposals ?? []).filter((p) => p.status === "pending").slice(0, 4).map((p) => ({ label: p.name, description: `${p.role} · ${(p.reason ?? "").slice(0, 30)}` }));
+      if (props.length) return { kind: "ask", question: "要新建哪个角色？（可从待确认提案中选择，或直接输入角色名）", options: props };
+      return { kind: "ask", question: "新建哪个角色？", options: [{ label: "直接输入", description: "在输入框输入角色名，如「新建角色 林墨」" }] };
+    }
+  }
+  if (intent === "relationship_edit") {
+    const a = String(params.nameA ?? params.a ?? "").trim();
+    const b = String(params.nameB ?? params.b ?? "").trim();
+    const rel = String(params.relation ?? "").trim();
+    if (!a || !b || !rel) {
+      const names = w.characters.slice(0, 4).map((c) => c.name);
+      const options = names.length >= 2
+        ? names.map((n) => ({ label: n, description: "选择此角色" }))
+        : [{ label: "输入角色名", description: "在输入框输入，如「给张三和李四建立仇人关系」" }];
+      const parts: string[] = [];
+      if (!a) parts.push("缺角色 A");
+      if (!b) parts.push("缺角色 B");
+      if (!rel) parts.push("缺关系词（如 仇人/盟友/师徒）");
+      return { kind: "ask", question: `建立关系还差：${parts.join("、")}。${a || b ? "请选择或输入另一个角色" : "请选择两个角色"}：`, options };
+    }
+  }
+  return null;
 }
 
 /** 表单卡构建：edit_world（角色/设定）、foreshadow_edit（伏笔增删改）走结构化表单，
@@ -882,6 +1145,90 @@ export function flattenFormValues(fields: FormFieldDef[], values: Record<string,
   return out;
 }
 
+/** 打开面板映射：open_* 意图 → 前端 onOpenPanel 分发键（target）/ 标题 / 定位参数（opts）/ 时机校验（blocked 返回拒绝原因） */
+const OPEN_PANELS: Record<
+  string,
+  {
+    title: string;
+    target: string;
+    detail: string;
+    opts?: (params: Record<string, unknown>, prompt?: string) => Record<string, unknown> | undefined;
+    /** 时机校验：返回非空字符串 = 拒绝并告知用户何时可操作（params 供 index 等提取） */
+    blocked?: (w: WorldState, ctx?: BrainChatContext["ctx"], params?: Record<string, unknown>) => string | null;
+  }
+> = {
+  open_proposals: {
+    title: "新角色提案", target: "proposals",
+    detail: "已为你打开底部新角色提案面板，可在其中查看推荐原因并确认/拒绝。",
+  },
+  open_settings: {
+    title: "打开设置", target: "settings",
+    detail: "已为你打开系统设置弹窗。",
+    opts: (params, prompt) => {
+      const t = String(params.tab ?? "");
+      if (["全局", "章节", "设定", "角色", "大纲", "导出"].includes(t)) return { tab: t };
+      // LLM 未提取 tab 时从用户输入兜底：添加/新建角色、用户（人物）页面 → 角色页（本系统无独立用户资料页）
+      const p = prompt ?? "";
+      if (/添加.{0,6}角色|新建.{0,6}角色|新建人物|用户页面|人物页面|角色页|加.{0,3}角色/.test(p)) return { tab: "角色" };
+      return undefined;
+    },
+  },
+  open_relationships: {
+    title: "打开关系图", target: "relationships",
+    detail: "已为你打开人物关系图，可查看各角色间的关联；点击角色可查看详情。",
+  },
+  open_taskcenter: {
+    title: "打开任务中心", target: "taskcenter",
+    detail: "已为你打开任务中心，可查看连载/推进任务进度与待确认事项。",
+  },
+  open_foreshadow: {
+    title: "打开伏笔账", target: "foreshadow",
+    detail: "已为你打开伏笔账，可查看全部伏笔的埋设/回收状态并增删改。",
+  },
+  open_review: {
+    title: "打开审查面板", target: "review",
+    detail: "已为你打开审查面板。",
+    // 优先取用户明确指定的章节（params.index），其次当前选中章
+    opts: (params) => {
+      const i = params?.index;
+      return i != null && i !== "" && Number.isFinite(Number(i)) ? { index: Number(i) } : undefined;
+    },
+    blocked: (w, ctx, params) => {
+      const specified = params?.index != null && params.index !== "" ? Number(params.index) : null;
+      const idx = specified != null && Number.isFinite(specified) ? specified : (typeof ctx?.chapterIndex === "number" ? ctx.chapterIndex : null);
+      const ch = idx != null && Number.isFinite(idx) ? w.chapters.find((c) => c.index === idx) : undefined;
+      if (specified != null && Number.isFinite(specified) && !ch) return `第 ${specified} 章不存在或还没有审查记录，写完并保存后会自动生成审查报告。`;
+      if (idx == null || !Number.isFinite(idx) || !ch) return "请先指定或选中一个已写章节，再让我打开它的审查面板。";
+      if (!ch.review) return `第 ${idx} 章还没有审查记录，写完并保存后会自动生成审查报告。`;
+      return null;
+    },
+  },
+  open_eval: {
+    title: "打开整书评估", target: "eval",
+    detail: "已为你打开整书评估面板。",
+    blocked: (w) => (w.chapters.length === 0 ? "还没有已写章节，写完第一章后即可评估整书质量。" : null),
+  },
+  open_gacha: {
+    title: "打开卡池", target: "gacha",
+    detail: "已为你打开卡池面板，可抽卡并查看待应用的卡牌。",
+  },
+  open_autostart: {
+    title: "打开自动连载", target: "autostart",
+    detail: "已为你打开自动连载确认框，配置目标章数后即可开始。",
+    blocked: (w) => {
+      const revise = w.chapters.filter((c) => c.review?.verdict === "revise");
+      if (revise.length) {
+        return `当前有 ${revise.length} 章需修订（第 ${revise.map((c) => c.index).join("、")} 章），自动连载前请先处理修订（章节操作栏「AI 修复」，或让我调出审查报告）。修订完成后随时可再让我打开自动连载。`;
+      }
+      return null;
+    },
+  },
+  open_memory: {
+    title: "打开记忆·台账", target: "memory",
+    detail: "已为你打开记忆·台账，可查看分层记忆与操作日志。",
+  },
+};
+
 /**
  * 中枢对话编排主流程（SSE，事件协议 v2）：
  * 1. 会话准备：新建会话或 resume 复用未完成消息
@@ -965,6 +1312,29 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
 
     // 抽卡：聊天内完整闭环——直接生成卡池 → 浏览卡（逐张应用/全部应用），不走 preview 卡
     if (intent === "gacha") {
+      // 系统状态冲突前置检测（抽卡为写操作，与连载/写作任务冲突时拒绝）
+      const gachaBusy: string[] = [];
+      if (ctx.ctx?.autoRunning) gachaBusy.push("自动连载正在运行中");
+      if (ctx.ctx?.writingRunning) gachaBusy.push("写作任务进行中");
+      if (ctx.ctx?.systemStatus) gachaBusy.push(ctx.ctx.systemStatus);
+      const sv3 = ctx.ctx?.server;
+      if (sv3?.advanceTaskRunning) gachaBusy.push("推进任务进行中");
+      if (sv3?.mediaGenerating) gachaBusy.push("插画/视频生成中");
+      if (gachaBusy.length) {
+        const text = reply || meta.title;
+        if (text) {
+          updateMessageText(title, sessionId, messageId, text, true);
+          send({ type: "delta", messageId, text });
+        }
+        const busyCard: BrainChatCard = {
+          kind: "result", title: meta.title, success: false,
+          detail: `当前${gachaBusy.join("、")}，为避免与运行中任务冲突暂不执行「${meta.title}」。可先等待完成或中断后再试。`,
+        };
+        markMessageDone(title, sessionId, messageId, [busyCard]);
+        send({ type: "card", messageId, card: busyCard });
+        send({ type: "done", messageId });
+        return;
+      }
       const text = reply || meta.title;
       if (text) {
         updateMessageText(title, sessionId, messageId, text, true);
@@ -1022,11 +1392,178 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
         markMessageDone(title, sessionId, messageId, [card]);
         send({ type: "card", messageId, card });
       } else {
-        // 信息不足：中枢主动询问补充（自然对话流，不弹误导表单）
-        await streamChatReply({ ...ctx, prompt: `用户想要「${meta.title}」，但缺少必要信息（如具体要编辑哪个角色、哪条伏笔）。请用一到两句自然的中文，询问用户需要补充的具体信息。不要执行任何操作。` }, messageId);
-        markMessageDone(title, sessionId, messageId);
+        // 信息不足：优先结构化 ask 追问卡（输入框上方询问面板，选项可点选，刷新后恢复）；
+        // 无法生成候选时降级为自然对话流追问
+        const ask = buildAskCard(w, intent, params);
+        if (ask) {
+          markMessageDone(title, sessionId, messageId, [ask]);
+          send({ type: "card", messageId, card: ask });
+        } else {
+          await streamChatReply({ ...ctx, prompt: `用户想要「${meta.title}」，但缺少必要信息（如具体要编辑哪个角色、哪条伏笔）。请用一到两句自然的中文，询问用户需要补充的具体信息。不要执行任何操作。` }, messageId);
+          markMessageDone(title, sessionId, messageId);
+        }
       }
       send({ type: "done", messageId }); // card 分支与询问分支共用一次 done
+      return;
+    }
+
+    // —— 角色写操作：评估 → 直接执行（关系/增删改）或拒绝（给原因，不轻易拒绝）——
+    // relationship_edit：给张三和李四建立仇人关系 → 评估冲突 → 通过直接写世界 + 「已建立关系：张三-(仇人)-李四」
+    // create_character / edit_character / delete_character：便捷增删改（参数不足先 ask 追问）
+    if (intent === "relationship_edit" || intent === "create_character" || intent === "edit_character" || intent === "delete_character") {
+      // 系统状态冲突前置检测：自动连载/写作任务运行中 → 拒绝写操作（load-modify-save 与连载任务竞态会互相覆盖）
+      const roleBusyReasons: string[] = [];
+      if (ctx.ctx?.autoRunning) roleBusyReasons.push("自动连载正在运行中");
+      if (ctx.ctx?.writingRunning) roleBusyReasons.push("写作任务进行中");
+      if (ctx.ctx?.systemStatus) roleBusyReasons.push(ctx.ctx.systemStatus);
+      const svR = ctx.ctx?.server;
+      if (svR?.advanceTaskRunning) roleBusyReasons.push("推进任务进行中");
+      if (svR?.mediaGenerating) roleBusyReasons.push("插画/视频生成中");
+      if (roleBusyReasons.length) {
+        const busyCard: BrainChatCard = {
+          kind: "result", title: meta.title, success: false,
+          detail: `当前${roleBusyReasons.join("、")}，为避免与运行中任务冲突暂不执行「${meta.title}」。可先等待完成或中断后再试。`,
+        };
+        markMessageDone(title, sessionId, messageId, [busyCard]);
+        send({ type: "card", messageId, card: busyCard });
+        send({ type: "done", messageId });
+        return;
+      }
+      const wLive = brainChatDeps.loadWorld(title);
+      if (!wLive) {
+        markMessageDone(title, sessionId, messageId, []);
+        send({ type: "done", messageId });
+        return;
+      }
+      // 先发「评估中」提示（delta），再出结果——呈现 评估中 → 结果 的过程
+      const assessing = reply || (intent === "relationship_edit" ? "正在评估关系与现状的冲突…" : `正在处理「${meta.title}」…`);
+      if (assessing) {
+        updateMessageText(title, sessionId, messageId, assessing, true);
+        send({ type: "delta", messageId, text: assessing });
+      }
+      let result: BrainChatCard | null = null;
+      let askCard: { kind: "ask"; question: string; options: { label: string; description?: string }[] } | null = null;
+      if (intent === "relationship_edit") {
+        const aName = String(params.nameA ?? params.a ?? "").trim();
+        const bName = String(params.nameB ?? params.b ?? "").trim();
+        const rel = typeof params.relation === "string" ? params.relation.trim() : "";
+        const remove = params.remove === true || params.action === "remove";
+        const a = aName ? wLive.characters.find((c) => c.name.includes(aName) || aName.includes(c.name)) : undefined;
+        const b = bName ? wLive.characters.find((c) => c.name.includes(bName) || bName.includes(c.name)) : undefined;
+        if (!aName || !bName || !rel) {
+          // 参数不足 → ask 追问（不轻易拒绝）
+          askCard = buildAskCard(wLive, "relationship_edit", params);
+        } else if (!a || !b) {
+          const missing = !a ? aName : bName;
+          result = {
+            kind: "result", title: "关系未建立", success: false,
+            detail: `「${missing}」还不在这本书里，暂时无法建立关系。可以让我「新建角色 ${missing}」，或从现有角色里选一个（现有：${wLive.characters.slice(0, 5).map((c) => c.name).join("、")}${wLive.characters.length > 5 ? "…" : ""}）。`,
+          };
+        } else if (a.id === b.id) {
+          result = { kind: "result", title: "关系未建立", success: false, detail: "不能与自己建立关系，请选择两个不同角色。" };
+        } else {
+          // 宽松评估：不轻易拒绝——已存在同值关系幂等确认；异值关系升级覆盖；无冲突直接建立
+          const existingA = a.relations?.[b.name];
+          const existingB = b.relations?.[a.name];
+          if (remove) {
+            const ra = { ...(a.relations ?? {}) };
+            delete ra[b.name];
+            a.relations = ra;
+            const rb = { ...(b.relations ?? {}) };
+            delete rb[a.name];
+            b.relations = rb;
+          } else {
+            a.relations = { ...(a.relations ?? {}), [b.name]: rel };
+            b.relations = { ...(b.relations ?? {}), [a.name]: rel };
+          }
+          logChange(wLive, {
+            chapter: wLive.nextChapter, actor: "user", kind: "relationship-edit",
+            detail: remove
+              ? `解除关系：${a.name}-(${existingA ?? "原关系"})-${b.name}`
+              : `${existingA ? `更新关系（原「${String(existingA).slice(0, 20)}」）` : "建立关系"}：${a.name}-(${rel})-${b.name}`,
+            commandId: "CMD-W12",
+          });
+          saveWorld(wLive);
+          result = {
+            kind: "result", title: remove ? "关系已解除" : "关系已建立", success: true,
+            detail: remove
+              ? `已解除关系：${a.name}-(${existingA ?? "原关系"})-${b.name}`
+              : `已建立关系：${a.name}-(${rel})-${b.name}${existingA ? `（原关系已更新）` : ""}${existingB ? `（反向关系 ${b.name}-(${existingB})-${a.name} 已同步更新）` : ""}`,
+          };
+        }
+      } else if (intent === "create_character") {
+        const cName = String(params.name ?? "").trim();
+        const role = String(params.role ?? "配角").trim();
+        if (!cName) {
+          askCard = buildAskCard(wLive, "create_character", params);
+        } else if (wLive.characters.some((c) => c.name === cName)) {
+          result = { kind: "result", title: "角色已存在", success: false, detail: `「${cName}」已经在这本书里了（${wLive.characters.find((c) => c.name === cName)?.role}）。可以让我「修改角色 ${cName}」或「查看 ${cName}」。` };
+        } else {
+          const id = `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+          wLive.characters.push({
+            id, name: cName, role, traits: [], motivation: String(params.motivation ?? ""),
+            status: String(params.status ?? "在世"), relations: {}, introducedAt: Date.now(),
+          });
+          logChange(wLive, { chapter: wLive.nextChapter, actor: "user", kind: "character-create", detail: `新建角色「${cName}」（${role}）`, commandId: "CMD-W12" });
+          saveWorld(wLive);
+          result = {
+            kind: "result", title: "角色已创建", success: true,
+            detail: `已创建角色：${cName}（定位：${role}）。可让我「为 ${cName} 生成立绘」「给 ${cName} 和某角色建立关系」，或在「打开设置-角色」页完善信息。`,
+          };
+        }
+      } else if (intent === "edit_character") {
+        const eName = String(params.name ?? "").trim();
+        const c = eName ? wLive.characters.find((x) => x.name.includes(eName) || eName.includes(x.name)) : undefined;
+        if (!eName || !c) {
+          // 缺名/找不到 → ask 追问（候选角色）或明确提示
+          if (eName) {
+            result = { kind: "result", title: "角色未找到", success: false, detail: `没有叫「${eName}」的角色。现有角色：${wLive.characters.slice(0, 5).map((x) => x.name).join("、")}${wLive.characters.length > 5 ? "…" : ""}` };
+          } else {
+            askCard = buildAskCard(wLive, "edit_world", params);
+          }
+        } else {
+          const updates: string[] = [];
+          if (params.role != null) { c.role = String(params.role); updates.push(`定位→${String(params.role)}`); }
+          if (params.status != null) { c.status = String(params.status); updates.push(`状态→${String(params.status)}`); }
+          if (params.age != null) { c.age = String(params.age); updates.push(`年龄→${String(params.age)}`); }
+          if (params.identity != null) { c.identity = String(params.identity); updates.push(`身份→${String(params.identity)}`); }
+          if (params.motivation != null) { c.motivation = String(params.motivation); updates.push(`动机→${String(params.motivation).slice(0, 20)}${String(params.motivation).length > 20 ? "…" : ""}`); }
+          if (params.look != null) { c.look = String(params.look); updates.push(`形象→${String(params.look).slice(0, 20)}`); }
+          if (params.voice != null) { c.voice = String(params.voice); updates.push(`声线→${String(params.voice)}`); }
+          if (!updates.length) {
+            result = { kind: "result", title: "未修改", success: false, detail: `请告诉我要修改「${c.name}」的哪一项（定位/状态/年龄/身份/动机/形象/声线），如「把 ${c.name} 的状态改成负伤」。` };
+          } else {
+            logChange(wLive, { chapter: wLive.nextChapter, actor: "user", kind: "character-edit", detail: `修改角色「${c.name}」：${updates.join("、")}`, commandId: "CMD-W12" });
+            saveWorld(wLive);
+            result = { kind: "result", title: "角色已更新", success: true, detail: `已更新「${c.name}」：${updates.join("、")}。` };
+          }
+        }
+      } else if (intent === "delete_character") {
+        const dName = String(params.name ?? "").trim();
+        const c = dName ? wLive.characters.find((x) => x.name.includes(dName) || dName.includes(x.name)) : undefined;
+        if (!dName || !c) {
+          result = dName
+            ? { kind: "result", title: "角色未找到", success: false, detail: `没有叫「${dName}」的角色。现有角色：${wLive.characters.slice(0, 5).map((x) => x.name).join("、")}${wLive.characters.length > 5 ? "…" : ""}` }
+            : { kind: "result", title: "未删除", success: false, detail: "请告诉我要删除哪个角色，如「删除角色 刘二」。" };
+        } else if ((c.appearedIn ?? []).length || wLive.chapters.some((ch) => ch.text.includes(c.name))) {
+          result = { kind: "result", title: "无法删除", success: false, detail: `「${c.name}」已在 ${(c.appearedIn ?? []).length || "部分"} 个章节出场，删除会破坏已写剧情。建议改为「把 ${c.name} 的状态改成离场」或在关系图中解除其关系后继续使用。` };
+        } else {
+          const idx = wLive.characters.indexOf(c);
+          wLive.characters.splice(idx, 1);
+          logChange(wLive, { chapter: wLive.nextChapter, actor: "user", kind: "character-delete", detail: `删除角色「${c.name}」`, commandId: "CMD-W12" });
+          saveWorld(wLive);
+          result = { kind: "result", title: "角色已删除", success: true, detail: `已删除角色：${c.name}。` };
+        }
+      }
+      if (askCard) {
+        markMessageDone(title, sessionId, messageId, [askCard]);
+        send({ type: "card", messageId, card: askCard });
+      } else {
+        const finalCard = result ?? { kind: "result" as const, title: meta.title, success: false, detail: "操作未完成，请重试或补充信息。" };
+        markMessageDone(title, sessionId, messageId, [finalCard]);
+        send({ type: "card", messageId, card: finalCard });
+      }
+      send({ type: "done", messageId });
       return;
     }
 
@@ -1039,16 +1576,47 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
 
     const cards: BrainChatCard[] = [];
 
-    // 打开新角色提案：纯 UI 动作——只回复 + 发「已打开」result 卡（前端检测到该卡 → 恢复底部提案区），不列提案列表
-    if (intent === "open_proposals") {
-      const text = reply || meta.title;
-      if (text) {
-        updateMessageText(title, sessionId, messageId, text, true);
-        send({ type: "delta", messageId, text });
+    // —— 打开系统面板/弹窗：纯 UI 导航（result 卡带 open 字段，前端统一分发触发对应弹窗） ——
+    // 时机校验：需在正确时机才能触发的（自动连载须无待修订章、评估须有已写章、审查须选中章有报告）在服务端拒绝并说明
+    // 注意：开场回复文本已由上方「操作意图」分支统一 delta 发送，此处不再重复发送（曾重复广播同一 delta）
+    if (intent.startsWith("open_")) {
+      const def = OPEN_PANELS[intent];
+      if (!def) {
+        // 未知 open 目标（模型幻觉）：明确告知不可用，避免静默落入 L0 查询分支
+        const card: BrainChatCard = {
+          kind: "result", title: meta.title, success: false,
+          detail: "暂不支持打开该面板。可尝试：打开设置 / 关系图 / 任务中心 / 伏笔账 / 审查面板 / 卡池 / 整书评估 / 记忆·台账 / 自动连载 / 新角色提案区。",
+        };
+        markMessageDone(title, sessionId, messageId, [card]);
+        send({ type: "card", messageId, card });
+        send({ type: "done", messageId });
+        return;
       }
+      if (def) {
+        const blocked = def.blocked ? def.blocked(w, ctx.ctx, params) : null;
+        if (blocked) {
+          const card: BrainChatCard = { kind: "result", title: meta.title, success: false, detail: blocked };
+          markMessageDone(title, sessionId, messageId, [card]);
+          send({ type: "card", messageId, card });
+          send({ type: "done", messageId });
+          return;
+        }
+        const card: BrainChatCard = {
+          kind: "result", title: def.title, success: true, detail: def.detail,
+          open: { target: def.target, ...(def.opts ? { opts: def.opts(params, activePrompt) } : {}) },
+        };
+        markMessageDone(title, sessionId, messageId, [card]);
+        send({ type: "card", messageId, card });
+        send({ type: "done", messageId });
+        return;
+      }
+    }
+
+    // —— 中枢能力清单：回复文本（流式）+ 固定摘要卡 ——
+    if (intent === "read_help") {
       const card: BrainChatCard = {
-        kind: "result", title: "新角色提案", success: true,
-        detail: "已为你打开底部新角色提案面板，可在其中查看推荐原因与确认/拒绝。",
+        kind: "result", title: "中枢能力清单", success: true,
+        detail: "数据询问：章节目录/角色（立绘·关系·出场·后续安排）/某章出场角色/人物关系/大纲/脉络时间线/伏笔/新角色提案/卡池/计划进度/任务（质量债与重写队列）/台账日志/审查报告/媒体资源/整书评估/设定世界书\n写作治理：推进剧情写一章/AI 重写章节/回溯重写/自动连载（开始·暂停·停止·跳过·确认草稿）/生成插画与视频/抽卡/设定一致性巡检/导出全书\n编辑计划：编辑设定与角色/新建·修改·删除角色/建立人物关系（如「给张三和李四建立仇人关系」）/伏笔增删改/展开弧章纲/调整生成参数/制定方案/征求意见\n打开面板：设置（含角色页）/关系图/任务中心/伏笔账/审查面板/卡池/整书评估/记忆·台账/自动连载/新角色提案区",
       };
       markMessageDone(title, sessionId, messageId, [card]);
       send({ type: "card", messageId, card });
@@ -1060,11 +1628,41 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
     if (meta.level === "L0" && !meta.action) {
       const card = executeQuery(w, intent, params);
       if (card) {
+        // 开场文本升级：LLM reply 是「这就为您调出」式空话、或角色查询需按问法侧重时，
+        // 用卡片要点重写（delta 为替换语义覆盖空话，不重复拼接；保留打字机动画体验）
+        const better = l0QueryReply(intent, card, activePrompt, reply);
+        if (better && better !== text) {
+          updateMessageText(title, sessionId, messageId, better, true);
+          send({ type: "delta", messageId, text: better });
+        }
         cards.push(card);
         send({ type: "card", messageId, card });
       }
     } else {
       // 写操作（L0 有 action 的如 gacha/eval/integrity 也走预览卡，客户端执行）
+      // —— 系统状态冲突前置检测：自动连载/写作任务运行中 → 拒绝写操作，给失败 result 卡（不生成 preview，避免双跑） ——
+      const busyReasons: string[] = [];
+      if (ctx.ctx?.autoRunning) busyReasons.push("自动连载正在运行中");
+      if (ctx.ctx?.writingRunning) busyReasons.push("写作任务进行中");
+      if (ctx.ctx?.systemStatus) busyReasons.push(ctx.ctx.systemStatus);
+      const sv2 = ctx.ctx?.server;
+      if (sv2?.advanceTaskRunning) busyReasons.push("推进任务进行中");
+      if (sv2?.mediaGenerating) busyReasons.push("插画/视频生成中");
+      if (busyReasons.length) {
+        const text = reply || meta.title;
+        if (text) {
+          updateMessageText(title, sessionId, messageId, text, true);
+          send({ type: "delta", messageId, text });
+        }
+        const busyCard: BrainChatCard = {
+          kind: "result", title: meta.title, success: false,
+          detail: `当前${busyReasons.join("、")}，为避免与运行中任务冲突暂不执行「${meta.title}」。可先等待完成或中断后再试。`,
+        };
+        markMessageDone(title, sessionId, messageId, [busyCard]);
+        send({ type: "card", messageId, card: busyCard });
+        send({ type: "done", messageId });
+        return;
+      }
       const needConfirm = meta.level === "L2" || meta.level === "L3";
       // 注入 params 到 action.body（title 放最后确保不被 LLM 返回的 params 覆盖）
       const body: Record<string, unknown> = { ...meta.action?.body, ...params, title };

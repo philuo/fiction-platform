@@ -3,6 +3,7 @@
 // 卡片类型定义同时供 PHASE 4 意图识别编排器产出
 // 可选 image 字段：任意卡片可携带一张图（角色立绘/章节插画等），渲染在卡片内容上方
 import { useState, type ReactNode } from "react";
+import { lensCn } from "../terms";
 
 // ============ 卡片数据类型 ============
 
@@ -129,7 +130,14 @@ export type ProgressCard = {
   detail?: string;
 };
 
-export type BrainCard = PreviewCard | ConfirmCard | ResultCard | BrowseCard | ChoiceCard | FormCard | ProgressCard;
+/** 追问选择卡（ask）：中枢信息不足时向用户询问（不渲染进聊天流，显示在输入框上方询问面板；刷新后恢复） */
+export type AskCard = {
+  kind: "ask";
+  question: string;
+  options: { label: string; description?: string }[];
+};
+
+export type BrainCard = PreviewCard | ConfirmCard | ResultCard | BrowseCard | ChoiceCard | FormCard | ProgressCard | AskCard;
 
 // ============ 级别徽章 ============
 
@@ -187,7 +195,7 @@ export const ConfirmCardView: React.FC<{
         <LevelBadge level={card.level} />
       </div>
       {card.impact && <p className="brain-card-impact">{card.impact}</p>}
-      {card.verdict && <p className="brain-card-verdict">闸门裁决：{card.verdict}</p>}
+      {card.verdict && <p className="brain-card-verdict">闸门裁决：{card.verdict === "allow" ? "放行" : card.verdict === "reject" ? "驳回" : String(card.verdict)}</p>}
       <div className="brain-card-actions">
         {completed ? (
           <span className="bc-done-tag">✓ 已处理</span>
@@ -202,6 +210,33 @@ export const ConfirmCardView: React.FC<{
     </div>
   );
 };
+
+// ============ 台账·日志中文标签（与 MemoryAuditModal 一致） ============
+const ACTOR_TEXT: Record<string, string> = { user: "用户", ai: "AI", brain: "中枢", system: "系统", integrity: "自检", auto: "连载", critic: "审查" };
+/** 指令级别徽章文本（L0-L3，对已完成叙事/账本的破坏性） */
+const LEVEL_TEXT: Record<string, string> = { L0: "L0·只读", L1: "L1·前瞻", L2: "L2·回溯", L3: "L3·不可逆" };
+
+/** 列表默认显示条数上限：超过则截断 + 「展开全部」（长列表可折叠） */
+const MAX_LIST_ITEMS = 6;
+
+/** 时间戳 → MM-DD HH:MM（logs 卡台账时间，替代 ISO 原始串） */
+function fmtCardTime(at: unknown): string {
+  const ts = typeof at === "number" ? at : typeof at === "string" ? Date.parse(at) : NaN;
+  if (!Number.isFinite(ts)) return String(at ?? "");
+  const d = new Date(ts);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return d.getMonth() + 1 + "-" + pad(d.getDate()) + " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
+}
+
+/** 列表截断按钮（超过 MAX_LIST_ITEMS 时显示） */
+function ListMoreButton({ total, shown, onToggle }: { total: number; shown: boolean; onToggle: () => void }) {
+  if (total <= MAX_LIST_ITEMS) return null;
+  return (
+    <button className="bc-list-more" onClick={onToggle}>
+      {shown ? "收起" : "还有 " + (total - MAX_LIST_ITEMS) + " 条 · 展开全部"}
+    </button>
+  );
+}
 
 // ============ ResultCard 结果卡 ============
 
@@ -349,6 +384,8 @@ export const BrowseCardView: React.FC<{
   completedItems?: ReadonlySet<string>;
 }> = ({ card, onAction, busy, completedItems }) => {
   const [open, setOpen] = useState(() => !FOLD_BROWSE_TYPES.has(card.browseType));
+  /** 长列表是否显示全部（截断状态：默认前 MAX_LIST_ITEMS 条 + 展开全部） */
+  const [showAllList, setShowAllList] = useState(false);
   let body: ReactNode = null;
   const d = card.data as Record<string, unknown> | null;
   if (card.browseType === "chapter" && d) {
@@ -359,10 +396,145 @@ export const BrowseCardView: React.FC<{
       </>
     );
   } else if (card.browseType === "character" && d) {
+    // 角色卡：立绘（CardFigure）+ 属性网格 + 动机 + 关系 + 出场 + 后续安排
+    const relations = (Array.isArray(d.relations) ? d.relations : []) as Record<string, unknown>[];
+    const appeared = (Array.isArray(d.appeared) ? d.appeared : []) as number[];
+    const arrangement = (Array.isArray(d.arrangement) ? d.arrangement : []) as string[];
+    const attrRows: [string, unknown][] = [
+      ["定位", d.role], ["状态", d.status], ["性别", d.gender], ["年龄", d.age],
+      ["身份", d.identity], ["声线", d.voice],
+    ];
     body = (
       <>
         <div className="bc-browse-title">{String(d.name ?? "")} · {String(d.role ?? "")}</div>
-        <p className="bc-browse-text">{String(d.motivation ?? "")}</p>
+        {attrRows.filter(([, v]) => v != null && v !== "").length > 0 && (
+          <div className="bc-stats">
+            {attrRows.filter(([, v]) => v != null && v !== "").map(([k, v]) => (
+              <span className="bc-stat" key={k}><b>{String(v)}</b>{k}</span>
+            ))}
+          </div>
+        )}
+        {d.look ? <p className="bc-browse-text">形象：{String(d.look)}</p> : null}
+        {d.motivation ? <p className="bc-browse-text">动机：{String(d.motivation)}</p> : null}
+        {d.exit ? <p className="bc-browse-text">离场：第 {String((d.exit as Record<string, unknown>).chapter)} 章 · {String((d.exit as Record<string, unknown>).reason ?? "")}</p> : null}
+        {relations.length > 0 && (
+          <div className="bc-browse-list">
+            <div className="bc-browse-sec">关系（{relations.length}）</div>
+            {relations.map((r, i) => (
+              <div key={i} className="bc-browse-item">
+                <span className="bc-browse-item-title">{String(r.relation ?? "")}</span>
+                <span className="bc-browse-meta">{String(r.name ?? "")}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        <p className="bc-browse-meta">出场：第 {appeared.join("、") || "—"} 章（共 {String(d.appearedCount ?? appeared.length)} 次）</p>
+        {arrangement.length > 0 && (
+          <div className="bc-browse-list">
+            <div className="bc-browse-sec">后续安排</div>
+            {arrangement.map((a, i) => <p key={i} className="bc-browse-text">{a}</p>)}
+          </div>
+        )}
+      </>
+    );
+  } else if (card.browseType === "appearances" && d) {
+    // 某章出场角色：章标题 + 角色列表（立绘标记）
+    const list = (Array.isArray(d.list) ? d.list : []) as Record<string, unknown>[];
+    body = (
+      <>
+        <div className="bc-browse-title">第 {String(d.chapter ?? "")} 章 · {String(d.chapterTitle ?? "")}</div>
+        <div className="bc-browse-list">
+          {list.map((c, i) => (
+            <div key={i} className="bc-browse-item">
+              <span className="bc-browse-item-title">{String(c.name ?? "")}</span>
+              <span className="bc-browse-meta">{String(c.role ?? "")}{c.portrait ? " · 有立绘" : ""}{c.status ? ` · ${String(c.status)}` : ""}</span>
+            </div>
+          ))}
+        </div>
+      </>
+    );
+  } else if (card.browseType === "relationships" && d) {
+    // 人物关系：a-(关系)-b 列表（局部关系网：d.name）
+    const list = (Array.isArray(d.list) ? d.list : []) as Record<string, unknown>[];
+    body = (
+      <>
+        {d.name ? <div className="bc-browse-title">{String(d.name)} 的关系网</div> : null}
+        <div className="bc-browse-list">
+          {list.map((r, i) => (
+            <div key={i} className="bc-browse-item bc-rel-item">
+              <span className="bc-browse-item-title">{String(r.a ?? "")}</span>
+              <span className="bc-rel-arrow">-({String(r.relation ?? "")})-</span>
+              <span className="bc-browse-item-title">{String(r.b ?? "")}</span>
+            </div>
+          ))}
+        </div>
+      </>
+    );
+  } else if (card.browseType === "outline" && d) {
+    // 全书大纲：主题 + 指南针 + 卷 + 弧线 + 进度
+    const volumes = (Array.isArray(d.volumes) ? d.volumes : []) as Record<string, unknown>[];
+    const arcs = (Array.isArray(d.arcs) ? d.arcs : []) as Record<string, unknown>[];
+    body = (
+      <>
+        {d.premise ? <p className="bc-browse-text">{String(d.premise)}</p> : null}
+        <div className="bc-stats">
+          <span className="bc-stat"><b>{String(d.done ?? "")}</b>已写章</span>
+          <span className="bc-stat"><b>{String(d.target ?? "")}</b>目标章</span>
+          {d.compass ? <span className="bc-stat"><b>{String(d.compass)}</b>指南针</span> : null}
+        </div>
+        {volumes.length > 0 && (
+          <div className="bc-browse-list">
+            <div className="bc-browse-sec">卷</div>
+            {volumes.map((v, i) => (
+              <div key={i} className="bc-browse-item">
+                <span className="bc-browse-item-title">{String(v.title ?? "")}</span>
+                <span className="bc-browse-meta">{String(v.status ?? "")}{v.range ? ` · 第 ${String((v.range as number[])[0])}-${String((v.range as number[])[1])} 章` : ""}</span>
+                {v.goal ? <p className="bc-browse-text">{String(v.goal)}</p> : null}
+              </div>
+            ))}
+          </div>
+        )}
+        {arcs.length > 0 && (
+          <div className="bc-browse-list">
+            <div className="bc-browse-sec">弧线</div>
+            {arcs.map((a, i) => (
+              <div key={i} className="bc-browse-item">
+                <span className="bc-browse-item-title">{String(a.title ?? "")}</span>
+                <span className="bc-browse-meta">{String(a.status ?? "")}{a.estChapters ? ` · 约 ${String(a.estChapters)} 章` : ""}</span>
+                {a.goal ? <p className="bc-browse-text">{String(a.goal)}</p> : null}
+              </div>
+            ))}
+          </div>
+        )}
+      </>
+    );
+  } else if (card.browseType === "timeline" && d) {
+    // 故事脉络：卷 → 弧 → 章 进展链
+    const volumes = (Array.isArray(d.volumes) ? d.volumes : []) as Record<string, unknown>[];
+    body = (
+      <>
+        <div className="bc-stats">
+          <span className="bc-stat"><b>下一章</b>第 {String(d.next ?? "")} 章</span>
+          {d.target ? <span className="bc-stat"><b>{String(d.target)}</b>目标章</span> : null}
+        </div>
+        {volumes.map((v, i) => (
+          <div key={i} className="bc-browse-list">
+            <div className="bc-browse-sec">{String(v.title ?? "")} · {String(v.status ?? "")}</div>
+            {(Array.isArray(v.arcs) ? v.arcs : []).map((a, j) => (
+              <div key={`a${j}`} className="bc-browse-item">
+                <span className="bc-browse-item-title">弧：{String((a as Record<string, unknown>).title ?? "")}</span>
+                <span className="bc-browse-meta">{String((a as Record<string, unknown>).status ?? "")}</span>
+              </div>
+            ))}
+            {(Array.isArray(v.chapters) ? v.chapters : []).map((ch, j) => (
+              <div key={`c${j}`} className="bc-browse-item">
+                <span className="bc-browse-item-id">第 {String((ch as Record<string, unknown>).index ?? "")} 章</span>
+                <span className="bc-browse-item-title">{String((ch as Record<string, unknown>).title ?? "")}</span>
+                <span className="bc-browse-meta">{String((ch as Record<string, unknown>).status ?? "")}</span>
+              </div>
+            ))}
+          </div>
+        ))}
       </>
     );
   } else if (card.browseType === "foreshadow" && d) {
@@ -449,9 +621,14 @@ export const BrowseCardView: React.FC<{
   } else if (card.browseType === "characters" && d) {
     // 角色列表：统计网格 + 每角色（定位/身份/状态/出场/立绘）
     const list = (Array.isArray(d.list) ? d.list : []) as Record<string, unknown>[];
+    // 统计网格键名中文化（后端/历史数据存 total/withPortrait/appeared，展示层统一映射为中文）
+    const CHARACTERS_STATS_CN: Record<string, string> = { total: "角色总数", withPortrait: "有立绘", appeared: "已出场" };
+    const statsCn = (d.stats as Record<string, unknown> | null | undefined)
+      ? Object.fromEntries(Object.entries(d.stats as Record<string, unknown>).map(([k, v]) => [CHARACTERS_STATS_CN[k] ?? k, v]))
+      : undefined;
     body = (
       <>
-        <CardStats stats={d.stats} />
+        <CardStats stats={statsCn} />
         <div className="bc-browse-list">
           {list.map((c) => (
             <CardListItem
@@ -486,7 +663,7 @@ export const BrowseCardView: React.FC<{
                 item={v}
                 title={<span className="bc-browse-item-title">{String(v.title ?? "")}</span>}
                 meta={v.goal ? <>{String(v.goal)}</> : null}
-                status={v.status}
+                status={v.status === "done" ? "完成" : v.status === "writing" ? "写作中" : v.status === "planned" ? "已规划" : String(v.status ?? "")}
                 statusLevel={v.status === "done" ? "ok" : v.status === "writing" ? "warn" : "info"}
               />
             ))}
@@ -501,7 +678,7 @@ export const BrowseCardView: React.FC<{
                 item={a}
                 title={<span className="bc-browse-item-title">{String(a.title ?? "")}</span>}
                 meta={a.goal ? <>{String(a.goal)}｜约 {String(a.estChapters ?? "?")} 章</> : null}
-                status={a.status}
+                status={a.status === "done" ? "完成" : a.status === "expanded" ? "已展开" : a.status === "skeleton" ? "骨架" : a.status === "writing" ? "写作中" : String(a.status ?? "")}
                 statusLevel={a.status === "done" ? "ok" : a.status === "writing" || a.status === "expanded" ? "warn" : "info"}
               />
             ))}
@@ -521,8 +698,9 @@ export const BrowseCardView: React.FC<{
       </>
     );
   } else if (card.browseType === "tasks" && d) {
-    // 任务中心：统计 + 质量债（内嵌 fix/ignore）+ 重写队列 + 弥合任务
+    // 任务中心：统计 + 质量债（内嵌 fix/ignore）+ 重写队列 + 弥合任务（质量债超长默认截断，可展开全部）
     const debt = (Array.isArray(d.debt) ? d.debt : []) as Record<string, unknown>[];
+    const shownDebt = showAllList ? debt : debt.slice(0, MAX_LIST_ITEMS);
     const rewriteQueue = (Array.isArray(d.rewriteQueue) ? d.rewriteQueue : []) as number[];
     const mergeTasks = (Array.isArray(d.mergeTasks) ? d.mergeTasks : []) as string[];
     body = (
@@ -531,17 +709,18 @@ export const BrowseCardView: React.FC<{
         {debt.length > 0 && (
           <div className="bc-browse-list">
             <div className="bc-browse-sec">质量债</div>
-            {debt.map((t) => (
+            {shownDebt.map((t) => (
               <WithItemActions key={String(t.id ?? "")} item={t} busy={busy} onAction={onAction} completed={completedItems?.has(String(t.id ?? ""))}>
                 <div className="bc-browse-item">
                   <div className="bc-browse-item-head">
-                    <span className="bc-browse-item-title">第 {String(t.chapterIndex ?? "")} 章 · {String(t.lens ?? "")}</span>
+                    <span className="bc-browse-item-title">第 {String(t.chapterIndex ?? "")} 章 · {lensCn(String(t.lens ?? ""))}</span>
                     <span className="bc-browse-item-badges"><CardStatusBadge status={t.severity === "major" ? "严重" : "轻微"} level={t.severity === "major" ? "danger" : "info"} /></span>
                   </div>
                   <p className="bc-browse-text">{String(t.issue ?? "")}</p>
                 </div>
               </WithItemActions>
             ))}
+            <ListMoreButton total={debt.length} shown={showAllList} onToggle={() => setShowAllList((v) => !v)} />
           </div>
         )}
         {rewriteQueue.length > 0 && (
@@ -563,20 +742,22 @@ export const BrowseCardView: React.FC<{
       </>
     );
   } else if (card.browseType === "logs" && d) {
-    // 台账·操作日志：时间 + actor + kind + commandId + detail
+    // 台账·操作日志：时间（MM-DD HH:MM）+ actor + kind + commandId + detail（超长默认截断）
     const list = (Array.isArray(d.list) ? d.list : []) as Record<string, unknown>[];
+    const shownLogs = showAllList ? list : list.slice(0, MAX_LIST_ITEMS);
     body = (
       <div className="bc-browse-list">
-        {list.map((e, i) => (
+        {shownLogs.map((e, i) => (
           <div key={i} className="bc-browse-item bc-log-item">
             <div className="bc-browse-item-head">
               <span className="bc-browse-item-id">{String(e.kind ?? "")}{e.commandId ? ` · ${String(e.commandId)}` : ""}</span>
-              {e.level ? <CardStatusBadge status={e.level} level={e.level === "L3" ? "danger" : e.level === "L2" ? "warn" : "info"} /> : null}
+              {e.level ? <CardStatusBadge status={LEVEL_TEXT[e.level as string] ?? String(e.level)} level={e.level === "L3" ? "danger" : e.level === "L2" ? "warn" : "info"} /> : null}
             </div>
             <p className="bc-browse-text">{String(e.detail ?? "")}</p>
-            <span className="bc-browse-meta">{String(e.at ?? "")} · {String(e.actor ?? "")}{e.chapter ? ` · 第 ${e.chapter} 章` : ""}</span>
+            <span className="bc-browse-meta">{fmtCardTime(e.at)} · {ACTOR_TEXT[String(e.actor ?? "")] ?? String(e.actor ?? "")}{e.chapter ? ` · 第 ${e.chapter} 章` : ""}</span>
           </div>
         ))}
+        <ListMoreButton total={list.length} shown={showAllList} onToggle={() => setShowAllList((v) => !v)} />
       </div>
     );
   } else if (card.browseType === "worldbook" && d) {
@@ -630,16 +811,21 @@ export const BrowseCardView: React.FC<{
       </>
     );
   } else if (card.browseType === "review" && d) {
-    // 审查报告：verdict + 5 维分数 + findings
+    // 审查报告：verdict + 5 维分数（中文维度名，固定顺序）+ findings（lens 中文化）
     const scores = d.scores as Record<string, unknown> | null | undefined;
     const findings = (Array.isArray(d.findings) ? d.findings : []) as Record<string, unknown>[];
+    const SCORE_CN: Record<string, string> = { coherence: "连贯", tension: "张力", prose: "文笔", pacing: "节奏", dialogue: "对话" };
+    const SCORE_ORDER = ["coherence", "tension", "prose", "pacing", "dialogue"];
+    const scoreEntries = scores
+      ? SCORE_ORDER.filter((k) => k in (scores as Record<string, unknown>)).map((k) => [k, (scores as Record<string, unknown>)[k]] as const)
+      : [];
     body = (
       <>
         <CardStatusBadge status={d.verdict === "pass" ? "通过" : "需修订"} level={d.verdict === "pass" ? "ok" : "warn"} />
-        {scores && (
+        {scoreEntries.length > 0 && (
           <div className="bc-stats">
-            {Object.entries(scores).map(([k, v]) => (
-              <span className="bc-stat" key={k}><b>{String(v)}</b>{k}</span>
+            {scoreEntries.map(([k, v]) => (
+              <span className="bc-stat" key={k}><b>{String(v)}</b>{SCORE_CN[k] ?? lensCn(k)}</span>
             ))}
           </div>
         )}
@@ -648,7 +834,7 @@ export const BrowseCardView: React.FC<{
             {findings.map((f, i) => (
               <div key={i} className="bc-browse-item">
                 <div className="bc-browse-item-head">
-                  <span className="bc-browse-item-title">{String(f.lens ?? "")}</span>
+                  <span className="bc-browse-item-title">{lensCn(String(f.lens ?? ""))}</span>
                   <CardStatusBadge status={f.severity === "major" ? "严重" : "轻微"} level={f.severity === "major" ? "danger" : "info"} />
                 </div>
                 <p className="bc-browse-text">{String(f.issue ?? "")}</p>
@@ -660,7 +846,28 @@ export const BrowseCardView: React.FC<{
       </>
     );
   } else if (card.browseType === "eval" && d) {
-    body = <p className="bc-browse-text">整书评估 overall: {String(d.overall ?? "")}</p>;
+    const dims = (Array.isArray(d.dimensions) ? d.dimensions : []) as Record<string, unknown>[];
+    body = (
+      <>
+        <CardStatusBadge status={d.overall != null ? "已评估" : "未评估"} level={d.overall != null ? "ok" : "info"} />
+        {d.overall != null && (
+          <div className="bc-stats">
+            <span className="bc-stat"><b>{String(d.overall)}</b>综合评分</span>
+          </div>
+        )}
+        {dims.length > 0 && (
+          <div className="bc-browse-list">
+            <div className="bc-browse-sec">分维度</div>
+            {dims.map((dim, i) => (
+              <div key={i} className="bc-browse-item">
+                <span className="bc-browse-item-title">{lensCn(String(dim.name ?? ""))}</span>
+                <span className="bc-browse-item-badges">{dim.score != null ? <CardStatusBadge status={`${String(dim.score)} 分`} level={Number(dim.score) >= 7 ? "ok" : Number(dim.score) >= 5 ? "warn" : "danger"} /> : <CardStatusBadge status="未评分" level="info" />}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </>
+    );
   } else {
     body = <p className="bc-browse-text">{JSON.stringify(d ?? {}).slice(0, 300)}</p>;
   }
@@ -899,6 +1106,7 @@ export const BrainCardView: React.FC<{
       case "opinion": return <ChoiceCardView card={card} onOption={onOption} busy={busy} />;
       case "form": return <FormCardView card={card} onSubmit={onFormSubmit} busy={busy} completed={completed} />;
       case "progress": return <ProgressCardView card={card} onCancel={onCancelProgress} />;
+      case "ask": return null; // 追问选择卡不渲染进聊天流（显示在输入框上方询问面板）
     }
   })();
   const image = (card as { image?: CardImage }).image;

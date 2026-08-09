@@ -144,11 +144,14 @@ export const ReviewPanel: React.FC<{
   const [showFsModal, setShowFsModal] = useState(false);
   const [highlightFsId, setHighlightFsId] = useState<string | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
+  // 点击面板内「原文」锚定时置位：activeIdx 变化不再把筛选 tab 重置为「全部」，保持用户选中的严重/轻微
+  const preserveFilterRef = useRef(false);
 
-  // 激活项变化：重置筛选、自动展开该项并滚动到可见
+  // 激活项变化：重置筛选（锚定原文除外）、自动展开该项并滚动到可见
   useEffect(() => {
     if (p.activeIdx == null) return;
-    setFilter("all");
+    if (!preserveFilterRef.current) setFilter("all");
+    preserveFilterRef.current = false;
     setExpanded((prev) => {
       const s = new Set(prev);
       s.add(p.activeIdx!);
@@ -325,7 +328,10 @@ export const ReviewPanel: React.FC<{
                     {f.evidence && (
                       <div
                         className={`ev ${p.readOnly ? "" : "ev-clickable"}`}
-                        onClick={p.readOnly ? undefined : () => (p.onCiteClick ? p.onCiteClick(f.evidence, idx, r) : scrollToCitation(f.evidence))}
+                        onClick={p.readOnly ? undefined : () => {
+                          if (p.activeIdx !== idx) preserveFilterRef.current = true; // 锚定原文：不切换筛选 tab
+                          p.onCiteClick ? p.onCiteClick(f.evidence, idx, r) : scrollToCitation(f.evidence);
+                        }}
                         title={p.readOnly ? undefined : "点击定位到正文对应位置"}
                       >
                         <span className="ev-icon">📌</span> 原文：「{decorateFsText(f.evidence)}」

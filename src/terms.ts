@@ -25,8 +25,27 @@ export const LENS_CN: Record<string, string> = {
   quality: "质量",
 };
 
-/** 维度中文：已知键映射，未知键原样返回（保留数据可追溯），空值返回 — */
-export const lensCn = (lens?: string): string => (lens ? (LENS_CN[lens] ?? lens) : "—");
+/** 维度中文：已知键映射，未知键原样返回（保留数据可追溯），空值返回 —。
+ * 支持斜杠组合键（如「连续性/outline」）逐段映射，避免混合键残留英文。 */
+export const lensCn = (lens?: string): string => {
+  if (!lens) return "—";
+  const segCn = (seg: string): string => {
+    const s = seg.trim();
+    if (!s) return "";
+    if (LENS_CN[s]) return LENS_CN[s];
+    // 前缀匹配：按键长降序，避免短键误吞长键（如 outline 前缀带括号注释）
+    const keys = Object.keys(LENS_CN).sort((a, b) => b.length - a.length);
+    for (const k of keys) {
+      if (s.startsWith(k)) return LENS_CN[k] + s.slice(k.length);
+    }
+    return s;
+  };
+  return lens
+    .split(/[/／]/)
+    .map(segCn)
+    .filter(Boolean)
+    .join("·");
+};
 
 /** 严重级别：major=严重 minor=轻微（badge / 筛选 / 统计文本统一） */
 export const SEVERITY_CN: Record<string, string> = { major: "严重", minor: "轻微" };

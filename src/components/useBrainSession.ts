@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { BrainCard } from "./brain-cards";
 import { apiFetch } from "../api/client";
+import { cacheGetSession, cachePutSession, cacheClearBook } from "./brainCache";
 
 export type ChatMessage = {
   id: string;
@@ -163,7 +164,19 @@ export function useBrainSession(title: string) {
    * - resume：本地不追加消息（服务端复用未完成消息，先 reset 再重新流式）
    * - ctx：前端上下文（左侧栏选中章等），供服务端意图识别参数提取兜底（需求 1/2）
    */
-  const send = useCallback(async (opts: { prompt: string; sessionId: string; resume?: boolean; ctx?: { chapterIndex?: number | null } }) => {
+  const send = useCallback(async (opts: { prompt: string; sessionId: string; resume?: boolean; ctx?: {
+    chapterIndex?: number | null;
+    chapterTitle?: string | null;
+    chapterStatus?: string | null;
+    chapterWords?: number | null;
+    versionCount?: number | null;
+    systemStatus?: string | null;
+    writingRunning?: boolean;
+    presence?: string | null;
+    activity?: string | null;
+    autoRunning?: boolean;
+    server?: Record<string, unknown>;
+  } }) => {
     const { prompt, sessionId, resume } = opts;
     if (!prompt.trim() || abortRef.current.has(sessionId)) return; // 该会话正在生成
     const ctrl = new AbortController();
@@ -335,13 +348,31 @@ export function useBrainSession(title: string) {
           } catch { /* 网络异常：保持现状，下次打开会话会从服务端拉取最新状态 */ }
         })();
       }
+      // Phase 4：回合结束把最终消息快照写回 indexeddb 缓存（服务端持久化 + 客户端缓存双写）
+      const arr = cacheRef.current.get(sessionId);
+      if (arr?.length) {
+        const comp = completedRef.current.get(sessionId);
+        void cachePutSession(title, sessionId, arr, comp ? [...comp] : []);
+      }
       void refreshList(); // 更新会话列表（标题/时间/streaming 标记）
     }
   }, [title, patchMsg, patchStreaming, setThinkingFor, refreshList, alignMsgId]);
 
   /** 展示某会话（缓存命中即时；未命中从服务端拉详情；streaming 会话自动 resume 续流）。
    *  ctx：resume 续流时透传前端上下文（选中章），供服务端意图识别参数提取兜底（需求 1/2）。 */
-  const openSession = useCallback(async (id: string, ctx?: { chapterIndex?: number | null }) => {
+  const openSession = useCallback(async (id: string, ctx?: {
+    chapterIndex?: number | null;
+    chapterTitle?: string | null;
+    chapterStatus?: string | null;
+    chapterWords?: number | null;
+    versionCount?: number | null;
+    systemStatus?: string | null;
+    writingRunning?: boolean;
+    presence?: string | null;
+    activity?: string | null;
+    autoRunning?: boolean;
+    server?: Record<string, unknown>;
+  }) => {
     setActive(id);
     setMessages(cacheRef.current.get(id) ?? []);
     setStreaming(abortRef.current.has(id));
@@ -362,6 +393,8 @@ export function useBrainSession(title: string) {
       completedRef.current.set(id, new Set(data.session.completed ?? []));
       setCompleted(completedRef.current.get(id) ?? new Set());
       setMessages(msgs);
+      // Phase 4：服务端权威快照写回 indexeddb 缓存（下次打开秒开；服务端始终最新，覆盖即一致）
+      void cachePutSession(title, id, msgs, [...(completedRef.current.get(id) ?? [])]);
       const running = data.session.streaming || abortRef.current.has(id);
       setStreaming(running);
       // 刷新恢复：该会话仍在生成（最后消息 pending，刷新前未完成）→ 自动 resume 续流至完成
@@ -490,6 +523,8 @@ export function useBrainSession(title: string) {
     setActive("");
     setMessages([]);
     setStreaming(false);
+    // Phase 4：切书时清上一本书的 indexeddb 缓存（防跨书串扰；当前书缓存由 openSession 拉 detail 时写回）
+    void cacheClearBook(loadedTitleRef.current);
     void (async () => {
       const list = await refreshList();
       const latest = list[0];

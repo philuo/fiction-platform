@@ -5,7 +5,7 @@
 // 它们含 process.env / node:fs 副作用，被打包进客户端 bundle 会在浏览器抛 ReferenceError: process is not defined，
 // 导致 React hydrate 中断、整页事件失效。所需逻辑在此内联。
 import type { ChangeLogEntry, ConsistencyFinding, WorldState } from "./world";
-import { isPendingForeshadow } from "./world";
+import { isPendingForeshadow, targetChapterCount } from "./world";
 
 // ============ 内联类型（避免 import eval.ts 拖入 node:fs / jsonutil / agnes / limiter） ============
 
@@ -306,7 +306,9 @@ function deriveVitals(w: WorldState, evalReport: EvalReportLike | null, integrit
   }
 
   const integrityDanger = integrityReport ? integrityReport.filter((f) => f.level === "danger").length : null;
-  const targetChapters = w.goal?.structure?.targetChapters ?? null;
+  // 目标章数：与 worldSummary / executeQuery 同口径（goal 显式 > 弧线估算合计 > 章纲总数），
+  // 保证 UI 中枢状态与聊天注入/章节目录进度条分母一致（goal.structure.targetChapters 常缺省）
+  const targetChapters = targetChapterCount(w);
 
   return {
     coherence,

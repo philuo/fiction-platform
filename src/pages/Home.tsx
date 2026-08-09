@@ -8,7 +8,7 @@ import { StatusPanel } from "../components/StatusPanel";
 import { ChapterView } from "../components/ChapterView";
 import { ReviewPanel, scrollToCitation } from "../components/ReviewPanel";
 import { GachaModal } from "../components/GachaModal";
-import { SettingsModal } from "../components/SettingsModal";
+import { SettingsModal, type Tab as SettingsTab } from "../components/SettingsModal";
 import { RelationshipModal } from "../components/RelationshipModal";
 import { LeftPanel } from "../components/LeftPanel";
 import { InterveneModal, type ImpactReportView } from "../components/InterveneModal";
@@ -93,6 +93,37 @@ function resolveInitialChapter(w: WorldState, urlChapter?: number): number {
   return first ? first.index : -1;
 }
 
+// —— Phase 3：客户端偏好缓存（localStorage，仅增强体验；服务端始终权威） ——
+// 原则：URL chapter（服务端 SSR）> localStorage 上次选中 > 第一章。localStorage 只存「用户偏好」，
+// 服务端 chapter 缺失时自动忽略（resolveInitialChapter 已兜底），不会与服务端状态冲突。
+const PREFS_KEY = "fp_reading_prefs";
+type ReadingPrefs = { [bookTitle: string]: { chapter: number; updatedAt: number } };
+
+function readPrefs(): ReadingPrefs {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(PREFS_KEY);
+    return raw ? (JSON.parse(raw) as ReadingPrefs) : {};
+  } catch { return {}; }
+}
+function writePrefs(prefs: ReadingPrefs) {
+  if (typeof window === "undefined") return;
+  try { window.localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch { /* 配额满/隐私模式：静默 */ }
+}
+/** 记录某书最近选中章节（仅当用户明确选择时，避免自动跳转覆盖） */
+function saveReadingPref(title: string, chapter: number) {
+  if (!title || chapter <= 0) return;
+  const prefs = readPrefs();
+  prefs[title] = { chapter, updatedAt: Date.now() };
+  writePrefs(prefs);
+}
+/** 读取某书上次选中章节（供打开书时恢复阅读位置） */
+function loadReadingPref(title: string): number | undefined {
+  const prefs = readPrefs();
+  const p = prefs[title];
+  return p && Number.isInteger(p.chapter) && p.chapter > 0 ? p.chapter : undefined;
+}
+
 const Home: React.FC<HomeProps> = (props) => {
   const [phase, setPhase] = useState<Phase>(props.initialData?.world ? "playing" : "landing");
   // 当前登录用户（SSR 注入 / 登录成功后设置；null = 未登录 → 渲染登录页）
@@ -100,12 +131,17 @@ const Home: React.FC<HomeProps> = (props) => {
   const [world, setWorld] = useState<WorldState | null>(props.initialData?.world ?? null);
   const [busy, setBusy] = useState(false);
   const [busyPhase, setBusyPhase] = useState("");
-  // 初始选中章节：SSR 预载时按 URL chapter 恢复；否则默认第一章（章节不存在/无记录时不回退最新章节）
-  const [activeIdx, setActiveIdx] = useState(() =>
-    props.initialData?.world ? resolveInitialChapter(props.initialData.world, props.initialData?.chapter) : -1,
-  ); // -1 = 无章节
+  // 初始选中章节：SSR 预载时按 URL chapter（服务端）恢复 → localStorage 上次选中 → 第一章。
+  // localStorage 仅增强阅读位置恢复；服务端 chapter 缺失自动忽略（resolveInitialChapter 兜底）
+  const [activeIdx, setActiveIdx] = useState(() => {
+    if (!props.initialData?.world) return -1;
+    const w = props.initialData.world;
+    return resolveInitialChapter(w, props.initialData?.chapter ?? loadReadingPref(w.title));
+  }); // -1 = 无章节
   const [showGacha, setShowGacha] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  /** 中枢「打开设置-角色页」等定位的初始 tab（每次打开设置弹窗时应用） */
+  const [settingsTab, setSettingsTab] = useState("");
   const [showMemoryAudit, setShowMemoryAudit] = useState(false); // 中枢弹窗一：分层记忆·台账·操作日志
   const [showBrainCabin, setShowBrainCabin] = useState(false); // 中枢对话舱：卡片式浏览 + 智能控制
   const [showTaskCenter, setShowTaskCenter] = useState(false); // 任务中心（弹窗二）：连载/推进任务进度与控制
@@ -127,6 +163,35 @@ const Home: React.FC<HomeProps> = (props) => {
       .catch(() => { /* 网络失败保持当前状态 */ });
     return () => { cancelled = true; };
   }, [world?.title]);
+  /** 中枢打开系统面板/弹窗（open_* 意图 result 卡带 open 字段）统一分发：target → 对应弹窗/区域 */
+  function handleOpenPanel(target: string, opts?: Record<string, unknown>) {
+    switch (target) {
+      case "proposals": savePropClosed(false); break;
+      case "settings":
+        setSettingsTab(String(opts?.tab ?? ""));
+        setShowSettings(true);
+        break;
+      case "relationships":
+        setRelModal({ editable: false, charId: null });
+        break;
+      case "taskcenter": setShowTaskCenter(true); break;
+      case "foreshadow": setShowForeshadow(true); break;
+      case "review": {
+        // 服务端已校验指定/选中章有审查报告；opts.index 指定章时先切换到该章（activeIdx 为 1-based 章号）
+        const idx = opts?.index != null ? Number(opts.index) : NaN;
+        if (Number.isFinite(idx) && world?.chapters.some((c) => c.index === idx)) setActiveIdx(idx);
+        if (shownReview || reviewMode) setReviewOpen(true);
+        else showToast("当前章节还没有审查报告，写完并保存后会自动生成");
+        break;
+      }
+      case "eval": setShowEval(true); break;
+      case "gacha": setShowGacha(true); break;
+      case "autostart": setShowAutoStart(true); break;
+      case "memory": setShowMemoryAudit(true); break;
+      default: break;
+    }
+  }
+
   /** 持久化新角色提案区关闭状态（乐观更新，失败回滚）；供刷新/SSR 首帧正确渲染 */
   function savePropClosed(closed: boolean) {
     if (!world) return;
@@ -235,8 +300,11 @@ const Home: React.FC<HomeProps> = (props) => {
       setPhase("playing");
       // 关闭/展开态不跨书残留：关闭状态按书持久化（useSyncExternalStore 随 propCloseKey 自动读该书存储），此处仅重置展开态
       setProposalExpanded(false);
-      // 恢复上次选中章节（URL chapter）；无记录/章节缺失 → 第一章
-      const initIdx = resolveInitialChapter(data.world, readUrlChapter());
+      // 恢复上次选中章节：URL chapter（服务端）优先 → localStorage 上次选中 → 第一章。
+      // localStorage 仅增强体验；章节缺失时 resolveInitialChapter 自动忽略（服务端权威兜底）
+      const urlIdx = readUrlChapter();
+      const prefIdx = loadReadingPref(data.world.title);
+      const initIdx = resolveInitialChapter(data.world, urlIdx ?? prefIdx);
       setActiveIdx(initIdx);
       setStoryUrl(data.world.title, initIdx > 0 ? initIdx : undefined);
       showToast(`《${data.world.title}》已加载`);
@@ -2010,6 +2078,7 @@ const Home: React.FC<HomeProps> = (props) => {
                 setActiveIdx(i);
                 // 路由记录选中章节（-1 = 跟随最新章节 → 记录为最新章节具体 index，刷新后回到该章）
                 const record = i > 0 ? i : (world.chapters[world.chapters.length - 1]?.index ?? undefined);
+                if (record) saveReadingPref(world.title, record);
                 setStoryUrl(world.title, record);
                 setEditing(false);
                 // 审查模式需手动退出：切换章节时保持打开，内容同步到新章节
@@ -2236,7 +2305,15 @@ const Home: React.FC<HomeProps> = (props) => {
           brainState={brainState}
           onWorldUpdate={() => { void refreshWorld(); }}
           onProposalTalk={() => savePropClosed(false)}
-          currentChapter={shownChapter ? { index: shownChapter.index } : null}
+          onOpenPanel={handleOpenPanel}
+          currentChapter={shownChapter ? {
+            index: shownChapter.index,
+            title: shownChapter.title,
+            status: shownChapter.review?.verdict ?? null,
+            words: shownChapter.text.length,
+            versionCount: (shownChapter.versions?.length ?? shownChapter.versionFiles?.length ?? 0),
+          } : null}
+          autoRunning={autoRunning}
         />
       )}
 
@@ -2325,6 +2402,7 @@ const Home: React.FC<HomeProps> = (props) => {
 
       {showSettings && world && (
         <SettingsModal
+          initialTab={(settingsTab || undefined) as SettingsTab | undefined}
           world={world}
           onClose={() => setShowSettings(false)}
           onSave={(patch) => saveWorld(patch)}

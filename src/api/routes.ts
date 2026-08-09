@@ -558,6 +558,48 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       return json({ brainState });
     }
 
+    case "/api/brain/context": {
+      // 中枢系统状态快照（索引式全知）：服务端权威聚合——自动连载/写作任务/媒体生成/视觉任务/待办清单。
+      // 供中枢按需拉取（而非每轮全量注入 LLM，控制 token）；前端 BrainCabin 一并注入 chatCtx。
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const bcCtxBody = await readBody(req);
+      const bcCtxTitle = String(bcCtxBody.title ?? "").trim();
+      if (!bcCtxTitle) return json({ error: "缺少 title" }, 400);
+      const bcCtxW = loadWorld(bcCtxTitle);
+      if (!bcCtxW) return json({ error: "故事不存在: " + bcCtxTitle }, 404);
+      // 自动连载 / 待入册草稿
+      const bcCtxAuto = loadAutoSession(bcCtxTitle);
+      const bcCtxPending = loadPendingChapter(bcCtxTitle);
+      // 写作任务（advance-task）
+      const bcCtxTask = getAdvanceTaskForClient(bcCtxTitle);
+      // 媒体生成中（内存表，按当前用户+书名 key）
+      const mk = mediaKey(bcCtxTitle);
+      const mediaGenerating = imageGenTasks.has(mk);
+      // 视觉任务运行中
+      const vk = `${currentUser() ?? ""}::${bcCtxTitle}`;
+      const vTasks = visualTasks.get(vk);
+      const visualRunning = vTasks ? [...vTasks.values()].some((v) => v.status === "running") : false;
+      // 待办清单（world 派生）
+      const pendingProposals = (bcCtxW.characterProposals ?? []).filter((pp) => pp.status === "pending").length;
+      const pendingCards = (bcCtxW.pendingCards ?? []).length;
+      const openDebt = (bcCtxW.qualityDebt ?? []).filter((d) => d.status === "open").length;
+      const reviseChapters = bcCtxW.chapters.filter((c) => c.review?.verdict === "revise").map((c) => c.index);
+      return json({
+        context: {
+          autoRunning: bcCtxAuto?.status === "running",
+          autoPhase: bcCtxAuto?.status === "running" ? bcCtxAuto?.phase : undefined,
+          pendingCommit: bcCtxPending ? { index: bcCtxPending.index ?? null, title: bcCtxPending.title ?? "" } : null,
+          advanceTaskRunning: bcCtxTask?.status === "running",
+          advancePhase: bcCtxTask?.status === "running" ? bcCtxTask?.phase : undefined,
+          mediaGenerating,
+          visualRunning,
+          pendingProposals,
+          pendingCards,
+          openDebt,
+          reviseChapters,
+        },
+      });
+    }
     case "/api/brain/chat": {
       // 中枢对话编排（SSE，事件协议 v2）：意图识别 + 流式回复 + 卡片（查询直接执行 / 写操作预览 / L2·L3 确认卡）
       // 会话化：body 带 sessionId（历史会话）或新建；resume=true 续流未完成消息

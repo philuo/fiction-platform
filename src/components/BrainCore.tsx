@@ -54,7 +54,9 @@ export const BrainCore: React.FC<{
   size?: "mini" | "full";
   /** 自定义尺寸（覆盖 size 默认值，供对话舱头部用 72） */
   px?: number;
-}> = ({ presence, activity = "idle", size = "full", px }) => {
+  /** 是否启用波环旋转/glyph 脉冲动画（消息流中的静态头像传 false，避免满屏动画） */
+  animated?: boolean;
+}> = ({ presence, activity = "idle", size = "full", px, animated = true }) => {
   const hue = HUE[presence];
   const glow = GLOW[presence];
   const pulseDur = PULSE_PERIOD[activity] ?? 2;
@@ -149,16 +151,16 @@ export const BrainCore: React.FC<{
       data-presence={presence}
     >
       <svg viewBox="0 0 24 24" width={dim} height={dim} style={{ display: "block", overflow: "visible" }}>
-        {/* 外脑波环：CSS 旋转脉冲 */}
+        {/* 外脑波环：CSS 旋转脉冲（animated=false 时静态，无动画样式） */}
         <circle
-          className="brain-core-wave"
+          className={animated ? "brain-core-wave" : ""}
           cx={12} cy={12} r={11} fill="none" stroke={hue} strokeWidth={0.3}
           strokeDasharray="1 3" opacity={0.3 + glow * 0.3}
           style={{ transformOrigin: "12px 12px", animationDuration: `${pulseDur}s` }}
         />
         {/* lucide Brain 路径：专业设计的大脑轮廓（沟回+脑叶），缩放到 24x24 viewBox */}
         <g
-          className="brain-core-glyph"
+          className={animated ? "brain-core-glyph" : ""}
           stroke={hue}
           strokeWidth={1.5}
           fill="none"

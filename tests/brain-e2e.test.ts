@@ -125,6 +125,29 @@ async function readSSE(body: ReadableStream<Uint8Array> | null): Promise<Record<
 }
 
 describe("中枢聊天 e2e：会话生命周期", () => {
+  test("中枢系统状态快照：/api/brain/context 返回自动连载/待办聚合（索引式全知）", async () => {
+    // 用固定用户名注册（cookieA 与 saveWorld 同一用户目录）；直接 storage 建书（绕开 LLM 立项，测试快速稳定）
+    const ctxUser = "e2e_ctx_" + Math.random().toString(36).slice(2, 8);
+    cookieA = await register(ctxUser);
+    const { saveWorld, runAsUser } = await import("../src/api/storage");
+    const w = structuredClone(mockWorld!);
+    w.title = "e2e-ctx-book";
+    w.characterProposals = [{ id: "cp1", name: "小翠", role: "掌柜", traits: [], motivation: "查清身世", reason: "呼应身世线", source: "writer", status: "pending" }];
+    w.pendingCards = [{ id: "g1", type: "伏笔", rarity: "SR", title: "锈剑", description: "一把剑", effect: "取剑", dueHint: "第8章", status: "pending" }];
+    w.qualityDebt = [{ id: "d1", text: "逻辑漏洞", status: "open", severity: "major" }];
+    w.chapters = [{ index: 1, title: "第一章", text: "正文", review: { verdict: "revise", round: 1, scores: { coherence: 6, logic: 6, pacing: 6, style: 6, character: 6 }, findings: [], summary: "需修订" } }];
+    runAsUser(ctxUser, () => saveWorld(w));
+    const res = await api("/api/brain/context", "POST", { title: "e2e-ctx-book" }, cookieA);
+    expect(res.status).toBe(200);
+    const d = (await res.json()) as { context: Record<string, unknown> };
+    expect(d.context.autoRunning).toBe(false);
+    expect(d.context.pendingProposals).toBe(1);
+    expect(d.context.pendingCards).toBe(1);
+    expect(d.context.openDebt).toBe(1);
+    expect(d.context.reviseChapters).toEqual([1]);
+    expect(typeof d.context.mediaGenerating).toBe("boolean");
+  });
+
   test("卡片操作完成标记持久化：POST /completed → detail 返回 completed（刷新恢复完成态）", async () => {
     cookieA = await register("e2e_user_" + Math.random().toString(36).slice(2, 8));
     const sid = "e2e-completed-" + Math.random().toString(36).slice(2, 8);
