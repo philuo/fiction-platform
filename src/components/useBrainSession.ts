@@ -9,6 +9,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { BrainCard } from "./brain-cards";
 import { apiFetch } from "../api/client";
 import { cachePutSession, cacheClearBook } from "./brainCache";
+import { uuid } from "../shared/uuid";
 
 export type ChatMessage = {
   id: string;
@@ -186,8 +187,8 @@ export function useBrainSession(title: string) {
     if (sessionId === activeIdRef.current) setReconnecting(false); // 新回合起步清重连态
 
     if (!resume) {
-      const userMsg: ChatMessage = { id: crypto.randomUUID(), role: "user", text: prompt, at: new Date().toISOString() };
-      const brainMsg: ChatMessage = { id: crypto.randomUUID(), role: "brain", text: "", cards: [], pending: true, at: new Date().toISOString() };
+      const userMsg: ChatMessage = { id: uuid(), role: "user", text: prompt, at: new Date().toISOString() };
+      const brainMsg: ChatMessage = { id: uuid(), role: "brain", text: "", cards: [], pending: true, at: new Date().toISOString() };
       const arr = cacheRef.current.get(sessionId) ?? [];
       arr.push(userMsg, brainMsg);
       cacheRef.current.set(sessionId, arr);
@@ -422,7 +423,7 @@ export function useBrainSession(title: string) {
       setCompleted(new Set());
       return "";
     }
-    const id = crypto.randomUUID();
+    const id = uuid();
     try {
       const res = await apiFetch("/api/brain/sessions", {
         method: "POST",

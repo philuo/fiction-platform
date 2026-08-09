@@ -11,6 +11,7 @@ import { BrainCardView, type BrainCard, type PreviewCard, type ChoiceOption, typ
 import { MarkdownView } from "./MarkdownView";
 import { useBrainSession, type ChatMessage } from "./useBrainSession";
 import { apiFetch } from "../api/client";
+import { uuid } from "../shared/uuid";
 import {
   PRESENCE_LABEL, ACTIVITY_LABEL, GOVERNANCE_LABEL,
   type BrainState, type Presence, type Activity,
@@ -489,7 +490,7 @@ export const BrainCabin: React.FC<{
 
   function appendBrainMsg(cards: BrainCard[]) {
     if (!activeId) return;
-    appendMsg(activeId, { id: crypto.randomUUID(), role: "brain", cards, at: new Date().toISOString() });
+    appendMsg(activeId, { id: uuid(), role: "brain", cards, at: new Date().toISOString() });
   }
 
   if (!open) return null;
