@@ -386,13 +386,23 @@ export const BrowseCardView: React.FC<{
   const [open, setOpen] = useState(() => !FOLD_BROWSE_TYPES.has(card.browseType));
   /** 长列表是否显示全部（截断状态：默认前 MAX_LIST_ITEMS 条 + 展开全部） */
   const [showAllList, setShowAllList] = useState(false);
+  /** 章节正文是否显示全文（默认截断预览 + 展开全文交互，正文长内容可看全貌） */
+  const [showFullText, setShowFullText] = useState(false);
   let body: ReactNode = null;
   const d = card.data as Record<string, unknown> | null;
   if (card.browseType === "chapter" && d) {
+    // 章节正文：默认截断预览，可「展开全文」查看全貌（长正文不淹没对话流，且不会只看半截）
+    const fullText = String(d.text ?? "");
+    const CHAP_PREVIEW = 200;
+    const chapTruncated = fullText.length > CHAP_PREVIEW;
     body = (
       <>
-        <div className="bc-browse-title">第 {String(d.index ?? "")} 章 · {String(d.title ?? "")}</div>
-        <p className="bc-browse-text">{String(d.text ?? "").slice(0, 200)}…</p>
+        <p className="bc-browse-text">{showFullText || !chapTruncated ? fullText : fullText.slice(0, CHAP_PREVIEW) + "…"}</p>
+        {chapTruncated && (
+          <button className="bc-list-more" onClick={() => setShowFullText((v) => !v)}>
+            {showFullText ? "收起全文" : `展开全文（共 ${fullText.length} 字）`}
+          </button>
+        )}
       </>
     );
   } else if (card.browseType === "character" && d) {
@@ -400,13 +410,13 @@ export const BrowseCardView: React.FC<{
     const relations = (Array.isArray(d.relations) ? d.relations : []) as Record<string, unknown>[];
     const appeared = (Array.isArray(d.appeared) ? d.appeared : []) as number[];
     const arrangement = (Array.isArray(d.arrangement) ? d.arrangement : []) as string[];
+    // 标题已是「{name} · {role}」（定位由标题 label 表达），网格不再重复展示定位
     const attrRows: [string, unknown][] = [
-      ["定位", d.role], ["状态", d.status], ["性别", d.gender], ["年龄", d.age],
+      ["状态", d.status], ["性别", d.gender], ["年龄", d.age],
       ["身份", d.identity], ["声线", d.voice],
     ];
     body = (
       <>
-        <div className="bc-browse-title">{String(d.name ?? "")} · {String(d.role ?? "")}</div>
         {attrRows.filter(([, v]) => v != null && v !== "").length > 0 && (
           <div className="bc-stats">
             {attrRows.filter(([, v]) => v != null && v !== "").map(([k, v]) => (
@@ -442,7 +452,6 @@ export const BrowseCardView: React.FC<{
     const list = (Array.isArray(d.list) ? d.list : []) as Record<string, unknown>[];
     body = (
       <>
-        <div className="bc-browse-title">第 {String(d.chapter ?? "")} 章 · {String(d.chapterTitle ?? "")}</div>
         <div className="bc-browse-list">
           {list.map((c, i) => (
             <div key={i} className="bc-browse-item">
@@ -458,7 +467,6 @@ export const BrowseCardView: React.FC<{
     const list = (Array.isArray(d.list) ? d.list : []) as Record<string, unknown>[];
     body = (
       <>
-        {d.name ? <div className="bc-browse-title">{String(d.name)} 的关系网</div> : null}
         <div className="bc-browse-list">
           {list.map((r, i) => (
             <div key={i} className="bc-browse-item bc-rel-item">

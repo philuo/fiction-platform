@@ -3752,7 +3752,7 @@ html { scroll-behavior: smooth; }
 }
 .bc-tabs-actions .bc-head-icon-btn { width: 1.5rem; height: 1.5rem; }
 
-.brain-cabin-stream { flex: 1; overflow-y: auto; padding: 0.8rem 1rem; display: flex; flex-direction: column; gap: 0.7rem; }
+.brain-cabin-stream { flex: 1; overflow-y: auto; padding: 0 1rem 0.8rem; display: flex; flex-direction: column; }
 .brain-cabin-empty { text-align: center; color: var(--ink-soft); font-size: 0.82rem; margin: auto; padding: 2rem 1rem; }
 .bc-empty-title { font-size: 0.86rem; color: var(--ink); font-weight: 600; margin: 0 0 0.4rem; }
 /* 空态快捷提问 chips（点击即发送，降低首次使用门槛） */
@@ -3769,11 +3769,13 @@ html { scroll-behavior: smooth; }
 .bc-msg { display: flex; gap: 0.5rem; align-items: flex-start; }
 .bc-msg-user {
   flex-direction: row-reverse;
-  /* 滚动吸附：问题消息在滚动经过时固定在面板顶部（sticky 相对 .brain-cabin-stream 滚动容器），
-     背景与面板同色保证不透视下方内容，底部微渐变过渡标示吸附状态 */
+  padding: 1rem 0 0.5rem;
+}
+/* 滚动吸附只作用于最后一条用户消息（当前问题，.bc-msg-user-last）：滚动经过时固定在面板顶部。
+   背景用不透明面板色，防止后续变高消息从吸附层下方透出（此前所有用户消息都 sticky + 渐变透明 → 层级错乱）。 */
+.bc-msg-user.bc-msg-user-last {
   position: sticky; top: 0; z-index: 2;
-  padding: 0.4rem 0 0.5rem;
-  background: linear-gradient(180deg, var(--paper) 84%, rgba(0, 0, 0, 0));
+  background: var(--paper);
 }
 .bc-msg-content { max-width: 82%; }
 .bc-msg-user .bc-msg-content { text-align: right; }
@@ -3833,11 +3835,7 @@ html { scroll-behavior: smooth; }
   transition: all var(--transition);
 }
 .bc-msg-fold:hover { border-color: var(--seal); }
-.bc-msg-fold-mini {
-  width: auto; margin-top: 0.4rem; padding: 0.12rem 0.5rem; font-size: 0.7rem;
-  background: none; color: var(--ink-soft);
-}
-.bc-msg-fold-mini:hover { color: var(--seal); border-color: var(--seal); }
+
 .bc-fold-caret { color: var(--seal); font-size: 0.7rem; transition: transform 0.15s; }
 .bc-fold-caret.open { transform: rotate(90deg); }
 .bc-fold-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -176,6 +176,13 @@ export function findProposalCardMessageId(messages: ChatMessage[]): string | und
 
 /** 追问选择面板恢复：返回最后一条含未答 ask 卡的中枢消息（ask 卡不渲染进聊天流，显示在输入框上方；
  *  刷新后从消息历史恢复未选择的面板；已选择（answeredIds）不再恢复） */
+/** 滚动吸附目标：仅最后一条用户消息（当前问题）吸顶吸附；历史用户消息随滚动流正常移动 */
+export function isLastUserMsg(messages: ChatMessage[], msg: ChatMessage): boolean {
+  if (msg.role !== "user") return false;
+  const last = messages[messages.length - 1];
+  return last?.role === "user" && last?.id === msg.id;
+}
+
 export function findPendingAskCard(messages: ChatMessage[], answeredIds?: ReadonlySet<string>): { msgId: string; ask: AskCard } | null {
   if (!messages.length) return null;
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -637,8 +644,11 @@ export const BrainCabin: React.FC<{
             const longText = shouldFoldLongText(msg);
             const hasConfirm = (msg.cards ?? []).some((c) => c.kind === "confirm");
             const folded = (collapsible || longText) && !msg.pending && !hasConfirm && !expandedMsgs.has(msg.id);
+            // 滚动吸附只作用于最后一条用户消息（当前问题）：历史用户消息随滚动流正常移动，
+            // 避免所有用户消息 sticky 吸顶 + 渐变背景透明导致后续消息从层级下方露出
+            const isLastUser = isLastUserMsg(messages, msg);
             return (
-            <div key={msg.id} className={`bc-msg bc-msg-${msg.role}`}>
+            <div key={msg.id} className={`bc-msg bc-msg-${msg.role}${isLastUser ? " bc-msg-user-last" : ""}`}>
               {msg.role === "brain" && <BrainCore presence={presence} activity={activity} size="mini" animated={false} />}
               <div className="bc-msg-content">
                 {folded ? (
@@ -678,13 +688,13 @@ export const BrainCabin: React.FC<{
                     onFormSubmit={(card2, values) => submitForm(card2, values, msg.id, i)}
                   />
                 ))}
-                {(collapsible || longText) && !msg.pending && !hasConfirm && (
-                  <button className="bc-msg-fold bc-msg-fold-mini" onClick={() => setExpandedMsgs((prev) => { const n = new Set(prev); n.delete(msg.id); return n; })} title="折叠此消息">▾ 收起</button>
-                )}
-                {/* 消息操作区：时间戳 + 复制（user 额外编辑）；pending 时不显示 */}
+                {/* 消息操作区：时间戳 + 收起（可折叠消息展开态，位于时间之后、功能按钮之前）+ 复制（user 额外编辑）；pending 时不显示 */}
                 {!msg.pending && (msg.text || (msg.cards?.length ?? 0) > 0) && (
                   <div className="bc-msg-ops">
                     <span className="bc-msg-time" title={fmtAbsTime(msg.at)}>{fmtTime(new Date(msg.at).getTime())}</span>
+                    {(collapsible || longText) && !hasConfirm && (
+                      <button className="bc-msg-op" onClick={() => setExpandedMsgs((prev) => { const n = new Set(prev); n.delete(msg.id); return n; })} title="折叠此消息">▾ 收起</button>
+                    )}
                     {msg.role === "user" && (
                       <button className="bc-msg-op" onClick={() => editPrompt(msg)} disabled={streaming || thinking} title="编辑并重发（截断后续对话）">✎ 编辑</button>
                     )}

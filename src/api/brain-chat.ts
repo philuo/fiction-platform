@@ -249,6 +249,7 @@ ${INTENT_ENUM.map((k) => `- ${k}：${INTENT_HINT[k] ?? k}`).join("\n")}
 - 「有哪些角色推荐」「列出提案」「查看提案内容」等**查询列表**表达 → intent 为 "read_proposals"（在聊天中列提案卡）
 - intent 为 "chat" 时 params 为空对象，reply 直接回答用户问题
 - 无法确定具体操作时选 "chat"
+- 用户只提到章节（如「第一章」「第三章」）而没说要看什么时，intent 仍选 "read_chapter" 并提取 {index: 章节号}，**不要直接输出正文**（系统会追问用户想做什么：看正文/生成插画/审查/聊聊）
 字符串值内部一律使用中文引号「」/『』，禁止英文双引号。`;
 
 type IntentResult = { intent: string; params: Record<string, unknown>; reply: string };
@@ -361,11 +362,21 @@ export function isHollowReply(text: string | undefined | null): boolean {
  *  （形象/状态/关系），避免不同问法得到雷同的空话；其余空话回退为卡片标题。 */
 export function l0QueryReply(intent: string, card: Record<string, unknown>, prompt: string, llmReply: string | undefined | null): string {
   const p = prompt ?? "";
+  if (intent === "read_chapter" && card.kind === "browse") {
+    // 正文即全部，无需 LLM 复述；模板说明已调取 + 字数 + 如何看全文（避免「重复输出标题」）
+    const d = (card.data ?? {}) as Record<string, unknown>;
+    const len = String(d.text ?? "").length;
+    return `第 ${String(d.index ?? "?")} 章「${String(d.title ?? "")}」已为你调取${len > 0 ? `（约 ${len} 字）` : ""}，正文可在下方卡片中展开查看全文。`;
+  }
   if (intent === "read_character" && card.kind === "browse") {
     const d = (card.data ?? {}) as Record<string, unknown>;
     const name = String(d.name ?? "该角色");
     const role = String(d.role ?? "");
-    if (/状态|近况|最新|现在|目前|处境/.test(p)) {
+    // LLM 已给出实质回复（非空话）时优先保留，仅空话才用模板侧重（避免把好回答降级）
+    const llm = (llmReply ?? "").trim();
+    if (llm && !isHollowReply(llm)) return llm;
+    // 状态正则刻意不含「现在/目前」：避免「他现在长什么样/她现在跟谁关系好」被状态分支劫持
+    if (/状态|近况|最新|处境/.test(p)) {
       return `「${name}」当前状态：${String(d.status ?? "—")}`;
     }
     if (/形象|样子|长什么样|什么样|外貌|穿着|长相/.test(p)) {
@@ -383,6 +394,35 @@ export function l0QueryReply(intent: string, card: Record<string, unknown>, prom
   const t = (llmReply ?? "").trim();
   if (t && !isHollowReply(t)) return t;
   return String(card.title ?? "");
+}
+
+/** 含糊章节提及判定：仅提到章节号（如「第一章」）而无明确「查看正文」动作词时返回 true——
+ *  此时应追问用户意图（看正文/生成插画/审查/聊聊），而非直接把正文糊上来（用户可能只想要插画或概况）。 */
+export function isAmbiguousChapterPrompt(prompt: string | undefined | null): boolean {
+  const p = (prompt ?? "").trim();
+  if (!p) return false;
+  // 必须确实提及了章节（第 N 章 / 第N章）
+  const chapterMention = /第\s*[0-9一二三四五六七八九十百]+\s*章/.test(p);
+  if (!chapterMention) return false;
+  // 明确查看/获取内容/评价的动作词 → 视为有明确意图，不追问
+  const actionWords = /查看|看|看看|浏览|读|阅读|打开|展示|调出|调取|给我|发|输出|全文|内容|正文|讲|说|写|概况|梗概|大概|什么|如何|怎么样|评价|评论|评估/;
+  return !actionWords.test(p);
+}
+
+/** read_chapter 含糊提及时的追问卡：让用户明确要做什么（查看正文/生成插画/审查/聊聊）。
+ *  选项 label 会被作为新输入继续对话（answerAsk 机制），命中对应意图。index 缺失时返回 null（调用方走原逻辑）。 */
+export function chapterAskCard(w: WorldState, params: Record<string, unknown>): { kind: "ask"; question: string; options: { label: string; description?: string }[] } | null {
+  const idx = Number(params.index);
+  if (!Number.isInteger(idx) || idx <= 0) return null;
+  const ch = w.chapters.find((c) => c.index === idx);
+  const label = ch ? `第 ${idx} 章「${ch.title}」` : `第 ${idx} 章`;
+  const options: { label: string; description?: string }[] = [
+    { label: `查看第 ${idx} 章正文`, description: "在聊天中展示章节全文，可展开查看" },
+    { label: `为第 ${idx} 章生成插画`, description: "按章节内容生成一张配图" },
+  ];
+  if (ch?.review?.verdict === "revise") options.push({ label: `查看第 ${idx} 章审查报告`, description: "展示该章审查意见与评分" });
+  options.push({ label: "只是聊聊", description: "与中枢讨论这一章，不执行操作" });
+  return { kind: "ask", question: `你想对${label}做什么？`, options };
 }
 
 /** L0 查询直接执行 → BrowseCard / ResultCard */
@@ -444,8 +484,9 @@ export function executeQuery(w: WorldState, intent: string, params: Record<strin
     const appeared = w.characters
       .filter((c) => (c.appearedIn ?? []).includes(idx) || ch.text.includes(c.name))
       .map((c) => ({ name: c.name, role: c.role, status: c.status, portrait: !!(c.portrait?.path || c.image) }));
+    // 章节名并入标题（卡片标题只保留 head 一处，body 不再重复展示章名）
     return {
-      kind: "browse", title: `第${idx}章 · 出场角色（${appeared.length} 个）`, browseType: "appearances",
+      kind: "browse", title: `第${idx}章 · ${ch.title} · 出场角色（${appeared.length} 个）`, browseType: "appearances",
       data: { chapter: idx, chapterTitle: ch.title, list: appeared },
     };
   }
@@ -1626,6 +1667,18 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
 
     // L0 查询类：直接执行 → BrowseCard/ResultCard
     if (meta.level === "L0" && !meta.action) {
+      // 含糊章节提及治理：仅提章节号（如「第一章」）而无查看动作 → 追问意图（看正文/插画/审查/聊聊），不直接输出正文
+      if (intent === "read_chapter" && isAmbiguousChapterPrompt(activePrompt)) {
+        const ask = chapterAskCard(w, params);
+        if (ask) {
+          updateMessageText(title, sessionId, messageId, ask.question, true);
+          send({ type: "delta", messageId, text: ask.question });
+          markMessageDone(title, sessionId, messageId, [ask]);
+          send({ type: "card", messageId, card: ask });
+          send({ type: "done", messageId });
+          return;
+        }
+      }
       const card = executeQuery(w, intent, params);
       if (card) {
         // 开场文本升级：LLM reply 是「这就为您调出」式空话、或角色查询需按问法侧重时，
@@ -1635,8 +1688,22 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
           updateMessageText(title, sessionId, messageId, better, true);
           send({ type: "delta", messageId, text: better });
         }
-        cards.push(card);
-        send({ type: "card", messageId, card });
+        // 跨消息去重：同会话最近 3 条 assistant 消息已含相同卡（整卡 JSON 相同 = 数据未变）→ 不发卡，
+        // 避免连续查询（如「哪几章需修改」「温雪见状态」）重复展示同一标题/内容的卡；文本要点已足够
+        const cardJson = JSON.stringify(card);
+        const dupCard = (session?.messages ?? [])
+          .filter((m) => m.role === "assistant")
+          .slice(-3)
+          .some((m) => (m.cards ?? []).some((c) => JSON.stringify(c) === cardJson));
+        if (!dupCard) {
+          cards.push(card);
+          send({ type: "card", messageId, card });
+        } else {
+          const base = better || text;
+          const finalText = `${base}（数据与上次查看一致，未重复展示卡片）`;
+          updateMessageText(title, sessionId, messageId, finalText, true);
+          send({ type: "delta", messageId, text: finalText });
+        }
       }
     } else {
       // 写操作（L0 有 action 的如 gacha/eval/integrity 也走预览卡，客户端执行）
