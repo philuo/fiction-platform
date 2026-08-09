@@ -1,7 +1,7 @@
-// 鲁棒 JSON 提取：LLM 输出可能带 ```json 围栏、前后杂文、尾部附加说明
-function balancedExtract(s: string): string | null {
-  // 从第一个 { 开始做平衡括号扫描（跳过字符串内的 { }），返回第一个完整 JSON 对象
-  const start = s.indexOf("{");
+// 鲁棒 JSON 提取：LLM 输出可能带 ```json 围栏、前后杂文、尾部附加说明、引号包裹、数组顶层
+function balancedExtractCore(s: string, open: string, close: string): string | null {
+  // 从第一个 open 开始做平衡括号扫描（跳过字符串内的括号），返回第一个完整 JSON 值
+  const start = s.indexOf(open);
   if (start === -1) return null;
   let depth = 0;
   let inStr = false;
@@ -13,13 +13,28 @@ function balancedExtract(s: string): string | null {
       else if (ch === "\\") esc = true;
       else if (ch === '"') inStr = false;
     } else if (ch === '"') inStr = true;
-    else if (ch === "{") depth++;
-    else if (ch === "}") {
+    else if (ch === open) depth++;
+    else if (ch === close) {
       depth--;
       if (depth === 0) return s.slice(start, i + 1);
     }
   }
   return null;
+}
+const balancedExtract = (s: string) => balancedExtractCore(s, "{", "}");
+const balancedArrayExtract = (s: string) => balancedExtractCore(s, "[", "]");
+
+/** 依次尝试 parse，返回第一个成功的值；全部失败返回 undefined */
+function tryParseCandidates(candidates: string[]): unknown {
+  for (const c of candidates) {
+    if (!c) continue;
+    try {
+      return JSON.parse(c);
+    } catch {
+      /* 尝试下一个候选 */
+    }
+  }
+  return undefined;
 }
 
 export function extractJson<T>(raw: string): T {
@@ -33,9 +48,31 @@ export function extractJson<T>(raw: string): T {
     try {
       return JSON.parse(balanced) as T;
     } catch {
-      /* 落到策略 3 */
+      /* 落到策略 2.5 */
     }
   }
+  // 策略 2.5：宽容候选链（逐个尝试，任一成功即返回）——
+  //  a) 第一个 { 到最后一个 }：剥离尾缀（含截断的引号/附加说明）
+  //  b) 整个输出被英文引号包裹：剥掉首尾引号后重试
+  //  c) 顶层是数组（如 [{...}]）：平衡方括号截取首个完整数组
+  const candidates: string[] = [];
+  const firstBrace = s.indexOf("{");
+  const lastBrace = s.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    candidates.push(s.slice(firstBrace, lastBrace + 1));
+  }
+  if (s.startsWith('"') && s.endsWith('"')) {
+    const unquoted = s.slice(1, -1).trim();
+    const ub = balancedExtract(unquoted);
+    if (ub) candidates.push(ub);
+    candidates.push(unquoted);
+  }
+  if (s.startsWith("[")) {
+    const arr = balancedArrayExtract(s);
+    if (arr) candidates.push(arr);
+  }
+  const parsed = tryParseCandidates(candidates);
+  if (parsed !== undefined) return parsed as T;
   // 策略 3：直接 parse（可能是严格 JSON）
   try {
     return JSON.parse(s) as T;
@@ -117,7 +154,7 @@ import type { ChatMessage } from "./agnes";
 import { chatStream } from "./agnes";
 
 const JSON_FIX_RULE =
-  "要求：只输出一个合法 JSON 对象（不要 markdown 围栏）；字符串值内部一律使用中文引号「」或『』，禁止在字符串里使用英文双引号（\"）。";
+  "要求：只输出一个以 { 开头、以 } 结尾的合法 JSON 对象（不要 markdown 围栏，不要用英文引号包裹整个输出，不要输出任何解释、前缀或后缀文字）；字符串值内部一律使用中文引号「」或『』，禁止在字符串里使用英文双引号（\"）。";
 
 export type ChatJsonOpts = {
   temperature?: number;
@@ -153,7 +190,7 @@ export async function chatJson<T>(
         msgs = [
           ...messages,
           { role: "assistant", content: raw.slice(0, 8000) },
-          { role: "user", content: `上次输出不是合法 JSON：${(e as Error).message}。请重新输出。${JSON_FIX_RULE}` },
+          { role: "user", content: `上次输出不是合法 JSON：${(e as Error).message}。\n上次输出预览（前 300 字符）：${JSON.stringify(raw.slice(0, 300))}\n请重新输出。${JSON_FIX_RULE}` },
         ];
         if (opts.schema) msgs = injectSchema(msgs, opts.schema);
       } else {
