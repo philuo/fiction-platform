@@ -66,7 +66,7 @@ async function fetchAction(endpoint: string, method: string, body: Record<string
 
 // —— Phase 3：中枢本地偏好（localStorage，纯用户体验增强；服务端始终权威） ——
 const CABIN_PREFS_KEY = "fp_cabin_prefs";
-type CabinPrefs = { mediaCount?: number; inputHeight?: number };
+type CabinPrefs = { mediaCount?: number; inputHeight?: number; panelWidth?: number };
 
 function readCabinPrefs(): CabinPrefs {
   if (typeof window === "undefined") return {};
@@ -176,13 +176,6 @@ export function findProposalCardMessageId(messages: ChatMessage[]): string | und
 
 /** 追问选择面板恢复：返回最后一条含未答 ask 卡的中枢消息（ask 卡不渲染进聊天流，显示在输入框上方；
  *  刷新后从消息历史恢复未选择的面板；已选择（answeredIds）不再恢复） */
-/** 滚动吸附目标：仅最后一条用户消息（当前问题）吸顶吸附；历史用户消息随滚动流正常移动 */
-export function isLastUserMsg(messages: ChatMessage[], msg: ChatMessage): boolean {
-  if (msg.role !== "user") return false;
-  const last = messages[messages.length - 1];
-  return last?.role === "user" && last?.id === msg.id;
-}
-
 export function findPendingAskCard(messages: ChatMessage[], answeredIds?: ReadonlySet<string>): { msgId: string; ask: AskCard } | null {
   if (!messages.length) return null;
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -246,6 +239,24 @@ export function longTextSummary(text: string, max = 60): string {
   const t = text.replace(/\s+/g, " ").trim();
   if (!t) return "";
   return t.length > max ? t.slice(0, max) + "…" : t;
+}
+
+/** 按问答段分组消息：每条用户提问开启一个新段，段内含其后所有中枢回复，直到下一条提问。
+ *  分段后每段（.bc-msg-group）成为其内部 sticky 用户消息的 containing block，吸附范围被限定在
+ *  「该问答段」内——当前段滚到底（即下一条提问到达顶部）时，本段提问自然释放、下一条接续吸附，
+ *  避免多条用户消息同时吸附在面板顶部时，较高的前序提问从较低的后序提问下方露出下半截。 */
+function groupMessages(msgs: ChatMessage[]): ChatMessage[][] {
+  const groups: ChatMessage[][] = [];
+  let cur: ChatMessage[] = [];
+  for (const m of msgs) {
+    if (m.role === "user" && cur.length) {
+      groups.push(cur);
+      cur = [];
+    }
+    cur.push(m);
+  }
+  if (cur.length) groups.push(cur);
+  return groups;
 }
 
 /** 空态快捷提问（点击即发送，降低首次使用门槛） */
@@ -364,6 +375,34 @@ export const BrainCabin: React.FC<{
   const writingTimerRef = useRef<number | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // 面板宽度：左侧边缘可拖拽改宽（localStorage 记住；窄屏忽略存储宽度强制全宽）
+  const MIN_PANEL_W = 320, MAX_PANEL_W = 760;
+  const [panelWidth, setPanelWidth] = useState<number | null>(() => {
+    const v = readCabinPrefs().panelWidth;
+    return v != null && v >= MIN_PANEL_W && v <= MAX_PANEL_W ? v : null;
+  });
+  const panelWidthRef = useRef<number | null>(panelWidth);
+  const resizeStartRef = useRef<{ x: number; w: number } | null>(null);
+  const [resizing, setResizing] = useState(false);
+  function onResizeStart(e: React.PointerEvent<HTMLDivElement>) {
+    if (typeof window !== "undefined" && window.innerWidth <= 640) return;
+    resizeStartRef.current = { x: e.clientX, w: panelWidthRef.current ?? 440 };
+    setResizing(true);
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+  }
+  function onResizeMove(e: React.PointerEvent<HTMLDivElement>) {
+    const s = resizeStartRef.current;
+    if (!s) return;
+    const w = Math.min(MAX_PANEL_W, Math.max(MIN_PANEL_W, s.w + (s.x - e.clientX)));
+    panelWidthRef.current = w;
+    setPanelWidth(w);
+  }
+  function onResizeEnd() {
+    if (!resizeStartRef.current) return;
+    resizeStartRef.current = null;
+    setResizing(false);
+    writeCabinPrefs({ panelWidth: panelWidthRef.current ?? undefined });
+  }
   // 挂载后恢复上次拖拽的输入区高度（localStorage 偏好；CSS min/max 已钳制）
   useEffect(() => {
     const h = readCabinPrefs().inputHeight;
@@ -532,7 +571,19 @@ export const BrainCabin: React.FC<{
 
   return (
     <div className="brain-cabin-mask" onClick={onClose}>
-      <div className="brain-cabin" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="brain-cabin"
+        style={panelWidth != null && (typeof window === "undefined" || window.innerWidth > 640) ? { width: panelWidth } : undefined}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* 左侧拖拽改宽手柄（pointer capture 持续跟踪，浏览器记住宽度） */}
+        <div
+          className={`bc-resize-handle${resizing ? " dragging" : ""}`}
+          onPointerDown={onResizeStart}
+          onPointerMove={onResizeMove}
+          onPointerUp={onResizeEnd}
+          title="拖拽调整面板宽度"
+        />
         {/* 顶部：大脑 + 状态区 + 右上角操作（新建/历史）；关闭按钮独立于右上角角落 */}
         <div className="brain-cabin-head">
           <button className="modal-close bc-head-close" onClick={onClose} title="关闭对话舱">
@@ -638,17 +689,17 @@ export const BrainCabin: React.FC<{
               <p className="bc-hint">也可以直接输入，如：「再写一章」「这本书质量怎么样」「给第三章配张插画」</p>
             </div>
           )}
-          {messages.map((msg) => {
+          {groupMessages(messages).map((group) => (
+            <div className="bc-msg-group" key={group[0]?.id ?? "group"}>
+            {group.map((msg) => {
             // 任务/指令类消息默认折叠为摘要行；纯文本超长回复（>FOLD_TEXT_THRESHOLD）也折叠；未决确认（confirm 卡）与生成中强制展开
             const collapsible = isCollapsibleMsg(msg);
             const longText = shouldFoldLongText(msg);
             const hasConfirm = (msg.cards ?? []).some((c) => c.kind === "confirm");
             const folded = (collapsible || longText) && !msg.pending && !hasConfirm && !expandedMsgs.has(msg.id);
-            // 滚动吸附只作用于最后一条用户消息（当前问题）：历史用户消息随滚动流正常移动，
-            // 避免所有用户消息 sticky 吸顶 + 渐变背景透明导致后续消息从层级下方露出
-            const isLastUser = isLastUserMsg(messages, msg);
+            // 滚动吸附：每条用户提问 sticky 吸顶（CSS 处理），当前视口内 AI 回复对应的提问自然吸附在顶部
             return (
-            <div key={msg.id} className={`bc-msg bc-msg-${msg.role}${isLastUser ? " bc-msg-user-last" : ""}`}>
+            <div key={msg.id} className={`bc-msg bc-msg-${msg.role}`}>
               {msg.role === "brain" && <BrainCore presence={presence} activity={activity} size="mini" animated={false} />}
               <div className="bc-msg-content">
                 {folded ? (
@@ -705,7 +756,9 @@ export const BrainCabin: React.FC<{
                 )}
               </div>
             </div>);
-          })}
+            })}
+            </div>
+          ))}
           {/* 聊天内写作进度（推进剧情/连载）：流式显示阶段与正文 */}
           {writing && (
             <BrainCardView
@@ -1053,13 +1106,14 @@ export const BrainCabin: React.FC<{
   async function executeCard(card: BrainCard, action?: { endpoint: string; method?: string; body: Record<string, unknown> }, msgId?: string, cardIndex?: number) {
     const act = action ?? (card.kind === "preview" ? card.action : undefined);
     if (!act) return;
-    if (guardBlocked(act, card.title)) return; // 前置校验：不可执行时反馈原因，不发请求（服务端仍兜底权威）
+    const cardTitle = card.kind === "ask" ? "" : card.title; // AskCard 无 title（且无 action 走不到这里，收窄用）
+    if (guardBlocked(act, cardTitle)) return; // 前置校验：不可执行时反馈原因，不发请求（服务端仍兜底权威）
     setExecuting(true);
     try {
       // 推进剧情 / 自动连载：聊天内流式显示写作过程（progress 卡实时阶段+正文），结束后 result 卡回执；
       // 仅成功才标记卡片完成（中断/失败保留按钮，用户可重试）
       if (act.endpoint === "/api/novel/step" || act.endpoint === "/api/novel/auto/start") {
-        const ok = await streamWritingTask(world.title, act, card.title);
+        const ok = await streamWritingTask(world.title, act, cardTitle);
         if (ok) markCardDone(msgId, cardIndex);
         onWorldUpdate?.();
         return;
@@ -1073,23 +1127,23 @@ export const BrainCabin: React.FC<{
         });
         const data = (await res.json().catch(() => ({}))) as { ok?: boolean; mediaIds?: string[]; mediaId?: string; error?: string };
         if (!res.ok || data.error) {
-          appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: String(data.error ?? `HTTP ${res.status}`) }]);
+          appendBrainMsg([{ kind: "result", title: cardTitle, success: false, detail: String(data.error ?? `HTTP ${res.status}`) }]);
           return;
         }
         const ids = data.mediaIds ?? (data.mediaId ? [data.mediaId] : []);
         const chapterIndex = Number(act.body.chapterIndex);
         if (ids.length) {
-          appendBrainMsg([{ kind: "result", title: card.title, success: true, detail: `生成任务已提交（${ids.length} 项），完成后自动显示` }]);
-          pollMediaGen(world.title, chapterIndex, ids, card.title);
+          appendBrainMsg([{ kind: "result", title: cardTitle, success: true, detail: `生成任务已提交（${ids.length} 项），完成后自动显示` }]);
+          pollMediaGen(world.title, chapterIndex, ids, cardTitle);
         } else {
-          appendBrainMsg([{ kind: "result", title: card.title, success: true, detail: "已提交生成任务" }]);
+          appendBrainMsg([{ kind: "result", title: cardTitle, success: true, detail: "已提交生成任务" }]);
         }
         markCardDone(msgId, cardIndex);
         onWorldUpdate?.();
         return;
       }
       const r = await fetchAction(act.endpoint, act.method ?? "POST", act.body);
-      appendBrainMsg([{ kind: "result", title: card.title, success: r.success, detail: r.detail }]);
+      appendBrainMsg([{ kind: "result", title: cardTitle, success: r.success, detail: r.detail }]);
       if (r.success) {
         // gacha 全部应用（auto:true）：pendingCards 一次性消耗，标记本卡全部列表项完成（刷新后保持「已处理」）
         if (act.endpoint === "/api/novel/gacha" && act.body.action === "apply" && act.body.auto === true && card.kind === "browse") {
@@ -1100,7 +1154,7 @@ export const BrainCabin: React.FC<{
         onWorldUpdate?.();
       }
     } catch (e) {
-      appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: (e as Error).message }]);
+      appendBrainMsg([{ kind: "result", title: cardTitle, success: false, detail: (e as Error).message }]);
     } finally {
       setExecuting(false);
     }

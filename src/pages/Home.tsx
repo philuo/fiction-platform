@@ -257,8 +257,9 @@ const Home: React.FC<HomeProps> = (props) => {
       if (data.stories) setStories(data.stories);
     } catch { /* ignore */ }
   }
-  // 初始加载列表
-  useEffect(() => { fetchStories(); }, []);
+  // 初始加载列表：登录后（user 出现，含登录/注册成功与 SSR 已登录直进）自动调取；
+  // 未登录时 list 接口 401 且无 token，不发起空请求
+  useEffect(() => { if (user) fetchStories(); }, [user]);
 
   // token 失效（apiFetch 401 清凭证后广播）：清用户态回登录页
   useEffect(() => {

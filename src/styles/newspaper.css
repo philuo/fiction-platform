@@ -3672,8 +3672,20 @@ html { scroll-behavior: smooth; }
   border-left: 1px solid var(--line-strong);
   box-shadow: -6px 0 24px rgba(0, 0, 0, 0.18);
   display: flex; flex-direction: column;
+  position: relative;
   animation: bcSlideIn 0.25s ease;
 }
+/* 左侧拖拽改宽手柄：悬停/拖拽时高亮；窄屏隐藏（面板全宽不可拖） */
+.bc-resize-handle {
+  position: absolute; left: -4px; top: 0; bottom: 0; width: 8px;
+  cursor: ew-resize; z-index: 1200; touch-action: none;
+}
+.bc-resize-handle::after {
+  content: ""; position: absolute; left: 2px; top: 0; bottom: 0; width: 2px;
+  background: transparent; transition: background 0.15s;
+}
+.bc-resize-handle:hover::after, .bc-resize-handle.dragging::after { background: var(--seal); }
+@media (max-width: 640px) { .bc-resize-handle { display: none; } }
 @keyframes bcSlideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
 .brain-cabin-head {
   position: relative;
@@ -3753,6 +3765,10 @@ html { scroll-behavior: smooth; }
 .bc-tabs-actions .bc-head-icon-btn { width: 1.5rem; height: 1.5rem; }
 
 .brain-cabin-stream { flex: 1; overflow-y: auto; padding: 0 1rem 0.8rem; display: flex; flex-direction: column; }
+/* 问答段容器：成为其内部 sticky 用户消息的 containing block，把吸附范围限定在本段内，
+   避免多条用户消息同时吸顶时较高的前序提问从较低后序提问下方露出下半截（若含块为整个
+   stream，前序消息会一直吸附到 stream 底部、被后序覆盖不全而露出）。 */
+.bc-msg-group { position: relative; display: flex; flex-direction: column; }
 .brain-cabin-empty { text-align: center; color: var(--ink-soft); font-size: 0.82rem; margin: auto; padding: 2rem 1rem; }
 .bc-empty-title { font-size: 0.86rem; color: var(--ink); font-weight: 600; margin: 0 0 0.4rem; }
 /* 空态快捷提问 chips（点击即发送，降低首次使用门槛） */
@@ -3767,14 +3783,13 @@ html { scroll-behavior: smooth; }
 .bc-hint { font-size: 0.72rem; color: var(--ink-soft); margin-top: 0.6rem; opacity: 0.8; }
 
 .bc-msg { display: flex; gap: 0.5rem; align-items: flex-start; }
+/* 滚动吸附：每条用户提问在本问答段（.bc-msg-group）内吸顶 top:0，段底（下一条提问到达顶部）时
+   释放、下一段提问接续吸附——经典聊天「当前问答段吸附」交互，且多条提问不会同时吸附而互相露出。
+   背景必须用不透明面板色（此前渐变透明背景导致后续变高消息从吸附层下方透出 → 层级错乱）。 */
 .bc-msg-user {
   flex-direction: row-reverse;
-  padding: 1rem 0 0.5rem;
-}
-/* 滚动吸附只作用于最后一条用户消息（当前问题，.bc-msg-user-last）：滚动经过时固定在面板顶部。
-   背景用不透明面板色，防止后续变高消息从吸附层下方透出（此前所有用户消息都 sticky + 渐变透明 → 层级错乱）。 */
-.bc-msg-user.bc-msg-user-last {
   position: sticky; top: 0; z-index: 2;
+  padding: 1.2rem 0 0.5rem; /* 吸附态贴近面板顶 */
   background: var(--paper);
 }
 .bc-msg-content { max-width: 82%; }

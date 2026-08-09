@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { BrainCard } from "./brain-cards";
 import { apiFetch } from "../api/client";
-import { cacheGetSession, cachePutSession, cacheClearBook } from "./brainCache";
+import { cachePutSession, cacheClearBook } from "./brainCache";
 
 export type ChatMessage = {
   id: string;
@@ -264,7 +264,7 @@ export function useBrainSession(title: string) {
           for (const line of lines) {
             if (!line.startsWith("data: ")) continue;
             lastEventAt = Date.now(); // ping 等任意事件均视为连接存活
-            let obj: { type?: string; messageId?: string; text?: string; card?: BrainCard; error?: string };
+            let obj: { type?: string; messageId?: string; text?: string; card?: BrainCard; error?: string; append?: boolean };
             try { obj = JSON.parse(line.slice(6)); } catch { continue; }
             eventCount++;
             if (obj.error) { events.onError?.(obj.error, obj.messageId); continue; }

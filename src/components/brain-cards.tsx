@@ -41,6 +41,8 @@ export type ResultCard = {
   success: boolean;
   detail: string;
   image?: CardImage;
+  /** open_* 意图 result 卡：打开面板/弹窗的显式协议（target + 定位 opts） */
+  open?: { target: string; opts?: Record<string, unknown> };
 };
 
 export type BrowseCardAction = {
@@ -55,7 +57,8 @@ export type BrowseCard = {
   browseType:
     | "chapter" | "character" | "foreshadow" | "review" | "eval" | "proposal" | "gacha"
     // —— 查询扩展（Phase 1）：列表/进度/统计可视化 ——
-    | "chapters" | "characters" | "plans" | "tasks" | "logs" | "worldbook" | "media";
+    | "chapters" | "characters" | "plans" | "tasks" | "logs" | "worldbook" | "media"
+    | "appearances" | "relationships" | "outline" | "timeline";
   data: unknown;
   /** 列表级可选操作（proposal 列表项内嵌 actions 由渲染层读取，此字段暂为列表级扩展） */
   actions?: BrowseCardAction[];

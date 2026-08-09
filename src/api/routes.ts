@@ -83,7 +83,7 @@ function sseStream(produce: (send: (obj: unknown) => void) => Promise<void>): Re
     },
   });
   return new Response(stream, {
-    headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache" },
+    headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no" },
   });
 }
 
@@ -439,7 +439,7 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
         },
       });
       return new Response(stream, {
-        headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache" },
+        headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no" },
       });
     }
 
@@ -588,7 +588,7 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
         context: {
           autoRunning: bcCtxAuto?.status === "running",
           autoPhase: bcCtxAuto?.status === "running" ? bcCtxAuto?.phase : undefined,
-          pendingCommit: bcCtxPending ? { index: bcCtxPending.index ?? null, title: bcCtxPending.title ?? "" } : null,
+          pendingCommit: bcCtxPending ? { index: bcCtxPending.chapterIndex ?? null, title: bcCtxPending.title ?? "" } : null,
           advanceTaskRunning: bcCtxTask?.status === "running",
           advancePhase: bcCtxTask?.status === "running" ? bcCtxTask?.phase : undefined,
           mediaGenerating,

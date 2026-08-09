@@ -257,7 +257,7 @@ type IntentResult = { intent: string; params: Record<string, unknown>; reply: st
 /** 意图识别（LLM）；失败降级为 chat。
  *  ctx：前端上下文（选中章）——用户未指定章节时作为参数兜底（需求 1/2）；
  *  history：最近会话文本（支持「上一章/刚说的那个」类指代）。 */
-async function recognizeIntent(w: WorldState, prompt: string, ctx?: { chapterIndex?: number | null }, history?: string[]): Promise<IntentResult> {
+async function recognizeIntent(w: WorldState, prompt: string, ctx?: BrainChatContext["ctx"], history?: string[]): Promise<IntentResult> {
   try {
     const ctxLines: string[] = [];
     if (history?.length) ctxLines.push(`最近对话：\n${history.join("\n")}`);
@@ -281,7 +281,7 @@ async function recognizeIntent(w: WorldState, prompt: string, ctx?: { chapterInd
       if (sv.advanceTaskRunning) sysState.push(`推进任务进行中${sv.advancePhase ? `（${sv.advancePhase}）` : ""}`);
       if (sv.mediaGenerating) sysState.push("插画/视频生成中");
       if (sv.visualRunning) sysState.push("角色视觉生成中");
-      if (sv.pendingCommit) sysState.push(`有第 ${sv.pendingCommit.index ?? "?"} 章待确认入册`);
+      if (sv.pendingCommit) sysState.push(`有第 ${(sv.pendingCommit as { index?: number | null }).index ?? "?"} 章待确认入册`);
     }
     if (sysState.length) ctxLines.push(`系统当前状态：${sysState.join("；")}（写操作需与运行中任务冲突时谨慎）`);
     const ctxBlock = ctxLines.length ? `\n\n${ctxLines.join("\n\n")}` : "";
@@ -528,13 +528,13 @@ export function executeQuery(w: WorldState, intent: string, params: Record<strin
     // 脉络：卷 → 弧 → 章 进展链
     const arcsByVol = new Map<string, NonNullable<typeof w.storyArcs>>();
     for (const a of w.storyArcs ?? []) {
-      const v = a.volume ?? "";
+      const v = a.volumeId ?? "";
       if (!arcsByVol.has(v)) arcsByVol.set(v, []);
       arcsByVol.get(v)!.push(a);
     }
     const volumes = (w.blueprint?.volumes ?? []).map((v) => ({
       title: v.title, status: v.status, goal: v.goal,
-      arcs: (arcsByVol.get(v.title) ?? []).map((a) => ({ title: a.title, status: a.status, estChapters: a.estChapters })),
+      arcs: (arcsByVol.get(v.id) ?? []).map((a) => ({ title: a.title, status: a.status, estChapters: a.estChapters })),
       chapters: w.chapters
         .filter((ch) => (v.chapterRange?.[0] ?? 0) <= ch.index && ch.index <= (v.chapterRange?.[1] ?? Number.MAX_SAFE_INTEGER))
         .map((ch) => ({ index: ch.index, title: ch.title, status: ch.review?.verdict === "revise" ? "需修订" : "已入册", words: ch.text.length })),
