@@ -322,7 +322,9 @@ export const BrainCabin: React.FC<{
   } | null;
   /** 自动连载是否运行中（服务端定时任务；中枢感知系统时机，冲突时拒绝写操作） */
   autoRunning?: boolean;
-}> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk, onOpenPanel, currentChapter, autoRunning }) => {
+  /** 世界构建中阶段文案（壳就绪进页面后后台仍在增强蓝图/章节；非空时中枢显示"世界构建中"而非待命） */
+  buildingStage?: string | null;
+}> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk, onOpenPanel, currentChapter, autoRunning, buildingStage }) => {
   const {
     sessions, activeId, messages, streaming, thinking, reconnecting,
     openSession, newSession, removeSession, truncate, appendMsg, send, stop, isStreaming,
@@ -495,11 +497,14 @@ export const BrainCabin: React.FC<{
 
   if (!open) return null;
 
-  // presence/activity：服务端轮询有延迟，前端在生成/思考/写作/重连时即时覆盖（与运行状态同步，避免「正在生成却显示待命」）
-  const liveActivity: Activity = streaming || thinking || writing?.status === "running"
-    ? "directing"
-    : (brainState?.activity ?? "idle");
+  // presence/activity：服务端轮询有延迟，前端在生成/思考/写作/重连/世界构建时即时覆盖（与运行状态同步，避免「正在生成却显示待命」）
+  const liveActivity: Activity = buildingStage
+    ? "housekeeping" // 世界构建中（后台增强蓝图/章节）→ 事务处理
+    : streaming || thinking || writing?.status === "running"
+      ? "directing"
+      : (brainState?.activity ?? "idle");
   const livePresence: Presence = reconnecting ? "alert"
+    : buildingStage ? "awake" // 世界构建中 → 觉醒（区别于待命/休眠）
     : (streaming || thinking || writing?.status === "running") ? "focused"
     : (brainState?.presence ?? "standby");
   const presence = livePresence;
@@ -548,6 +553,7 @@ export const BrainCabin: React.FC<{
   }
   const runningStatus = (() => {
     if (reconnecting) return "连接已断开，正在重连…";
+    if (buildingStage) return `世界构建中：${buildingStage}`;
     if (streaming) return "中枢正在生成回复…";
     if (thinking) return "中枢正在思考…";
     if (activity !== "idle") return `中枢正在${ACTIVITY_LABEL[activity]}`;

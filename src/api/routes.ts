@@ -7,7 +7,8 @@ import * as steering from "./steering";
 import { runAuto, stopAuto, pauseAuto } from "./autorun";
 import { evaluateBookCached, readEvalReport } from "./eval";
 import { extractFingerprint } from "./style";
-import { loadWorld, listStories, listStoriesMeta, exportMarkdown, exportEpub, slugify as slug, saveWorld, storyDir, storyExists, loadAutoSession, clearAutoSession, loadPendingChapter, clearPendingChapter, currentUser, migrateLegacyStoriesTo, runAsUser, userDir } from "./storage";
+import { loadWorld, listStories, listStoriesMeta, deleteStory, exportMarkdown, exportEpub, slugify as slug, saveWorld, storyDir, storyExists, loadAutoSession, clearAutoSession, loadPendingChapter, clearPendingChapter, currentUser, migrateLegacyStoriesTo, runAsUser, userDir } from "./storage";
+import { createNewStoryTask, completeNewStoryTask, failNewStoryTask, markNewStoryTaskReady, updateNewStoryTaskStage, getNewStoryTask, listActiveNewStoryTasks } from "./newtask";
 import { buildAutoLore, mergeLore, sanitizeLore } from "./lore";
 import { generateImage, saveImage, readImage, deleteMediaFile } from "./images";
 import { pollVideoTask, downloadVideo, saveVideo } from "./videos";
@@ -83,7 +84,7 @@ function sseStream(produce: (send: (obj: unknown) => void) => Promise<void>): Re
     },
   });
   return new Response(stream, {
-    headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no" },
+    headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive" },
   });
 }
 
@@ -92,6 +93,9 @@ export class AppError extends Error {}
 
 // 自动连载活跃运行注册表：同一用户名下同一书名同时只允许一个 runAuto 循环（防双跑重复写章/停止信号串扰）
 const activeAuto = new Set<string>();
+// 已删除图书注册表（key 同 autoKey：`<user>::<slug>`）：删除后仍在锁外跑的后台任务（角色视觉生成等）
+// 据此自查，避免向已删目录继续写媒体/烧配额；延迟清理防无限增长
+const deletedStories = new Set<string>();
 // 媒体重生成并发防护：同一 mediaId 同时只允许一个重生成（单进程部署，进程内集合即可）
 const regenBusy = new Set<string>();
 /** 进程内注册表 key：前缀当前用户，不同账号的同名书 / 相同 mediaId 互不串扰 */
@@ -141,6 +145,8 @@ type VisualTaskResult = { status: "running" | "done" | "failed"; reason?: string
 const visualTasks = new Map<string, Map<string, VisualTaskResult>>();
 /** 角色视觉生成中集合（进程级去重：同一角色同时只允许一个自动生成任务） */
 const visualInFlight = new Set<string>();
+/** 小说封面生成中集合（进程级去重：同一本书同时只允许一个自动封面任务） */
+const coverInFlight = new Set<string>();
 /** 视觉自动重试冷却：失败/尝试后 1 分钟内不再自动触发（防高频烧配额；手动生成不受影响）。入口触发与中枢巡检共用 */
 const VISUAL_RETRY_COOLDOWN = 60_000;
 
@@ -163,6 +169,8 @@ function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter
   void (async () => {
     const t0 = Date.now();
     const failures: string[] = [];
+    // 删除自查：书已被删除时停止后续生成（书目录删除后仍在锁外跑的任务在每步生成前检查，防写孤儿媒体/继续烧配额）
+    const deleted = () => deletedStories.has(tKey);
     try {
       // ⓪ 立即落盘 visualTriedAt（读时自愈据此冷却重试，防烧配额；每次尝试都刷新时间戳，失败也置位，手动生成不受影响）；此步失败不阻塞生成
       try {
@@ -178,6 +186,7 @@ function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter
         console.warn(`[media] 角色 visualTriedAt 落盘失败（不影响生成）: ${c.name}`, (e as Error).message);
       }
       // ① 头像（缺失才生成）：纯文生方形头像（头像先于立绘生成，是立绘的容貌基准，不依赖立绘）
+      if (deleted()) return;
       let avatar: { path: string; prompt: string } | undefined;
       if (!c.image) {
         try {
@@ -189,6 +198,7 @@ function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter
         }
       }
       // ② 立绘（缺失才生成；重生成走手动入口）：必须以头像为参考图图生图，立绘与头像容貌一致；无头像时 generateCharacterPortrait 抛错（渠道单一，不降级纯文生）
+      if (deleted()) return;
       let portrait = c.portrait;
       if (!portrait?.path) {
         try {
@@ -253,6 +263,55 @@ function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter
         // 在返回给前端后清理（否则前端轮询永远拿不到 failed/reason，失败提示链路失效）
         tasks.set(c.id, { status: failures.length ? "failed" : "done", reason: failures.join("；") });
       }
+    }
+  })();
+}
+
+/** 小说封面自动生成（fire-and-forget）：新建书（立项壳就绪）后自动生成封面，与角色视觉生成并行。
+ * 幂等：已有封面跳过；锁内复查（防并发覆盖手动生成）；失败不阻塞（前端读时自愈/手动生成兜底）。
+ * 与 /api/novel/image kind=cover 同 prompt（标题+体裁+基调+时代+地点，A4 比例），画风与全书统一。 */
+function ensureCover(title: string, w: WorldState): void {
+  if (w.cover) return; // 已有封面跳过
+  const uk = currentUser() ?? "";
+  const tKey = `${uk}::${slug(title)}`;
+  if (coverInFlight.has(tKey)) return; // 已在生成中
+  coverInFlight.add(tKey);
+  const deleted = () => deletedStories.has(tKey);
+  void (async () => {
+    const t0 = Date.now();
+    try {
+      // 锁内复查 + 落盘（防并发期间已有封面；与手动生成互斥）
+      const { path, oldRel } = await withTitleLock(slug(title), async () => {
+        const cur = loadWorld(title);
+        if (!cur) throw new AppError("故事不存在: " + title);
+        if (cur.cover) return { path: cur.cover, oldRel: "" }; // 并发复查：已有封面不覆盖
+        if (deleted()) return { path: "", oldRel: "" };
+        const prompt = `${cur.title}（${cur.genre}）小说封面：${cur.setting.tone}，${cur.setting.time}，${cur.setting.place}，电影感光影，戏剧性构图，细节丰富的插画，画面中不要出现文字，无水印`;
+        const buf = await generateImage(prompt, "768x1086");
+        const p = saveImage(title, `cover-${Date.now().toString(36)}.png`, buf);
+        const w2 = loadWorld(title);
+        if (!w2 || w2.cover) return { path: w2?.cover ?? p, oldRel: w2?.cover ? "" : p }; // 再次复查：落盘期间被手动生成则不覆盖
+        w2.cover = p;
+        steering.logChange(w2, { chapter: w2.nextChapter, actor: "system", kind: "cover-auto", detail: "自动生成小说封面", commandId: "CMD-M09" });
+        saveWorld(w2);
+        return { path: p, oldRel: "" };
+      });
+      if (oldRel && oldRel !== path) deleteMediaFile(title, oldRel); // 未采用则清理新图
+      console.log(`[media] 封面自动生成结束: ${title}（${((Date.now() - t0) / 1000).toFixed(1)}s）`);
+    } catch (e) {
+      const msg = (e as Error).message;
+      console.warn(`[media] 封面自动生成失败（不影响使用，可手动生成）: ${title}`, msg);
+      try {
+        await withTitleLock(slug(title), async () => {
+          const w2 = loadWorld(title);
+          if (w2) {
+            steering.logChange(w2, { chapter: w2.nextChapter, actor: "system", kind: "visual-fail", detail: `封面自动生成失败：${msg}`, commandId: "CMD-M09" });
+            saveWorld(w2);
+          }
+        });
+      } catch { /* 日志尽力而为 */ }
+    } finally {
+      coverInFlight.delete(tKey);
     }
   })();
 }
@@ -439,7 +498,7 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
         },
       });
       return new Response(stream, {
-        headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no" },
+        headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive" },
       });
     }
 
@@ -668,17 +727,62 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
       const idea = String(body.idea ?? "").trim();
       if (!idea) return json({ error: "缺少 idea" }, 400);
+      const genre = body.genre ? String(body.genre) : undefined;
       try {
-        const world = await director.newStory(idea, body.genre ? String(body.genre) : undefined);
-        // 立项初始角色自动生成头像+立绘（后台 fire-and-forget，不阻塞立项返回；前端轮询 /api/novel/visual/status，
-        // 期间中枢显示「自动生成角色头像/立绘中…」，完成后操作日志留 CMD-M07/CMD-M08 记录）
-        const fresh = world.characters.filter((c) => !(c.portrait?.path && c.image));
-        for (const c of fresh) ensureCharacterVisuals(world.title, world, c);
-        return json({ ok: true, world: sanitize(world), visualPending: fresh.length > 0 });
+        // 异步立项：立即返回 taskId，后台跑完 5 个 LLM 调用（1-3 分钟）再落盘。
+        // 前端据 taskId 轮询 /api/novel/new/status，列表接口合并 creating 占位——用户"点了就有反馈"，
+        // 刷新列表也能看到生成中的书；不再同步阻塞 HTTP 请求（原实现最坏挂十几分钟）。
+        const { id: taskId, created } = createNewStoryTask(idea, genre);
+        if (created) {
+          // 只有真正新建任务才启动后台执行；复用已有 running 时（created=false）不再启动，
+          // 否则两个并发 newStory 写同一 taskId 互相覆盖终态（防重入状态管理硬约束）
+          const username = currentUser();
+          void (async () => {
+            try {
+              // 两段式立项：
+              // 段 1（壳就绪）——立项主调用 + 落盘基础 world，随即 markReady；前端轮询到 ready
+              // 立即进入三栏页面，角色视觉同步提前启动（角色已就绪，不等待蓝图）。
+              const world = await runAsUser(username, () => director.newStoryCore(idea, genre));
+              markNewStoryTaskReady(taskId, world.title);
+              const fresh = world.characters.filter((c) => !(c.portrait?.path && c.image));
+              for (const c of fresh) ensureCharacterVisuals(world.title, world, c);
+              // 封面自动生成（fire-and-forget，与角色视觉并行）：新书封面随立绘/头像一起后台生成
+              ensureCover(world.title, world);
+              // 段 2（后台增强）——字段兜底 + 蓝图 + 首弧章节，逐阶段上报进度供前端构建徽章展示
+              try {
+                await runAsUser(username, async () => {
+                  updateNewStoryTaskStage(taskId, "正在补全角色设定…");
+                  await director.newStoryEnhance(world, idea);
+                });
+              } catch (e) {
+                // 壳已就绪、增强失败：任务标 failed 但书名已在（前端页面内提示"世界已生成，增强未完成"，可手动重试蓝图）
+                console.error("[api/novel/new] 后台立项增强失败:", e);
+                failNewStoryTask(taskId, e instanceof AppError ? e.message : "世界已生成，但蓝图/章节增强失败，可在小说内手动生成");
+                return;
+              }
+              completeNewStoryTask(taskId, world.title);
+              console.log(`[api/novel/new] 立项完成: ${world.title}（task=${taskId}）`);
+            } catch (e) {
+              // 段 1 失败（壳未就绪）：任务 failed，前端列表占位卡提示失败
+              console.error("[api/novel/new] 后台立项失败:", e);
+              failNewStoryTask(taskId, e instanceof AppError ? e.message : "立项失败，请稍后重试");
+            }
+          })();
+        }
+        return json({ ok: true, taskId, created });
       } catch (e) {
         console.error("[api/novel/new]", e);
-        return json({ error: e instanceof AppError ? e.message : "立项失败，请稍后重试" }, 502);
+        return json({ error: "立项提交失败，请稍后重试" }, 502);
       }
+    }
+
+    case "/api/novel/new/status": {
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const id = String(body.taskId ?? "").trim();
+      if (!id) return json({ error: "缺少 taskId" }, 400);
+      const t = getNewStoryTask(id);
+      if (!t) return json({ error: "任务不存在" }, 404);
+      return json({ status: t.status, title: t.title, error: t.error, idea: t.idea, stage: t.stage });
     }
 
     case "/api/novel/state": {
@@ -720,7 +824,41 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
     }
 
     case "/api/novel/list": {
-      return json({ stories: listStoriesMeta() });
+      // creating：进行中的异步立项任务（running 壳未就绪 + ready 壳已就绪仍在增强）。
+      // 失败任务不进列表——失败即时 toast 提示即可，不残留卡片；status 端点仍可查终态
+      return json({
+        stories: listStoriesMeta(),
+        creating: listActiveNewStoryTasks().map((t) => ({ id: t.id, idea: t.idea, genre: t.genre ?? "", status: t.status, title: t.title, createdAt: t.startedAt })),
+      });
+    }
+
+    case "/api/novel/delete": {
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const title = String(body.title ?? "").trim();
+      if (!title) return json({ error: "缺少 title" }, 400);
+      try {
+        // 先停该书运行态（自动连载/推进任务/暂存草稿），再锁内删除目录（与并发写章互斥，防删除后任务回写复活）
+        const autoKey = `${currentUser() ?? ""}::${slug(title)}`;
+        stopAuto(title);
+        clearAutoSession(title);
+        clearPendingChapter(title);
+        clearAdvanceTask(title);
+        const ok = await withTitleLock(slug(title), async () => {
+          if (!storyExists(title)) throw new AppError("故事不存在: " + title);
+          return deleteStory(title);
+        });
+        activeAuto.delete(autoKey);
+        // 该书正在后台生成的角色视觉任务：删除后无书可写，清理状态表（防 /visual/status 残留），
+        // 并登记已删除标记让仍在锁外跑的任务在下一步写盘前自查（防向已删目录写孤儿媒体/继续烧配额）
+        const delKey = `${currentUser() ?? ""}::${slug(title)}`;
+        visualTasks.delete(delKey);
+        deletedStories.add(delKey);
+        setTimeout(() => deletedStories.delete(delKey), 30 * 60_000).unref?.();
+        return json({ ok });
+      } catch (e) {
+        console.error("[api/novel/delete]", e);
+        return json({ error: e instanceof AppError ? e.message : "删除失败，请稍后重试" }, 502);
+      }
     }
 
     case "/api/novel/step": {

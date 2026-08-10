@@ -9,7 +9,7 @@ import type { Presence, Activity } from "../api/brain-state";
 // presence → 色相
 const HUE: Record<Presence, string> = {
   dormant: "#55504a",
-  standby: "#191817",
+  standby: "#7a6f5e", // 与 weary 一致：底部控制条为深色（--ink），原 #191817 在深底上不可见
   awake: "#b03a2e",
   focused: "#3b4d8f",
   pondering: "#3a6d8c",

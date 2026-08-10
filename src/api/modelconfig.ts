@@ -43,7 +43,7 @@ export type TaskProfile = {
 export const TASK_PROFILES: Record<string, TaskProfile> = {
   // —— 叙事生成类（N）——
   writer: { model: "exec", temperature: 0.9, maxTokens: 60000, timeoutMs: 240_000, fallback: "throw" }, // 流式写正文（字数治理保留）
-  init: { model: "exec", temperature: 0.9, maxTokens: 60000, fallback: "throw" }, // 立项建世界（N01）
+  init: { model: "exec", temperature: 0.9, maxTokens: 60000, timeoutMs: 180_000, retries: 3, fallback: "throw" }, // 立项建世界（N01；异步任务，放宽超时/重试降失败率）
   outline: { model: "exec", temperature: 0.8, maxTokens: 60000, fallback: "default" }, // 大纲要点（W01）
   blueprint: { model: "exec", temperature: 0.9, maxTokens: 60000, fallback: "default" }, // 蓝图候选（W02/W03）
   patch: { model: "exec", temperature: 1.0, maxTokens: 60000, fallback: "default" }, // 段落修补（N11，温度由 gen 动态 min(t,1.0)）

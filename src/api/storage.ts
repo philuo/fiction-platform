@@ -368,6 +368,15 @@ export function listStories(username?: string): string[] {
   return readdir(dir).filter((d) => isStoryDirectory(join(dir, d)));
 }
 
+/** 删除整本书：仅允许删除书目录（含 meta.json 或 state.json），连带清理 versions/ 媒体/中枢会话等全部数据。
+ * 非书条目（sqlite、会话记录等）一律拒绝；目录不存在返回 false。 */
+export function deleteStory(title: string, username?: string): boolean {
+  const dir = storyDir(title, username);
+  if (!isStoryDirectory(dir)) return false;
+  rmSync(dir, { recursive: true, force: true });
+  return true;
+}
+
 export type StoryMeta = { slug: string; title: string; genre: string; chapters: number; updatedAt: string; cover?: string };
 
 /** 列出当前用户所有故事的元信息（优先读 meta.json，缺失时回退解析 state.json）。

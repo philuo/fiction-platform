@@ -55,6 +55,9 @@ export async function buildBlueprint(w: WorldState, hint?: string): Promise<Blue
     {
       temperature: 0.9,
       maxTokens: 60000,
+      // 立项异步链（newStory → buildBlueprint）：放宽超时/重试，降低失败率（立项失败不可忍受）
+      timeoutMs: 180_000,
+      retries: 3,
       schema: {
         type: "object",
         required: ["options"],
@@ -185,6 +188,9 @@ export async function expandArc(w: WorldState, arcId: string): Promise<ChapterPl
     {
       temperature: 0.8,
       maxTokens: 60000,
+      // 立项异步链（confirmBlueprint → expandArc）：放宽超时/重试，降低失败率
+      timeoutMs: 180_000,
+      retries: 3,
       schema: {
         type: "object",
         required: ["chapters"],

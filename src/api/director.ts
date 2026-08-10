@@ -88,6 +88,14 @@ const INIT_SYSTEM = `你是小说立项导演。根据用户的一句话灵感�
 字符串值内部一律使用中文引号「」/『』，禁止英文双引号。`;
 
 export async function newStory(idea: string, genre?: string): Promise<WorldState> {
+  const w = await newStoryCore(idea, genre);
+  await newStoryEnhance(w, idea);
+  return w;
+}
+
+/** 立项第 1 段（壳就绪）：只跑立项主调用并落盘基础 world（title/premise/setting/characters）。
+ * 返回后可立即进入三栏页面；蓝图/章节/字段兜底由 newStoryEnhance 后台补全（读时自愈兜底）。 */
+export async function newStoryCore(idea: string, genre?: string): Promise<WorldState> {
   const out = await chatJson<{
     title?: string;
     genre?: string;
@@ -102,6 +110,10 @@ export async function newStory(idea: string, genre?: string): Promise<WorldState
     {
       temperature: 0.9,
       maxTokens: 60000,
+      // 立项为异步任务（提交立即返回，超时不影响前端），超时长短只影响失败率——必须放宽，立项失败不可忍受。
+      // 180s×3 重试：上游正常 ~15-70s，偶发慢/抖动也有充足余量；重试留 3 次覆盖瞬时网络失败。
+      timeoutMs: 180_000,
+      retries: 3,
       // jsonschema：立项输出结构化约束（角色性别强制 男/女 枚举）
       schema: {
         type: "object",
@@ -163,6 +175,13 @@ export async function newStory(idea: string, genre?: string): Promise<WorldState
     introducedAt: 0,
   }));
   logChange(w, { chapter: w.nextChapter, actor: "user", kind: "newStory", detail: `立项建世界《${w.title}》（${w.genre}）：${w.premise.slice(0, 60)}${w.premise.length > 60 ? "…" : ""}，初始角色 ${w.characters.length} 名（头像/立绘自动生成中）`, commandId: "CMD-N01" });
+  saveWorld(w); // 壳就绪：title 已分配、基础设定/角色已落盘，页面可打开
+  return w;
+}
+
+/** 立项第 2 段（后台增强）：角色字段兜底 + 自动导演（蓝图候选并默认确认第一套，含首弧章节计划）。
+ * 各步骤失败不阻塞（写作时读时自愈兜底），与第 1 段解耦——用户在壳就绪后即可进页面，此段并行跑完。 */
+export async function newStoryEnhance(w: WorldState, idea: string): Promise<void> {
   // 性别/年龄/身份缺失兜底推断（弱模型 schema required 仍可能漏字段；缺失会导致头像 prompt 写「性别未知」画出默认脸）——失败不阻塞立项
   try { await fillMissingCharacterFields(w); } catch (e) { console.warn("[director] 角色字段兜底推断失败（不阻塞）:", (e as Error).message); }
   saveWorld(w);
@@ -176,7 +195,6 @@ export async function newStory(idea: string, genre?: string): Promise<WorldState
   } catch {
     /* 蓝图生成失败：保留基础世界，后续可由 /api/novel/blueprint 手动重试 */
   }
-  return w;
 }
 
 /** 角色性别/年龄/身份缺失兜底推断（导出供存量迁移脚本复用）：
@@ -203,6 +221,9 @@ export async function fillMissingCharacterFields(w: WorldState): Promise<number>
     {
       temperature: 0.3,
       maxTokens: 2000,
+      // 立项异步链：放宽超时/重试（字段兜底为小任务，120s 余量充足），降低失败率
+      timeoutMs: 120_000,
+      retries: 3,
       schema: {
         type: "object",
         required: ["characters"],

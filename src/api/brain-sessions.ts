@@ -11,6 +11,7 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { slugify, currentUser } from "./storage";
+import { uuid } from "../shared/uuid";
 
 export type BrainChatRole = "user" | "assistant";
 
@@ -118,7 +119,7 @@ function mutateSession(title: string, id: string, fn: (s: BrainSession) => void,
 export function createSession(title: string, firstPrompt?: string, id?: string): BrainSession {
   const now = Date.now();
   const s: BrainSession = {
-    id: id ?? crypto.randomUUID(),
+    id: id ?? uuid(),
     title: makeTitle(firstPrompt ?? "新会话"),
     createdAt: now,
     updatedAt: now,

@@ -39,6 +39,8 @@ type Props = {
   /** 推进剧情当前阶段（busyPhase）；空串 = 空闲 */
   advancePhase: string;
   advanceBusy: boolean;
+  /** 世界构建中阶段文案（壳就绪后后台增强蓝图/章节；非空时任务中心显示构建进度） */
+  buildingStage?: string | null;
   autoRunning: boolean; // 本页正在跑 auto SSE（运行中才可暂停）
   pendingCommitIdx: number | null; // 推进剧情待人工确认入册的章节号（SSE pending-commit 事件）
   onClose: () => void;
@@ -105,6 +107,19 @@ export const TaskCenterModal: React.FC<Props> = (p) => {
               <div className="mem-empty">暂无连载任务 · 在底部「推进剧情」下拉选「章节连载」开始</div>
             </>
           )}
+
+          {/* —— 世界构建任务（异步立项增强阶段） —— */}
+          {p.buildingStage ? (
+            <>
+              <div className="mem-group-title" style={{ marginTop: "1.2rem" }}>世界构建</div>
+              <div className="task-row">
+                <span className="auto-badge auto-badge-running">构建中</span>
+                <span className="mem-char-status">{p.buildingStage}</span>
+              </div>
+              <div className="task-progress"><div className="task-progress-bar task-progress-bar-indeterminate" /></div>
+              <div className="task-note">正在后台增强故事蓝图与章节结构，完成后自动进入可写作状态；期间推进/编辑已禁用</div>
+            </>
+          ) : null}
 
           {/* —— 推进剧情任务 —— */}
           <div className="mem-group-title" style={{ marginTop: "1.2rem" }}>推进剧情（单章）</div>

@@ -20,6 +20,7 @@ import { readEvalReport } from "./eval";
 import { isPendingForeshadow, targetChapterCount } from "./world";
 import { mediaDataUri } from "./media";
 import { gachaGenerate as directorGachaGenerate } from "./director";
+import { uuid } from '../shared/uuid';
 import type { CardType } from "./cards";
 import type { Card as WorldCard, WorldState } from "./world";
 import {
@@ -35,7 +36,7 @@ import {
   type BrainChatCard,
 } from "./brain-sessions";
 
-const uid = () => crypto.randomUUID();
+const uid = () => uuid();
 
 /** 是否为用户取消（DOMException AbortError / signal aborted） */
 function isAbort(e: unknown, signal?: AbortSignal): boolean {

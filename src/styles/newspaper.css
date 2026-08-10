@@ -1213,6 +1213,7 @@ video.chapter-media { aspect-ratio: 896 / 560; object-fit: cover; background: #1
   padding: 0 0.3em;
   border-radius: 2px;
   font-size: 0.62rem;
+  white-space: nowrap;
 }
 .story-card-arrow {
   font-size: 1.1rem;
@@ -1222,6 +1223,132 @@ video.chapter-media { aspect-ratio: 896 / 560; object-fit: cover; background: #1
 .story-card:hover .story-card-arrow {
   transform: translateX(3px);
   color: var(--seal);
+}
+/* 异步立项生成中占位卡：虚线描边 + 封面脉冲 + spinner，提示任务进行中（不可点击打开） */
+.story-card-creating {
+  cursor: default;
+  border-style: dashed;
+  border-color: var(--line-strong);
+  background: repeating-linear-gradient(45deg, #fdfaf2, #fdfaf2 8px, #faf5e8 8px, #faf5e8 16px);
+}
+.story-card-creating:hover {
+  border-color: var(--line-strong);
+  box-shadow: none;
+  transform: none;
+  background: repeating-linear-gradient(45deg, #fdfaf2, #fdfaf2 8px, #faf5e8 8px, #faf5e8 16px);
+}
+.story-card-creating:hover::before { transform: scaleY(0); }
+/* ready 态（世界已就绪）：可点击进入，悬停恢复卡片反馈 */
+.story-card-ready {
+  cursor: pointer;
+}
+.story-card-ready:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(25, 24, 23, 0.1);
+  border-color: var(--seal);
+}
+.story-card-ready .story-card-title { color: var(--seal); }
+.story-card-ready .creating-hint { color: var(--ink); font-style: normal; }
+.story-card-cover-creating {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(145deg, #3a3632, var(--ink));
+  color: var(--paper);
+  font-size: 0.95rem;
+  position: relative;
+  animation: creatingCoverPulse 1.6s ease-in-out infinite;
+}
+@keyframes creatingCoverPulse {
+  0%, 100% { opacity: 0.75; }
+  50% { opacity: 1; }
+}
+.creating-spinner {
+  width: 0.7rem;
+  height: 0.7rem;
+  border: 2px solid rgba(246, 241, 230, 0.35);
+  border-top-color: var(--paper);
+  border-radius: 50%;
+  position: absolute;
+  top: 0.25rem;
+  right: 0.25rem;
+  animation: creatingSpin 0.9s linear infinite;
+}
+@keyframes creatingSpin {
+  to { transform: rotate(360deg); }
+}
+.creating-hint {
+  max-width: 18rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--seal);
+  font-style: italic;
+}
+/* 世界构建中横幅（三栏页面顶部）：壳就绪进入页面后后台仍在增强，实时展示阶段让用户感知系统在干活 */
+.building-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(90deg, rgba(176, 58, 46, 0.06), rgba(176, 58, 46, 0.02));
+  font-family: var(--sans);
+  font-size: 0.78rem;
+  color: var(--ink);
+  letter-spacing: 0.02em;
+}
+.building-banner-spinner {
+  width: 0.8rem;
+  height: 0.8rem;
+  flex-shrink: 0;
+  border: 2px solid rgba(176, 58, 46, 0.3);
+  border-top-color: var(--seal);
+  border-radius: 50%;
+  animation: creatingSpin 0.9s linear infinite;
+}
+.building-banner-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 删除图书 icon（右上角操作位）：默认浅色小 icon，hover 变红；二次确认态为红色实底「确认删除？」按钮 */
+.story-card-delete {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.7rem;
+  height: 1.7rem;
+  flex-shrink: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--ink-soft);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.story-card-delete:hover {
+  color: var(--seal);
+  background: rgba(176, 58, 46, 0.08);
+  border-color: rgba(176, 58, 46, 0.3);
+}
+.story-card-delete:active { transform: scale(0.92); }
+.story-card-delete.confirm {
+  width: auto;
+  padding: 0 0.55rem;
+  color: #fff;
+  background: var(--seal);
+  border-color: var(--seal);
+  font-family: var(--sans);
+  font-size: 0.66rem;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+  animation: storyDelConfirmIn 0.18s ease;
+}
+.story-card-delete.confirm:hover { background: #962e24; color: #fff; }
+@keyframes storyDelConfirmIn {
+  from { transform: scale(0.9); opacity: 0.6; }
+  to { transform: scale(1); opacity: 1; }
 }
 
 /* 空状态 */
@@ -2192,6 +2319,20 @@ input[type="checkbox"], input[type="radio"] {
 @keyframes shimmer {
   from { transform: translateX(-100%); }
   to { transform: translateX(100%); }
+}
+
+/* 按钮内 spinner（推进剧情等运行中 loading 指示） */
+.btn-spinner {
+  display: inline-block;
+  width: 0.72rem;
+  height: 0.72rem;
+  margin-right: 0.35rem;
+  vertical-align: -0.1rem;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: creatingSpin 0.9s linear infinite;
+  opacity: 0.9;
 }
 
 /* ============ 弹窗内滚动条美化 ============ */
@@ -4252,6 +4393,15 @@ html { scroll-behavior: smooth; }
 .task-row { display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
 .task-progress { height: 8px; background: var(--paper-dark); border: 1px solid var(--line); margin-bottom: 0.7rem; }
 .task-progress-bar { height: 100%; background: var(--seal); transition: width 0.4s ease; }
+/* 不确定进度（世界构建中：阶段未知，动画滑动表达进行中） */
+.task-progress-bar-indeterminate {
+  width: 35%;
+  animation: taskProgressSlide 1.4s ease-in-out infinite;
+}
+@keyframes taskProgressSlide {
+  0% { margin-left: -35%; }
+  100% { margin-left: 100%; }
+}
 .task-steps { display: flex; gap: 0.25rem; margin: 0.6rem 0 0.8rem; flex-wrap: wrap; }
 .task-step {
   display: inline-flex; align-items: center; gap: 0.3rem;

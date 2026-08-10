@@ -1,7 +1,7 @@
 // 主界面：启动页（立项）→ 创作游戏界面（日式报纸 HUD + 完整控制面板）
 // 交互：立项一句话 / 指令输入 / 抽卡筛选 / 世界观·设定·角色·大纲编辑 / 章节段落编辑 / 推进
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, BookMarked, BookOpen, ChevronDown, Dices, History, List, LogOut, MoreHorizontal, PenLine, Play, RefreshCw, Search, Sparkles, Users, Video, Wand2, X } from "../components/icons";
+import { AlertTriangle, BookMarked, BookOpen, ChevronDown, Dices, History, List, LogOut, MoreHorizontal, PenLine, Play, RefreshCw, Search, Sparkles, Trash2, Users, Video, Wand2, X } from "../components/icons";
 import type { Card, Chapter, ChapterMedia, Character, LoreEntry, ReviewResult, WorldPatch, WorldState } from "../api/world";
 import { Masthead } from "../components/Masthead";
 import { StatusPanel } from "../components/StatusPanel";
@@ -147,6 +147,10 @@ const Home: React.FC<HomeProps> = (props) => {
   const [showTaskCenter, setShowTaskCenter] = useState(false); // 任务中心（弹窗二）：连载/推进任务进度与控制
   const [advanceMenu, setAdvanceMenu] = useState(false); // 底部"推进剧情"下拉（本章续写/章节连载）展开态
   const [pendingCommitIdx, setPendingCommitIdx] = useState<number | null>(null); // 推进剧情待人工确认入册的章节号（commitPolicy=confirm）
+  /** 页面内构建状态：currentTaskId 非空表示当前打开的书还在后台增强（壳已就绪），轮询 status 更新阶段文案。
+   *  声明须早于 taskActive（245 行）——世界构建中纳入运行锁，禁止手动推进/编辑（与章节续写一致） */
+  const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
+  const [buildingStage, setBuildingStage] = useState<string | null>(null);
   const [showForeshadow, setShowForeshadow] = useState(false); // 伏笔账编辑弹窗（底部控制条角色与关系旁）
   const [proposalExpanded, setProposalExpanded] = useState(false); // 底部新角色提案区：抽屉展开态（覆盖三栏）
   // 新角色提案区关闭状态（服务端按用户 + 书名存储）：
@@ -242,21 +246,53 @@ const Home: React.FC<HomeProps> = (props) => {
 
   // —— 运行锁（用户决策）：连载/推进运行中（含暂停态）全面禁止一切编辑类操作（AI 与手工均不可）——
   // 必须取消任务回到空闲状态才可手动操作，避免与正在写入的账本/正文产生冲突
-  const taskActive = busy || autoRunning || autoSession?.status === "running" || autoSession?.status === "paused";
+  // 世界构建中（buildingStage 非空）同样禁止手动推进/编辑/AI 操作——后台正在增强蓝图/章节，与章节续写一致
+  const taskActive = busy || autoRunning || autoSession?.status === "running" || autoSession?.status === "paused" || Boolean(buildingStage);
   function requireIdle(): boolean {
     if (!taskActive) return true;
     showToast("任务运行中（连载/推进），一切编辑类操作已禁止——请先取消任务回到空闲状态。");
     return false;
   }
 
-  // 加载小说列表
+  // 加载小说列表（stories + 进行中的异步立项任务 creating）
+  const [creating, setCreating] = useState<{ id: string; idea: string; genre: string; status: string; title?: string; createdAt: string }[]>([]);
   async function fetchStories() {
     try {
       const res = await apiFetch("/api/novel/list");
-      const data = (await res.json()) as { stories?: StoryMeta[] };
+      const data = (await res.json()) as { stories?: StoryMeta[]; creating?: { id: string; idea: string; genre: string; status: string; title?: string; createdAt: string }[] };
       if (data.stories) setStories(data.stories);
+      setCreating(data.creating ?? []);
     } catch { /* ignore */ }
   }
+
+  /** 删除图书二次确认（与中枢历史会话删除同款交互）：首次点击进入确认态（3s 未确认自动恢复），再点才真正删除 */
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  const delTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  async function confirmDeleteStory(slugName: string, title: string) {
+    if (pendingDelete !== slugName) {
+      setPendingDelete(slugName);
+      if (delTimerRef.current) clearTimeout(delTimerRef.current);
+      delTimerRef.current = setTimeout(() => setPendingDelete(null), 3000);
+      return;
+    }
+    if (delTimerRef.current) clearTimeout(delTimerRef.current);
+    setPendingDelete(null);
+    try {
+      const res = await apiFetch("/api/novel/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      });
+      const data = (await res.json()) as { ok?: boolean; error?: string };
+      if (data.error || !data.ok) throw new Error(data.error ?? "删除失败");
+      showToast(`《${title}》已删除`);
+      fetchStories();
+    } catch (e) {
+      showToast("删除失败: " + (e as Error).message);
+    }
+  }
+  // 卸载时清理确认态定时器
+  useEffect(() => () => { if (delTimerRef.current) clearTimeout(delTimerRef.current); }, []);
   // 初始加载列表：登录后（user 出现，含登录/注册成功与 SSR 已登录直进）自动调取；
   // 未登录时 list 接口 401 且无 token，不发起空请求
   useEffect(() => { if (user) fetchStories(); }, [user]);
@@ -326,6 +362,8 @@ const Home: React.FC<HomeProps> = (props) => {
     setActiveIdx(-1);
     setEditing(false);
     setStoryUrl();
+    setCurrentTaskId(null); // 离开页面：清除构建状态（任务仍在后台跑，列表占位卡继续显示）
+    setBuildingStage(null);
     fetchStories();
   }
 
@@ -361,31 +399,167 @@ const Home: React.FC<HomeProps> = (props) => {
   }, [world, activeIdx, lastChapter]);
   const shownReview = shownChapter?.review ?? null;
 
+  /** 异步立项提交（本次会话发起的最新任务，完成后自动打开新书） */
+  const lastTaskIdRef = useRef<string | null>(null);
   async function startStory() {
     if (!idea.trim()) return;
-    setBusy(true);
-    setBusyPhase("立项中…");
     try {
       const res = await apiFetch("/api/novel/new", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ idea: idea.trim(), genre: genre.trim() || undefined }),
       });
-      const data = (await res.json()) as { world?: WorldState; visualPending?: boolean; error?: string };
-      if (data.error || !data.world) throw new Error(data.error ?? "立项失败");
-      setWorld(data.world);
-      setPhase("playing");
-      setStoryUrl(data.world.title);
-      // 初始角色头像/立绘后台自动生成：立项期间中枢显示「自动生成角色头像/立绘中…」，完成后刷新世界并恢复待命
-      if (data.visualPending) startVisualPolling(data.world.title);
-      showToast(`《${data.world.title}》立项完成，导演与审查者已就位。`);
+      const data = (await res.json()) as { taskId?: string; created?: boolean; error?: string };
+      if (data.error || !data.taskId) throw new Error(data.error ?? "立项提交失败");
+      if (data.created === false) {
+        // 已有立项进行中（防重入复用）：明确告知，不清空输入，用户可等完成后再提交
+        showToast("已有新书正在生成中，请等它完成后再提交新构思");
+        return;
+      }
+      lastTaskIdRef.current = data.taskId;
+      setIdea(""); // 提交后清空输入（列表占位卡展示生成中）
+      showToast("立项已提交，正在生成世界…（可在列表查看进度）");
+      fetchStories();
+      // 任务可能瞬时失败（如 LLM 上游网络故障，0s 内 ConnectionRefused）：立即主动查一次，
+      // 否则 creating 为空时轮询不会启动，用户将永远看不到失败反馈
+      void checkTaskOnce(data.taskId);
     } catch (e) {
-      showToast("立项失败: " + (e as Error).message);
-    } finally {
-      setBusy(false);
-      setBusyPhase("");
+      showToast("立项提交失败: " + (e as Error).message);
     }
   }
+
+  /** 单次查询任务终态：failed 立即 toast 失败原因；done 自动打开；running/ready 交由轮询 */
+  async function checkTaskOnce(taskId: string) {
+    try {
+      const sr = await apiFetch("/api/novel/new/status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ taskId }),
+      });
+      const st = (await sr.json()) as { status?: string; title?: string; error?: string };
+      if (st.status === "failed") {
+        lastTaskIdRef.current = null;
+        showToast("立项失败: " + (st.error ?? "未知错误"));
+      } else if (st.status === "done" && st.title) {
+        lastTaskIdRef.current = null;
+        showToast(`《${st.title}》立项完成，导演与审查者已就位。`);
+        void openStory(st.title);
+      } else if (st.status === "ready" && st.title && phase !== "playing") {
+        lastTaskIdRef.current = null;
+        setCurrentTaskId(taskId);
+        setBuildingStage("世界已就绪，正在生成故事蓝图…");
+        void openStory(st.title);
+      }
+    } catch { /* 查询失败：交给轮询处理 */ }
+  }
+
+  /** 立项任务轮询：有 creating 时每 3s 刷新列表；检测自己提交的任务 → ready 立即进三栏页面 / 终态提示 */
+  const newTaskPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const lastSeenCreatingRef = useRef<Set<string>>(new Set());
+  async function pollNewTasks() {
+    const res = await apiFetch("/api/novel/list");
+    const data = (await res.json()) as { stories?: StoryMeta[]; creating?: { id: string; idea: string; genre: string; status: string; title?: string; createdAt: string }[] };
+    if (data.stories) setStories(data.stories);
+    const next = data.creating ?? [];
+    setCreating(next);
+    const ids = new Set(next.map((c) => c.id));
+    const mine = lastTaskIdRef.current;
+    if (mine) {
+      const myTask = next.find((c) => c.id === mine);
+      if (myTask?.status === "ready" && phase !== "playing") {
+        // 壳就绪：立即进入三栏页面（title 已分配、基础世界已落盘），后台继续增强，页面内构建徽章显示进度
+        lastTaskIdRef.current = null;
+        setCurrentTaskId(mine);
+        setBuildingStage("世界已就绪，正在生成故事蓝图…");
+        void openStory(myTask.title ?? "");
+      } else if (!myTask) {
+        // 我的任务不在当前 creating → 已终态（可能是两轮之间失败的，无需"上一轮见过"——
+        // 快速失败的任务从未进入 creating 列表，但 checkTaskOnce 已兜底；这里覆盖轮询期间的失败）
+        lastTaskIdRef.current = null;
+        try {
+          const sr = await apiFetch("/api/novel/new/status", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ taskId: mine }),
+          });
+          const st = (await sr.json()) as { status?: string; title?: string; error?: string };
+          if (st.status === "failed") showToast("立项失败: " + (st.error ?? "未知错误"));
+          else if (st.status === "done" && st.title) void openStory(st.title);
+        } catch { /* 查询失败下次轮询再试 */ }
+      }
+    }
+    lastSeenCreatingRef.current = ids;
+    if (!next.length) stopNewTaskPolling();
+  }
+  function startNewTaskPolling() {
+    if (newTaskPollRef.current) return;
+    lastSeenCreatingRef.current = new Set(creating.map((c) => c.id));
+    newTaskPollRef.current = setInterval(() => void pollNewTasks(), 3000);
+  }
+  function stopNewTaskPolling() {
+    if (newTaskPollRef.current) { clearInterval(newTaskPollRef.current); newTaskPollRef.current = null; }
+  }
+  // creating 变化：非空则开始轮询（含刷新后看到历史生成中任务）
+  useEffect(() => {
+    if (creating.length > 0) startNewTaskPolling();
+    else stopNewTaskPolling();
+  }, [creating]);
+  useEffect(() => () => { stopNewTaskPolling(); }, []);
+
+  /** 页面内构建状态：currentTaskId 非空表示当前打开的书还在后台增强（壳已就绪），轮询 status 更新阶段文案 */
+  const buildPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  async function pollBuildingStatus() {
+    if (!currentTaskId) return;
+    try {
+      const res = await apiFetch("/api/novel/new/status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ taskId: currentTaskId }),
+      });
+      const st = (await res.json()) as { status?: string; stage?: string; error?: string; title?: string };
+      if (st.status === "ready" && st.stage) {
+        setBuildingStage(st.stage);
+      } else if (st.status === "done") {
+        setCurrentTaskId(null);
+        setBuildingStage(null);
+        stopBuildingPoll();
+        // 刷新世界拿到增强后的完整内容（蓝图/章节就绪），构建完成及时感知
+        void refreshWorld();
+        showToast(st.title ? `《${st.title}》世界构建完成，导演与审查者已就位。` : "世界构建完成。");
+      } else if (st.status === "failed") {
+        setCurrentTaskId(null);
+        setBuildingStage(null);
+        stopBuildingPoll();
+        // 壳仍在（书名已落盘）：刷新世界恢复可写作状态，仅提示增强未完成
+        void refreshWorld();
+        showToast("世界已生成，但部分增强未完成：" + (st.error ?? "未知原因"));
+      }
+    } catch { /* 网络抖动，下次轮询再试 */ }
+  }
+  function startBuildingPoll() {
+    if (buildPollRef.current) return;
+    buildPollRef.current = setInterval(() => void pollBuildingStatus(), 3000);
+  }
+  function stopBuildingPoll() {
+    if (buildPollRef.current) { clearInterval(buildPollRef.current); buildPollRef.current = null; }
+  }
+  // 进页面（currentTaskId 设置）后开始构建轮询；离开页面/卸载清理
+  useEffect(() => {
+    if (currentTaskId) startBuildingPoll();
+    else stopBuildingPoll();
+  }, [currentTaskId]);
+  useEffect(() => () => { stopBuildingPoll(); }, []);
+  // 刷新/重进页面后恢复世界构建状态：creating 列表含 ready/running 任务且 title 匹配当前打开的书
+  // （currentTaskId/buildingStage 是内存态，刷新即丢；此处从服务端 creating 恢复，任务仍在后台跑）
+  useEffect(() => {
+    if (phase === "playing" && world?.title && !currentTaskId) {
+      const t = creating.find((c) => (c.status === "running" || c.status === "ready") && c.title === world.title);
+      if (t) {
+        setCurrentTaskId(t.id);
+        setBuildingStage(t.status === "ready" ? "世界已就绪，正在生成故事蓝图…" : "世界构建中…");
+      }
+    }
+  }, [creating, phase, world?.title, currentTaskId]);
 
   async function refreshWorld() {
     if (!world) return;
@@ -497,7 +671,7 @@ const Home: React.FC<HomeProps> = (props) => {
   }
 
   async function advance() {
-    if (!world || busy) return;
+    if (!world || busy || buildingStage) return; // 世界构建中禁止手动推进（后台正在增强蓝图/章节）
     setBusy(true);
     setBusyPhase("导演写作中…");
     setLiveDraft("");
@@ -998,10 +1172,11 @@ const Home: React.FC<HomeProps> = (props) => {
   const [visualGen, setVisualGen] = useState(false);
   const visualTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   // 中枢四维状态派生（零 LLM，前端从 world + 运行时信号确定性派生；驱动底部状态条中枢图标的神态与脉冲）
-  // busy 口径：单章推进 busyPhase / 角色视觉后台生成 / 连载运行 任一即视为中枢忙碌（图标脉动表达 loading）
-  const brainBusy = Boolean(busyPhase) || visualGen || autoSession?.status === "running";
+  // busy 口径：单章推进 busyPhase / 角色视觉后台生成 / 连载运行 / 世界构建中 任一即视为中枢忙碌（图标脉动表达 loading）
+  const brainBusy = Boolean(busyPhase) || visualGen || autoSession?.status === "running" || Boolean(buildingStage);
   // 活动描述（busy title 展示中枢正在做什么；paused 为 busy 口径扩展预留，非忙碌时 title 显示「待命」）
   const brainAction =
+    (buildingStage ? `世界构建中：${buildingStage}` : "") ||
     busyPhase ||
     (visualGen ? "自动生成角色头像/立绘中…" : "") ||
     ((autoSession?.status === "running" || autoSession?.status === "paused")
@@ -1010,11 +1185,11 @@ const Home: React.FC<HomeProps> = (props) => {
   const brainState = useMemo(
     () => deriveBrainState(world, {
       busy: brainBusy,
-      phase: busyPhase || (visualGen ? "自动生成角色头像/立绘中…" : "") || (autoSession?.status === "running" ? autoSession.phase : ""),
+      phase: (buildingStage ? "世界构建中…" : "") || busyPhase || (visualGen ? "自动生成角色头像/立绘中…" : "") || (autoSession?.status === "running" ? autoSession.phase : ""),
       visualGen,
       autoRunning: autoSession?.status === "running",
     }),
-    [world, brainBusy, busyPhase, visualGen, autoSession],
+    [world, brainBusy, busyPhase, visualGen, autoSession, buildingStage],
   );
   // 角色全局立绘：大图预览 + 生成/重新生成（点击角色列表中的立绘或角色项触发）
   const [portraitView, setPortraitView] = useState<Character | null>(null);
@@ -1864,6 +2039,7 @@ const Home: React.FC<HomeProps> = (props) => {
   }
 
   const statusText =
+    (buildingStage ? `世界构建中：${buildingStage}` : "") ||
     busyPhase ||
     (world?.chapters.length ? `第 ${world!.nextChapter} 章待写作` : "待机");
 
@@ -1971,8 +2147,27 @@ const Home: React.FC<HomeProps> = (props) => {
               <button className="btn-new-story" onClick={() => setShowNewStory(true)}>+ 新建</button>
             </div>
 
-            {stories.length > 0 ? (
+            {stories.length > 0 || creating.length > 0 ? (
               <div className="story-list">
+                {/* 异步立项生成中的占位卡：点击进入编辑不可用，展示任务进行中（刷新列表仍可见） */}
+                {creating.map((t) => (
+                  <div
+                    className={`story-card story-card-creating${t.status === "ready" ? " story-card-ready" : ""}`}
+                    key={t.id}
+                    title={t.status === "ready" ? `《${t.title ?? "未命名"}》世界已就绪，点击进入（后台仍在完善蓝图与章节）` : "新书正在生成中…（后台执行中，完成即出现在列表）"}
+                    onClick={t.status === "ready" && t.title ? () => { setCurrentTaskId(t.id); setBuildingStage("世界已就绪，正在生成故事蓝图…"); openStory(t.title!); } : undefined}
+                  >
+                    <div className="story-card-cover story-card-cover-creating"><span className="creating-spinner" />✦</div>
+                    <div className="story-card-info">
+                      <div className="story-card-title">{t.status === "ready" ? `《${t.title ?? "未命名"}》构建中` : "新书生成中…"}</div>
+                      <div className="story-card-meta">
+                        {t.genre && <span className="story-card-genre">{t.genre}</span>}
+                        <span className="creating-hint">{t.status === "ready" ? "世界已就绪，点击进入，蓝图与章节后台完善中…" : `${t.idea.slice(0, 36)}${t.idea.length > 36 ? "…" : ""}`}</span>
+                      </div>
+                    </div>
+                    <span className="story-card-arrow">{t.status === "ready" ? "→" : "…"}</span>
+                  </div>
+                ))}
                 {stories.map((s, i) => (
                   <div className="story-card" style={{ animationDelay: `${i * 0.06}s` }} onClick={() => openStory(s.title)} key={s.slug}>
                     {s.cover ? (
@@ -1988,6 +2183,13 @@ const Home: React.FC<HomeProps> = (props) => {
                         {s.updatedAt && <span>{new Date(s.updatedAt).toLocaleDateString("zh-CN")}</span>}
                       </div>
                     </div>
+                    <button
+                      className={`story-card-delete${pendingDelete === s.slug ? " confirm" : ""}`}
+                      title={pendingDelete === s.slug ? "再次点击确认删除" : "删除图书"}
+                      onClick={(e) => { e.stopPropagation(); confirmDeleteStory(s.slug, s.title); }}
+                    >
+                      {pendingDelete === s.slug ? "确认删除？" : <Trash2 size={14} />}
+                    </button>
                     <span className="story-card-arrow">→</span>
                   </div>
                 ))}
@@ -2069,6 +2271,14 @@ const Home: React.FC<HomeProps> = (props) => {
             onOpenSettings={() => { setShowSettings(true); void refreshWorld(); }}
           />
 
+          {/* 世界构建中横幅：壳已就绪进入页面后，后台仍在增强（蓝图/章节/视觉），实时展示阶段让用户感知系统在干活 */}
+          {buildingStage && currentTaskId && (
+            <div className="building-banner">
+              <span className="building-banner-spinner" />
+              <span className="building-banner-text">世界构建中：{buildingStage}</span>
+            </div>
+          )}
+
           <div className="game-grid">
             {/* 左栏：目录 / 脉络（只读速览，设定统一在设置面板操作） */}
             <LeftPanel
@@ -2094,29 +2304,32 @@ const Home: React.FC<HomeProps> = (props) => {
 
             {/* 中央：正文 / 章节编辑器 */}
             <div className="game-col game-col-center">
-              <div className="center-header">
-                {shownChapter && !editing && (
-                  <div className="chapter-actions">
-                    {(shownReview || reviewMode) && (
-                      reviewMode ? (
-                        <button className="btn-save" onClick={exitReviewMode}><X size={13} /> 退出审查</button>
-                      ) : (
-                        <button className="btn-save" onClick={openReviewPanel}><Search size={13} /> 审查报告</button>
-                      )
-                    )}
-                    <button className="btn-save" onClick={startEdit} disabled={taskActive} title={taskActive ? "任务运行中已禁止编辑——可浏览正文，写操作请先取消任务" : undefined}><PenLine size={13} /> 编辑</button>
-                    <button className="btn-save" data-menu-trigger onClick={toggleChapterMenu}><MoreHorizontal size={13} /> 更多 <ChevronDown size={11} className="chevron" /></button>
-                  </div>
-                )}
-                {editing && (
-                  <div className="editor-tools">
-                    <button className="btn" onClick={() => setEditing(false)}>取消</button>
-                    <button className="btn btn-primary" onClick={saveEdit} disabled={taskActive} title={taskActive ? "任务运行中已禁止内容修订——请先取消任务" : undefined}>
-                      {busy ? "保存中…" : "保存修改"}
-                    </button>
-                  </div>
-                )}
-              </div>
+              {/* center-header 仅在有关键操作时展示：世界生成中/暂无正文（无 shownChapter 且未编辑）不渲染空占位 */}
+              {(shownChapter || editing) && (
+                <div className="center-header">
+                  {shownChapter && !editing && (
+                    <div className="chapter-actions">
+                      {(shownReview || reviewMode) && (
+                        reviewMode ? (
+                          <button className="btn-save" onClick={exitReviewMode}><X size={13} /> 退出审查</button>
+                        ) : (
+                          <button className="btn-save" onClick={openReviewPanel}><Search size={13} /> 审查报告</button>
+                        )
+                      )}
+                      <button className="btn-save" onClick={startEdit} disabled={taskActive} title={taskActive ? "任务运行中已禁止编辑——可浏览正文，写操作请先取消任务" : undefined}><PenLine size={13} /> 编辑</button>
+                      <button className="btn-save" data-menu-trigger onClick={toggleChapterMenu}><MoreHorizontal size={13} /> 更多 <ChevronDown size={11} className="chevron" /></button>
+                    </div>
+                  )}
+                  {editing && (
+                    <div className="editor-tools">
+                      <button className="btn" onClick={() => setEditing(false)}>取消</button>
+                      <button className="btn btn-primary" onClick={saveEdit} disabled={taskActive} title={taskActive ? "任务运行中已禁止内容修订——请先取消任务" : undefined}>
+                        {busy ? "保存中…" : "保存修改"}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
               <div className="center-scroll">
                 {/* P4 实时写作预览（delta 流式打字机） */}
                 {liveDraft && (
@@ -2267,7 +2480,7 @@ const Home: React.FC<HomeProps> = (props) => {
             {!autoRunning && (
               <div className="advance-wrap">
                 <button className="btn btn-primary" onClick={() => { if (!taskActive) setAdvanceMenu((m) => !m); }} disabled={taskActive} title="推进剧情：写下一章（点击展开更多选项）">
-                  {taskActive ? "进行中…" : (<><Play size={15} /> 推进剧情 <ChevronDown size={13} /></>)}
+                  {taskActive ? (<><span className="btn-spinner" /> 进行中…</>) : (<><Play size={15} /> 推进剧情 <ChevronDown size={13} /></>)}
                 </button>
                 {advanceMenu && !taskActive && (
                   <div className="advance-menu">
@@ -2315,6 +2528,7 @@ const Home: React.FC<HomeProps> = (props) => {
             versionCount: (shownChapter.versions?.length ?? shownChapter.versionFiles?.length ?? 0),
           } : null}
           autoRunning={autoRunning}
+          buildingStage={buildingStage}
         />
       )}
 
@@ -2326,6 +2540,7 @@ const Home: React.FC<HomeProps> = (props) => {
           pending={autoPending}
           advancePhase={busyPhase}
           advanceBusy={busy && !autoRunning}
+          buildingStage={buildingStage}
           autoRunning={autoRunning}
           pendingCommitIdx={pendingCommitIdx}
           onClose={() => setShowTaskCenter(false)}

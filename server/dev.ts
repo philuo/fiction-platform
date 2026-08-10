@@ -5,8 +5,10 @@
 //   需额外监听 src 变化自动重建 bundle（否则浏览器拿到的仍是旧前端代码）
 import { render } from "./entry-server";
 import { buildHtml } from "./render";
+import { watch } from "node:fs";
 import { handleApi, migrateLegacyOnBoot, resumeAutoSessions, startVisualSweep } from "../src/api/routes";
 import { cleanupStaleAdvanceTasks } from "../src/api/advancetask";
+import { cleanupNewStoryTasks } from "../src/api/newtask";
 import { loadWorld, runAsUser } from "../src/api/storage";
 import { userFromRequest, getPropClosed } from "../src/api/auth";
 // 仅注册到 --hot 监听图（客户端代码 / CSS 变化触发重建）；SSR 环境下无副作用（内部有 window 保护）
@@ -37,33 +39,42 @@ async function buildClient(): Promise<string[]> {
 }
 
 let devOutputs: string[];
-try {
-  devOutputs = await buildClient();
-} catch {
-  process.exit(1);
-}
-console.log("[dev] 客户端 bundle:", devOutputs.join(", "));
+// 一次性执行保护：bun --hot 在 src 内容变化时会重载模块链并**重新执行 dev.ts 顶层代码**。
+// 若顶层再次注册 watch("src")，旧 watcher 不会被关闭（清理挂在 process.on("exit")，--hot 重跑不触发），
+// 每次保存泄漏一个 watcher → 第 N 次保存触发 N 次重建（观测：4 次保存重建 10 次 = 1+2+3+4）。
+// 用 globalThis 标记确保「启动构建 + watcher 注册」只执行一次；Bun.serve 保持每轮重跑重新注册（跟随最新 server 代码）。
+const DEV_INIT_KEY = "__moshift_dev_initialized__";
+const g = globalThis as { [k: string]: unknown };
+if (!g[DEV_INIT_KEY]) {
+  g[DEV_INIT_KEY] = true;
+  try {
+    devOutputs = await buildClient();
+  } catch {
+    process.exit(1);
+  }
+  console.log("[dev] 客户端 bundle:", devOutputs.join(", "));
 
-// 客户端 bundle 自动重建：bun --hot 只热替换服务端模块、不重跑顶层 Bun.build，
-// 因此监听 src 变化（组件/CSS/共享模块）防抖重建，保证浏览器刷新即拿到最新前端代码
-import { watch } from "node:fs";
-let rebuildTimer: ReturnType<typeof setTimeout> | null = null;
-function scheduleRebuild() {
-  if (rebuildTimer) clearTimeout(rebuildTimer);
-  rebuildTimer = setTimeout(async () => {
-    try {
-      const outs = await buildClient();
-      console.log("[dev] 客户端 bundle 已重建（src 变更）:", outs.join(", "));
-    } catch (e) {
-      console.error("[dev] 客户端重建失败，等待下次变更重试:", e);
-    }
-  }, 300);
+  // 客户端 bundle 自动重建：bun --hot 只热替换服务端模块、不重跑顶层 Bun.build，
+  // 因此监听 src 变化（组件/CSS/共享模块）防抖重建，保证浏览器刷新即拿到最新前端代码
+  let rebuildTimer: ReturnType<typeof setTimeout> | null = null;
+  function scheduleRebuild() {
+    if (rebuildTimer) clearTimeout(rebuildTimer);
+    rebuildTimer = setTimeout(async () => {
+      try {
+        const outs = await buildClient();
+        console.log("[dev] 客户端 bundle 已重建（src 变更）:", outs.join(", "));
+      } catch (e) {
+        console.error("[dev] 客户端重建失败，等待下次变更重试:", e);
+      }
+    }, 300);
+  }
+  const srcWatcher = watch("src", { recursive: true }, () => scheduleRebuild());
+  // 进程退出时清理监听（--hot 热替换本模块时不触发；Ctrl+C 正常退出）
+  process.on("exit", () => {
+    try { srcWatcher.close(); } catch { /* 忽略 */ }
+  });
 }
-const srcWatcher = watch("src", { recursive: true }, () => scheduleRebuild());
-// 进程退出时清理监听（--hot 热替换本模块时不触发；Ctrl+C 正常退出）
-process.on("exit", () => {
-  try { srcWatcher.close(); } catch { /* 忽略 */ }
-});
+devOutputs ??= ["entry-client.js", "entry-client.css"];
 
 const MIME: Record<string, string> = {
   ".js": "text/javascript",
@@ -170,5 +181,11 @@ setTimeout(() => {
     cleanupStaleAdvanceTasks();
   } catch (e) {
     console.error("[dev] 推进任务清理失败:", e);
+  }
+  // 异步立项任务：陈旧 running（服务重启中断）标记 failed，终态超期清理
+  try {
+    cleanupNewStoryTasks();
+  } catch (e) {
+    console.error("[dev] 立项任务清理失败:", e);
   }
 }, 0);
