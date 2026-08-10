@@ -10,7 +10,7 @@ import { extractFingerprint } from "./style";
 import { loadWorld, listStories, listStoriesMeta, deleteStory, exportMarkdown, exportEpub, slugify as slug, saveWorld, storyDir, storyExists, loadAutoSession, clearAutoSession, loadPendingChapter, clearPendingChapter, currentUser, migrateLegacyStoriesTo, runAsUser, userDir } from "./storage";
 import { createNewStoryTask, completeNewStoryTask, failNewStoryTask, markNewStoryTaskReady, updateNewStoryTaskStage, getNewStoryTask, listActiveNewStoryTasks, removeNewStoryTaskByTitle } from "./newtask";
 import { buildAutoLore, mergeLore, sanitizeLore } from "./lore";
-import { generateImage, saveImage, readImage, deleteMediaFile } from "./images";
+import { generateImage, saveImage, readImage, deleteMediaFile, compressToJpeg } from "./images";
 import { pollVideoTask, downloadVideo, saveVideo } from "./videos";
 import { planScenes, generateSceneImage, createSceneVideo, styleAnchor, findCharacterRef, findVideoFirstFrame, generateCharacterPortrait, generateCharacterAvatar, mediaDataUri, mediaId, identityDress, MAX_IMAGES_PER_CHAPTER, markOrphanMedia } from "./media";
 import { auditWorld, autoRepair, alignWorld, collectOrphanMediaFiles } from "./integrity";
@@ -295,7 +295,9 @@ function ensureCover(title: string, w: WorldState): void {
         if (deleted()) return { path: "", oldRel: "" };
         const prompt = `${cur.title}（${cur.genre}）小说封面：${cur.setting.tone}，${cur.setting.time}，${cur.setting.place}，电影感光影，戏剧性构图，细节丰富的插画，画面中不要出现文字，无水印`;
         const buf = await generateImage(prompt, "768x1086");
-        const p = saveImage(title, `cover-${Date.now().toString(36)}.png`, buf);
+        // Bun 图片压缩：原始 PNG 可能数 MB，等比缩到 A4 尺寸 + JPEG q82（与立绘/插画一致），体积降 ~90%
+        const compressed = await compressToJpeg(buf, 768, 1086);
+        const p = saveImage(title, `cover-${Date.now().toString(36)}.jpg`, compressed);
         const w2 = loadWorld(title);
         if (!w2 || w2.cover) return { path: w2?.cover ?? p, oldRel: w2?.cover ? "" : p }; // 再次复查：落盘期间被手动生成则不覆盖
         w2.cover = p;
@@ -1801,7 +1803,9 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             // A4 纸张宽高比 (210:297 ≈ 1:1.414)；中文提示词（与全书风格统一）
             prompt = userPrompt || `${w.title}（${w.genre}）小说封面：${w.setting.tone}，${w.setting.time}，${w.setting.place}，电影感光影，戏剧性构图，细节丰富的插画，画面中不要出现文字，无水印`;
             const buf = await generateImage(prompt, "768x1086");
-            path = saveImage(title, `cover-${Date.now().toString(36)}.png`, buf);
+            // Bun 图片压缩：等比缩到 A4 尺寸 + JPEG q82，体积降 ~90%（与自动封面/立绘一致）
+            const compressed = await compressToJpeg(buf, 768, 1086);
+            path = saveImage(title, `cover-${Date.now().toString(36)}.jpg`, compressed);
             oldRel = w.cover ?? "";
             w.cover = path;
           } else {
