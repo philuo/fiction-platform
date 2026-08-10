@@ -2,7 +2,7 @@
 // 覆盖：commandId 徽章（含指令名 title）、level 徽章（L0-L3 文本）、reason 中枢结论行
 // 说明：MemoryAuditModal 是交互式弹窗，操作日志内容仅在「操作日志」tab 内渲染，
 // 因此需真实挂载 + 点击 tab 后再断言（SSR 静态渲染无法覆盖交互态）。
-import { describe, test, expect, beforeAll } from "bun:test";
+import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { Window } from "happy-dom";
 import React from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -11,6 +11,7 @@ import { MemoryAuditModal } from "../src/components/MemoryAuditModal";
 import { emptyWorld, type ChangeLogEntry, type WorldState } from "../src/api/world";
 
 let win: Window;
+const origFetch = globalThis.fetch;
 beforeAll(() => {
   win = new Window({ url: "http://localhost/" });
   globalThis.window = win as unknown as Window & typeof globalThis;
@@ -22,6 +23,10 @@ beforeAll(() => {
   // 组件挂载时 fetch /api/novel/changelog 拉权威日志；测试返回无 entries 的空对象，
   // 使组件保持 world.changeLog 初始快照（entries 字段缺失时 Array.isArray 为 false，不覆盖）
   globalThis.fetch = (async () => ({ json: async () => ({}) })) as unknown as typeof fetch;
+});
+afterAll(() => {
+  // 恢复全局 fetch：bun test 默认同进程并发跑文件，永久覆盖会污染其他测试文件（如 agnes 重试测试）
+  globalThis.fetch = origFetch;
 });
 
 function mkWorld(entries: ChangeLogEntry[]): WorldState {

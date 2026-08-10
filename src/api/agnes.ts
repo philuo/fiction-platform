@@ -71,21 +71,44 @@ async function postJson(url: string, body: unknown, timeoutMs = 120_000, signal?
   );
 }
 
-function isRetryable(msg: string): boolean {
+/** 网络层瞬时错误码（fetch 抛 TypeError：socket 断开/重置/拒绝/超时/DNS 解析等）——重试可恢复，必须重试 */
+const NETWORK_ERROR_CODES = new Set([
+  "ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "ETIMEDOUT", "EPIPE",
+  "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "ENOTCONN",
+  "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_SOCKET",
+  "ERR_STREAM_PREMATURE_CLOSE", "ERR_HTTP2_STREAM_ERROR", "ERR_HTTP2_INVALID_SESSION",
+]);
+
+/** 错误是否可安全重试（瞬时故障）。
+ *  - AbortError（外部取消）绝不重试——用户主动停止，重试无意义且浪费配额；
+ *  - 检查 e.code / e.cause.code 网络错误码（ECONNRESET 等 fetch 底层 TypeError），命中即重试；
+ *  - 其余按消息特征：HTTP 429/5xx、空内容/空输出、网络错误、超时、fetch 底层异常文本。
+ *  ——修 ECONNRESET 等网络抖动一次即立项失败：retries 配置此前形同虚设（消息不含可识别模式直接抛）。 */
+export function isRetryableError(e: unknown): boolean {
+  if (e instanceof DOMException && e.name === "AbortError") return false;
+  const err = e as { code?: unknown; cause?: unknown; message?: string };
+  const codes = [err.code, (err.cause as { code?: unknown } | undefined)?.code];
+  if (codes.some((c) => typeof c === "string" && NETWORK_ERROR_CODES.has(c))) return true;
+  const msg = `${err.message ?? ""}`;
   return (
     msg.startsWith("HTTP 429") ||
     msg.startsWith("HTTP 5") ||
-    msg.includes("网络错误") ||
     msg.includes("空内容") ||
     msg.includes("空输出") ||
+    msg.includes("网络错误") ||
+    msg.includes("fetch failed") ||
+    msg.includes("socket connection was closed") ||
+    msg.includes("other side closed") ||
+    msg.includes("terminated") ||
     /timeout/i.test(msg)
   );
 }
 
 /** 可感知错误的智能重试：失败可重试则按指数退避重试；
- * 任何异常（503/504/空内容/超时）先输出诊断分析日志（HTTP 状态/finish_reason/token 用量），
- * 再常规退避重试，不修改任何请求参数（不使用 reasoning_effort）。返回最后一次错误。 */
-async function withSmartRetry(
+ * 任何异常（503/504/空内容/超时/网络断开）先输出诊断分析日志（HTTP 状态/finish_reason/token 用量），
+ * 再常规退避重试，不修改任何请求参数（不使用 reasoning_effort）。返回最后一次错误。
+ * 导出供测试直测重试接线（不依赖全局 fetch，避免并发测试文件互相污染）。 */
+export async function withSmartRetry(
   doCall: (attemptOpts: AgnesOptions) => Promise<unknown>,
   opts: AgnesOptions,
   maxRetries = 4,
@@ -96,7 +119,7 @@ async function withSmartRetry(
       return await doCall(opts);
     } catch (e) {
       lastErr = e as Error;
-      if (!isRetryable(lastErr.message)) throw lastErr;
+      if (!isRetryableError(lastErr)) throw lastErr;
       // 诊断分析：汇总错误特征供运维定位（不改变请求参数，仅常规指数退避重试）
       const diag: string[] = [`第${attempt + 1}/${maxRetries}次尝试失败`, `err=${lastErr.message.slice(0, 120)}`];
       if (lastErr instanceof LLMError) {

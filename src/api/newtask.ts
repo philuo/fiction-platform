@@ -134,6 +134,14 @@ export function listActiveNewStoryTasks(): NewStoryTask[] {
   return loadNewStoryTasks().filter((t) => t.status === "running" || t.status === "ready");
 }
 
+/** 删除一本书时同步清理其关联的立项任务（running/ready/done 全清——书已删，任务无存在意义；
+ *  防「书删了占位卡复活、点开 404」的状态不一致） */
+export function removeNewStoryTaskByTitle(title: string): void {
+  const tasks = loadNewStoryTasks();
+  const next = tasks.filter((t) => t.title !== title);
+  if (next.length !== tasks.length) saveNewStoryTasks(next);
+}
+
 /** 服务启动清理：陈旧 running → failed（执行上下文不持久化，重启即中断）；终态超保留期清理；截断上限 */
 export function cleanupNewStoryTasks(): void {
   cleanupForDir("");

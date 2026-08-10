@@ -4391,16 +4391,18 @@ html { scroll-behavior: smooth; }
   flex-direction: column;
 }
 .task-row { display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
-.task-progress { height: 8px; background: var(--paper-dark); border: 1px solid var(--line); margin-bottom: 0.7rem; }
+.task-progress { height: 8px; background: var(--paper-dark); border: 1px solid var(--line); margin-bottom: 0.7rem; overflow: hidden; }
 .task-progress-bar { height: 100%; background: var(--seal); transition: width 0.4s ease; }
-/* 不确定进度（世界构建中：阶段未知，动画滑动表达进行中） */
+/* 不确定进度（世界构建中：阶段未知，动画滑动表达进行中）。
+ * 必须 overflow:hidden 裁剪动画条 + transform 动画（不参与布局）：margin-left 动画在
+ * 无裁剪时会把 35% 宽的条推出容器（右边缘到 135%），水平溢出触发任务面板周期性的横向滚动条 */
 .task-progress-bar-indeterminate {
   width: 35%;
   animation: taskProgressSlide 1.4s ease-in-out infinite;
 }
 @keyframes taskProgressSlide {
-  0% { margin-left: -35%; }
-  100% { margin-left: 100%; }
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
 }
 .task-steps { display: flex; gap: 0.25rem; margin: 0.6rem 0 0.8rem; flex-wrap: wrap; }
 .task-step {

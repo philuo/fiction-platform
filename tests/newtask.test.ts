@@ -127,6 +127,22 @@ describe("newtask 任务状态机", () => {
     });
   });
 
+  test("removeNewStoryTaskByTitle：删除书时按 title 清理任务（running/ready/done 全清，不影响其他书）", () => {
+    storage.runAsUser(U, () => {
+      newtask._clearNewStoryTasks();
+      const { id: idA } = newtask.createNewStoryTask("书A的念头");
+      newtask.completeNewStoryTask(idA, "书A"); // 先完成 A，释放 running 槽，B 才能新建（防重入）
+      const { id: idB } = newtask.createNewStoryTask("书B的念头");
+      newtask.markNewStoryTaskReady(idB, "书B"); // ready（壳已落盘，仍在增强）
+      newtask.removeNewStoryTaskByTitle("书A");
+      const tasks = newtask.loadNewStoryTasks();
+      expect(tasks.some((t) => t.id === idA)).toBe(false); // done 任务被清
+      expect(tasks.some((t) => t.id === idB)).toBe(true); // 其他书保留
+      newtask.removeNewStoryTaskByTitle("书B");
+      expect(newtask.loadNewStoryTasks()).toHaveLength(0);
+    });
+  });
+
   test("cleanup：陈旧 running/ready（>2h）→ failed；终态超期清除", () => {
     // 无用户上下文：数据落在 data/ 根，由 cleanupNewStoryTasks 的遗留目录分支（cleanupForDir("")）覆盖
     // （cleanup 遍历 listUsernames 即已注册用户表；测试环境无注册用户，故不走 runAsUser 路径）

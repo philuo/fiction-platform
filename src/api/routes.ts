@@ -8,7 +8,7 @@ import { runAuto, stopAuto, pauseAuto } from "./autorun";
 import { evaluateBookCached, readEvalReport } from "./eval";
 import { extractFingerprint } from "./style";
 import { loadWorld, listStories, listStoriesMeta, deleteStory, exportMarkdown, exportEpub, slugify as slug, saveWorld, storyDir, storyExists, loadAutoSession, clearAutoSession, loadPendingChapter, clearPendingChapter, currentUser, migrateLegacyStoriesTo, runAsUser, userDir } from "./storage";
-import { createNewStoryTask, completeNewStoryTask, failNewStoryTask, markNewStoryTaskReady, updateNewStoryTaskStage, getNewStoryTask, listActiveNewStoryTasks } from "./newtask";
+import { createNewStoryTask, completeNewStoryTask, failNewStoryTask, markNewStoryTaskReady, updateNewStoryTaskStage, getNewStoryTask, listActiveNewStoryTasks, removeNewStoryTaskByTitle } from "./newtask";
 import { buildAutoLore, mergeLore, sanitizeLore } from "./lore";
 import { generateImage, saveImage, readImage, deleteMediaFile } from "./images";
 import { pollVideoTask, downloadVideo, saveVideo } from "./videos";
@@ -90,6 +90,13 @@ function sseStream(produce: (send: (obj: unknown) => void) => Promise<void>): Re
 
 /** 业务错误：消息可安全回显给前端（区别于内部异常） */
 export class AppError extends Error {}
+
+/** 错误信息归一（入库/回显）：取首行（剥离 stack 尾部）、截断 300 字符；
+ *  非 AppError（LLMError/TypeError 等）也保留真实原因（如 ECONNRESET/超时），不笼统吞掉 */
+function errorDetail(e: unknown, fallback: string): string {
+  const msg = e instanceof Error && e.message ? e.message.split("\n")[0].trim() : "";
+  return msg ? msg.slice(0, 300) : fallback;
+}
 
 // 自动连载活跃运行注册表：同一用户名下同一书名同时只允许一个 runAuto 循环（防双跑重复写章/停止信号串扰）
 const activeAuto = new Set<string>();
@@ -757,15 +764,16 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
               } catch (e) {
                 // 壳已就绪、增强失败：任务标 failed 但书名已在（前端页面内提示"世界已生成，增强未完成"，可手动重试蓝图）
                 console.error("[api/novel/new] 后台立项增强失败:", e);
-                failNewStoryTask(taskId, e instanceof AppError ? e.message : "世界已生成，但蓝图/章节增强失败，可在小说内手动生成");
+                failNewStoryTask(taskId, `世界已生成，但蓝图/章节增强失败（${errorDetail(e, "可在小说内手动生成")}）`);
                 return;
               }
               completeNewStoryTask(taskId, world.title);
               console.log(`[api/novel/new] 立项完成: ${world.title}（task=${taskId}）`);
             } catch (e) {
-              // 段 1 失败（壳未就绪）：任务 failed，前端列表占位卡提示失败
+              // 段 1 失败（壳未就绪）：任务 failed，前端列表占位卡提示失败。
+              // 保留真实原因（ECONNRESET/超时/空内容等）供用户感知与诊断，不再笼统吞掉
               console.error("[api/novel/new] 后台立项失败:", e);
-              failNewStoryTask(taskId, e instanceof AppError ? e.message : "立项失败，请稍后重试");
+              failNewStoryTask(taskId, `立项失败：${errorDetail(e, "请稍后重试")}`);
             }
           })();
         }
@@ -843,6 +851,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         clearAutoSession(title);
         clearPendingChapter(title);
         clearAdvanceTask(title);
+        // 同步清理该书关联的异步立项任务（running/ready/done 全清——书已删，任务无存在意义，防占位卡复活）
+        removeNewStoryTaskByTitle(title);
         const ok = await withTitleLock(slug(title), async () => {
           if (!storyExists(title)) throw new AppError("故事不存在: " + title);
           return deleteStory(title);

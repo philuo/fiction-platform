@@ -247,10 +247,58 @@ const Home: React.FC<HomeProps> = (props) => {
   // —— 运行锁（用户决策）：连载/推进运行中（含暂停态）全面禁止一切编辑类操作（AI 与手工均不可）——
   // 必须取消任务回到空闲状态才可手动操作，避免与正在写入的账本/正文产生冲突
   // 世界构建中（buildingStage 非空）同样禁止手动推进/编辑/AI 操作——后台正在增强蓝图/章节，与章节续写一致
-  const taskActive = busy || autoRunning || autoSession?.status === "running" || autoSession?.status === "paused" || Boolean(buildingStage);
+  /** 任务状态恢复中：刷新/重进页面进入 playing 后，busy/autoRunning/buildingStage 等内存态需异步从
+   *  服务端恢复（推进任务/连载会话/世界构建三路查询），完成前 taskActive 视为运行中——消除
+   *  「刷新后一瞬间按钮可点」的风险窗口（此时服务端任务可能仍在跑，误点会与服务端任务冲突）。
+   *  初始值：SSR 预载路径（initialData.world 直进 playing）首帧即置锁；非 SSR 由协调 effect 置位。 */
+  const [restoringTasks, setRestoringTasks] = useState<boolean>(() => Boolean(props.initialData?.world));
+  const taskActive = busy || autoRunning || autoSession?.status === "running" || autoSession?.status === "paused" || Boolean(buildingStage) || restoringTasks;
+  /** 恢复代次：协调 effect 每次执行自增。旧 effect 实例的 release/兜底回调据此自检——
+   *  切书/重进 playing 时新 effect 置锁后，旧实例的异步完成不会误释放新锁（代次不匹配直接忽略）。 */
+  const restoreGenRef = useRef(0);
+  /** 协调三路任务状态恢复并持锁：进入 playing（SSR 首帧 / openStory / 重进页面）时置恢复锁，
+   *  推进任务（step/status）、连载会话（auto/status）、世界构建（novel/list → creating）三路查询
+   *  全部首次决策完成后释放。查询为幂等 GET；推进恢复唯一触发点在此（openStory/SSR 不再单独调用，
+   *  restoreAdvanceTask 自带 in-flight 防重）；连载展示由下方 autoCheckedRef 防重的 effect 负责（此处只取决策信号）。
+   *  任一查询抛错也走 finally 释放，锁不会永久卡住；world 离开 playing 立即释放。
+   *  兜底超时 15s：apiFetch 无超时，若 fetch 挂起（服务端无响应）三路查询永不 resolve 会死锁——超时强制解锁
+   *  （恢复窗口 15s 远超正常 GET 耗时，任务运行中 status 查询会正常返回，不会误释放运行锁）。 */
+  useEffect(() => {
+    const gen = ++restoreGenRef.current;
+    if (phase !== "playing" || !world) {
+      setRestoringTasks(false);
+      return;
+    }
+    setRestoringTasks(true);
+    let pending = 3;
+    const release = () => {
+      if (restoreGenRef.current !== gen) return; // 旧代回调：新锁已置位，忽略
+      if (--pending <= 0) setRestoringTasks(false);
+    };
+    const timer = setTimeout(() => { if (restoreGenRef.current === gen) setRestoringTasks(false); }, 15_000);
+    void restoreAdvanceTask(world.title).finally(release); // 首查决策后即 resolve（running 的轮询挂后台）
+    void fetchAutoStatus().catch(() => {}).finally(release); // 内部已 setAutoSession（锁释放时状态已就位）
+    void (async () => {
+      try {
+        const res = await apiFetch("/api/novel/list");
+        const data = (await res.json()) as { stories?: StoryMeta[]; creating?: { id: string; idea: string; genre: string; status: string; title?: string; createdAt: string }[] };
+        if (data.stories) setStories(data.stories);
+        setCreating(data.creating ?? []);
+        // 世界构建匹配（与下方 creating 驱动 effect 同逻辑）：creating 到位即同步决策——
+        // 锁释放时 buildingStage 已设，消除「fetchStories 先释放锁、554 行 effect 后设 buildingStage」的窗口
+        const t = (data.creating ?? []).find((c) => (c.status === "running" || c.status === "ready") && c.title === world?.title);
+        if (t) {
+          setCurrentTaskId(t.id);
+          setBuildingStage(t.status === "ready" ? "世界已就绪，正在生成故事蓝图…" : "世界构建中…");
+        }
+      } catch { /* 查询失败：不匹配（视为无构建任务），锁正常释放 */ } finally { release(); }
+    })();
+    return () => { restoreGenRef.current++; clearTimeout(timer); }; // cleanup：作废旧代回调，新 effect 的锁不受干扰
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, world?.title]);
   function requireIdle(): boolean {
     if (!taskActive) return true;
-    showToast("任务运行中（连载/推进），一切编辑类操作已禁止——请先取消任务回到空闲状态。");
+    showToast(restoringTasks ? "正在恢复任务状态，请稍候…" : "任务运行中（连载/推进），一切编辑类操作已禁止——请先取消任务回到空闲状态。");
     return false;
   }
 
@@ -345,8 +393,8 @@ const Home: React.FC<HomeProps> = (props) => {
       setActiveIdx(initIdx);
       setStoryUrl(data.world.title, initIdx > 0 ? initIdx : undefined);
       showToast(`《${data.world.title}》已加载`);
-      // 恢复单章推进任务状态（刷新/重进后不丢状态：后台 running 恢复显示，done/failed 提示结果）
-      void restoreAdvanceTask(title);
+      // 单章推进任务状态恢复已收敛到协调 effect（restoringTasks 锁持有者）统一触发——
+      // 此处不再调用 restoreAdvanceTask，避免与协调 effect 双路并发（done/failed 分支无防重，会重复提示/刷新）
     } catch (e) {
       showToast("加载失败: " + (e as Error).message);
     } finally {
@@ -449,6 +497,9 @@ const Home: React.FC<HomeProps> = (props) => {
         setCurrentTaskId(taskId);
         setBuildingStage("世界已就绪，正在生成故事蓝图…");
         void openStory(st.title);
+      } else if (sr.status === 404) {
+        lastTaskIdRef.current = null;
+        showToast("立项任务已不存在（可能书籍已被删除）");
       }
     } catch { /* 查询失败：交给轮询处理 */ }
   }
@@ -485,6 +536,7 @@ const Home: React.FC<HomeProps> = (props) => {
           const st = (await sr.json()) as { status?: string; title?: string; error?: string };
           if (st.status === "failed") showToast("立项失败: " + (st.error ?? "未知错误"));
           else if (st.status === "done" && st.title) void openStory(st.title);
+          else if (sr.status === 404) showToast("立项任务已不存在（可能书籍已被删除）");
         } catch { /* 查询失败下次轮询再试 */ }
       }
     }
@@ -516,6 +568,15 @@ const Home: React.FC<HomeProps> = (props) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ taskId: currentTaskId }),
       });
+      // 404 = 任务不存在：书被删除（removeNewStoryTaskByTitle 清任务）或任务被服务端清理。
+      // 必须清构建态停轮询，否则 buildingStage 残留永久禁用一切操作（双 tab 删书场景）
+      if (res.status === 404) {
+        setCurrentTaskId(null);
+        setBuildingStage(null);
+        stopBuildingPoll();
+        showToast("构建任务已不存在（可能书籍已被删除），已恢复可编辑状态");
+        return;
+      }
       const st = (await res.json()) as { status?: string; stage?: string; error?: string; title?: string };
       if (st.status === "ready" && st.stage) {
         setBuildingStage(st.stage);
@@ -622,8 +683,12 @@ const Home: React.FC<HomeProps> = (props) => {
     }
   }
 
+  /** in-flight 防重：恢复查询进行中禁止再次进入（openStory/SSR/协调 effect 收敛后由协调 effect
+   *  唯一触发；此防重防御未来误用/极端时序，防止双路并发重复 finishRestoreAdvance） */
+  const advanceRestoreInFlight = useRef(false);
   async function restoreAdvanceTask(storyTitle: string) {
-    if (advanceRestoreTimer.current) return; // 已在恢复中
+    if (advanceRestoreInFlight.current || advanceRestoreTimer.current) return; // 已在恢复中
+    advanceRestoreInFlight.current = true;
     try {
       const res = await apiFetch("/api/novel/step/status", {
         method: "POST",
@@ -667,7 +732,9 @@ const Home: React.FC<HomeProps> = (props) => {
           console.warn("[advance-restore] 轮询失败，稍后重试:", (e as Error).message);
         }
       }, 5000);
-    } catch { /* 查询失败静默（不阻塞打开故事） */ }
+    } catch { /* 查询失败静默（不阻塞打开故事） */ } finally {
+      advanceRestoreInFlight.current = false;
+    }
   }
 
   async function advance() {
@@ -1354,12 +1421,8 @@ const Home: React.FC<HomeProps> = (props) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [world]);
 
-  // SSR 预载路径恢复（initialData 直接进 playing，不走 openStory）：挂载后恢复单章推进任务状态
-  useEffect(() => {
-    if (!props.initialData?.world) return;
-    void restoreAdvanceTask(props.initialData.world.title);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // SSR 预载路径（initialData 直接进 playing，不走 openStory）的任务状态恢复已收敛到协调 effect
+  // （依赖 [phase, world?.title]，SSR 首帧 phase=playing 即触发），此处不再单独调用 restoreAdvanceTask
 
   /** 分镜：LLM 挑选关键场景 → 弹出确认窗（不直接生成）；240s 超时保护（服务端单次最长 90s，内部重试 + 外层重试共 3 次预算） */
   async function planMedia(kind: "image" | "video", count: number) {
@@ -1687,7 +1750,7 @@ const Home: React.FC<HomeProps> = (props) => {
   // 存量"需修改"章节（revise）：自动连载前置检查——审查未通过不允许连载
   const reviseChapters = (world?.chapters ?? []).filter((c) => c.review?.verdict === "revise");
   async function startAutoRun(chapters: number) {
-    if (!world || busy || autoRunning) return;
+    if (!world || busy || autoRunning || Boolean(buildingStage) || restoringTasks) return;
     if (reviseChapters.length) {
       showToast(`存在 ${reviseChapters.length} 章需修改（第 ${reviseChapters.map((c) => c.index).join("、")} 章），请先 AI 修复或手动修改后再连载。`);
       return;
@@ -2150,7 +2213,11 @@ const Home: React.FC<HomeProps> = (props) => {
             {stories.length > 0 || creating.length > 0 ? (
               <div className="story-list">
                 {/* 异步立项生成中的占位卡：点击进入编辑不可用，展示任务进行中（刷新列表仍可见） */}
-                {creating.map((t) => (
+                {/* ready 任务书已落盘（stories 已有同名正式卡可打开）时隐藏占位卡，避免「两本同名书」视觉重复；
+                    构建进度由页面内构建徽章展示（creating 数组仍完整保留供恢复/轮询） */}
+                {creating
+                  .filter((t) => !(t.status === "ready" && t.title && stories.some((s) => s.title === t.title)))
+                  .map((t) => (
                   <div
                     className={`story-card story-card-creating${t.status === "ready" ? " story-card-ready" : ""}`}
                     key={t.id}
@@ -2607,7 +2674,7 @@ const Home: React.FC<HomeProps> = (props) => {
               </p>
             )}
             <div style={{ display: "flex", gap: "0.6rem" }}>
-              <button className="btn btn-primary" disabled={reviseChapters.length > 0} onClick={() => { setShowAutoStart(false); void startAutoRun(autoChapters); }}>
+              <button className="btn btn-primary" disabled={reviseChapters.length > 0 || taskActive} title={taskActive ? "任务运行中已禁用（恢复/构建/连载中不可启动新连载）" : undefined} onClick={() => { setShowAutoStart(false); void startAutoRun(autoChapters); }}>
                 <Play size={14} /> 开始连载
               </button>
               <button className="btn" onClick={() => setShowAutoStart(false)}>取消</button>
