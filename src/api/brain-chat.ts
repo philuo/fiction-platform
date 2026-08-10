@@ -6,6 +6,7 @@
 // 事件协议（v2）：
 //   { type: "intent" }                        # 意图识别开始（前端 loading）
 //   { type: "delta", messageId, text }        # 回复增量：text=消息累计全文（前端打字机动画）
+//   { type: "reasoning", messageId, text }    # 思维链增量（思考模式开启时）：与正文 delta 分离，前端折叠展示
 //   { type: "card", messageId, card }         # 卡片（预览/确认/结果/浏览/计划/意见询问）
 //   { type: "done", messageId }               # 回合完成（消息已落盘）
 //   { type: "interrupted", messageId }        # 中断/出错（消息保留已生成文本，可重新编辑）
@@ -33,6 +34,7 @@ import {
   markMessageInterrupted,
   markStreaming,
   updateMessageText,
+  updateMessageThinking,
   type BrainChatCard,
 } from "./brain-sessions";
 
@@ -697,6 +699,9 @@ export type BrainChatContext = {
   signal?: AbortSignal;
   /** resume 模式：复用最后一条未完成 assistant 消息重新生成（不重复写用户消息，前端先 reset 再收 delta） */
   resume?: boolean;
+  /** DeepSeek 思考模式开关（true=开，false/缺省=关）：仅影响纯对话回复的 streamChatReply，
+   *  思考开启时思维链经 reasoning SSE 事件流式推前端（折叠展示）；默认关（首字节提速 90%+）。 */
+  thinking?: boolean;
   /** 前端系统快照（左侧栏选中章详情 + 系统时机 + presence/activity + 自动连载）：中枢全知上下文。
    *  用于意图识别/参数提取兜底（未指定章节的操作默认用选中章），并感知「系统正在做什么/是否冲突」。 */
   ctx?: {
@@ -778,9 +783,11 @@ export function createStreamShaper(
 }
 
 async function streamChatReply(ctx: BrainChatContext, messageId: string): Promise<void> {
-  const { title, sessionId, prompt, send, signal, ctx: snap } = ctx;
+  const { title, sessionId, prompt, send, signal, ctx: snap, thinking } = ctx;
   let acc = "";
+  let accThinking = "";
   let lastFlush = 0;
+  let lastThinkingFlush = 0;
   // 世界摘要（动态读取，避免过期）；失败静默降级为仅 prompt
   let worldCtx = "";
   try {
@@ -802,6 +809,8 @@ async function streamChatReply(ctx: BrainChatContext, messageId: string): Promis
   const userContent = worldCtx ? `当前世界与系统状态：\n${worldCtx}\n\n用户问题：${prompt}` : prompt;
   // 流式整形：上游聚合吐巨块 → 按 4字符/30ms 节奏推给前端（真流式感，防同步连发被 React 批处理合并）
   const shaper = createStreamShaper((text) => send({ type: "delta", messageId, text, append: true }));
+  // 思维链独立通道：思考内容与正文 delta 分离推送（前端折叠展示，无边框文字样式）
+  const thinkingShaper = createStreamShaper((text) => send({ type: "reasoning", messageId, text, append: true }));
   await brainChatDeps.chatStream(
     [
       { role: "system", content: CHAT_SYSTEM },
@@ -818,10 +827,31 @@ async function streamChatReply(ctx: BrainChatContext, messageId: string): Promis
         updateMessageText(title, sessionId, messageId, acc, false);
       }
     },
-    { ...taskOpts("brainGate"), signal, temperature: 0.7, maxTokens: 20000, retries: 2 },
+    {
+      ...taskOpts("brainGate"),
+      signal,
+      temperature: 0.7,
+      maxTokens: 20000,
+      retries: 2,
+      // 思考模式开关（默认关）：thinking={type:"disabled"} 关闭思维链（首字节提速 90%+，tokenrhythm 实测生效）
+      thinking: thinking ? "enabled" : "disabled",
+      onReasoning: (delta) => {
+        accThinking += delta;
+        thinkingShaper.push(delta);
+        const now = Date.now();
+        if (now - lastThinkingFlush > 500) {
+          lastThinkingFlush = now;
+          updateMessageThinking(title, sessionId, messageId, accThinking, true);
+        } else {
+          updateMessageThinking(title, sessionId, messageId, accThinking, false);
+        }
+      },
+    },
   );
   shaper.drain(); // flush 剩余分片（数据完整性）
+  thinkingShaper.drain();
   updateMessageText(title, sessionId, messageId, acc, true);
+  if (accThinking) updateMessageThinking(title, sessionId, messageId, accThinking, true);
 }
 
 /** 可执行意图白名单（选项的 intent → action 映射用；无 action 的只读意图不提供执行） */
@@ -1346,7 +1376,9 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
       return;
     }
     messageId = pending.id;
-    // 前端清空该消息，后续 delta 重新填充（避免已生成文本与新流重复拼接）
+    // 前端清空该消息，后续 delta 重新填充（避免已生成文本与新流重复拼接）。
+    // 注意：与 attach（断线续流，reset 携带 text/thinking 重放）不同，resume 是重新生成，
+    // 必须不带 text/thinking——否则旧内容 + 新流 append 叠加造成重复拼接。
     send({ type: "reset", messageId });
     // 用最后一条用户输入作为回复上下文
     const lastUser = lastUserMessage(session);

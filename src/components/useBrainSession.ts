@@ -15,6 +15,8 @@ export type ChatMessage = {
   id: string;
   role: "user" | "brain";
   text?: string;
+  /** DeepSeek 思维链内容（思考模式开启时流式累积，与正文分离）；折叠展示 */
+  thinking?: string;
   cards?: BrainCard[];
   /** 流式生成中（显示光标/停止按钮） */
   pending?: boolean;
@@ -42,6 +44,7 @@ export type BrainSessionDetail = {
     id: string;
     role: "user" | "assistant";
     text?: string;
+    thinking?: string;
     cards?: BrainCard[];
     pending?: boolean;
     interrupted?: boolean;
@@ -56,11 +59,13 @@ type SSEEvents = {
   onIntent?: () => void;
   /** append=true：增量块（前端拼接）；缺省：替换（单次全量，如 plan/opinion 回复） */
   onDelta?: (messageId: string, text: string, append?: boolean) => void;
+  /** 思维链增量（DeepSeek reasoning_content，思考模式开启时）：与正文 delta 分离，折叠展示 */
+  onReasoning?: (messageId: string, text: string, append?: boolean) => void;
   onCard?: (messageId: string, card: BrainCard) => void;
   onDone?: (messageId: string) => void;
   onInterrupted?: (messageId: string) => void;
   /** text：服务端重放已生成文本（attach 恢复时携带，前端保留而非清空，避免已回复内容闪没） */
-  onReset?: (messageId: string, text?: string) => void;
+  onReset?: (messageId: string, text?: string, thinking?: string) => void;
   /** messageId：服务端 error 事件携带时精确落到对应消息；缺省回退会话最后一条消息 */
   onError?: (msg: string, messageId?: string) => void;
 };
@@ -71,6 +76,7 @@ function toDisplayMsg(m: BrainSessionDetail["messages"][number]): ChatMessage {
     id: m.id,
     role: m.role === "user" ? "user" : "brain",
     text: m.text ?? "",
+    thinking: m.thinking,
     cards: m.cards,
     pending: m.pending,
     interrupted: m.interrupted,
@@ -165,7 +171,7 @@ export function useBrainSession(title: string) {
    * - resume：本地不追加消息（服务端复用未完成消息，先 reset 再重新流式）
    * - ctx：前端上下文（左侧栏选中章等），供服务端意图识别参数提取兜底（需求 1/2）
    */
-  const send = useCallback(async (opts: { prompt: string; sessionId: string; resume?: boolean; ctx?: {
+  const send = useCallback(async (opts: { prompt: string; sessionId: string; resume?: boolean; thinking?: boolean; ctx?: {
     chapterIndex?: number | null;
     chapterTitle?: string | null;
     chapterStatus?: string | null;
@@ -207,6 +213,14 @@ export function useBrainSession(title: string) {
         cacheRef.current.set(sessionId, next);
         if (sessionId === activeIdRef.current) setMessages(next);
       },
+      onReasoning: (messageId, text, append) => {
+        const mid = alignMsgId(sessionId, messageId);
+        const arr = cacheRef.current.get(sessionId);
+        if (!arr) return;
+        const next = arr.map((m) => (m.id === mid ? { ...m, thinking: append ? (m.thinking ?? "") + text : text } : m));
+        cacheRef.current.set(sessionId, next);
+        if (sessionId === activeIdRef.current) setMessages(next);
+      },
       onCard: (messageId, card) => {
         setThinkingFor(sessionId, false);
         const mid = alignMsgId(sessionId, messageId);
@@ -219,9 +233,9 @@ export function useBrainSession(title: string) {
       onDone: (messageId) => { setThinkingFor(sessionId, false); patchMsg(sessionId, alignMsgId(sessionId, messageId), { pending: false, interrupted: false }); },
       onInterrupted: (messageId) => { setThinkingFor(sessionId, false); patchMsg(sessionId, alignMsgId(sessionId, messageId), { pending: false, interrupted: true }); },
       // 保留服务端重放文本：attach 恢复/resume 重放时不闪没已生成内容，后续 delta 在其上继续累积
-      onReset: (messageId, text) => {
+      onReset: (messageId, text, thinking) => {
         setThinkingFor(sessionId, false);
-        patchMsg(sessionId, alignMsgId(sessionId, messageId), { text: text ?? "", cards: [], interrupted: false, pending: true });
+        patchMsg(sessionId, alignMsgId(sessionId, messageId), { text: text ?? "", thinking: thinking ?? "", cards: [], interrupted: false, pending: true });
       },
       // error 优先按服务端 messageId 精确定位（并发/attach 多连接场景不错标到别的消息）；缺省回退最后一条
       onError: (msg, messageId) => {
@@ -243,7 +257,7 @@ export function useBrainSession(title: string) {
       const res = await apiFetch("/api/brain/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, prompt, sessionId, resume: resume ?? false, attach: isRetry, ctx: opts.ctx }),
+        body: JSON.stringify({ title, prompt, sessionId, resume: resume ?? false, attach: isRetry, thinking: opts.thinking ?? false, ctx: opts.ctx }),
         signal: ctrl.signal,
       });
       if (!res.ok || !res.body) throw new Error("对话失败");
@@ -265,7 +279,7 @@ export function useBrainSession(title: string) {
           for (const line of lines) {
             if (!line.startsWith("data: ")) continue;
             lastEventAt = Date.now(); // ping 等任意事件均视为连接存活
-            let obj: { type?: string; messageId?: string; text?: string; card?: BrainCard; error?: string; append?: boolean };
+            let obj: { type?: string; messageId?: string; text?: string; thinking?: string; card?: BrainCard; error?: string; append?: boolean };
             try { obj = JSON.parse(line.slice(6)); } catch { continue; }
             eventCount++;
             if (obj.error) { events.onError?.(obj.error, obj.messageId); continue; }
@@ -273,10 +287,11 @@ export function useBrainSession(title: string) {
             switch (obj.type) {
               case "intent": events.onIntent?.(); break;
               case "delta": if (obj.messageId && obj.text != null) events.onDelta?.(obj.messageId, obj.text, obj.append === true); break;
+              case "reasoning": if (obj.messageId && obj.text != null) events.onReasoning?.(obj.messageId, obj.text, obj.append === true); break;
               case "card": if (obj.messageId && obj.card) events.onCard?.(obj.messageId, obj.card); break;
               case "done": if (obj.messageId) events.onDone?.(obj.messageId); break;
               case "interrupted": if (obj.messageId) events.onInterrupted?.(obj.messageId); break;
-              case "reset": if (obj.messageId) events.onReset?.(obj.messageId, obj.text); break;
+              case "reset": if (obj.messageId) events.onReset?.(obj.messageId, obj.text, obj.thinking); break;
               default: /* ping 忽略 */
             }
           }

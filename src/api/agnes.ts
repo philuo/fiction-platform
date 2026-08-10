@@ -37,6 +37,12 @@ export type AgnesOptions = {
   retries?: number;
   /** 外部取消信号（"停止生成"）：abort 时终止 LLM 请求（与超时合并，不覆盖超时） */
   signal?: AbortSignal;
+  /** DeepSeek 思考模式开关（OpenAI 协议 thinking:{type:...}）：enabled=开（输出思维链），disabled=关。
+   *  tokenrhythm 中转实测：reasoning_effort 不透传但 thinking:{type} 生效（关闭后 reasoning_tokens=0）。
+   *  不传 = 服务端默认（DeepSeek 默认开启思考）。 */
+  thinking?: "enabled" | "disabled";
+  /** 思考内容流式回调（delta.reasoning_content，与正文 onChunk 分离）：思考开启时收到 */
+  onReasoning?: (delta: string) => void;
 };
 
 export class LLMError extends Error {
@@ -145,8 +151,9 @@ async function callOnce(model: string, messages: ChatMessage[], opts: AgnesOptio
   if (opts.tools) payload.tools = opts.tools;
   if (opts.maxTokens) payload.max_tokens = opts.maxTokens;
   if (opts.stream) payload.stream = true;
-  // 不使用 reasoning_effort：任何端点都不传思考强度参数，由服务端默认策略决定；
-  // 注意：服务端默认输出上限 4096，各调用点必须显式传大 max_tokens 兜底避免空输出
+  // DeepSeek 思考模式开关（OpenAI 协议）：thinking:{type:"enabled"/"disabled"}
+  // 不传 thinking 时不加该字段（服务端默认策略）；显式 disabled 关闭思维链（tokenrhythm 实测生效，首字节提速 90%+）
+  if (opts.thinking) payload.thinking = { type: opts.thinking };
   return postJson(`${BASE_URL}/chat/completions`, payload, opts.timeoutMs ?? 120_000, opts.signal);
 }
 
@@ -289,13 +296,16 @@ export async function chat(messages: ChatMessage[], opts: AgnesOptions = {}): Pr
   return r.content;
 }
 
-/** 读取一条 SSE 流并逐 delta 回调；流式无输出同样按可重试错误处理 */
-async function readStream(res: Response, onChunk: (delta: string) => void): Promise<string> {
+/** 读取一条 SSE 流并逐 delta 回调；流式无输出同样按可重试错误处理。
+ *  onReasoning：DeepSeek 思考内容（delta.reasoning_content）回调，与正文 content 分离。
+ *  导出供测试直测（避免 mock 全局 fetch 污染同进程其他测试文件）。 */
+export async function readStream(res: Response, onChunk: (delta: string) => void, onReasoning?: (delta: string) => void): Promise<string> {
   if (!res.ok) {
     const data = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
     throw new LLMError(`HTTP ${res.status}: ${data?.error?.message ?? "stream 请求失败"}`);
   }
   const full: string[] = [];
+  const fullReasoning: string[] = [];
   const reader = res.body!.getReader();
   const decoder = new TextDecoder();
   let buf = "";
@@ -311,11 +321,16 @@ async function readStream(res: Response, onChunk: (delta: string) => void): Prom
       const data = t.slice(5).trim();
       if (data === "[DONE]") continue;
       try {
-        const chunk = JSON.parse(data) as { choices?: { delta?: { content?: string } }[] };
+        const chunk = JSON.parse(data) as { choices?: { delta?: { content?: string; reasoning_content?: string } }[] };
         const delta = chunk.choices?.[0]?.delta?.content;
         if (delta) {
           full.push(delta);
           onChunk(delta);
+        }
+        const reasoning = chunk.choices?.[0]?.delta?.reasoning_content;
+        if (reasoning) {
+          fullReasoning.push(reasoning);
+          onReasoning?.(reasoning);
         }
       } catch {
         /* 忽略不完整 chunk */
@@ -340,7 +355,7 @@ export async function chatStream(
     const r = (await withSmartRetry(
       (attemptOpts) => {
         const streamOpts = { ...attemptOpts, stream: true };
-        return callOnce(model, messages, streamOpts).then((res) => readStream(res, onChunk));
+        return callOnce(model, messages, streamOpts).then((res) => readStream(res, onChunk, opts.onReasoning));
       },
       opts,
       retries,

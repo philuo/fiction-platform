@@ -603,6 +603,65 @@ describe("brainChatStream（SSE 编排，事件协议 v2）", () => {
     expect(lastMsg.cards).toBeUndefined();
   });
 
+  test("思考模式开：thinking:true → chatStream 收到 enabled + reasoning 事件流式 + 落盘 thinking", async () => {
+    mockWorld = mkWorld();
+    nextChatContent = JSON.stringify({ intent: "chat", reply: "" });
+    const orig = brainChatDeps.chatStream;
+    let captured: Record<string, unknown> | null = null;
+    brainChatDeps.chatStream = (async (_msgs: ChatMessage[], onChunk: (d: string) => void, opts?: Record<string, unknown>) => {
+      captured = opts ?? null;
+      const onReasoning = (opts?.onReasoning as ((d: string) => void) | undefined);
+      if (onReasoning) for (const ch of "让我想想") onReasoning(ch);
+      for (const ch of "这是回答") onChunk(ch);
+      return "这是回答";
+    }) as typeof brainChatDeps.chatStream;
+    try {
+      const events: Record<string, unknown>[] = [];
+      await brainChatStream({
+        title: "brain-chat-test", prompt: "你好", sessionId: "think-session", thinking: true,
+        send: (o) => events.push(o as Record<string, unknown>),
+      });
+      // thinking 透传 enabled（关闭思维链的参数在 agnes 层转 {type:"enabled"}）
+      expect(captured?.thinking).toBe("enabled");
+      // reasoning 事件流式增量（append:true），拼回完整思维链
+      const reasoningEvents = events.filter((e) => e.type === "reasoning");
+      expect(reasoningEvents.length).toBeGreaterThan(1);
+      expect(reasoningEvents.map((e) => e.text as string).join("")).toBe("让我想想");
+      // 思维链落盘（刷新后可恢复展示）
+      const sess = sessGet("brain-chat-test", "think-session");
+      const lastMsg = sess!.messages[sess!.messages.length - 1];
+      expect(lastMsg.thinking).toBe("让我想想");
+      expect(lastMsg.text).toBe("这是回答");
+    } finally {
+      brainChatDeps.chatStream = orig;
+    }
+  });
+
+  test("思考模式默认关：不传 thinking → chatStream 收到 disabled，无 reasoning 事件", async () => {
+    mockWorld = mkWorld();
+    nextChatContent = JSON.stringify({ intent: "chat", reply: "" });
+    const orig = brainChatDeps.chatStream;
+    let captured: Record<string, unknown> | null = null;
+    brainChatDeps.chatStream = (async (_msgs: ChatMessage[], onChunk: (d: string) => void, opts?: Record<string, unknown>) => {
+      captured = opts ?? null;
+      for (const ch of "回答") onChunk(ch);
+      return "回答";
+    }) as typeof brainChatDeps.chatStream;
+    try {
+      const events: Record<string, unknown>[] = [];
+      await brainChatStream({
+        title: "brain-chat-test", prompt: "你好", sessionId: "think-session-2",
+        send: (o) => events.push(o as Record<string, unknown>),
+      });
+      expect(captured?.thinking).toBe("disabled");
+      expect(events.some((e) => e.type === "reasoning")).toBe(false);
+      const sess = sessGet("brain-chat-test", "think-session-2");
+      expect(sess!.messages[sess!.messages.length - 1].thinking).toBeUndefined();
+    } finally {
+      brainChatDeps.chatStream = orig;
+    }
+  });
+
   test("意图 read_chapter → delta(reply) + card(browse) + done", async () => {
     mockWorld = mkWorld();
     nextChatContent = JSON.stringify({ intent: "read_chapter", params: { index: 1 }, reply: "为你打开第一章" });
@@ -782,6 +841,44 @@ describe("brainChatStream（SSE 编排，事件协议 v2）", () => {
     expect(sess.messages.filter((m) => m.role === "user").length).toBe(1);
     expect(sess.messages.length).toBe(2);
     expect(events[events.length - 1].type).toBe("done");
+  });
+
+  test("resume：reset 不带 thinking，重新生成后思维链不重复拼接", async () => {
+    mockWorld = mkWorld();
+    const orig = brainChatDeps.chatStream;
+    // 第一回合：产生思维链+正文，收到 reasoning 后中断（留下 interrupted 消息）
+    brainChatDeps.chatStream = (async (_msgs: ChatMessage[], onChunk: (d: string) => void, opts?: Record<string, unknown>) => {
+      (opts?.onReasoning as ((d: string) => void) | undefined)?.("旧思考");
+      if (opts?.signal?.aborted) throw new DOMException("aborted", "AbortError");
+      for (const ch of "旧正文") onChunk(ch);
+      return "旧正文";
+    }) as typeof brainChatDeps.chatStream;
+    const ac1 = new AbortController();
+    await brainChatStream({
+      title: "brain-chat-test", prompt: "续写", sessionId: "resume-think-session", thinking: true,
+      send: (o) => { if ((o as Record<string, unknown>).type === "reasoning") ac1.abort(); },
+      signal: ac1.signal,
+    });
+    // 第二回合：resume 重新生成，新流产生新思维链
+    brainChatDeps.chatStream = (async (_msgs: ChatMessage[], onChunk: (d: string) => void, opts?: Record<string, unknown>) => {
+      (opts?.onReasoning as ((d: string) => void) | undefined)?.("新思考");
+      for (const ch of "新正文") onChunk(ch);
+      return "新正文";
+    }) as typeof brainChatDeps.chatStream;
+    const events: Record<string, unknown>[] = [];
+    await brainChatStream({
+      title: "brain-chat-test", prompt: "续写", sessionId: "resume-think-session", resume: true, thinking: true,
+      send: (o) => events.push(o as Record<string, unknown>),
+    });
+    const reset = events.find((e) => e.type === "reset") as Record<string, unknown> | undefined;
+    // reset 不带 thinking（前端据此清空旧思维链，避免旧内容 + 新流 append 重复拼接）
+    expect(reset?.thinking).toBeUndefined();
+    // 落盘 thinking = 仅新思维链（无「旧思考」残留）
+    const sess = sessGet("brain-chat-test", "resume-think-session")!;
+    const last = sess.messages[sess.messages.length - 1];
+    expect(last.thinking).toBe("新思考");
+    expect(last.text).toBe("新正文");
+    brainChatDeps.chatStream = orig;
   });
 });
 

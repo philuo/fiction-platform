@@ -466,7 +466,7 @@ const Home: React.FC<HomeProps> = (props) => {
       }
       lastTaskIdRef.current = data.taskId;
       setIdea(""); // 提交后清空输入（列表占位卡展示生成中）
-      showToast("立项已提交，正在生成世界…（可在列表查看进度）");
+      showToast("立项已提交，正在初始化…");
       fetchStories();
       // 任务可能瞬时失败（如 LLM 上游网络故障，0s 内 ConnectionRefused）：立即主动查一次，
       // 否则 creating 为空时轮询不会启动，用户将永远看不到失败反馈

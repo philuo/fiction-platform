@@ -23,6 +23,8 @@ export type BrainChatMsg = {
   role: BrainChatRole;
   /** 消息正文：流式生成中实时追加 */
   text: string;
+  /** DeepSeek 思维链内容（思考模式开启时流式累积，与正文分离存储）；折叠展示用 */
+  thinking?: string;
   /** 完成后携带的卡片（预览/确认/结果/浏览/计划/意见询问） */
   cards?: BrainChatCard[];
   /** epoch ms */
@@ -179,6 +181,19 @@ export function updateMessageText(title: string, sessionId: string, messageId: s
     (s) => {
       const m = s.messages.find((x) => x.id === messageId);
       if (m) m.text = text;
+    },
+    persist,
+  );
+}
+
+/** 流式生成中更新消息思维链（thinking）：与正文同节流语义，persist=true 落盘 / false 仅内存 */
+export function updateMessageThinking(title: string, sessionId: string, messageId: string, thinking: string, persist = true): void {
+  mutateSession(
+    title,
+    sessionId,
+    (s) => {
+      const m = s.messages.find((x) => x.id === messageId);
+      if (m) m.thinking = thinking;
     },
     persist,
   );

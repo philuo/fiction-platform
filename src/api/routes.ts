@@ -684,6 +684,8 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       const bcResume = bcChatBody.resume === true;
       // attach-only（断线自动重连用）：只挂到已在运行的任务，无任务则立即结束流——绝不发起新回合（防重复生成）
       const bcAttach = bcChatBody.attach === true;
+      // DeepSeek 思考模式开关（true=开，false/缺省=关）：透传至 streamChatReply，思维链经 reasoning 事件流式推前端
+      const bcThinking = bcChatBody.thinking === true;
       // 前端上下文（左侧栏选中章等）：供意图识别参数提取兜底（需求 1/2）
       const bcCtx = (bcChatBody.ctx ?? null) as { chapterIndex?: number | null } | null;
       if (!bcChatTitle) return json({ error: "缺少 title" }, 400);
@@ -698,7 +700,7 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
         if (attached) {
           const sess = getBrainSession(bcChatTitle, bcSessionId);
           const pending = sess ? lastPendingMessage(sess) : null;
-          if (pending) send({ type: "reset", messageId: pending.id, text: pending.text });
+          if (pending) send({ type: "reset", messageId: pending.id, text: pending.text, thinking: pending.thinking ?? "" });
           // 客户端已断开（req.signal abort）时立即退出，避免空轮询悬挂
           while (isSessionRunning(bcChatTitle, bcSessionId) && !req.signal.aborted) await Bun.sleep(300);
           // 收尾窗口兜底：任务已 done 但 running 仍 true 时 attach（无 pending 消息），
@@ -715,7 +717,7 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
         task.running = true;
         const broadcast = (obj: unknown) => broadcastToSession(bcChatTitle, bcSessionId, obj);
         try {
-          await brainChatStream({ title: bcChatTitle, prompt: bcChatPrompt, sessionId: bcSessionId, send: broadcast, signal: req.signal, resume: bcResume, ctx: bcCtx ?? undefined });
+          await brainChatStream({ title: bcChatTitle, prompt: bcChatPrompt, sessionId: bcSessionId, send: broadcast, signal: req.signal, resume: bcResume, thinking: bcThinking, ctx: bcCtx ?? undefined });
         } finally {
           task.running = false;
           finishSessionTask(bcChatTitle, bcSessionId);

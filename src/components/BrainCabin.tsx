@@ -372,6 +372,28 @@ export const BrainCabin: React.FC<{
   }, [open, world.title]);
   /** 已手动展开的任务/指令类消息（默认折叠为摘要行，点击展开） */
   const [expandedMsgs, setExpandedMsgs] = useState<Set<string>>(new Set());
+  /** 已展开思维链的消息（思考内容默认折叠，点击展开；无边框文字样式） */
+  const [expandedThinking, setExpandedThinking] = useState<Set<string>>(new Set());
+  /** 中枢聊天思考模式开关（默认关：首字节提速 90%+；localStorage 持久化，会话间保持） */
+  const [brainThinking, setBrainThinking] = useState<boolean>(() => {
+    try { return localStorage.getItem("bc.thinking") === "1"; } catch { return false; }
+  });
+  function toggleBrainThinking() {
+    setBrainThinking((v) => {
+      const nv = !v;
+      try { localStorage.setItem("bc.thinking", nv ? "1" : "0"); } catch { /* 隐私模式忽略 */ }
+      return nv;
+    });
+  }
+  /** 切换某条消息思维链的展开/折叠（默认折叠） */
+  function toggleThinkingFold(id: string) {
+    setExpandedThinking((prev) => {
+      const n = new Set(prev);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
+  }
   /** 聊天内写作进度（推进剧情/连载）：流式显示阶段与正文，结束后追加结果卡 */
   const [writing, setWriting] = useState<{ title: string; phase: string; text: string; status: "running" | "done" | "failed"; detail?: string } | null>(null);
   const writingAbortRef = useRef<AbortController | null>(null);
@@ -754,6 +776,28 @@ export const BrainCabin: React.FC<{
                 {msg.role === "brain" && msg.pending && !shownText && (
                   <ThinkingSkeleton />
                 )}
+                {/* 思维链（思考模式开启时流式累积）：默认折叠为一行摘要，点击展开显示 markdown（无边框文字样式） */}
+                {msg.thinking ? (
+                  <div className="bc-msg-thinking">
+                    {expandedThinking.has(msg.id) ? (
+                      <>
+                        <button className="bc-thinking-toggle-row" onClick={() => toggleThinkingFold(msg.id)} title="折叠思维链">
+                          <span className="bc-fold-caret">▾</span>
+                          <span className="bc-thinking-ico">🧠</span> 收起思考
+                        </button>
+                        <div className="bc-thinking-body">
+                          <MarkdownView text={msg.thinking} />
+                        </div>
+                      </>
+                    ) : (
+                      <button className="bc-thinking-toggle-row" onClick={() => toggleThinkingFold(msg.id)} title="展开思维链">
+                        <span className="bc-fold-caret">▸</span>
+                        <span className="bc-thinking-ico">🧠</span>
+                        <span className="bc-thinking-summary">已深度思考（{msg.thinking.length} 字）</span>
+                      </button>
+                    )}
+                  </div>
+                ) : null}
                 {shownText ? (
                   <div className={`bc-msg-text${msg.pending ? " bc-typing" : ""}`}>
                     <MarkdownView text={shownText} />
@@ -905,15 +949,26 @@ export const BrainCabin: React.FC<{
             placeholder={streaming ? "中枢正在回复…（可继续输入，生成结束后发送）" : "对中枢说点什么…（Enter 发送，Shift+Enter 换行）"}
             rows={2}
           />
-          {streaming ? (
-            <button className="bc-send bc-send-stop" onClick={stop} title="中断生成（保留已输出内容）" aria-label="中断生成">
-              <Square size={16} />
+          <div className="bc-send-col">
+            {streaming ? (
+              <button className="bc-send bc-send-stop" onClick={stop} title="中断生成（保留已输出内容）" aria-label="中断生成">
+                <Square size={16} />
+              </button>
+            ) : (
+              <button className="bc-send bc-send-go" onClick={() => void doSend()} disabled={!input.trim() || executing} title="发送" aria-label="发送">
+                <Send size={16} />
+              </button>
+            )}
+            {/* 思考模式开关：位于发送按钮下方，与发送按钮同尺寸圆形 icon，样式统一 */}
+            <button
+              className={`bc-send bc-think-toggle${brainThinking ? " active" : ""}`}
+              onClick={toggleBrainThinking}
+              title={brainThinking ? "思考模式：开（中枢输出思维链，回答更慢但更严谨）" : "思考模式：关（不输出思维链，响应更快；点击开启深度思考）"}
+              aria-pressed={brainThinking}
+            >
+              <span className="bc-thinking-ico">🧠</span>
             </button>
-          ) : (
-            <button className="bc-send bc-send-go" onClick={() => void doSend()} disabled={!input.trim() || executing} title="发送" aria-label="发送">
-              <Send size={16} />
-            </button>
-          )}
+          </div>
         </div>
         )}
       </div>
@@ -967,7 +1022,7 @@ export const BrainCabin: React.FC<{
     stickToBottom(); // 发送后新消息滚动跟随
     let sid = activeId;
     if (!sid) sid = await newSession(prompt);
-    await send({ prompt, sessionId: sid, ctx: chatCtx });
+    await send({ prompt, sessionId: sid, ctx: chatCtx, thinking: brainThinking });
   }
 
   /** 重新生成：resume 当前会话最后一条未完成消息 */
@@ -976,7 +1031,7 @@ export const BrainCabin: React.FC<{
     const lastBrain = [...messages].reverse().find((m) => m.role === "brain" && m.interrupted);
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
     if (!lastBrain || !lastUser) return;
-    void send({ prompt: lastUser.text ?? "", sessionId: activeId, resume: true, ctx: chatCtx });
+    void send({ prompt: lastUser.text ?? "", sessionId: activeId, resume: true, ctx: chatCtx, thinking: brainThinking });
   }
 
   /**
