@@ -381,6 +381,8 @@ export type WorldState = {
   lore?: LoreEntry[]; // 世界书条目（M3）
   plotThreads?: Arc[]; // 情节弧线（原 arcs，migrateWorld 迁移）
   cover?: string; // 书籍封面（相对 data/<story>/ 的路径）
+  /** 上次封面自动生成尝试时间戳（读时自愈冷却用，与 visualTriedAt 同策略，防每次打开页面重复尝试烧配额；手动生成不受影响） */
+  coverTriedAt?: number;
   /** 全局当前状态：单行自然语言（季节/天气/昼夜/局势/关键处境），chronicler 结算滚动更新，用户可改 */
   current?: string;
   nextChapter: number;

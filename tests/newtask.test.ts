@@ -3,10 +3,10 @@
 // ② 防重入：已有 running 时复用 id；
 // ③ /api/novel/new 立即返回 taskId（不阻塞），后台任务终态可经 /api/novel/new/status 查询；
 // ④ /api/novel/list 合并 creating（进行中任务对前端可见）；
-// ⑤ 陈旧 running 清理标 failed。
+// ⑤ 启动清理：running/ready 一律标 failed（服务重启后台执行已死）。
 // 使用临时 cwd 隔离；后台任务在无 LLM key 环境下快速失败（401），不依赖真实模型。
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type * as Storage from "../src/api/storage";
@@ -143,20 +143,23 @@ describe("newtask 任务状态机", () => {
     });
   });
 
-  test("cleanup：陈旧 running/ready（>2h）→ failed；终态超期清除", () => {
+  test("cleanup（启动时）：所有 running/ready 一律标 failed（执行上下文不持久化，重启即中断），终态超期清除", () => {
     // 无用户上下文：数据落在 data/ 根，由 cleanupNewStoryTasks 的遗留目录分支（cleanupForDir("")）覆盖
     // （cleanup 遍历 listUsernames 即已注册用户表；测试环境无注册用户，故不走 runAsUser 路径）
     newtask._clearNewStoryTasks();
-    newtask.createNewStoryTask("陈旧任务");
-    // 把 updatedAt 改成 2 小时+1 分钟前模拟中断
-    const p = join(dataDir, "data", "newstory-tasks.json");
-    const tasks = JSON.parse(readFileSync(p, "utf-8"));
-    tasks[0].updatedAt = new Date(Date.now() - (2 * 60 + 1) * 60 * 1000).toISOString();
-    writeFileSync(p, JSON.stringify(tasks), "utf-8");
+    const { id: idDone } = newtask.createNewStoryTask("已完成的任务");
+    newtask.completeNewStoryTask(idDone, "完成的书"); // 释放 running 槽
+    const { id: idReady } = newtask.createNewStoryTask("壳已就绪的任务");
+    newtask.markNewStoryTaskReady(idReady, "壳之书"); // ready（壳已就绪仍在增强）
+    const { id: idRunning } = newtask.createNewStoryTask("刚提交的任务"); // 非陈旧 running
     newtask.cleanupNewStoryTasks();
+    // running + ready 全部被标 failed（无论新旧——重启后后台执行必死），前端可查失败原因，
+    // 占位卡/「世界构建中」横幅不再永久 loading；done 任务保留
     expect(newtask.listActiveNewStoryTasks()).toHaveLength(0);
-    // 陈旧任务被标 failed（可查询到，前端感知失败原因）
-    expect(newtask.loadNewStoryTasks().some((t) => t.status === "failed")).toBe(true);
+    const after = newtask.loadNewStoryTasks();
+    expect(after.find((t) => t.id === idReady)?.status).toBe("failed");
+    expect(after.find((t) => t.id === idRunning)?.status).toBe("failed");
+    expect(after.find((t) => t.id === idDone)?.status).toBe("done");
   });
 });
 

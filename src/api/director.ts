@@ -6,7 +6,7 @@ import { applyCards, autoPick, generateCardPool, type CardType } from "./cards";
 import { reviewChapter, type CriticVerdict } from "./critic";
 import { chatJson } from "./jsonutil";
 import * as anysearch from "./anysearch";
-import { allocateTitle, appendCheckpoint, clearPendingChapter, loadPendingChapter, savePendingChapter, saveWorld } from "./storage";
+import { allocateTitle, appendCheckpoint, clearPendingChapter, loadPendingChapter, mergeConcurrentMedia, savePendingChapter, saveWorld } from "./storage";
 import { checkInterrupt, logChange } from "./steering";
 import { patchChapter } from "./patch";
 import { ensureChapterPlan, handleArcBoundary, healLegacyStory, markChapterDone, buildBlueprint, confirmBlueprint } from "./planner";
@@ -184,6 +184,9 @@ export async function newStoryCore(idea: string, genre?: string): Promise<WorldS
 export async function newStoryEnhance(w: WorldState, idea: string): Promise<void> {
   // 性别/年龄/身份缺失兜底推断（弱模型 schema required 仍可能漏字段；缺失会导致头像 prompt 写「性别未知」画出默认脸）——失败不阻塞立项
   try { await fillMissingCharacterFields(w); } catch (e) { console.warn("[director] 角色字段兜底推断失败（不阻塞）:", (e as Error).message); }
+  // 与并发落盘竞争修复：段 1 后 ensureCover/ensureCharacterVisuals 在后台把封面/角色视觉写进磁盘，
+  // 本函数持段 1 旧快照——保存前合并最新状态，避免旧快照把新落盘字段覆盖回空（封面丢失根因）
+  mergeConcurrentMedia(w);
   saveWorld(w);
   // 立项即自动导演（P3）：生成蓝图候选并默认确认第一套（失败不阻塞，写作时自愈）
   try {

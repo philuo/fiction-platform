@@ -1,7 +1,7 @@
 // 分层滚动规划（P3，修 A1-A4）：蓝图（指南针+进度承诺+卷骨架）→ 弧（滚动展开）→ 本章计划（核销）
 // 参考 ainovel-cli：初始只规划 2 卷骨架 + 第 1 弧详章；弧/卷边界触发摘要归并 + 展开下一弧
 import { chatJson } from "./jsonutil";
-import { saveWorld } from "./storage";
+import { mergeConcurrentMedia, saveWorld } from "./storage";
 import { logCommandChange } from "./steering";
 import { summarizeRange } from "./memory";
 import type { Blueprint, ChapterPlan, StoryArc, Volume, WorldState } from "./world";
@@ -138,6 +138,7 @@ export async function confirmBlueprint(w: WorldState, opt: BlueprintOption): Pro
   const first = arcs.find((a) => a.status === "skeleton");
   if (first) await expandArc(w, first.id);
   logCommandChange(w, { chapter: w.nextChapter, actor: "user", kind: "blueprint-confirm", detail: `确认蓝图《${w.blueprint.theme?.slice(0, 30)}》（${volumesCount(w)} 卷 / ${arcs.length} 弧骨架，已展开首弧详纲）`, commandId: "CMD-W03" });
+  mergeConcurrentMedia(w); // 立项段 2 持旧快照：保存前合并并发落盘的封面/角色视觉字段，防覆盖
   saveWorld(w);
   return w;
 }
@@ -225,6 +226,7 @@ export async function expandArc(w: WorldState, arcId: string): Promise<ChapterPl
   w.chapterPlans = [...(w.chapterPlans ?? []), ...plans];
   arc.status = "expanded";
   logCommandChange(w, { chapter: safeStart, actor: "ai", kind: "arc-expand", detail: `展开弧「${arc.title}」章节计划 ${plans.length} 章（第 ${safeStart} 章起）`, commandId: "CMD-W05" });
+  mergeConcurrentMedia(w); // 立项段 2 持旧快照：保存前合并并发落盘的封面/角色视觉字段，防覆盖
   saveWorld(w);
   return plans;
 }

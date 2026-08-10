@@ -25,10 +25,7 @@ export type NewStoryTask = {
   error?: string;
 };
 
-/** 陈旧判定：running 超过 2 小时视为中断。立项链路已放宽超时/重试（单调用 180s×4 次×5 调用×chatJson 2 层 ≈ 2 小时），
- *  必须留足余量，否则运行中的长任务会被误判陈旧标 failed（立项失败不可忍受）。 */
-const STALE_MS = 2 * 60 * 60 * 1000;
-/** done/failed 终态保留时长：前端轮询 / 列表感知窗口，之后清理 */
+/** 终态（done/failed）保留时长：前端轮询 / 列表感知窗口，之后清理 */
 const DONE_RETENTION_MS = 30 * 60 * 1000;
 /** 任务文件保留上限（防无限增长） */
 const MAX_TASKS = 50;
@@ -142,7 +139,10 @@ export function removeNewStoryTaskByTitle(title: string): void {
   if (next.length !== tasks.length) saveNewStoryTasks(next);
 }
 
-/** 服务启动清理：陈旧 running → failed（执行上下文不持久化，重启即中断）；终态超保留期清理；截断上限 */
+/** 服务启动清理（仅在启动时调用一次）：running/ready 一律标 failed——执行上下文不持久化，
+ * 服务重启即中断，旧任务的后台线程已死；保留 running/ready 会让前端占位卡/「世界构建中」横幅永久 loading。
+ * （运行期间的任务由 complete/fail 收敛终态，无"运行中超时"概念，无需陈旧判定。）
+ * 终态超保留期清理；截断上限。 */
 export function cleanupNewStoryTasks(): void {
   cleanupForDir("");
   for (const username of listUsernames()) {
@@ -161,10 +161,10 @@ function cleanupForDir(username: string): void {
     const next: NewStoryTask[] = [];
     let changed = false;
     for (const t of tasks) {
-      if ((t.status === "running" || t.status === "ready") && now - Date.parse(t.updatedAt) > STALE_MS) {
+      if (t.status === "running" || t.status === "ready") {
         next.push({ ...t, status: "failed", error: "服务重启中断了立项任务，请重新发起", updatedAt: new Date().toISOString() });
         changed = true; // 状态变更（数量不变也须落盘）
-        console.log(`[newtask] 清理陈旧立项任务: ${t.id}`);
+        console.log(`[newtask] 清理中断的立项任务: ${t.id}（服务重启，后台执行已死）`);
       } else if ((t.status === "done" || t.status === "failed") && now - Date.parse(t.updatedAt) > DONE_RETENTION_MS) {
         changed = true; // 终态超期清除
         continue;

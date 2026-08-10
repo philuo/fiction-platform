@@ -301,6 +301,7 @@ function ensureCover(title: string, w: WorldState): void {
         const w2 = loadWorld(title);
         if (!w2 || w2.cover) return { path: w2?.cover ?? p, oldRel: w2?.cover ? "" : p }; // 再次复查：落盘期间被手动生成则不覆盖
         w2.cover = p;
+        w2.coverTriedAt = Date.now(); // 成功也刷新尝试时间戳（与角色视觉 visualTriedAt 同策略）
         steering.logChange(w2, { chapter: w2.nextChapter, actor: "system", kind: "cover-auto", detail: "自动生成小说封面", commandId: "CMD-M09" });
         saveWorld(w2);
         return { path: p, oldRel: "" };
@@ -314,6 +315,8 @@ function ensureCover(title: string, w: WorldState): void {
         await withTitleLock(slug(title), async () => {
           const w2 = loadWorld(title);
           if (w2) {
+            // 失败也刷新 coverTriedAt：读时自愈据此冷却（防每次打开页面重复尝试烧配额；手动生成不受影响）
+            w2.coverTriedAt = Date.now();
             steering.logChange(w2, { chapter: w2.nextChapter, actor: "system", kind: "visual-fail", detail: `封面自动生成失败：${msg}`, commandId: "CMD-M09" });
             saveWorld(w2);
           }
@@ -821,6 +824,11 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         return Date.now() - c.visualTriedAt > VISUAL_RETRY_COOLDOWN;
       });
       for (const c of needy) ensureCharacterVisuals(w.title, w, c);
+      // 封面读时自愈（兜底）：cover 缺失且未尝试（或过冷却）→ 后台自动生成（与角色视觉同策略）。
+      // 修复「立项段 2 旧快照覆盖并发落盘」等历史丢封面场景——此前封面无自愈路径，丢了就永久缺
+      if (!w.cover && (!w.coverTriedAt || Date.now() - w.coverTriedAt > VISUAL_RETRY_COOLDOWN)) {
+        ensureCover(w.title, w);
+      }
       // 中枢四维状态（轻量：复用落盘 eval，不含完整性扫描——完整扫描见 /api/brain/state）
       const stSession = loadAutoSession(title);
       const stAutoRunning = stSession?.status === "running";

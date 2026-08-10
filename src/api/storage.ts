@@ -287,6 +287,30 @@ export function loadWorld(title: string): WorldState | null {
   return w;
 }
 
+/** 把磁盘最新状态中「并发后台任务写入、而快照缺失」的字段补进内存快照（快照已有值优先，绝不覆盖快照内容）。
+ * 用途：立项段 2（newStoryEnhance 链：fillMissingCharacterFields → confirmBlueprint → expandArc）持有段 1 的旧 world 快照，
+ * 期间 ensureCover / ensureCharacterVisuals 在锁内 load→改→save 并发落盘 cover / 角色视觉字段；
+ * 若段 2 直接 saveWorld(旧快照) 会把它们整体覆盖回空——封面 png 变磁盘孤儿、列表页永远无封面
+ * （角色视觉有读时自愈能补回，封面此前无自愈所以用户「生成成功→刷新消失」）。
+ * 调用时机：旧快照生命周期内的每个 saveWorld 之前（仅这些点，避免全局 saveWorld 增加无谓磁盘读）。 */
+export function mergeConcurrentMedia(w: WorldState): WorldState {
+  try {
+    const fresh = loadWorld(w.title);
+    if (!fresh) return w;
+    if (!w.cover && fresh.cover) w.cover = fresh.cover;
+    for (const fc of fresh.characters) {
+      const mc = w.characters.find((c) => c.id === fc.id);
+      if (!mc) continue;
+      if (!mc.image && fc.image) mc.image = fc.image;
+      if (!mc.portrait?.path && fc.portrait?.path) mc.portrait = fc.portrait;
+      if (!mc.visualTriedAt && fc.visualTriedAt) mc.visualTriedAt = fc.visualTriedAt;
+    }
+  } catch {
+    /* 读取失败：按快照原样保存（不阻塞落盘） */
+  }
+  return w;
+}
+
 // —— 连载暂存区（git 工作区语义）：审查不通过的草稿落盘，供重试/跳过 ——
 
 function pendingPath(title: string): string {

@@ -182,7 +182,7 @@ setTimeout(() => {
   } catch (e) {
     console.error("[dev] 推进任务清理失败:", e);
   }
-  // 异步立项任务：陈旧 running（服务重启中断）标记 failed，终态超期清理
+  // 异步立项任务：running/ready 一律标记 failed（服务重启后台执行已死，前端占位卡/构建横幅不永久 loading），终态超期清理
   try {
     cleanupNewStoryTasks();
   } catch (e) {

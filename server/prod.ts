@@ -2,6 +2,7 @@
 // 纯 Bun.serve：静态资源（dist/client）+ API + SSR（bun build 的 server bundle）
 import { handleApi, migrateLegacyOnBoot, resumeAutoSessions, startVisualSweep } from "../src/api/routes";
 import { cleanupStaleAdvanceTasks } from "../src/api/advancetask";
+import { cleanupNewStoryTasks } from "../src/api/newtask";
 import { loadWorld, runAsUser } from "../src/api/storage";
 import { userFromRequest, getPropClosed } from "../src/api/auth";
 import { buildHtml } from "./render";
@@ -118,5 +119,11 @@ setTimeout(() => {
     cleanupStaleAdvanceTasks();
   } catch (e) {
     console.error("[prod] 推进任务清理失败:", e);
+  }
+  // 异步立项任务：running/ready 一律标 failed（服务重启后台执行已死，保留会让前端占位卡/「世界构建中」永久 loading），终态超期清理
+  try {
+    cleanupNewStoryTasks();
+  } catch (e) {
+    console.error("[prod] 立项任务清理失败:", e);
   }
 }, 0);
