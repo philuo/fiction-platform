@@ -33,6 +33,8 @@ export type BrainChatMsg = {
   pending?: boolean;
   /** 被用户中断 */
   interrupted?: boolean;
+  /** 系统事件消息（kind="system"）：系统状态变化自动注入会话（连载提交/任务完成等），前端灰色系统条渲染 */
+  kind?: "system";
 };
 
 export type BrainSession = {
@@ -46,6 +48,8 @@ export type BrainSession = {
   streaming: boolean;
   /** 已执行的卡片操作 key（`消息id:卡片下标[:列表项id]`）：服务端持久化，刷新后随详情返回，前端恢复完成态 */
   completed?: string[];
+  /** 已注入的系统事件 id（幂等去重：同一事件不重复注入聊天会话） */
+  systemNotes?: string[];
 };
 
 /** 单会话消息条数上限（防文件膨胀；超出丢最旧） */
@@ -171,6 +175,27 @@ export function appendMessage(title: string, sessionId: string, msg: BrainChatMs
     s.messages.push(msg);
     if (!s.title || s.title === "新会话") s.title = makeTitle(msg.text);
   });
+}
+
+/** 系统事件注入会话（幂等）：把系统状态变化（连载提交章节/任务完成等）以【系统】消息追加到
+ * 最近更新的会话（listSessions 首条；无会话则跳过——事件不补录，后续新事件照常注入）。
+ * 已注入的事件按 eventId 记录在 session.systemNotes 去重，同事件不重复刷屏；
+ * 消息进入会话历史 → 意图识别/回复上下文（hist.slice(-6)）自动携带，中枢 AI 感知系统动态。
+ * @returns 是否实际注入（false=无会话或重复事件）
+ */
+export function appendSystemNote(title: string, eventId: string, text: string): boolean {
+  const session = listSessions(title)[0];
+  if (!session) return false;
+  let injected = false;
+  mutateSession(title, session.id, (s) => {
+    const notes = s.systemNotes ?? (s.systemNotes = []);
+    if (notes.includes(eventId)) return; // 幂等：同事件不重复注入
+    notes.push(eventId);
+    if (notes.length > 200) s.systemNotes = notes.slice(-200); // 防膨胀，只留最近 200 条事件 id
+    s.messages.push({ id: `sys-${eventId}`, role: "assistant", text: `【系统】${text}`, at: Date.now(), kind: "system" });
+    injected = true;
+  });
+  return injected;
 }
 
 /** 流式生成中更新消息文本：persist=true 落盘（消息完成/关键节点），false 仅内存（高频 delta 节流） */

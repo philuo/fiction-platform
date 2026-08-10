@@ -32,6 +32,7 @@ import {
   registerSessionTask,
   truncateSession as truncateBrainSession,
   markSessionCompleted as markBrainSessionCompleted,
+  appendSystemNote as appendBrainSystemNote,
 } from "./brain-sessions";
 import { startAdvanceTask, updateAdvanceTaskPhase, completeAdvanceTask, failAdvanceTask, getAdvanceTaskForClient, clearAdvanceTask } from "./advancetask";
 import { migrateChapterMedia, touchChapter, genOf, type WorldState, type Character as WorldCharacter, type ChapterMedia, type ConsistencyFinding, type PendingChapter } from "./world";
@@ -328,6 +329,40 @@ function ensureCover(title: string, w: WorldState): void {
   })();
 }
 
+// —— 读时自愈后台化 ——
+// 原 /api/novel/state 在 withTitleLock 内同步执行 load→自愈→save，与自动连载的
+// writeOneChapter（锁内 5-15 分钟：多次 LLM 调用+重试）排同一把锁 → 连载期间打开小说
+// state 一直 pending。改为无锁读 + 自愈保存后台化：state 秒回（读到磁盘最新一致快照，
+// saveWorld 原子写，最多落后连载正在写的一章），自愈在后台锁内 load 最新再 save，
+// 与连载写章互斥、不基于旧快照覆盖。per-title 去重防高频打开堆积。
+const readSelfHealInFlight = new Set<string>();
+function scheduleReadSelfHeal(title: string): void {
+  const uk = currentUser() ?? "";
+  const key = `${uk}::${slug(title)}`;
+  if (readSelfHealInFlight.has(key)) return;
+  readSelfHealInFlight.add(key);
+  void (async () => {
+    try {
+      await withTitleLock(slug(title), async () => {
+        const w = loadWorld(title);
+        if (!w) return;
+        // 自愈：出场角色重算 + 旧媒体迁移 + 一致性自动修复（幂等，旧书打开即治理），有变更才持久化
+        let dirty = director.recomputeAppearedIn(w);
+        if (migrateChapterMedia(w)) dirty = true;
+        if (autoRepair(w).length) dirty = true;
+        if (dirty) {
+          applyStateChange(w, { actor: "system", commandId: "CMD-S08", field: "appearedIn", reason: "读时自愈：重算登场记录/媒体迁移/一致性修复", chapter: w.nextChapter });
+          saveWorld(w);
+        }
+      });
+    } catch (e) {
+      console.warn(`[state] 读时自愈后台落盘失败（不影响打开）: ${title}`, (e as Error).message);
+    } finally {
+      readSelfHealInFlight.delete(key);
+    }
+  })();
+}
+
 /** 中枢巡检：扫描 data 下所有故事的每个角色，检测头像/立绘是否生成——缺失且未尝试（或已过 1 分钟冷却）的自动补全。
  * 与入口触发（立项/入册/手动新增/读时自愈）互补：即使角色经由任何路径进入世界而未走入口（如手动改存档、dev 热重启丢任务后），
  * 中枢巡检也会兜底补全；触发条件与读时自愈完全一致（visualTriedAt 冷却共用 VISUAL_RETRY_COOLDOWN），幂等（视觉完整跳过）。
@@ -597,6 +632,19 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       return json({ ok });
     }
 
+    case "/api/brain/sessions/system-note": {
+      // 系统状态变化注入聊天会话（幂等）：前端统一状态轮询检测到变化（连载提交章节/任务完成等）
+      // 后调用，服务端按 eventId 去重注入【系统】消息到最近会话 → 中枢 AI 与用户感知系统动态
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const snBody = await readBody(req);
+      const snTitle = String(snBody.title ?? "").trim();
+      const snEventId = String(snBody.eventId ?? "").trim();
+      const snText = String(snBody.text ?? "").trim();
+      if (!snTitle || !snEventId || !snText) return json({ error: "缺少 title/eventId/text" }, 400);
+      const injected = appendBrainSystemNote(snTitle, snEventId, snText);
+      return json({ ok: true, injected });
+    }
+
     case "/api/brain/sessions/truncate": {
       // 编辑重发前置：删除 fromMessageId 及其后的消息（截断会话）
       if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
@@ -662,6 +710,8 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
           pendingCommit: bcCtxPending ? { index: bcCtxPending.chapterIndex ?? null, title: bcCtxPending.title ?? "" } : null,
           advanceTaskRunning: bcCtxTask?.status === "running",
           advancePhase: bcCtxTask?.status === "running" ? bcCtxTask?.phase : undefined,
+          /** 推进任务启动时间（稳定标识）：前端「推进任务完成」事件注入聊天用其做 eventId（防并发重复/漏报） */
+          advanceStartedAt: bcCtxTask?.status === "running" ? bcCtxTask?.startedAt : undefined,
           mediaGenerating,
           visualRunning,
           pendingProposals,
@@ -803,20 +853,12 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
     case "/api/novel/state": {
       const title = String(body.title ?? "").trim();
       if (!title) return json({ error: "缺少 title" }, 400);
-      // 锁内 load→自愈→save：与并发写章互斥，防读时自愈基于旧快照覆盖（可靠性）
-      const w = await withTitleLock(slug(title), async () => {
-        const w = loadWorld(title);
-        if (!w) throw new AppError("故事不存在: " + title);
-        // 自愈：出场角色重算 + 旧媒体迁移 + 一致性自动修复（幂等，旧书打开即治理），有变更则持久化
-        let dirty = director.recomputeAppearedIn(w);
-        if (migrateChapterMedia(w)) dirty = true;
-        if (autoRepair(w).length) dirty = true;
-        if (dirty) {
-          applyStateChange(w, { actor: "system", commandId: "CMD-S08", field: "appearedIn", reason: "读时自愈：重算登场记录/媒体迁移/一致性修复", chapter: w.nextChapter });
-          saveWorld(w);
-        }
-        return w;
-      });
+      // 无锁读（saveWorld 原子写 tmp+rename：磁盘永远是完整一致快照，最多落后连载正在写的一章）。
+      // 修复：连载每章在锁内执行 writeOneChapter（5-15 分钟），state 若同步等锁会一直 pending；
+      // 读时自愈保存已后台化（scheduleReadSelfHeal，锁内 load 最新再 save，与连载互斥不覆盖）
+      const w = loadWorld(title);
+      if (!w) throw new AppError("故事不存在: " + title);
+      scheduleReadSelfHeal(title);
       // 读时自愈②：视觉缺失的角色 → 后台补头像+立绘（fire-and-forget，不阻塞打开）。
       // 触发条件：未自动尝试过，或上次尝试失败已过冷却期（visualTriedAt 防高频烧配额，也避免 dev 热重启丢任务后永久缺视觉）；
       // 前端据 visualPending 启动轮询，中枢显示「自动生成角色头像/立绘中…」，完成后刷新恢复待命

@@ -324,11 +324,13 @@ export const BrainCabin: React.FC<{
   autoRunning?: boolean;
   /** 世界构建中阶段文案（壳就绪进页面后后台仍在增强蓝图/章节；非空时中枢显示"世界构建中"而非待命） */
   buildingStage?: string | null;
-}> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk, onOpenPanel, currentChapter, autoRunning, buildingStage }) => {
+  /** 系统事件信号：Home 注入系统消息到聊天会话后递增；聊天舱内实时重拉会话（显示最新【系统】条） */
+  sysTick?: number;
+}> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk, onOpenPanel, currentChapter, autoRunning, buildingStage, sysTick = 0 }) => {
   const {
     sessions, activeId, messages, streaming, thinking, reconnecting,
     openSession, newSession, removeSession, truncate, appendMsg, send, stop, isStreaming,
-    completed, markCompleted,
+    completed, markCompleted, reloadActive,
   } = useBrainSession(world.title);
 
   const [input, setInput] = useState("");
@@ -543,6 +545,11 @@ export const BrainCabin: React.FC<{
     if (stickBottomRef.current) el.scrollTop = el.scrollHeight;
   }, [messages, thinking, reveal]);
   useEffect(() => { if (open) stickToBottom(); }, [open, activeId]);
+  // 系统事件注入信号：Home 轮询检测到系统状态变化并注入聊天会话后递增 → 重拉当前会话显示最新【系统】条
+  useEffect(() => {
+    if (sysTick > 0) void reloadActive();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sysTick]);
 
   function appendBrainMsg(cards: BrainCard[]) {
     if (!activeId) return;
@@ -761,11 +768,17 @@ export const BrainCabin: React.FC<{
             // 打字机显示：pending 消息按 reveal 节奏显示（流式感），非 pending 显示完整文本
             const shownText = msg.pending ? (msg.text ?? "").slice(0, reveal[msg.id] ?? 0) : (msg.text ?? "");
             // 滚动吸附：每条用户提问 sticky 吸顶（CSS 处理），当前视口内 AI 回复对应的提问自然吸附在顶部
+            const isSysNote = msg.kind === "system";
             return (
-            <div key={msg.id} className={`bc-msg bc-msg-${msg.role}`}>
-              {msg.role === "brain" && <BrainCore presence={presence} activity={activity} size="mini" animated={false} />}
+            <div key={msg.id} className={`bc-msg bc-msg-${msg.role}${isSysNote ? " bc-msg-system" : ""}`}>
+              {msg.role === "brain" && !isSysNote && <BrainCore presence={presence} activity={activity} size="mini" animated={false} />}
+              {isSysNote && <span className="bc-msg-system-ico" title="系统事件">⚙</span>}
               <div className="bc-msg-content">
-                {folded ? (
+                {isSysNote ? (
+                  <div className="bc-msg-system-text">
+                    <MarkdownView text={shownText || (msg.text ?? "")} />
+                  </div>
+                ) : folded ? (
                   <button className="bc-msg-fold" onClick={() => setExpandedMsgs((prev) => { const n = new Set(prev); n.add(msg.id); return n; })} title="展开查看详情">
                     <span className="bc-fold-caret">▸</span>
                     <span className="bc-fold-text">{msgCollapseSummary(msg)}</span>

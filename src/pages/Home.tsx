@@ -241,8 +241,12 @@ const Home: React.FC<HomeProps> = (props) => {
   const [showAutoPanel, setShowAutoPanel] = useState(false);
   const [showAutoStart, setShowAutoStart] = useState(false);
   const [autoChapters, setAutoChapters] = useState(5);
-  const autoPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const sysPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoCheckedRef = useRef<string | null>(null);
+  /** 推进任务阶段（任务中心展示）：轮询从 /api/brain/context 同步——聊天中启动的推进任务本页也能看到进度 */
+  const [advancePhase, setAdvancePhase] = useState("");
+  /** 系统事件注入信号：injectSystemNote 成功后递增，透传 BrainCabin 重拉会话（聊天舱内实时显示【系统】条） */
+  const [sysTick, setSysTick] = useState(0);
 
   // —— 运行锁（用户决策）：连载/推进运行中（含暂停态）全面禁止一切编辑类操作（AI 与手工均不可）——
   // 必须取消任务回到空闲状态才可手动操作，避免与正在写入的账本/正文产生冲突
@@ -252,7 +256,7 @@ const Home: React.FC<HomeProps> = (props) => {
    *  「刷新后一瞬间按钮可点」的风险窗口（此时服务端任务可能仍在跑，误点会与服务端任务冲突）。
    *  初始值：SSR 预载路径（initialData.world 直进 playing）首帧即置锁；非 SSR 由协调 effect 置位。 */
   const [restoringTasks, setRestoringTasks] = useState<boolean>(() => Boolean(props.initialData?.world));
-  const taskActive = busy || autoRunning || autoSession?.status === "running" || autoSession?.status === "paused" || Boolean(buildingStage) || restoringTasks;
+  const taskActive = busy || autoRunning || autoSession?.status === "running" || autoSession?.status === "paused" || Boolean(buildingStage) || Boolean(advancePhase) || restoringTasks;
   /** 恢复代次：协调 effect 每次执行自增。旧 effect 实例的 release/兜底回调据此自检——
    *  切书/重进 playing 时新 effect 置锁后，旧实例的异步完成不会误释放新锁（代次不匹配直接忽略）。 */
   const restoreGenRef = useRef(0);
@@ -636,6 +640,13 @@ const Home: React.FC<HomeProps> = (props) => {
     if (dw && data.visualPending) startVisualPolling(dw.title);
   }
 
+  /** 全量状态即时刷新（聊天卡片执行后 / 连载 SSE 结束后调用）：
+   *  world（章节/角色）+ 系统运行时状态（连载会话/推进任务）一步到位——
+   *  解决「聊天中触发的指令/任务卡片状态与系统 UI 不同步」：不只刷 world，连载控制台/任务中心/中枢指示器同步更新 */
+  async function refreshAllStates() {
+    await Promise.all([refreshWorld().catch(() => {}), pollSysStateOnce().catch(() => {})]);
+  }
+
   /** 单章推进任务恢复（刷新/重进页面后）：查询持久化任务状态——
    * running → 恢复忙碌态 + 轮询直到完成（后台仍在执行，不重复发起）；
    * done → 刷新世界 + 提示（pendingCommit 则打开任务中心确认）；failed → 报错提示。
@@ -849,8 +860,7 @@ const Home: React.FC<HomeProps> = (props) => {
       if (res.status === 409) throw new Error("连载已在运行中");
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       showToast("连载已恢复（断点续跑）。");
-      await refreshWorld();
-      await fetchAutoStatus();
+      await refreshAllStates();
     } catch (e) {
       showToast("恢复失败: " + (e as Error).message);
     }
@@ -1709,39 +1719,127 @@ const Home: React.FC<HomeProps> = (props) => {
     }
   }
 
-  /** 后台续跑轮询：SSE 断开（刷新/切页）后每 5s 同步一次进度；终态（paused/stopped/done）自动停止 */
-  function startAutoPoll() {
-    stopAutoPoll();
-    autoPollRef.current = setInterval(async () => {
-      const s = await fetchAutoStatus();
-      if (!s) return;
-      if (s.status !== "running") {
-        stopAutoPoll();
-        if (s.status === "paused") setShowAutoPanel(true);
-        if (s.status === "done" || s.status === "stopped") await refreshWorld();
+  /** 把系统状态变化注入中枢聊天会话（幂等：服务端按 eventId 去重，同事件不重复注入）。
+   *  聊天中可见系统动态（灰色【系统】条），且消息进入会话历史 → 中枢 AI 感知（意图识别 hist 携带） */
+  async function injectSystemNote(eventId: string, text: string) {
+    if (!world) return;
+    try {
+      const res = await apiFetch("/api/brain/sessions/system-note", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: world.title, eventId, text }),
+      });
+      if (res.ok) {
+        const d = (await res.json().catch(() => ({}))) as { injected?: boolean };
+        if (d.injected) setSysTick((t) => t + 1); // 实际注入成功 → 通知聊天舱重拉（显示最新系统条）
       }
-    }, 5000);
+    } catch { /* 注入失败静默：不影响系统功能 */ }
   }
-  function stopAutoPoll() {
-    if (autoPollRef.current) {
-      clearInterval(autoPollRef.current);
-      autoPollRef.current = null;
+
+  // 统一状态轮询基线：上次快照（首次为 null，仅建立基线不判定变化）
+  const prevSysRef = useRef<{
+    written: number;
+    autoRunning: boolean;
+    autoPhase: string;
+    advanceRunning: boolean;
+    advanceStartedAt: string | null;
+  } | null>(null);
+
+  /** 单次系统状态快照拉取 + 变化检测（统一轮询与卡片执行后即时刷新共用）。
+   *  连载会话（auto/status）+ 运行时上下文（brain/context：推进任务/媒体/视觉）并行拉取；
+   *  检测到状态转移（新章提交 / 连载开始·结束·暂停 / 推进任务完成）→ 刷新 world（新章出现）+
+   *  注入聊天会话 + 打开连载控制台。解决：长期停留页面不同步、聊天触发任务后系统 UI 不更新
+   *  可靠性：任一来源拉取失败 → 本轮只更新展示状态、跳过变化检测（prev 不推进），
+   *  避免网络抖动误报「连载结束/任务完成」污染聊天上下文 */
+  type SysCtx = { autoRunning?: boolean; advanceTaskRunning?: boolean; advancePhase?: string; advanceStartedAt?: string; mediaGenerating?: boolean; visualRunning?: boolean };
+  async function pollSysStateOnce() {
+    if (!world) return;
+    const auto = await fetchAutoStatus().catch(() => null);
+    let ctx: SysCtx | null = null;
+    try {
+      const res = await apiFetch("/api/brain/context", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: world.title }),
+      });
+      if (res.ok) ctx = ((await res.json()) as { context?: SysCtx }).context ?? null;
+    } catch { /* 网络抖动 */ }
+
+    // 推进任务阶段同步（聊天中启动的任务在任务中心可见）；ctx 失败时保留旧值（防误释放运行锁）
+    if (ctx) setAdvancePhase(ctx.advanceTaskRunning ? (ctx.advancePhase ?? "推进中") : "");
+
+    // 快照不可靠（auto/ctx 任一失败）→ 只更新展示，不判定变化（prev 不推进，防误报状态转移）
+    if (!auto || !ctx) return;
+    const prev = prevSysRef.current;
+    const now = {
+      written: auto.written ?? 0,
+      autoRunning: ctx.autoRunning ?? false,
+      autoPhase: auto.phase ?? "",
+      advanceRunning: ctx.advanceTaskRunning ?? false,
+      advanceStartedAt: ctx.advanceStartedAt ?? null,
+    };
+
+    if (prev) {
+      const notes: { id: string; text: string }[] = [];
+      let worldDirty = false;
+      // 连载：已写章数前进 → 刷新 world（新章出现）+ 通知聊天
+      if (now.autoRunning && now.written > prev.written) {
+        worldDirty = true;
+        notes.push({ id: `auto-ch${now.written}`, text: `自动连载已提交第 ${now.written} 章${now.autoPhase ? `（${now.autoPhase}）` : ""}` });
+      }
+      // 连载：running → 终态（paused/stopped/done）——eventId 用 updatedAt（并发重判定时服务端幂等去重）
+      if (prev.autoRunning && !now.autoRunning) {
+        worldDirty = true;
+        const status = auto.status;
+        const phaseText = auto.phase ?? "";
+        if (status === "paused") {
+          setShowAutoPanel(true);
+          notes.push({ id: `auto-paused-${auto.updatedAt ?? prev.written}`, text: `自动连载已暂停：${phaseText || "审查未通过"}` });
+        } else {
+          notes.push({ id: `auto-ended-${auto.updatedAt ?? prev.written}`, text: `自动连载已结束：${phaseText || (status === "stopped" ? "已手动停止" : "已完成")}` });
+        }
+      }
+      // 连载：空闲 → running（聊天中/其他入口启动，本页发现）→ 打开连载控制台 + 通知
+      if (!prev.autoRunning && now.autoRunning) {
+        setShowAutoPanel(true);
+        notes.push({ id: `auto-started-${auto.startedAt ?? prev.written}`, text: `自动连载已开始${now.autoPhase ? `：${now.autoPhase}` : ""}` });
+      }
+      // 推进任务：running → 结束 → 刷新 world + 通知（eventId 用任务启动时间，每个任务唯一：并发重判定同 id 服务端去重、不同任务不互吞）
+      if (prev.advanceRunning && !now.advanceRunning) {
+        worldDirty = true;
+        notes.push({ id: `advance-ended-${prev.advanceStartedAt ?? prev.written}`, text: "推进任务已完成，正文已更新" });
+      }
+      if (worldDirty) void refreshWorld();
+      for (const n of notes) void injectSystemNote(n.id, n.text);
+    }
+    prevSysRef.current = now;
+  }
+
+  /** 统一系统状态轮询：打开小说常驻 3s（长期停留页面也同步连载/任务/系统状态），离开页面停止 */
+  function startSysPoll() {
+    stopSysPoll();
+    sysPollRef.current = setInterval(() => void pollSysStateOnce(), 3000);
+  }
+  function stopSysPoll() {
+    if (sysPollRef.current) {
+      clearInterval(sysPollRef.current);
+      sysPollRef.current = null;
     }
   }
-  // 卸载时停止轮询（任务在服务端继续运行，不受页面影响）
-  useEffect(() => () => stopAutoPoll(), []);
+  // 卸载时停止轮询（任务在服务端继续运行，不受页面影响）；mountedRef 防卸载后 SSE finally 重建轮询泄漏
+  const mountedRef = useRef(true);
+  useEffect(() => () => { mountedRef.current = false; stopSysPoll(); }, []);
 
-  // 打开小说 / 刷新恢复：检查未完成会话（running → 控制台+轮询；paused → 控制台）
+  // 打开小说 / 刷新恢复：启动统一状态轮询（常驻同步），并检查未完成会话（running/paused → 连载控制台）
   useEffect(() => {
     if (!world || autoCheckedRef.current === world.title) return;
     autoCheckedRef.current = world.title;
+    prevSysRef.current = null; // 重置变化检测基线（切书防串书误报：书 A 连载结束判定不能注入书 B）
+    startSysPoll();
     void (async () => {
       const s = await fetchAutoStatus();
       if (!s) return;
-      if (s.status === "running" || s.status === "paused") {
-        setShowAutoPanel(true);
-        if (s.status === "running") startAutoPoll();
-      }
+      if (s.status === "running" || s.status === "paused") setShowAutoPanel(true);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [world]);
@@ -1758,7 +1856,7 @@ const Home: React.FC<HomeProps> = (props) => {
     setAutoRunning(true);
     setBusy(true);
     setLiveDraft("");
-    stopAutoPoll(); // 本页 SSE 直连，无需轮询
+    stopSysPoll(); // 本页 SSE 直连，无需轮询
     void fetchAutoStatus(); // 运行前同步会话基础数据（控制台可用）
     let interrupted = false;
     try {
@@ -1804,8 +1902,7 @@ const Home: React.FC<HomeProps> = (props) => {
           if (ev.phase === "auto-done" && ev.report) report = ev.report;
         }
       }
-      await refreshWorld();
-      await fetchAutoStatus();
+      await refreshAllStates();
       const reasonText: Record<string, string> = {
         done: "已完成目标章数", complete: "全书完结", stopped: "已手动停止",
         interrupted: "被干预打断", score: "评分熔断（连续低分）", quota: "额度/限流暂停", error: "连续失败暂停", review: "审查未通过暂停",
@@ -1826,6 +1923,7 @@ const Home: React.FC<HomeProps> = (props) => {
       setBusy(false);
       setBusyPhase("");
       setLiveDraft("");
+      if (mountedRef.current) startSysPoll(); // SSE 断开：恢复统一轮询兜底同步（后台可能仍在续跑；卸载后不再重建）
     }
   }
 
@@ -1865,7 +1963,7 @@ const Home: React.FC<HomeProps> = (props) => {
         body: JSON.stringify({ title: world.title }),
       });
     } catch { /* 清理失败不打扰 */ }
-    stopAutoPoll();
+    stopSysPoll();
     setAutoSession(null);
     setAutoPending(null);
     setShowAutoPanel(false);
@@ -2584,7 +2682,7 @@ const Home: React.FC<HomeProps> = (props) => {
           onClose={() => setShowBrainCabin(false)}
           world={world}
           brainState={brainState}
-          onWorldUpdate={() => { void refreshWorld(); }}
+          onWorldUpdate={() => { void refreshAllStates(); }}
           onProposalTalk={() => savePropClosed(false)}
           onOpenPanel={handleOpenPanel}
           currentChapter={shownChapter ? {
@@ -2596,6 +2694,7 @@ const Home: React.FC<HomeProps> = (props) => {
           } : null}
           autoRunning={autoRunning}
           buildingStage={buildingStage}
+          sysTick={sysTick}
         />
       )}
 
@@ -2605,7 +2704,7 @@ const Home: React.FC<HomeProps> = (props) => {
           title={world.title}
           session={autoSession}
           pending={autoPending}
-          advancePhase={busyPhase}
+          advancePhase={busyPhase || advancePhase}
           advanceBusy={busy && !autoRunning}
           buildingStage={buildingStage}
           autoRunning={autoRunning}

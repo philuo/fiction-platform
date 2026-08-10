@@ -3967,6 +3967,16 @@ html { scroll-behavior: smooth; }
 }
 .bc-msg-brain .bc-msg-text { background: var(--paper-dark); border: 1px solid var(--line); color: var(--ink); border-top-left-radius: 0.1rem; }
 .bc-msg-user .bc-msg-text { background: var(--ink); color: var(--paper); border-top-right-radius: 0.1rem; }
+/* 系统事件消息（kind="system"）：灰色系统条，无头像，与 AI 回复视觉区分 */
+.bc-msg-system { align-items: center; }
+.bc-msg-system .bc-msg-content { max-width: 100%; }
+.bc-msg-system-ico { font-size: 0.72rem; color: var(--ink-soft); flex-shrink: 0; }
+.bc-msg-system-text {
+  display: inline-block; padding: 0.3rem 0.7rem; border-radius: 0.4rem;
+  font-size: 0.76rem; line-height: 1.55; color: var(--ink-soft);
+  background: transparent; border: 1px dashed var(--line); border-left: 3px solid var(--line-strong);
+  white-space: pre-wrap; word-break: break-word;
+}
 .bc-cursor { animation: bcBlink 0.8s infinite; color: var(--seal); }
 @keyframes bcBlink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 .bc-msg-brain .brain-core { flex-shrink: 0; margin-top: 0.1rem; }

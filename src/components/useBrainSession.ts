@@ -22,6 +22,8 @@ export type ChatMessage = {
   pending?: boolean;
   /** 被中断（可重新生成/编辑） */
   interrupted?: boolean;
+  /** 系统事件消息（kind="system"）：系统状态变化自动注入，前端灰色系统条渲染 */
+  kind?: "system";
   at: string;
 };
 
@@ -48,6 +50,7 @@ export type BrainSessionDetail = {
     cards?: BrainCard[];
     pending?: boolean;
     interrupted?: boolean;
+    kind?: "system";
     at: number;
   }[];
   streaming: boolean;
@@ -80,6 +83,7 @@ function toDisplayMsg(m: BrainSessionDetail["messages"][number]): ChatMessage {
     cards: m.cards,
     pending: m.pending,
     interrupted: m.interrupted,
+    kind: m.kind,
     at: new Date(m.at).toISOString(),
   };
 }
@@ -375,7 +379,8 @@ export function useBrainSession(title: string) {
   }, [title, patchMsg, patchStreaming, setThinkingFor, refreshList, alignMsgId]);
 
   /** 展示某会话（缓存命中即时；未命中从服务端拉详情；streaming 会话自动 resume 续流）。
-   *  ctx：resume 续流时透传前端上下文（选中章），供服务端意图识别参数提取兜底（需求 1/2）。 */
+   *  ctx：resume 续流时透传前端上下文（选中章），供服务端意图识别参数提取兜底（需求 1/2）。
+   *  force=true：强制重拉详情并覆盖缓存（系统事件注入/外部状态变化后同步最新消息，跳过缓存短路）。 */
   const openSession = useCallback(async (id: string, ctx?: {
     chapterIndex?: number | null;
     chapterTitle?: string | null;
@@ -388,12 +393,12 @@ export function useBrainSession(title: string) {
     activity?: string | null;
     autoRunning?: boolean;
     server?: Record<string, unknown>;
-  }) => {
+  }, force?: boolean) => {
     setActive(id);
     setMessages(cacheRef.current.get(id) ?? []);
     setStreaming(abortRef.current.has(id));
     setCompleted(completedRef.current.get(id) ?? new Set()); // 本会话已有完成记录：立即恢复
-    if (cacheRef.current.has(id)) return; // 已有缓存：即时展示，不重复拉取/续流
+    if (!force && cacheRef.current.has(id)) return; // 已有缓存：即时展示，不重复拉取/续流
     try {
       const res = await apiFetch("/api/brain/sessions/detail", {
         method: "POST",
@@ -418,11 +423,18 @@ export function useBrainSession(title: string) {
       // 否则每次打开弹窗/切换会话都会意外发起聊天请求。
       const last = msgs[msgs.length - 1];
       const lastUser = [...msgs].reverse().find((m) => m.role === "user");
-      if (last && last.role === "brain" && last.pending && lastUser && !abortRef.current.has(id)) {
+      if (!force && last && last.role === "brain" && last.pending && lastUser && !abortRef.current.has(id)) {
         void send({ prompt: lastUser.text ?? "", sessionId: id, resume: true, ctx });
       }
     } catch { /* 静默 */ }
   }, [title, send]);
+
+  /** 强制重拉当前 active 会话详情（系统事件注入到最近会话后，聊天舱实时同步显示） */
+  const reloadActive = useCallback(async () => {
+    const id = activeIdRef.current;
+    if (!id) return;
+    await openSession(id, undefined, true);
+  }, [openSession]);
 
   /**
    * 新建会话（前端预生成 id，服务端按 id 创建；可带首条 prompt）。
@@ -566,6 +578,7 @@ export function useBrainSession(title: string) {
     reconnecting,
     completed,
     markCompleted,
+    reloadActive,
     isStreaming: (id: string) => abortRef.current.has(id),
   };
 }
