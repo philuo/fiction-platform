@@ -378,6 +378,36 @@ export const BrainCabin: React.FC<{
   const writingTimerRef = useRef<number | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // —— 打字机渲染（流式感）：上游推理模型思考期零输出、完成后一次性吐出，React 批处理会让文本
+  // 一次性全部出现（无流式感）。此处对 pending 消息按固定节奏 reveal 文本，无论上游/批处理多快
+  // 都保持平滑逐字显示；msg.text 数据层保持完整累积（刷新/复制/折叠等不受影响）。
+  // 非 pending（done/interrupted）直接显示全文，不经过打字机。
+  const TYPING_TICK_MS = 24;
+  const TYPING_CHARS = 3; // 每 tick reveal 字符数（≈125 字/s，长回复 ~10-20s 显示完）
+  const [reveal, setReveal] = useState<Record<string, number>>({});
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  useEffect(() => {
+    const t = setInterval(() => {
+      setReveal((prev) => {
+        const next: Record<string, number> = {};
+        let changed = false;
+        for (const m of messagesRef.current) {
+          if (m.role !== "brain") continue;
+          if (!m.pending) { if (prev[m.id] != null) changed = true; continue; } // done 消息清理 reveal
+          const len = m.text?.length ?? 0;
+          if (!len) continue; // 思考期无文本：保持骨架
+          const cur = prev[m.id] ?? 0;
+          const nv = cur >= len ? len : Math.min(len, cur + TYPING_CHARS);
+          next[m.id] = nv;
+          if (nv !== cur) changed = true;
+        }
+        return changed ? next : prev;
+      });
+    }, TYPING_TICK_MS);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // 面板宽度：左侧边缘可拖拽改宽（localStorage 记住；窄屏忽略存储宽度强制全宽）
   const MIN_PANEL_W = 320, MAX_PANEL_W = 760;
   const [panelWidth, setPanelWidth] = useState<number | null>(() => {
@@ -483,11 +513,13 @@ export const BrainCabin: React.FC<{
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const key = `${messages.length}:${messages[messages.length - 1]?.text?.length ?? 0}:${thinking}`;
+    const last = messages[messages.length - 1];
+    // reveal 纳入滚动 key：打字机逐字 reveal（独立 state，messages 不变）时滚动跟随文本生长
+    const key = `${messages.length}:${last?.text?.length ?? 0}:${last?.id != null ? (reveal[last.id] ?? 0) : 0}:${thinking}`;
     if (key === lastScrollKeyRef.current) return;
     lastScrollKeyRef.current = key;
     if (stickBottomRef.current) el.scrollTop = el.scrollHeight;
-  }, [messages, thinking]);
+  }, [messages, thinking, reveal]);
   useEffect(() => { if (open) stickToBottom(); }, [open, activeId]);
 
   function appendBrainMsg(cards: BrainCard[]) {
@@ -704,6 +736,8 @@ export const BrainCabin: React.FC<{
             const longText = shouldFoldLongText(msg);
             const hasConfirm = (msg.cards ?? []).some((c) => c.kind === "confirm");
             const folded = (collapsible || longText) && !msg.pending && !hasConfirm && !expandedMsgs.has(msg.id);
+            // 打字机显示：pending 消息按 reveal 节奏显示（流式感），非 pending 显示完整文本
+            const shownText = msg.pending ? (msg.text ?? "").slice(0, reveal[msg.id] ?? 0) : (msg.text ?? "");
             // 滚动吸附：每条用户提问 sticky 吸顶（CSS 处理），当前视口内 AI 回复对应的提问自然吸附在顶部
             return (
             <div key={msg.id} className={`bc-msg bc-msg-${msg.role}`}>
@@ -717,12 +751,12 @@ export const BrainCabin: React.FC<{
                   </button>
                 ) : (
                   <>
-                {msg.role === "brain" && msg.pending && !msg.text && (
+                {msg.role === "brain" && msg.pending && !shownText && (
                   <ThinkingSkeleton />
                 )}
-                {msg.text ? (
+                {shownText ? (
                   <div className={`bc-msg-text${msg.pending ? " bc-typing" : ""}`}>
-                    <MarkdownView text={msg.text} />
+                    <MarkdownView text={shownText} />
                     {msg.pending && <span className="bc-cursor">▋</span>}
                   </div>
                 ) : null}

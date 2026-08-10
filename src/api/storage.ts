@@ -210,6 +210,15 @@ export function saveWorld(w: WorldState): string {
   const path = join(dir, "state.json");
   if (existsSync(path)) copyFileSync(path, join(dir, "state.json.bak"));
   w.updatedAt = new Date().toISOString();
+  // cover 保留保护：封面由并发 fire-and-forget 任务（ensureCover）在锁内写盘，而后续基于内存对象
+  // （无 cover 字段）的 saveWorld 全量覆盖会丢失封面——如立项段 2 newStoryEnhance 覆盖 ensureCover 刚写入的 cover。
+  // w.cover 为空且磁盘已有封面时保留磁盘值（cover 只增不删：生成/上传/替换，无删除操作，保留安全）。
+  if (!w.cover && existsSync(path)) {
+    try {
+      const prev = JSON.parse(readFileSync(path, "utf-8")) as WorldState;
+      if (prev.cover) w.cover = prev.cover;
+    } catch { /* 保留保护尽力而为 */ }
+  }
   // versions 外置：序列化副本中用 versionFiles 替换 versions
   const snapshot = {
     ...w,

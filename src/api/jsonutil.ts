@@ -151,7 +151,22 @@ export function validateJsonSchema(value: unknown, schema: JsonSchema, path = "$
 
 // —— JSON 输出重试：LLM 输出不合法 JSON 或不符合 schema 时，回填上次输出并要求修复（最多 1 次重试） ——
 import type { ChatMessage } from "./agnes";
-import { chatStream } from "./agnes";
+import { chat, chatStream, isRetryableError } from "./agnes";
+
+/** 单次 JSON 生成调用：流式优先（长任务流式聚合，规避非流式网关 504）。
+ * 但 tokenrhythm 等上游对流式有 ~30s 无首字节断开（ECONNRESET，推理模型思考期常见）——
+ * 流式失败（可重试网络错误）时降级非流式 chat 兜底（非流式 504 同样走其内部重试），最大化成功率。 */
+async function jsonCallOnce(msgs: ChatMessage[], opts: ChatJsonOpts): Promise<string> {
+  try {
+    return await chatStream(msgs, () => {}, opts);
+  } catch (e) {
+    if (isRetryableError(e)) {
+      console.warn(`[jsonutil] 流式调用失败，降级非流式 chat 兜底: ${(e as Error).message.slice(0, 120)}`);
+      return await chat(msgs, opts);
+    }
+    throw e;
+  }
+}
 
 const JSON_FIX_RULE =
   "要求：只输出一个以 { 开头、以 } 结尾的合法 JSON 对象（不要 markdown 围栏，不要用英文引号包裹整个输出，不要输出任何解释、前缀或后缀文字）；字符串值内部一律使用中文引号「」或『』，禁止在字符串里使用英文双引号（\"）。";
@@ -180,8 +195,9 @@ export async function chatJson<T>(
   let msgs = opts.schema ? injectSchema(messages, opts.schema) : messages;
   for (let attempt = 0; attempt < 2; attempt++) {
     // 流式聚合（chatStream）替代非流式 chat：流式持续返回数据，避开上游网关对长时非流式请求的空闲超时（504）——
-    // 审查/记账/评估等 JSON 任务耗时可达数分钟，非流式极易被网关切断
-    const raw = await chatStream(msgs, () => {}, opts);
+    // 审查/记账/评估等 JSON 任务耗时可达数分钟，非流式极易被网关切断。
+    // 流式失败（ECONNRESET 等）由 jsonCallOnce 降级非流式兜底（见上）
+    const raw = await jsonCallOnce(msgs, opts);
     let parsed: T;
     try {
       parsed = extractJson<T>(raw);

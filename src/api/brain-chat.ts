@@ -735,6 +735,48 @@ export const brainChatDeps = {
 
 /** 纯对话回复：真流式（chatStream 逐 delta），每 500ms 节流落盘一次。
  *  注入世界摘要 + 系统快照：纯对话也能感知当前世界状态与系统时机（中枢全知）。 */
+
+/**
+ * 流式整形器：把上游"聚合式流式"（tokenrhythm 网关思考完成后一次性推 34-101KB 巨块）拆成
+ * 稳定的 4 字符/30ms 小增量，让前端逐 delta 独立渲染（真流式感）。
+ * - 上游慢速（相邻 delta 间隔 > tickMs）：每次 push 无 pending timer → 立即转发，不人为延迟；
+ * - 上游巨块同步连发：首分片立即发，剩余按 tickMs 节奏逐片发，避免同步连发被 React 批处理合并为一次渲染；
+ * - drain()：回合结束 flush 剩余分片（数据完整性）。
+ */
+export function createStreamShaper(
+  emit: (text: string) => void,
+  charsPerTick = 4,
+  tickMs = 30,
+): { push: (text: string) => void; drain: () => void } {
+  let queue = "";
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const tick = () => {
+    timer = null;
+    const take = queue.slice(0, charsPerTick);
+    queue = queue.slice(take.length);
+    if (take) emit(take);
+    if (queue) timer = setTimeout(tick, tickMs);
+  };
+  return {
+    push(text: string) {
+      if (!text) return;
+      queue += text;
+      if (!timer) tick(); // 无 pending 节奏时立即发一分片；否则按 tickMs 节奏续发
+    },
+    drain() {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      while (queue) {
+        const take = queue.slice(0, charsPerTick);
+        queue = queue.slice(take.length);
+        if (take) emit(take);
+      }
+    },
+  };
+}
+
 async function streamChatReply(ctx: BrainChatContext, messageId: string): Promise<void> {
   const { title, sessionId, prompt, send, signal, ctx: snap } = ctx;
   let acc = "";
@@ -758,6 +800,8 @@ async function streamChatReply(ctx: BrainChatContext, messageId: string): Promis
     }
   } catch { /* 世界读取失败：仅用 prompt 兜底 */ }
   const userContent = worldCtx ? `当前世界与系统状态：\n${worldCtx}\n\n用户问题：${prompt}` : prompt;
+  // 流式整形：上游聚合吐巨块 → 按 4字符/30ms 节奏推给前端（真流式感，防同步连发被 React 批处理合并）
+  const shaper = createStreamShaper((text) => send({ type: "delta", messageId, text, append: true }));
   await brainChatDeps.chatStream(
     [
       { role: "system", content: CHAT_SYSTEM },
@@ -765,8 +809,7 @@ async function streamChatReply(ctx: BrainChatContext, messageId: string): Promis
     ],
     (delta) => {
       acc += delta;
-      // 增量块（append:true）：前端拼接而非替换——避免每块重传累积全文导致传输体积线性膨胀（长文本后期卡顿）
-      send({ type: "delta", messageId, text: delta, append: true });
+      shaper.push(delta);
       const now = Date.now();
       if (now - lastFlush > 500) {
         lastFlush = now;
@@ -777,6 +820,7 @@ async function streamChatReply(ctx: BrainChatContext, messageId: string): Promis
     },
     { ...taskOpts("brainGate"), signal, temperature: 0.7, maxTokens: 20000, retries: 2 },
   );
+  shaper.drain(); // flush 剩余分片（数据完整性）
   updateMessageText(title, sessionId, messageId, acc, true);
 }
 
