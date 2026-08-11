@@ -999,15 +999,19 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             }, { commitPolicy: genOf(w).commitPolicy ?? "auto" });
           });
           completeAdvanceTask(title, { chapterIndex: result.chapter.index, verdict: result.review?.verdict, rounds: result.rounds });
+          // 推进完成广播：前端据此清 advancePhase 释放运行锁（阶段 5 轮询降级后不再靠轮询清）
+          publishSync({ type: "task-status", title, kind: "advance", id: String(result.chapter.index), status: "done", at: Date.now(), user: currentUser() ?? undefined });
           send({ phase: "result", result: { chapter: result.chapter, review: result.review, rounds: result.rounds } });
         } catch (e) {
           // commitPolicy=confirm：审查通过后暂存待人工确认（非错误，前端弹确认条）
           if (e instanceof director.PendingCommitError) {
             completeAdvanceTask(title, { chapterIndex: e.chapterIndex, verdict: e.review?.verdict, rounds: e.review?.round, pendingCommit: true });
+            publishSync({ type: "task-status", title, kind: "advance", id: String(e.chapterIndex), status: "pending-commit", at: Date.now(), user: currentUser() ?? undefined });
             send({ phase: "pending-commit", chapterIndex: e.chapterIndex, review: e.review });
             return;
           }
           failAdvanceTask(title, e instanceof AppError ? e.message : "推进失败，请重试");
+          publishSync({ type: "task-status", title, kind: "advance", status: "failed", error: e instanceof AppError ? e.message : "推进失败", at: Date.now(), user: currentUser() ?? undefined });
           throw e;
         }
       });

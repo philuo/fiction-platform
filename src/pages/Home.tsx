@@ -669,7 +669,12 @@ const Home: React.FC<HomeProps> = (props) => {
   useSyncChannel({
     title: world?.title ?? null,
     onWorldChanged: (e) => { void refreshWorld(e.regions); },
-    onTaskStatus: () => { void refreshWorld(); },
+    onTaskStatus: (e) => {
+      // 推进任务完成广播（kind:"advance"）→ 清 advancePhase 释放运行锁（覆盖底部按钮/聊天/多 tab 发起路径；
+      // 轮询降级后此广播是唯一不依赖本页 SSE 的释放通道）
+      if (e.kind === "advance") setAdvancePhase("");
+      void refreshWorld(e.kind === "advance" ? ["U03", "U06", "U08", "U10"] : undefined);
+    },
     onAutoStatus: () => { void fetchAutoStatus(); },
     onBrainNote: () => setSysTick((t) => t + 1),
     onCardUpdate: (e) => cardPatchRef.current?.(e),
@@ -707,6 +712,7 @@ const Home: React.FC<HomeProps> = (props) => {
     stopAdvanceRestorePolling();
     setBusy(false);
     setBusyPhase("");
+    setAdvancePhase(""); // 修复：恢复任务结束同样清 advancePhase（轮询降级后无兜底）
     setLiveDraft("");
     await clearAdvanceTaskFile(storyTitle);
     if (task.status === "failed") {
@@ -866,6 +872,9 @@ const Home: React.FC<HomeProps> = (props) => {
     } finally {
       setBusy(false);
       setBusyPhase("");
+      // 修复：SSE 直连结束必须同步清 advancePhase（推进期间轮询会置它；阶段 5 轮询降级后
+      // 不再有轮询兜底清空，残留会卡死运行锁 taskActive → 按钮永久 loading 直到刷新）
+      setAdvancePhase("");
     }
   }
 

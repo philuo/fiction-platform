@@ -217,3 +217,18 @@ describe("saveWorld → 事件总线 → WS 广播（真实链路集成）", () 
     ws.close();
   });
 });
+
+describe("task-status advance 广播（推进完成释放运行锁，bug 修复）", () => {
+  test("publishSync task-status(kind:advance) → 广播到频道（前端清 advancePhase 依据）", async () => {
+    const { publishSync } = await import("../src/api/sync");
+    const { ws, waitFor } = await connectWs("sync_ws_user");
+    ws.send(JSON.stringify({ type: "subscribe", title: "sync-ws-world" }));
+    await waitFor((m) => m.type === "subscribed");
+
+    publishSync({ type: "task-status", title: "sync-ws-world", kind: "advance", id: "1", status: "done", at: Date.now(), user: "sync_ws_user" });
+    const evt = await waitFor((m) => m.type === "task-status");
+    expect(evt.kind).toBe("advance");
+    expect(evt.status).toBe("done");
+    ws.close();
+  });
+});
