@@ -54,6 +54,15 @@ export type SyncEvent = {
       text: string;
       at: number;
     }
+  | {
+      type: "card-update";
+      title: string;
+      sessionId: string;
+      messageId: string;
+      cardId: string;
+      patch: Record<string, unknown>;
+      at: number;
+    }
 );
 
 // ============ 订阅注册 ============
@@ -146,4 +155,18 @@ export function notifyWorldSaved(title: string, reason = "save", user?: string):
   const version = (worldVersions.get(key) ?? 0) + 1;
   worldVersions.set(key, version);
   publishSync({ type: "world-changed", title, version, reason, at: Date.now(), user });
+}
+
+/** 卡片就地更新事件发布（阶段 3a）：updateMessageCard 命中后调用。
+ *  按 sessionId+messageId+cardId 节流（同卡连续更新合并为最新 patch）。 */
+export function publishCardUpdate(
+  title: string,
+  sessionId: string,
+  messageId: string,
+  cardId: string,
+  patch: Record<string, unknown>,
+  user?: string,
+): void {
+  if (listeners.size === 0) return;
+  publishSync({ type: "card-update", title, sessionId, messageId, cardId, patch, at: Date.now(), user });
 }

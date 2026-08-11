@@ -65,23 +65,24 @@ afterAll(() => {
 const tick = (ms = 0) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** 测试壳：把 hook 暴露出来断言 */
-function Harness(props: { title: string | null; log: (e: string) => void; onReconnected?: () => void; onBrainNote?: (e: SyncChannelEvent & { type: "brain-note" }) => void }) {
+function Harness(props: { title: string | null; log: (e: string) => void; onReconnected?: () => void; onBrainNote?: (e: SyncChannelEvent & { type: "brain-note" }) => void; onCardUpdate?: (e: SyncChannelEvent & { type: "card-update" }) => void }) {
   const { connected } = useSyncChannel({
     title: props.title,
     onWorldChanged: () => props.log("world-changed"),
     onAutoStatus: () => props.log("auto-status"),
     onTaskStatus: () => props.log("task-status"),
     onBrainNote: (e) => props.onBrainNote?.(e),
+    onCardUpdate: (e) => props.onCardUpdate?.(e),
     onReconnected: () => { props.onReconnected?.(); props.log("reconnected"); },
   });
   return React.createElement("div", { "data-connected": String(connected) });
 }
 
-function mountHarness(title: string | null, log: (e: string) => void, onReconnected?: () => void, onBrainNote?: (e: SyncChannelEvent & { type: "brain-note" }) => void): { root: Root; el: HTMLElement } {
+function mountHarness(title: string | null, log: (e: string) => void, onReconnected?: () => void, onBrainNote?: (e: SyncChannelEvent & { type: "brain-note" }) => void, onCardUpdate?: (e: SyncChannelEvent & { type: "card-update" }) => void): { root: Root; el: HTMLElement } {
   const mount = document.createElement("div");
   document.body.appendChild(mount);
   const root = createRoot(mount);
-  root.render(React.createElement(Harness, { title, log, onReconnected, onBrainNote }));
+  root.render(React.createElement(Harness, { title, log, onReconnected, onBrainNote, onCardUpdate }));
   return { root, el: mount };
 }
 
@@ -132,9 +133,9 @@ test("world-changed 分发 + 版本去重（旧版本忽略，更新版本触发
   root.unmount();
 });
 
-test("auto-status / task-status / brain-note 分发到对应回调", async () => {
+test("auto-status / task-status / brain-note / card-update 分发到对应回调", async () => {
   const log: string[] = [];
-  const { root } = mountHarness("书C", (e) => log.push(e), undefined, (e) => log.push("note:" + e.eventId));
+  const { root } = mountHarness("书C", (e) => log.push(e), undefined, (e) => log.push("note:" + e.eventId), (e) => log.push("card:" + e.cardId));
   await afterMount();
   const ws = FakeWebSocket.instances[0];
   ws.open();
@@ -142,8 +143,9 @@ test("auto-status / task-status / brain-note 分发到对应回调", async () =>
   ws.emit({ type: "auto-status", title: "书C", status: "paused", phase: "已暂停", at: Date.now() });
   ws.emit({ type: "task-status", title: "书C", kind: "media", id: "m1", status: "ready", at: Date.now() });
   ws.emit({ type: "brain-note", title: "书C", eventId: "auto-ch1", text: "连载已提交第 1 章", at: Date.now() });
+  ws.emit({ type: "card-update", title: "书C", sessionId: "s1", messageId: "m1", cardId: "card-media-1", patch: { status: "ready" }, at: Date.now() });
   await tick(20);
-  expect(log).toEqual(["auto-status", "task-status", "note:auto-ch1"]);
+  expect(log).toEqual(["auto-status", "task-status", "note:auto-ch1", "card:card-media-1"]);
   root.unmount();
 });
 

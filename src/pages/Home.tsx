@@ -1,6 +1,6 @@
 // 主界面：启动页（立项）→ 创作游戏界面（日式报纸 HUD + 完整控制面板）
 // 交互：立项一句话 / 指令输入 / 抽卡筛选 / 世界观·设定·角色·大纲编辑 / 章节段落编辑 / 推进
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSyncChannel } from "../components/useSyncChannel";
 import { AlertTriangle, BookMarked, BookOpen, ChevronDown, Dices, History, List, LogOut, MoreHorizontal, PenLine, Play, RefreshCw, Search, Sparkles, Trash2, Users, Video, Wand2, X } from "../components/icons";
 import type { Card, Chapter, ChapterMedia, Character, LoreEntry, ReviewResult, WorldPatch, WorldState } from "../api/world";
@@ -653,12 +653,19 @@ const Home: React.FC<HomeProps> = (props) => {
   // task-status → 刷新世界（任务完成已落盘，无需再查系统状态——局部更新省一次 /api/brain/context）；
   // auto-status → 连载会话；brain-note → 系统事件已注入聊天，sysTick 递增让 BrainCabin 重拉（多 tab 一致）；
   // 重连成功 → 全量补偿一次（事件可能错过）。
+  // 卡片就地更新注册（阶段 3a）：BrainCabin 挂载时注册 patch 处理器；card-update 事件经此转发（聊天舱关闭时事件丢弃，重开拉服务端最新）
+  const cardPatchRef = useRef<((e: { sessionId: string; messageId: string; cardId: string; patch: Record<string, unknown> }) => void) | null>(null);
+  const registerCardPatch = useCallback((fn: (e: { sessionId: string; messageId: string; cardId: string; patch: Record<string, unknown> }) => void) => {
+    cardPatchRef.current = fn;
+  }, []);
+
   useSyncChannel({
     title: world?.title ?? null,
     onWorldChanged: () => { void refreshWorld(); },
     onTaskStatus: () => { void refreshWorld(); },
     onAutoStatus: () => { void fetchAutoStatus(); },
     onBrainNote: () => setSysTick((t) => t + 1),
+    onCardUpdate: (e) => cardPatchRef.current?.(e),
     onReconnected: () => { void refreshAllStates(); },
   });
 
@@ -2710,6 +2717,7 @@ const Home: React.FC<HomeProps> = (props) => {
           autoRunning={autoRunning}
           buildingStage={buildingStage}
           sysTick={sysTick}
+          registerCardPatch={registerCardPatch}
         />
       )}
 

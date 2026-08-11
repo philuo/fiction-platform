@@ -25,6 +25,7 @@ import {
   markStreaming,
   registerSessionTask,
   truncateSession,
+  updateMessageCard,
   updateMessageText,
 } from "../src/api/brain-sessions";
 
@@ -209,6 +210,38 @@ describe("卡片操作完成标记（markSessionCompleted）与 resume 定位工
     const mid2 = getSession(TITLE, s.id)!;
     expect(lastPendingMessage(mid2)).toBeNull(); // interrupted 不再是 pending
     expect(lastIncompleteMessage(mid2)?.id).toBe("a1"); // 但仍是未完成（可 resume）
+  });
+
+  test("updateMessageCard：按 cardId 就地更新卡片并落盘；无 cardId/不匹配 → false 且不破坏", () => {
+    const s = createSession(TITLE, "卡片更新测试");
+    sessionIds.push(s.id);
+    appendMessage(TITLE, s.id, { id: "u1", role: "user", text: "生成插画", at: Date.now() });
+    appendMessage(TITLE, s.id, {
+      id: "a1", role: "assistant", text: "已创建任务", at: Date.now(),
+      cards: [
+        { kind: "result", title: "任务", success: true, detail: "生成中", cardId: "card-media-1" },
+        { kind: "browse", title: "无 id 卡", browseType: "media", data: {} }, // 无 cardId（旧卡兼容）
+      ],
+    });
+    // 命中 cardId → 就地合并 patch（保留 cardId）
+    const hit = updateMessageCard(TITLE, s.id, "a1", "card-media-1", { detail: "已完成", success: false });
+    expect(hit).toBe(true);
+    const updated = getSession(TITLE, s.id)!;
+    const card = updated.messages[1].cards![0] as { cardId?: string; detail?: string; title?: string; success?: boolean };
+    expect(card.detail).toBe("已完成");
+    expect(card.success).toBe(false);
+    expect(card.cardId).toBe("card-media-1"); // 保留
+    expect(card.title).toBe("任务"); // 未 patch 字段保留
+    // 无 cardId 的卡不更新
+    const hit2 = updateMessageCard(TITLE, s.id, "a1", "card-media-1", { detail: "再改" });
+    expect(hit2).toBe(true);
+    // 不匹配 cardId → false 且卡片数组不变
+    const before = JSON.stringify(getSession(TITLE, s.id)!.messages[1].cards);
+    const miss = updateMessageCard(TITLE, s.id, "a1", "no-such-card", { detail: "x" });
+    expect(miss).toBe(false);
+    expect(JSON.stringify(getSession(TITLE, s.id)!.messages[1].cards)).toBe(before);
+    // 消息不存在 → false
+    expect(updateMessageCard(TITLE, s.id, "nomsg", "card-media-1", {})).toBe(false);
   });
 });
 

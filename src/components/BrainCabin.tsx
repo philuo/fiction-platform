@@ -326,10 +326,13 @@ export const BrainCabin: React.FC<{
   buildingStage?: string | null;
   /** 系统事件信号：Home 注入系统消息到聊天会话后递增；聊天舱内实时重拉会话（显示最新【系统】条） */
   sysTick?: number;
-}> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk, onOpenPanel, currentChapter, autoRunning, buildingStage, sysTick = 0 }) => {
+  /** 卡片就地更新注册（阶段 3a）：挂载时注册 patch 处理器，Home 的 useSyncChannel 收到 card-update 后调用。
+   *  @param fn 处理器（接收 card-update 事件）；卸载时传入空函数解绑。 */
+  registerCardPatch?: (fn: (e: { sessionId: string; messageId: string; cardId: string; patch: Record<string, unknown> }) => void) => void;
+}> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk, onOpenPanel, currentChapter, autoRunning, buildingStage, sysTick = 0, registerCardPatch }) => {
   const {
     sessions, activeId, messages, streaming, thinking, reconnecting,
-    openSession, newSession, removeSession, truncate, appendMsg, send, stop, isStreaming,
+    openSession, newSession, removeSession, truncate, appendMsg, patchCard, send, stop, isStreaming,
     completed, markCompleted, reloadActive,
   } = useBrainSession(world.title);
 
@@ -550,6 +553,17 @@ export const BrainCabin: React.FC<{
     if (sysTick > 0) void reloadActive();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sysTick]);
+
+  // 卡片就地更新（阶段 3a）：card-update 事件 → 按 messageId+cardId 就地替换卡片（不重拉会话）。
+  // patchCard 是 useCallback([]) 稳定引用；每次渲染把最新 patch 处理器写入 ref，
+  // 挂载时经 registerCardPatch 注册给 Home（Home 的 useSyncChannel 收到 card-update 后调用）。
+  const patchCardRef = useRef<((e: { sessionId: string; messageId: string; cardId: string; patch: Record<string, unknown> }) => void) | null>(null);
+  patchCardRef.current = (e) => patchCard(e.sessionId, e.messageId, e.cardId, e.patch);
+  useEffect(() => {
+    if (registerCardPatch) registerCardPatch((e) => patchCardRef.current?.(e));
+    return () => { if (registerCardPatch) registerCardPatch(() => {}); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [registerCardPatch]);
 
   function appendBrainMsg(cards: BrainCard[]) {
     if (!activeId) return;

@@ -475,3 +475,20 @@ describe("system-note 路由（系统状态注入聊天记录的 HTTP 入口）"
     expect(((await noSession.json()) as { injected: boolean }).injected).toBe(false);
   });
 });
+
+describe("update-card 路由（卡片就地更新，阶段 3a）", () => {
+  test("缺参数 → 400；消息/卡片不存在 → updated:false（不广播、不崩溃）", async () => {
+    cookieA = await register("e2e_uc_" + Math.random().toString(36).slice(2, 8));
+    const sid = "e2e-uc-" + Math.random().toString(36).slice(2, 8);
+    const create = await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "生成插画" }, cookieA);
+    expect(create.status).toBe(201);
+
+    // 缺参数 → 400
+    const bad = await api("/api/brain/sessions/update-card", "POST", { title: "e2e-book", sessionId: sid, messageId: "m1", cardId: "" }, cookieA);
+    expect(bad.status).toBe(400);
+    // 消息/卡片不存在 → updated:false（不广播、不崩溃）
+    const miss = await api("/api/brain/sessions/update-card", "POST", { title: "e2e-book", sessionId: sid, messageId: "no-msg", cardId: "card-x", patch: { detail: "y" } }, cookieA);
+    expect(miss.status).toBe(200);
+    expect(((await miss.json()) as { updated: boolean }).updated).toBe(false);
+  });
+});

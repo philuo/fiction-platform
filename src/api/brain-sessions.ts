@@ -268,6 +268,32 @@ export function markStreaming(title: string, sessionId: string): void {
   });
 }
 
+/** 就地更新某消息内指定卡片（阶段 3a：卡片稳定标识 cardId → 系统事件就地翻转状态/刷新数据）。
+ *  @returns 是否命中（消息不存在 / 卡片无 cardId / cardId 不匹配 → false，调用方不广播）
+ */
+export function updateMessageCard(
+  title: string,
+  sessionId: string,
+  messageId: string,
+  cardId: string,
+  patch: Record<string, unknown>,
+): boolean {
+  let hit = false;
+  mutateSession(title, sessionId, (s) => {
+    const m = s.messages.find((x) => x.id === messageId);
+    if (!m) return;
+    for (let i = 0; i < (m.cards ?? []).length; i++) {
+      const c = m.cards![i] as (BrainChatCard & { cardId?: string });
+      if (c.cardId === cardId) {
+        m.cards![i] = { ...c, ...patch, cardId }; // 保留 cardId；patch 覆盖其余字段
+        hit = true;
+        return;
+      }
+    }
+  });
+  return hit;
+}
+
 /** 会话最后一条未完成（pending=流式进行中 或 interrupted=被中断）消息；无则 null（resume 续流目标） */
 export function lastIncompleteMessage(s: BrainSession): BrainChatMsg | null {
   for (let i = s.messages.length - 1; i >= 0; i--) {

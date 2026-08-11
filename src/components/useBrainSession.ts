@@ -517,6 +517,27 @@ export function useBrainSession(title: string) {
     if (id === activeIdRef.current) setMessages([...arr]);
   }, []);
 
+  /** 就地更新某消息内指定卡片（阶段 3a）：按 cardId 替换卡片对象，不重拉会话。
+   *  由 useSyncChannel 的 card-update 事件驱动（多 tab 一致）；命中返回 true。 */
+  const patchCard = useCallback((sessionId: string, messageId: string, cardId: string, patch: Record<string, unknown>): boolean => {
+    const arr = cacheRef.current.get(sessionId);
+    if (!arr) return false;
+    let hit = false;
+    const next = arr.map((m) => {
+      if (m.id !== messageId || !m.cards?.length) return m;
+      const cards = m.cards.map((c) => {
+        if (hit || (c as { cardId?: string }).cardId !== cardId) return c;
+        hit = true;
+        return { ...c, ...patch, cardId } as typeof c; // 保留 cardId
+      });
+      return { ...m, cards };
+    });
+    if (!hit) return false;
+    cacheRef.current.set(sessionId, next);
+    if (sessionId === activeIdRef.current) setMessages(next);
+    return true;
+  }, []);
+
   /** 标记当前会话某卡片操作已完成（key：`消息id:卡片下标[:列表项id]`）。
    *  本地乐观更新（按钮即时反馈）+ 服务端持久化（刷新后恢复完成态）；POST 失败静默——仅影响刷新恢复，不阻塞操作。 */
   const markCompleted = useCallback(async (key: string) => {
@@ -572,6 +593,7 @@ export function useBrainSession(title: string) {
     removeSession,
     truncate,
     appendMsg,
+    patchCard,
     send,
     stop,
     refreshList,

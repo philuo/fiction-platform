@@ -203,4 +203,17 @@ describe("saveWorld → 事件总线 → WS 广播（真实链路集成）", () 
     expect(note.title).toBe("sync-ws-world");
     ws.close();
   });
+
+  test("publishSync card-update → 事件广播到频道（卡片就地更新链路）", async () => {
+    const { publishSync } = await import("../src/api/sync");
+    const { ws, waitFor } = await connectWs("sync_ws_user");
+    ws.send(JSON.stringify({ type: "subscribe", title: "sync-ws-world" }));
+    await waitFor((m) => m.type === "subscribed");
+
+    publishSync({ type: "card-update", title: "sync-ws-world", sessionId: "s1", messageId: "m1", cardId: "card-1", patch: { status: "ready" }, at: Date.now(), user: "sync_ws_user" });
+    const evt = await waitFor((m) => m.type === "card-update");
+    expect(evt.cardId).toBe("card-1");
+    expect((evt.patch as Record<string, unknown>).status).toBe("ready");
+    ws.close();
+  });
 });

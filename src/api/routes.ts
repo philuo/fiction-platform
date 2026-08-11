@@ -34,6 +34,7 @@ import {
   truncateSession as truncateBrainSession,
   markSessionCompleted as markBrainSessionCompleted,
   appendSystemNote as appendBrainSystemNote,
+  updateMessageCard as updateBrainMessageCard,
 } from "./brain-sessions";
 import { startAdvanceTask, updateAdvanceTaskPhase, completeAdvanceTask, failAdvanceTask, getAdvanceTaskForClient, clearAdvanceTask } from "./advancetask";
 import { migrateChapterMedia, touchChapter, genOf, type WorldState, type Character as WorldCharacter, type ChapterMedia, type ConsistencyFinding, type PendingChapter } from "./world";
@@ -631,6 +632,35 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       if (!bcTitle || !bcId || !bcKey) return json({ error: "缺少 title/id/key" }, 400);
       const ok = markBrainSessionCompleted(bcTitle, bcId, bcKey);
       return json({ ok });
+    }
+
+    case "/api/brain/sessions/update-card": {
+      // 卡片就地更新（阶段 3a）：系统事件按 cardId 就地更新已落盘卡片（任务完成翻转状态/刷新数据）。
+      // 命中后广播 card-update 事件 → 所有订阅该书连接前端就地替换卡片（多 tab 一致，无需重拉会话）。
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const ucBody = await readBody(req);
+      const ucTitle = String(ucBody.title ?? "").trim();
+      const ucSessionId = String(ucBody.sessionId ?? "").trim();
+      const ucMessageId = String(ucBody.messageId ?? "").trim();
+      const ucCardId = String(ucBody.cardId ?? "").trim();
+      const ucPatch = (ucBody.patch ?? null) as Record<string, unknown> | null;
+      if (!ucTitle || !ucSessionId || !ucMessageId || !ucCardId || !ucPatch || typeof ucPatch !== "object") {
+        return json({ error: "缺少 title/sessionId/messageId/cardId/patch" }, 400);
+      }
+      const updated = updateBrainMessageCard(ucTitle, ucSessionId, ucMessageId, ucCardId, ucPatch);
+      if (updated) {
+        publishSync({
+          type: "card-update",
+          title: ucTitle,
+          sessionId: ucSessionId,
+          messageId: ucMessageId,
+          cardId: ucCardId,
+          patch: ucPatch,
+          at: Date.now(),
+          user: currentUser() ?? undefined,
+        });
+      }
+      return json({ ok: true, updated });
     }
 
     case "/api/brain/sessions/system-note": {

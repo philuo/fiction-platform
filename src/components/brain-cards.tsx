@@ -12,7 +12,13 @@ export type CardImage = { src: string; alt?: string };
 
 export type BrainCardLevel = "L0" | "L1" | "L2" | "L3";
 
-export type PreviewCard = {
+/** 卡片公共字段（新增字段向后兼容——旧卡片无 cardId 时跳过就地更新） */
+export type BrainCardBase = {
+  /** 卡片稳定标识（阶段 3a）：系统事件可就地更新该卡（如任务完成翻转状态）；未产出则跳过更新 */
+  cardId?: string;
+};
+
+export type PreviewCard = BrainCardBase & {
   kind: "preview";
   title: string;
   commandId?: string;
@@ -25,7 +31,7 @@ export type PreviewCard = {
   image?: CardImage;
 };
 
-export type ConfirmCard = {
+export type ConfirmCard = BrainCardBase & {
   kind: "confirm";
   title: string;
   commandId?: string;
@@ -35,7 +41,7 @@ export type ConfirmCard = {
   options: ("merge" | "rewrite" | "abort")[];
 };
 
-export type ResultCard = {
+export type ResultCard = BrainCardBase & {
   kind: "result";
   title: string;
   success: boolean;
@@ -51,7 +57,7 @@ export type BrowseCardAction = {
   action: { endpoint: string; method?: string; body: Record<string, unknown> };
 };
 
-export type BrowseCard = {
+export type BrowseCard = BrainCardBase & {
   kind: "browse";
   title: string;
   browseType:
@@ -82,7 +88,7 @@ export type ChoiceOption = {
   action?: { endpoint: string; method?: string; body: Record<string, unknown> };
 };
 
-export type ChoiceCard = {
+export type ChoiceCard = BrainCardBase & {
   kind: "plan" | "opinion";
   title: string;
   summary?: string;
@@ -107,7 +113,7 @@ export type FormField = {
   transform?: "bool";
 };
 
-export type FormCard = {
+export type FormCard = BrainCardBase & {
   kind: "form";
   title: string;
   commandId?: string;
@@ -122,7 +128,7 @@ export type FormCard = {
 };
 
 /** 写作进度卡（推进剧情/自动连载聊天内流式展示）：阶段步骤条 + 流式正文 + 状态 */
-export type ProgressCard = {
+export type ProgressCard = BrainCardBase & {
   kind: "progress";
   title: string;
   /** 当前阶段（start/writing/reviewing/settling/saving/result/pending-commit/auto-status/auto-done…） */
@@ -134,7 +140,7 @@ export type ProgressCard = {
 };
 
 /** 追问选择卡（ask）：中枢信息不足时向用户询问（不渲染进聊天流，显示在输入框上方询问面板；刷新后恢复） */
-export type AskCard = {
+export type AskCard = BrainCardBase & {
   kind: "ask";
   question: string;
   options: { label: string; description?: string }[];
