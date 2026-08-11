@@ -6,18 +6,22 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   appendMessage,
+  appendSystemNote,
   attachSessionTask,
   broadcastToSession,
   createSession,
   deleteSession,
+  detachSessionTask,
   finishSessionTask,
   getSession,
+  lastIncompleteMessage,
   lastPendingMessage,
   lastUserMessage,
   listSessions,
   makeTitle,
   markMessageDone,
   markMessageInterrupted,
+  markSessionCompleted,
   markStreaming,
   registerSessionTask,
   truncateSession,
@@ -157,5 +161,103 @@ describe("会话级任务注册表（连接解耦）", () => {
     const t2 = registerSessionTask(TITLE, s.id, e2);
     expect(t1).toBe(t2);
     expect(t2.emitters.size).toBe(2);
+  });
+
+  test("detach 后该连接不再收到广播，其余连接不受影响", () => {
+    const s = createSession(TITLE, "detach 测试");
+    sessionIds.push(s.id);
+    const gotA: unknown[] = [];
+    const gotB: unknown[] = [];
+    const task = registerSessionTask(TITLE, s.id, (o) => gotA.push(o));
+    task.running = true;
+    attachSessionTask(TITLE, s.id, (o) => gotB.push(o));
+
+    broadcastToSession(TITLE, s.id, { n: 1 });
+    expect(gotA).toHaveLength(1);
+    expect(gotB).toHaveLength(1);
+
+    detachSessionTask(TITLE, s.id, task.emitters.values().next().value); // 摘除 A
+    broadcastToSession(TITLE, s.id, { n: 2 });
+    expect(gotA).toHaveLength(1); // A 不再收
+    expect(gotB).toHaveLength(2); // B 仍收
+    finishSessionTask(TITLE, s.id);
+  });
+});
+
+describe("卡片操作完成标记（markSessionCompleted）与 resume 定位工具", () => {
+  test("markSessionCompleted 幂等：同 key 只记录一次", () => {
+    const s = createSession(TITLE, "completed 测试");
+    sessionIds.push(s.id);
+    appendMessage(TITLE, s.id, { id: "u1", role: "user", text: "抽卡", at: Date.now() });
+    appendMessage(TITLE, s.id, { id: "a1", role: "assistant", text: "", at: Date.now(), cards: [{ kind: "browse" }] });
+    expect(markSessionCompleted(TITLE, s.id, "a1:0")).toBe(true);
+    expect(markSessionCompleted(TITLE, s.id, "a1:0")).toBe(false); // 幂等
+    expect(markSessionCompleted(TITLE, s.id, "a1:1")).toBe(true); // 不同 key 记录
+    const s2 = getSession(TITLE, s.id)!;
+    expect(s2.completed).toEqual(["a1:0", "a1:1"]);
+  });
+
+  test("lastIncompleteMessage：pending 与 interrupted 均算未完成（resume 目标），lastPendingMessage 仅 pending", () => {
+    const s = createSession(TITLE, "定位工具测试");
+    sessionIds.push(s.id);
+    appendMessage(TITLE, s.id, { id: "u1", role: "user", text: "继续", at: Date.now() });
+    appendMessage(TITLE, s.id, { id: "a1", role: "assistant", text: "写了一半", at: Date.now(), pending: true });
+    const mid = getSession(TITLE, s.id)!;
+    expect(lastPendingMessage(mid)?.id).toBe("a1");
+    expect(lastIncompleteMessage(mid)?.id).toBe("a1");
+    markMessageInterrupted(TITLE, s.id, "a1");
+    const mid2 = getSession(TITLE, s.id)!;
+    expect(lastPendingMessage(mid2)).toBeNull(); // interrupted 不再是 pending
+    expect(lastIncompleteMessage(mid2)?.id).toBe("a1"); // 但仍是未完成（可 resume）
+  });
+});
+
+describe("系统事件注入（appendSystemNote）—— 聊天记录同步系统状态的核心", () => {
+  const SYS_TITLE = "system-note-test";
+
+  test("注入最近会话：kind=system 消息追加到列表首条（最近更新）", () => {
+    const old = createSession(SYS_TITLE, "旧会话");
+    const fresh = createSession(SYS_TITLE, "新会话");
+    appendMessage(SYS_TITLE, fresh.id, { id: "u1", role: "user", text: "hi", at: Date.now() });
+    appendMessage(SYS_TITLE, old.id, { id: "u2", role: "user", text: "hi2", at: Date.now() });
+
+    const targetBefore = listSessions(SYS_TITLE)[0]; // 最近更新（old 后 append → 排最前）
+    const injected = appendSystemNote(SYS_TITLE, "evt-auto-ch1", "自动连载已提交第 1 章");
+    expect(injected).toBe(true);
+    const target = listSessions(SYS_TITLE)[0];
+    expect(target.id).toBe(targetBefore.id);
+    const last = target.messages[target.messages.length - 1];
+    expect(last.kind).toBe("system");
+    expect(last.role).toBe("assistant");
+    expect(last.text).toContain("【系统】自动连载已提交第 1 章");
+    expect(target.systemNotes).toContain("evt-auto-ch1");
+    // 非目标会话未注入
+    const other = listSessions(SYS_TITLE)[1];
+    expect(other.messages.some((m) => m.kind === "system")).toBe(false);
+  });
+
+  test("幂等：同 eventId 不重复注入", () => {
+    const before = listSessions(SYS_TITLE)[0];
+    const beforeSys = before.messages.filter((m) => m.kind === "system").length;
+    const first = appendSystemNote(SYS_TITLE, "evt-dup", "连载已开始");
+    const again = appendSystemNote(SYS_TITLE, "evt-dup", "连载已开始");
+    expect(first).toBe(true);
+    expect(again).toBe(false);
+    const s = listSessions(SYS_TITLE)[0];
+    const sysCount = s.messages.filter((m) => m.kind === "system").length;
+    expect(sysCount).toBe(beforeSys + 1); // 首次注入 1 条，重复被拒不追加
+  });
+
+  test("无会话 → false（事件不补录，不崩溃）", () => {
+    expect(appendSystemNote("no-session-book", "evt-1", "任何事件")).toBe(false);
+  });
+
+  test("systemNotes 上限 200：只留最近 200 条事件 id（防文件膨胀）", () => {
+    const fresh = createSession(SYS_TITLE, "上限测试");
+    for (let i = 0; i < 205; i++) appendSystemNote(SYS_TITLE, `evt-${i}`, `事件 ${i}`);
+    const s = getSession(SYS_TITLE, fresh.id)!;
+    expect(s.systemNotes?.length).toBe(200);
+    expect(s.systemNotes![s.systemNotes!.length - 1]).toBe("evt-204"); // 最新的保留
+    expect(s.systemNotes).not.toContain("evt-0"); // 最旧的被丢弃
   });
 });

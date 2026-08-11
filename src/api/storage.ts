@@ -10,6 +10,7 @@ import { spawnSync } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Arc, ChapterVersion, PendingChapter, WorldState } from "./world";
 import type { EvalReport } from "./eval";
+import { notifyWorldSaved } from "./sync";
 
 export function slugify(title: string): string {
   const s = title.trim().replace(/[\\/:*?"<>|\s]+/g, "-").slice(0, 40);
@@ -245,6 +246,8 @@ export function saveWorld(w: WorldState): string {
   } catch {
     /* meta 写失败不影响主存档 */
   }
+  // A 级广播点：world 已落盘 → 通知事件总线（无订阅者时零开销；节流合并高频写）
+  notifyWorldSaved(w.title, "save", currentUser() ?? undefined);
   return path;
 }
 

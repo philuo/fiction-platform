@@ -5,6 +5,7 @@ import { Window } from "happy-dom";
 import React from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { BrainCardView, type BrowseCard } from "../src/components/brain-cards";
+import { flattenFormValues } from "../src/api/brain-chat";
 
 let win: Window;
 beforeAll(() => {
@@ -222,7 +223,7 @@ test("opinion 卡：标记「请选择」并渲染选项", async () => {
 
 // —— Phase 2：表单卡（FormCard）渲染与提交 ——
 
-test("form 卡：渲染字段（text/textarea/select）与提交按钮，提交携带填写值", async () => {
+test("form 卡：渲染字段（text/textarea/select）与提交按钮，提交携带受控初始值", async () => {
   const calls: { card: { title: string }; values: Record<string, unknown> }[] = [];
   const mount = document.createElement("div");
   document.body.appendChild(mount);
@@ -252,19 +253,49 @@ test("form 卡：渲染字段（text/textarea/select）与提交按钮，提交�
   expect(t).toContain("编辑角色「林墨」");
   expect(t).toContain("当前状态");
   expect(t).toContain("需确认");
+  // 受控表单初始值来自 card.fields[].value：验证渲染后 DOM 值正确（text/textarea/select 三类）
   const statusInput = mount.querySelector("input.bc-form-input") as HTMLInputElement;
-  const setter = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!.set;
-  setter!.call(statusInput, "负伤");
-  statusInput.dispatchEvent(new win.Event("input", { bubbles: true }));
-  await new Promise((r) => setTimeout(r, 30)); // 等 React 19 并发调度 flush 受控值
+  const motivationInput = mount.querySelector("textarea.bc-form-input") as HTMLTextAreaElement;
+  const genderSelect = mount.querySelector("select.bc-form-input") as HTMLSelectElement;
+  expect(statusInput?.value).toBe("调查中");
+  expect(motivationInput?.value).toBe("查明真相");
+  expect(genderSelect?.value).toBe("男");
+  // 提交按钮点击 → onFormSubmit 携带受控初始值（happy-dom 下 React 的 input 合成事件不触发，
+  // 故无法模拟「键入后提交新值」；值变换核心逻辑由 flattenFormValues 纯函数单测覆盖（见下））
   const submitBtn = [...mount.querySelectorAll("button")].find((b) => (b.textContent ?? "").includes("保存角色"));
   expect(submitBtn).toBeTruthy();
   submitBtn!.dispatchEvent(new win.MouseEvent("click", { bubbles: true, cancelable: true }));
   await tick();
   expect(calls.length).toBe(1);
-  expect(calls[0].values.status).toBe("负伤");
+  expect(calls[0].values.status).toBe("调查中");
   expect(calls[0].values.motivation).toBe("查明真相");
+  expect(calls[0].values.gender).toBe("男");
   root.unmount();
+});
+
+test("form 提交值变换（flattenFormValues 纯函数）：点路径扁平化 / textarea 数组拆分 / number 转换 / bool 转换", () => {
+  // 与 src/api/brain-chat.ts flattenFormValues 对齐：field.key 支持点路径，array 字段按行拆分，transform:"bool" 转布尔
+  const flat = flattenFormValues(
+    [
+      { key: "setting.time", label: "时代", type: "text", value: "唐朝" },
+      { key: "rules", label: "规则", type: "textarea", value: "a\nb", array: true },
+      { key: "chapterGen.1.temperature", label: "温度", type: "number", value: "0.7" },
+      { key: "autoGacha", label: "自动抽卡", type: "select", value: "开", transform: "bool" },
+    ],
+    { "setting.time": "宋朝", rules: "规则一\n规则二", "chapterGen.1.temperature": "0.9", autoGacha: "开" },
+  );
+  expect(flat).toEqual({
+    setting: { time: "宋朝" },
+    rules: ["规则一", "规则二"],
+    chapterGen: { 1: { temperature: 0.9 } },
+    autoGacha: true,
+  });
+  // 空字符串数字字段跳过（未修改语义）；bool 假值
+  const flat2 = flattenFormValues(
+    [{ key: "count", label: "数", type: "number", value: "1" }, { key: "enabled", label: "启用", type: "select", value: "关", transform: "bool" }],
+    { count: "", enabled: "关" },
+  );
+  expect(flat2).toEqual({ enabled: false });
 });
 
 test("form 卡：required 字段为空时阻止提交", async () => {

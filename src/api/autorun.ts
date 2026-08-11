@@ -11,6 +11,7 @@ import {
   clearPendingChapter, currentUser, loadAutoSession, loadPendingChapter, saveAutoSession, savePendingChapter, saveWorld,
   type AutoSession,
 } from "./storage";
+import { publishSync } from "./sync";
 
 export type AutoOptions = {
   maxChapters: number; // 硬上限（≤30，防失控烧额度；绝对目标，含恢复的初始 written）
@@ -63,7 +64,19 @@ function isPausedByUser(title: string): boolean {
 function touchSession(title: string, patch: Partial<AutoSession>): void {
   const prev = loadAutoSession(title);
   if (!prev) return;
-  saveAutoSession(title, { ...prev, ...patch, updatedAt: new Date().toISOString() });
+  const next = { ...prev, ...patch, updatedAt: new Date().toISOString() };
+  saveAutoSession(title, next);
+  // C 级广播点：连载会话状态转移（开始/暂停/每章提交/终态）→ 事件总线（无订阅者零开销，节流合并）
+  publishSync({
+    type: "auto-status",
+    title,
+    status: next.status,
+    phase: next.phase,
+    written: next.written,
+    updatedAt: next.updatedAt,
+    at: Date.now(),
+    user: currentUser() ?? undefined,
+  });
 }
 
 /** 写会话终态（done/complete → done；其余人为或异常停止 → stopped） */

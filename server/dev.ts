@@ -7,6 +7,7 @@ import { render } from "./entry-server";
 import { buildHtml } from "./render";
 import { watch } from "node:fs";
 import { handleApi, migrateLegacyOnBoot, resumeAutoSessions, startVisualSweep } from "../src/api/routes";
+import { handleSyncUpgrade, syncWebsocket, attachSyncPublish } from "../src/api/sync-server";
 import { cleanupStaleAdvanceTasks } from "../src/api/advancetask";
 import { cleanupNewStoryTasks } from "../src/api/newtask";
 import { loadWorld, runAsUser } from "../src/api/storage";
@@ -92,14 +93,19 @@ const MIME: Record<string, string> = {
   ".map": "application/json",
 };
 
-Bun.serve({
+const server = Bun.serve({
   hostname: "0.0.0.0", // 监听所有网卡（局域网/容器可访问）
   port,
   // idleTimeout：默认 10s 会切断 SSE 长连接（写+审+记账可达数分钟）；设 255s（Bun 允许最大值），配合 sseStream 8s 心跳保活
   idleTimeout: 255,
-  async fetch(req) {
+  websocket: syncWebsocket,
+  async fetch(req, server) {
     const url = new URL(req.url);
     const pathname = url.pathname;
+
+    // WS 升级优先（独立路径，不落入 handleApi）
+    const syncUp = handleSyncUpgrade(pathname, req, server);
+    if (syncUp !== null) return syncUp;
 
     // API 路由优先
     const apiRes = await handleApi(pathname, req);
@@ -154,6 +160,9 @@ Bun.serve({
     }
   },
 });
+
+// 状态同步事件 → WS 广播（把事件总线接上本服务器实例的 pub-sub）
+attachSyncPublish(server);
 
 console.log(`[dev] 墨枢 SSR 服务器: http://localhost:${port}（bun --hot 热重启，Ctrl+C 停止）`);
 

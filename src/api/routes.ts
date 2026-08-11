@@ -16,6 +16,7 @@ import { planScenes, generateSceneImage, createSceneVideo, styleAnchor, findChar
 import { auditWorld, autoRepair, alignWorld, collectOrphanMediaFiles } from "./integrity";
 import { resetChapterLedger, settleChapter } from "./chronicler";
 import { applyStateChange, finalizeStateChange } from "./statechange";
+import { publishSync } from "./sync";
 import { withTitleLock } from "./titlelock";
 import { deriveBrainState } from "./brain-state";
 import { brainChatStream } from "./brain-chat";
@@ -2040,6 +2041,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           await Promise.allSettled(created.map(async (item, i) => {
             const s = toAdd[i];
             imageGenTasks.set(mediaKey(item.id), true);
+            let mediaOk = false;
+            let mediaErr = "";
             try {
               // 参考图级联：主体角色立绘绝对优先 → 跨章角色插画（仅用已就绪图）；角色无任何图时后台补立绘，不阻塞本次插画
               const ref = findCharacterRef(w0, idx, s.anchor, s.subject || undefined);
@@ -2082,8 +2085,10 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
                 saveWorld(w);
               });
               ok++;
+              mediaOk = true;
             } catch (e) {
               console.warn(`[media/generate] 插画生成失败（${item.id}）:`, (e as Error).message);
+              mediaErr = (e as Error).message.slice(0, 200);
               await withTitleLock(slug(title), async () => {
                 const w = loadWorld(title);
                 const ch = w?.chapters.find((x) => x.index === idx);
@@ -2098,6 +2103,17 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
               });
             } finally {
               imageGenTasks.delete(mediaKey(item.id));
+              // D 级广播点：媒体任务完成翻转（成功 ready / 失败 failed）→ 事件总线
+              publishSync({
+                type: "task-status",
+                title,
+                kind: "media",
+                id: item.id,
+                status: mediaOk ? "ready" : "failed",
+                error: mediaOk ? undefined : mediaErr || undefined,
+                at: Date.now(),
+                user: currentUser() ?? undefined,
+              });
             }
           }));
           console.log(`[media/generate] 插画后台完成 ${ok}/${created.length}，总耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
@@ -2224,7 +2240,18 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         .map(([id, v]) => ({ id, name: w?.characters.find((c) => c.id === id)?.name ?? id, reason: v.reason ?? "" }));
       const done = entries.filter(([, v]) => v.status === "done").length;
       // 任务全部结束（无 running）→ 清表（failed/done 随本次响应返回一次）
-      if (entries.length && !entries.some(([, v]) => v.status === "running")) visualTasks.delete(tKey);
+      if (entries.length && !entries.some(([, v]) => v.status === "running")) {
+        visualTasks.delete(tKey);
+        // D 级广播点：角色视觉任务全部完成 → 事件总线（未在轮询的其他 tab 也能即时感知）
+        publishSync({
+          type: "task-status",
+          title,
+          kind: "visual",
+          status: failed.length ? "failed" : "done",
+          at: Date.now(),
+          user: currentUser() ?? undefined,
+        });
+      }
       return json({ ok: true, pending, failed, done, count: pending.length });
     }
 

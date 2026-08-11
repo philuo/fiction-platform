@@ -1,6 +1,7 @@
 // 主界面：启动页（立项）→ 创作游戏界面（日式报纸 HUD + 完整控制面板）
 // 交互：立项一句话 / 指令输入 / 抽卡筛选 / 世界观·设定·角色·大纲编辑 / 章节段落编辑 / 推进
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useSyncChannel } from "../components/useSyncChannel";
 import { AlertTriangle, BookMarked, BookOpen, ChevronDown, Dices, History, List, LogOut, MoreHorizontal, PenLine, Play, RefreshCw, Search, Sparkles, Trash2, Users, Video, Wand2, X } from "../components/icons";
 import type { Card, Chapter, ChapterMedia, Character, LoreEntry, ReviewResult, WorldPatch, WorldState } from "../api/world";
 import { Masthead } from "../components/Masthead";
@@ -646,6 +647,17 @@ const Home: React.FC<HomeProps> = (props) => {
   async function refreshAllStates() {
     await Promise.all([refreshWorld().catch(() => {}), pollSysStateOnce().catch(() => {})]);
   }
+
+  // 阶段 1b：状态同步 WebSocket 频道——服务端事件推送即时刷新（与 sysPoll 双跑，轮询兜底校验）。
+  // world-changed → 刷新世界（新章/任务完成即时感知）；task-status → 全量状态（媒体/视觉完成同步中枢指示器）；
+  // auto-status → 连载会话；重连成功 → 全量补偿一次（事件可能错过）。
+  useSyncChannel({
+    title: world?.title ?? null,
+    onWorldChanged: () => { void refreshWorld(); },
+    onTaskStatus: () => { void refreshAllStates(); },
+    onAutoStatus: () => { void fetchAutoStatus(); },
+    onReconnected: () => { void refreshAllStates(); },
+  });
 
   /** 单章推进任务恢复（刷新/重进页面后）：查询持久化任务状态——
    * running → 恢复忙碌态 + 轮询直到完成（后台仍在执行，不重复发起）；

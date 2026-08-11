@@ -408,7 +408,7 @@ export function isAmbiguousChapterPrompt(prompt: string | undefined | null): boo
   const chapterMention = /第\s*[0-9一二三四五六七八九十百]+\s*章/.test(p);
   if (!chapterMention) return false;
   // 明确查看/获取内容/评价的动作词 → 视为有明确意图，不追问
-  const actionWords = /查看|看|看看|浏览|读|阅读|打开|展示|调出|调取|给我|发|输出|全文|内容|正文|讲|说|写|概况|梗概|大概|什么|如何|怎么样|评价|评论|评估/;
+  const actionWords = /查看|看|看看|浏览|读|阅读|打开|展示|调出|调取|给我|发|输出|全文|内容|正文|讲|说|写|概况|梗概|大概|什么|如何|怎么样|评价|评论|评估|生成|配图|插图|画/;
   return !actionWords.test(p);
 }
 

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { emptyWorld, type WorldState } from "../src/api/world";
 import type { Card as WorldCard } from "../src/api/world";
-import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, extractNameFromHistory } from "../src/api/brain-chat";
+import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, extractNameFromHistory, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard } from "../src/api/brain-chat";
 import { getSession as sessGet, lastPendingMessage as sessLastPending } from "../src/api/brain-sessions";
 import type { ChatMessage } from "../src/api/agnes";
 
@@ -961,3 +961,83 @@ describe("buildMediaCard（生成插画/视频表单卡，需求 1）", () => {
   });
 });
 
+
+// —— 回复文本与追问引导（聊天体验关键：空话检测 / 角色查询侧重 / 含糊章节追问） ——
+
+describe("isHollowReply：空话开场检测（仅「这就为您调出」式短句判空）", () => {
+  test("空话短语 → true", () => {
+    expect(isHollowReply("这就为您调出")).toBe(true);
+    expect(isHollowReply("这就为您调取第三章")).toBe(true);
+    expect(isHollowReply("为您展示该角色")).toBe(true);
+  });
+
+  test("实质回复（含要点或长度 > 30）→ false", () => {
+    expect(isHollowReply("「林墨」当前状态：负伤，正随商队北行。")).toBe(false);
+    expect(isHollowReply("这章写得不错，节奏比上一章紧凑。")).toBe(false);
+    expect(isHollowReply("这就为您调出第三章的全部正文内容以及它的审查意见和相关角色出场情况的详细列表。")).toBe(false); // >30 字的长句即使含「调出」也不算空话
+    expect(isHollowReply("")).toBe(false);
+    expect(isHollowReply(null)).toBe(false);
+  });
+});
+
+describe("l0QueryReply：查询开场文本（read_chapter 模板 / read_character 按问法侧重）", () => {
+  test("read_chapter + browse 卡 → 模板说明已调取 + 字数", () => {
+    const r = l0QueryReply("read_chapter", { kind: "browse", title: "第3章 · 风云", data: { index: 3, title: "风云", text: "一二三四五" } }, "看第三章", null);
+    expect(r).toContain("第 3 章「风云」已为你调取");
+    expect(r).toContain("约 5 字");
+  });
+
+  test("read_character + 状态问法 → 当前状态；形象问法 → 形象；关系问法 → 关系", () => {
+    const card = { kind: "browse", title: "林墨 · 主角", data: { name: "林墨", role: "主角", status: "负伤", look: "玄色长衫", relations: [{ name: "沈夜", relation: "仇人" }] } };
+    expect(l0QueryReply("read_character", card, "林墨现在什么状态", null)).toContain("当前状态：负伤");
+    expect(l0QueryReply("read_character", card, "林墨长什么样", null)).toContain("的形象：玄色长衫");
+    expect(l0QueryReply("read_character", card, "林墨和谁有仇", null)).toContain("人物关系");
+    expect(l0QueryReply("read_character", card, "林墨是谁", null)).toContain("主角");
+  });
+
+  test("LLM 实质回复（非空话）优先保留；空话回退卡片标题", () => {
+    const card = { kind: "browse", title: "伏笔账本（3 条）", data: { list: [] } };
+    const good = l0QueryReply("read_foreshadow", card, "看看伏笔", "目前有 3 条伏笔，其中 1 条活跃。");
+    expect(good).toBe("目前有 3 条伏笔，其中 1 条活跃。");
+    const hollow = l0QueryReply("read_foreshadow", card, "看看伏笔", "这就为您调出伏笔");
+    expect(hollow).toBe("伏笔账本（3 条）");
+  });
+});
+
+describe("isAmbiguousChapterPrompt：仅提章节号无动作词 → 追问（不直接输出正文）", () => {
+  test("纯章节号 → true（追问意图）", () => {
+    expect(isAmbiguousChapterPrompt("第三章")).toBe(true);
+    expect(isAmbiguousChapterPrompt("第 5 章")).toBe(true);
+  });
+
+  test("带查看/生成/评价等动作词 → false（明确意图）", () => {
+    expect(isAmbiguousChapterPrompt("查看第三章")).toBe(false);
+    expect(isAmbiguousChapterPrompt("给第二章生成插画")).toBe(false);
+    expect(isAmbiguousChapterPrompt("第三章写得怎么样")).toBe(false);
+    expect(isAmbiguousChapterPrompt("讲讲第一章的剧情")).toBe(false);
+  });
+
+  test("无章节提及 → false", () => {
+    expect(isAmbiguousChapterPrompt("接下来怎么写")).toBe(false);
+    expect(isAmbiguousChapterPrompt("")).toBe(false);
+  });
+});
+
+describe("chapterAskCard：含糊章节的追问卡（看正文/插画/聊聊，revise 加审查）", () => {
+  test("合法章 → 4 选项（含聊聊）；revise 章追加审查选项", () => {
+    const w = emptyWorld();
+    w.chapters.push({ index: 1, title: "风云起", text: "正文", review: { verdict: "revise", round: 2, scores: { coherence: 7, tension: 6, prose: 8, pacing: 7, dialogue: 7 }, findings: [] } } as never);
+    const card = chapterAskCard(w, { index: 1 });
+    expect(card?.kind).toBe("ask");
+    expect(card?.options.map((o) => o.label)).toContain("查看第 1 章正文");
+    expect(card?.options.map((o) => o.label)).toContain("为第 1 章生成插画");
+    expect(card?.options.map((o) => o.label)).toContain("查看第 1 章审查报告"); // revise 章才有
+    expect(card?.options.map((o) => o.label)).toContain("只是聊聊");
+  });
+
+  test("index 非法 / 缺失 → null（调用方走原逻辑）", () => {
+    expect(chapterAskCard(emptyWorld(), {})).toBeNull();
+    expect(chapterAskCard(emptyWorld(), { index: 0 })).toBeNull();
+    expect(chapterAskCard(emptyWorld(), { index: "abc" })).toBeNull();
+  });
+});

@@ -443,3 +443,35 @@ describe("中枢聊天 e2e：极端场景", () => {
     }
   });
 });
+
+describe("system-note 路由（系统状态注入聊天记录的 HTTP 入口）", () => {
+  test("注入成功 → injected:true；重复 eventId → injected:false（幂等）；detail 可见 system 消息", async () => {
+    cookieA = await register("e2e_sys_" + Math.random().toString(36).slice(2, 8));
+    const sid = "e2e-sys-" + Math.random().toString(36).slice(2, 8);
+    const create = await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "聊聊连载" }, cookieA);
+    expect(create.status).toBe(201);
+
+    const first = await api("/api/brain/sessions/system-note", "POST", { title: "e2e-book", eventId: "auto-ch1", text: "自动连载已提交第 1 章" }, cookieA);
+    expect(first.status).toBe(200);
+    expect(((await first.json()) as { injected: boolean }).injected).toBe(true);
+
+    const dup = await api("/api/brain/sessions/system-note", "POST", { title: "e2e-book", eventId: "auto-ch1", text: "自动连载已提交第 1 章" }, cookieA);
+    expect(((await dup.json()) as { injected: boolean }).injected).toBe(false);
+
+    // detail 可见注入的 system 消息（聊天记录里真实出现）
+    const detail = await api("/api/brain/sessions/detail", "POST", { title: "e2e-book", id: sid }, cookieA);
+    const d = (await detail.json()) as { session: { messages: { kind?: string; text?: string }[] } };
+    const sys = d.session.messages.filter((m) => m.kind === "system");
+    expect(sys).toHaveLength(1);
+    expect(sys[0].text).toContain("自动连载已提交第 1 章");
+  });
+
+  test("缺参数 → 400；无会话 → injected:false（事件不补录，不崩溃）", async () => {
+    cookieA = await register("e2e_sys2_" + Math.random().toString(36).slice(2, 8));
+    const bad = await api("/api/brain/sessions/system-note", "POST", { title: "e2e-book", eventId: "", text: "x" }, cookieA);
+    expect(bad.status).toBe(400);
+    const noSession = await api("/api/brain/sessions/system-note", "POST", { title: "e2e-nosession-book", eventId: "e1", text: "连载已开始" }, cookieA);
+    expect(noSession.status).toBe(200);
+    expect(((await noSession.json()) as { injected: boolean }).injected).toBe(false);
+  });
+});
