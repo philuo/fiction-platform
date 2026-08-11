@@ -662,6 +662,9 @@ const Home: React.FC<HomeProps> = (props) => {
   const registerCardPatch = useCallback((fn: (e: { sessionId: string; messageId: string; cardId: string; patch: Record<string, unknown> }) => void) => {
     cardPatchRef.current = fn;
   }, []);
+  /** WS 连接状态（阶段 5）：连接=true 时事件驱动不轮询；断开=false 时 sysPoll 降级。
+   *  ref 镜像供异步回调（startAutoRun finally）读最新值 */
+  const wsConnectedRef = useRef(false);
 
   useSyncChannel({
     title: world?.title ?? null,
@@ -670,6 +673,13 @@ const Home: React.FC<HomeProps> = (props) => {
     onAutoStatus: () => { void fetchAutoStatus(); },
     onBrainNote: () => setSysTick((t) => t + 1),
     onCardUpdate: (e) => cardPatchRef.current?.(e),
+    // 降级通道（阶段 5）：WS 连接时停 sysPoll（事件驱动）；WS 断开时启动 sysPoll（轮询兜底防漏事件）。
+    // 与连载 SSE 直连（startAutoRun stopSysPoll）叠加：WS 断 + 连载 SSE 在 → 仍不轮询（SSE 自身实时）。
+    onStatusChange: (connected) => {
+      wsConnectedRef.current = connected;
+      if (connected) stopSysPoll();
+      else if (!autoRunning) startSysPoll(); // 连载 SSE 直连时即使 WS 断也不轮询（SSE 实时）
+    },
     onReconnected: () => { void refreshAllStates(); },
   });
 
@@ -1949,7 +1959,8 @@ const Home: React.FC<HomeProps> = (props) => {
       setBusy(false);
       setBusyPhase("");
       setLiveDraft("");
-      if (mountedRef.current) startSysPoll(); // SSE 断开：恢复统一轮询兜底同步（后台可能仍在续跑；卸载后不再重建）
+      // SSE 断开：WS 连接时由事件驱动（task-status/auto-status 覆盖连载完成）；仅 WS 也断时恢复轮询兜底
+      if (mountedRef.current && !wsConnectedRef.current) startSysPoll();
     }
   }
 

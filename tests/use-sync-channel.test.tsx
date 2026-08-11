@@ -237,3 +237,28 @@ test("心跳：连接后定时发送 ping（30s 间隔）保活", async () => {
   expect(ws.sent).toContain(JSON.stringify({ type: "subscribe", title: "书I" }));
   root.unmount();
 });
+
+test("onStatusChange：连接建立触发 true；断开触发 false（降级通道信号）", async () => {
+  const statuses: boolean[] = [];
+  const { root } = mountHarnessWithStatus("书J", statuses);
+  await afterMount();
+  FakeWebSocket.instances[0].open();
+  await tick(20);
+  expect(statuses).toEqual([true]);
+  FakeWebSocket.instances[0].drop();
+  await tick(20);
+  expect(statuses).toEqual([true, false]); // 断开 → false（前端据此启动轮询降级）
+  root.unmount();
+});
+
+function mountHarnessWithStatus(title: string, statuses: boolean[]): { root: Root; el: HTMLElement } {
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root = createRoot(mount);
+  root.render(React.createElement(StatusHarness, { title, statuses }));
+  return { root, el: mount };
+}
+function StatusHarness(props: { title: string; statuses: boolean[] }) {
+  useSyncChannel({ title: props.title, onStatusChange: (c) => props.statuses.push(c) });
+  return React.createElement("div");
+}

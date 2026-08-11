@@ -394,6 +394,7 @@ SessionMeta = routes.ts 内联构造的列表项（title/时间/streaming/messag
 - **重连全量补偿（HA2）**：WS 断线指数退避重连，`onReconnected` → `refreshAllStates()` 全量补偿（不只 world，含连载/任务/聊天状态）。
 - **进度卡服务端兜底翻转（HA3）**：推进任务完成/失败时服务端主动翻转最近 running progress 卡（`finalizeProgressForTask` + card-update 广播）——刷新/SSE 断开后任务由轮询感知完成，卡片仍能翻转到终态（不永久 running）。
 - **区域级刷新（阶段 4）**：`world-changed` 事件带 `regions`（COUPLING §2 U01-U19 映射账本）——业务写点按受影响区域传参（连载每章 commit → U03/U04/U05/U06/U08/U10；媒体完成 → U06/U07）；前端按 regions 跳过无关副作用（如视觉轮询探测）；缺省=全量刷新兜底，协议向后兼容。
+- **sysPoll 降为纯降级通道（阶段 5）**：WS 连接建立即 `stopSysPoll()`（常驻 3s 轮询关闭，事件驱动）；WS 断开自动恢复轮询兜底（防漏事件）；连载 SSE 直连时即使 WS 断也不轮询（SSE 自身实时）；`onReconnected` 全量补偿保证断开期间状态不丢。
 
 #### 2.7.1 测试全绿基线（本轮修复 + 补充）
 
