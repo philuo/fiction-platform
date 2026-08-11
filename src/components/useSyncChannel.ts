@@ -8,7 +8,7 @@ import { useEffect, useRef, useState } from "react";
 
 /** 事件类型（与 src/api/sync.ts SyncEvent 一致；服务端透传原样 JSON） */
 export type SyncChannelEvent =
-  | { type: "world-changed"; title: string; version: number; reason?: string; at: number }
+  | { type: "world-changed"; title: string; version: number; reason?: string; regions?: string[]; at: number }
   | { type: "auto-status"; title: string; status: string; phase?: string; written?: number; updatedAt?: string; at: number }
   | { type: "task-status"; title: string; kind: "build" | "advance" | "media" | "visual"; id?: string; status: string; error?: string; at: number }
   | { type: "brain-note"; title: string; eventId: string; text: string; at: number }

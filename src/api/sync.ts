@@ -27,6 +27,8 @@ export type SyncEvent = {
       version: number;
       /** 触发语义（阶段 0 统一 "save"；后续可扩展 actor/field 语义） */
       reason?: string;
+      /** 受影响 UI 区域（COUPLING §2 U01-U19；缺省=全部区域，前端全量刷新） */
+      regions?: string[];
       at: number;
     }
   | {
@@ -148,13 +150,16 @@ export function worldVersion(title: string): number {
 }
 
 /** A 级：saveWorld 落盘后调用（storage.ts 钩子）。无订阅者时零开销。
- *  user：所属用户名（频道隔离用），由调用方从 currentUser() 传入。 */
-export function notifyWorldSaved(title: string, reason = "save", user?: string): void {
+ *  user：所属用户名（频道隔离用），由调用方从 currentUser() 传入。
+ *  regions：受影响 UI 区域（COUPLING §2 U01-U19；缺省=全部，前端全量刷新）。
+ *  ——注意：storage.saveWorld 是通用落盘，不感知业务上下文，默认不传 regions（全量）；
+ *    业务写点（routes/director 等）如需区域级刷新，可显式调用 publishSync 带 regions。 */
+export function notifyWorldSaved(title: string, reason = "save", user?: string, regions?: string[]): void {
   if (listeners.size === 0) return;
   const key = slugify(title);
   const version = (worldVersions.get(key) ?? 0) + 1;
   worldVersions.set(key, version);
-  publishSync({ type: "world-changed", title, version, reason, at: Date.now(), user });
+  publishSync({ type: "world-changed", title, version, reason, regions, at: Date.now(), user });
 }
 
 /** 卡片就地更新事件发布（阶段 3a）：updateMessageCard 命中后调用。

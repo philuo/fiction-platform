@@ -2131,7 +2131,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
                 m.error = undefined;
                 touchChapter(w, idx);
                 applyStateChange(w, { actor: "user", commandId: "CMD-M02", field: "chapters[].media", reason: `第 ${idx} 章插画生成完成（${item.id}）`, chapter: idx });
-                saveWorld(w);
+                saveWorld(w, ["U06", "U07"]); // 区域级刷新：仅正文媒体区 + 媒体进度区
               });
               ok++;
               mediaOk = true;
@@ -2147,7 +2147,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
                   m.error = (e as Error).message;
                   touchChapter(w, idx);
                   applyStateChange(w, { actor: "user", commandId: "CMD-M02", field: "chapters[].media", reason: `第 ${idx} 章插画生成失败（${item.id}）：${(e as Error).message.slice(0, 60)}`, chapter: idx });
-                  saveWorld(w);
+                  saveWorld(w, ["U06", "U07"]); // 区域级刷新
                 }
               });
             } finally {

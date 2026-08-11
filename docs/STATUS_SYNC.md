@@ -393,6 +393,7 @@ SessionMeta = routes.ts 内联构造的列表项（title/时间/streaming/messag
 - **心跳健康检测（HA1）**：服务端 60s 无消息断开僵尸连接（30s 扫描），前端 30s 周期 ping 保活——断网/挂起连接及时释放，快速切换为重连路径。
 - **重连全量补偿（HA2）**：WS 断线指数退避重连，`onReconnected` → `refreshAllStates()` 全量补偿（不只 world，含连载/任务/聊天状态）。
 - **进度卡服务端兜底翻转（HA3）**：推进任务完成/失败时服务端主动翻转最近 running progress 卡（`finalizeProgressForTask` + card-update 广播）——刷新/SSE 断开后任务由轮询感知完成，卡片仍能翻转到终态（不永久 running）。
+- **区域级刷新（阶段 4）**：`world-changed` 事件带 `regions`（COUPLING §2 U01-U19 映射账本）——业务写点按受影响区域传参（连载每章 commit → U03/U04/U05/U06/U08/U10；媒体完成 → U06/U07）；前端按 regions 跳过无关副作用（如视觉轮询探测）；缺省=全量刷新兜底，协议向后兼容。
 
 #### 2.7.1 测试全绿基线（本轮修复 + 补充）
 

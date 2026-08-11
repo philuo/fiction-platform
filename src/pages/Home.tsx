@@ -627,7 +627,7 @@ const Home: React.FC<HomeProps> = (props) => {
     }
   }, [creating, phase, world?.title, currentTaskId]);
 
-  async function refreshWorld() {
+  async function refreshWorld(regions?: string[]) {
     if (!world) return;
     const res = await apiFetch("/api/novel/state", {
       method: "POST",
@@ -637,8 +637,12 @@ const Home: React.FC<HomeProps> = (props) => {
     const data = (await res.json()) as { world?: WorldState; visualPending?: boolean };
     const dw = data.world;
     if (dw) setWorld(dw);
+    // 区域级刷新：仅受影响区域变化时，跳过重副作用（如视觉轮询探测/媒体恢复）——
+    // 但 world 是整包对象，React 按 props 引用重渲染子树；regions 用于「跳过无关副作用」决策
+    // （缺省/全量：保留视觉轮询等既有副作用）
+    const isFull = !regions || regions.length === 0 || regions.includes("U01");
     // 读时自愈/新增角色触发的视觉自动生成：启动轮询（中枢显示「自动生成角色头像/立绘中…」，完成后恢复待命）
-    if (dw && data.visualPending) startVisualPolling(dw.title);
+    if (dw && data.visualPending && isFull) startVisualPolling(dw.title);
   }
 
   /** 全量状态即时刷新（聊天卡片执行后 / 连载 SSE 结束后调用）：
@@ -661,7 +665,7 @@ const Home: React.FC<HomeProps> = (props) => {
 
   useSyncChannel({
     title: world?.title ?? null,
-    onWorldChanged: () => { void refreshWorld(); },
+    onWorldChanged: (e) => { void refreshWorld(e.regions); },
     onTaskStatus: () => { void refreshWorld(); },
     onAutoStatus: () => { void fetchAutoStatus(); },
     onBrainNote: () => setSysTick((t) => t + 1),

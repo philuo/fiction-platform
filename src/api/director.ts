@@ -589,7 +589,8 @@ export async function commitChapter(
     commandId: "CMD-N02",
     level: "L2",
   });
-  saveWorld(world);
+  // 区域级刷新：新章提交影响 目录/正文/状态面板/规划/控制条（COUPLING §2）
+  saveWorld(world, ["U03", "U04", "U05", "U06", "U08", "U10"]);
   appendCheckpoint(world.title, args.checkpointStep ?? "commit", index);
   onEvent?.({
     phase: "done",

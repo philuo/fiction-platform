@@ -145,3 +145,18 @@ describe("订阅者异常隔离", () => {
     unsub2();
   });
 });
+
+describe("区域级刷新（regions 维度）", () => {
+  test("notifyWorldSaved 带 regions → 事件携带；缺省 → undefined（全量）", () => {
+    const got: SyncEvent[] = [];
+    const unsub = subscribeSync((e) => got.push(e));
+    notifyWorldSaved("书R1", "save", "u1", ["U06", "U07"]);
+    notifyWorldSaved("书R2", "save", "u1");
+    flushSyncPending();
+    const r1 = got.find((e) => (e as { title?: string }).title === "书R1") as Extract<SyncEvent, { type: "world-changed" }>;
+    const r2 = got.find((e) => (e as { title?: string }).title === "书R2") as Extract<SyncEvent, { type: "world-changed" }>;
+    expect(r1.regions).toEqual(["U06", "U07"]);
+    expect(r2.regions).toBeUndefined(); // 缺省=全量
+    unsub();
+  });
+});

@@ -68,7 +68,7 @@ const tick = (ms = 0) => new Promise<void>((r) => setTimeout(r, ms));
 function Harness(props: { title: string | null; log: (e: string) => void; onReconnected?: () => void; onBrainNote?: (e: SyncChannelEvent & { type: "brain-note" }) => void; onCardUpdate?: (e: SyncChannelEvent & { type: "card-update" }) => void }) {
   const { connected } = useSyncChannel({
     title: props.title,
-    onWorldChanged: () => props.log("world-changed"),
+    onWorldChanged: (e) => props.log("world-changed" + (e.regions ? ":" + e.regions.join(",") : "")),
     onAutoStatus: () => props.log("auto-status"),
     onTaskStatus: () => props.log("task-status"),
     onBrainNote: (e) => props.onBrainNote?.(e),
@@ -123,13 +123,13 @@ test("world-changed 分发 + 版本去重（旧版本忽略，更新版本触发
   await tick(20);
   expect(log).toEqual([]);
   // 版本 6 → 触发
-  ws.emit({ type: "world-changed", title: "书B", version: 6, at: Date.now() });
+  ws.emit({ type: "world-changed", title: "书B", version: 6, at: Date.now(), regions: ["U06", "U07"] });
   await tick(20);
-  expect(log).toEqual(["world-changed"]);
+  expect(log).toEqual(["world-changed:U06,U07"]);
   // 版本 5（乱序回退）→ 忽略
   ws.emit({ type: "world-changed", title: "书B", version: 5, at: Date.now() });
   await tick(20);
-  expect(log).toEqual(["world-changed"]);
+  expect(log).toEqual(["world-changed:U06,U07"]);
   root.unmount();
 });
 

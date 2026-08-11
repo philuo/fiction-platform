@@ -205,7 +205,7 @@ function pruneVersionFiles(title: string, referenced: Set<string>): void {
   }
 }
 
-export function saveWorld(w: WorldState): string {
+export function saveWorld(w: WorldState, regions?: string[]): string {
   const dir = storyDir(w.title);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, "state.json");
@@ -247,7 +247,8 @@ export function saveWorld(w: WorldState): string {
     /* meta 写失败不影响主存档 */
   }
   // A 级广播点：world 已落盘 → 通知事件总线（无订阅者时零开销；节流合并高频写）
-  notifyWorldSaved(w.title, "save", currentUser() ?? undefined);
+  // regions：受影响 UI 区域（COUPLING §2 U01-U19）；缺省=全部（全量刷新兜底）
+  notifyWorldSaved(w.title, "save", currentUser() ?? undefined, regions);
   return path;
 }
 
