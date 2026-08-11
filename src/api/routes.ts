@@ -643,6 +643,11 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       const snText = String(snBody.text ?? "").trim();
       if (!snTitle || !snEventId || !snText) return json({ error: "缺少 title/eventId/text" }, 400);
       const injected = appendBrainSystemNote(snTitle, snEventId, snText);
+      if (injected) {
+        // 阶段 2a：注入成功 → 广播 brain-note 事件 → 所有订阅该书的连接（其他 tab/入口）即时感知并重拉会话。
+        // 替代「仅发起 tab 靠 sysTick 重拉」的单一链路，多 tab 一致；服务端幂等去重保证同事件只注入一次。
+        publishSync({ type: "brain-note", title: snTitle, eventId: snEventId, text: snText, at: Date.now(), user: currentUser() ?? undefined });
+      }
       return json({ ok: true, injected });
     }
 

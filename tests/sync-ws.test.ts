@@ -189,4 +189,18 @@ describe("saveWorld → 事件总线 → WS 广播（真实链路集成）", () 
     expect(evt.title).toBe("sync-ws-world");
     ws.close();
   });
+
+  test("publishSync brain-note → 事件广播到频道（多 tab 感知链路）", async () => {
+    const { publishSync } = await import("../src/api/sync");
+    const { ws, waitFor } = await connectWs("sync_ws_user");
+    ws.send(JSON.stringify({ type: "subscribe", title: "sync-ws-world" }));
+    await waitFor((m) => m.type === "subscribed");
+
+    // 模拟 system-note 端点注入成功后的广播（routes.ts 在 appendBrainSystemNote 返回 true 时 publishSync brain-note）
+    publishSync({ type: "brain-note", title: "sync-ws-world", eventId: "evt-broadcast-1", text: "连载已提交第 1 章", at: Date.now(), user: "sync_ws_user" });
+    const note = await waitFor((m) => m.type === "brain-note");
+    expect(note.eventId).toBe("evt-broadcast-1");
+    expect(note.title).toBe("sync-ws-world");
+    ws.close();
+  });
 });

@@ -648,14 +648,17 @@ const Home: React.FC<HomeProps> = (props) => {
     await Promise.all([refreshWorld().catch(() => {}), pollSysStateOnce().catch(() => {})]);
   }
 
-  // 阶段 1b：状态同步 WebSocket 频道——服务端事件推送即时刷新（与 sysPoll 双跑，轮询兜底校验）。
-  // world-changed → 刷新世界（新章/任务完成即时感知）；task-status → 全量状态（媒体/视觉完成同步中枢指示器）；
-  // auto-status → 连载会话；重连成功 → 全量补偿一次（事件可能错过）。
+  // 阶段 1b/2：状态同步 WebSocket 频道——服务端事件推送即时刷新（与 sysPoll 双跑，轮询兜底校验）。
+  // world-changed → 刷新世界（新章/任务完成即时感知）；
+  // task-status → 刷新世界（任务完成已落盘，无需再查系统状态——局部更新省一次 /api/brain/context）；
+  // auto-status → 连载会话；brain-note → 系统事件已注入聊天，sysTick 递增让 BrainCabin 重拉（多 tab 一致）；
+  // 重连成功 → 全量补偿一次（事件可能错过）。
   useSyncChannel({
     title: world?.title ?? null,
     onWorldChanged: () => { void refreshWorld(); },
-    onTaskStatus: () => { void refreshAllStates(); },
+    onTaskStatus: () => { void refreshWorld(); },
     onAutoStatus: () => { void fetchAutoStatus(); },
+    onBrainNote: () => setSysTick((t) => t + 1),
     onReconnected: () => { void refreshAllStates(); },
   });
 

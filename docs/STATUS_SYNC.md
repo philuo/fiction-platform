@@ -550,6 +550,7 @@ Bun.serve({
 | `auto-status:*` | 连载控制台 / 任务中心 / 中枢指示器 | `setAutoSession`（局部，无需全量） |
 | `brain-note` | 中枢聊天 | `reloadActive()`（幂等由服务端 eventId 去重） |
 | **`card-update`**（§2.3.6） | 中枢聊天**已有卡片** | 前端按 `(sessionId, messageId, cardId)` 就地替换卡片对象（`setMessages`），不重拉、不追加新消息；配套服务端 `updateMessageCard` 持久化 |
+| **`brain-note`**（阶段 2a 已落地） | 中枢聊天（**多 tab 一致**） | 服务端 `appendSystemNote` 注入成功即广播 `brain-note` 事件 → 所有订阅该书连接收到 → Home `setSysTick+1` → BrainCabin `reloadActive`（复用现有 sysTick 链路，替代"仅发起 tab 重拉"的单一通道） |
 
 区域级局部刷新（P11）作为第二阶段：COUPLING.md §2 的「指令→UI 区域映射账本」是现成设计依据。
 
