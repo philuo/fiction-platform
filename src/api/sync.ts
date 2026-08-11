@@ -45,6 +45,10 @@ export type SyncEvent = {
       title: string;
       kind: "build" | "advance" | "media" | "visual";
       id?: string;
+      /** 子类型（media 分支）：plan=分镜任务完成广播（前端据此就地翻「分镜完成」卡，免轮询）；缺省=媒体生成任务 */
+      sub?: "plan";
+      /** 分镜完成场景列表（sub:"plan" ready 时携带，前端就地翻卡直接可用） */
+      scenes?: { anchor: string; scene: string; caption?: string }[];
       status: string;
       error?: string;
       at: number;

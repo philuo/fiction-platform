@@ -69,7 +69,7 @@ export function sceneCharAudit(w: WorldState, chapterIndex: number, anchor: stri
 }
 
 /** 每章插画数量上限（用户确认）：超限禁用生成，手动删除后可补 */
-export const MAX_IMAGES_PER_CHAPTER = 3;
+export { MAX_IMAGES_PER_CHAPTER } from "../shared/media-const";
 
 // —— 画风锚点：全书统一风格短语（纯函数零 LLM；按 genre/tone/time 关键词映射，兜底通用电影级动漫风）——
 // 提示词全中文（Agnes 为国产模型，官方推荐示例即中文，用户也能看懂）

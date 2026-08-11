@@ -197,6 +197,21 @@ const Home: React.FC<HomeProps> = (props) => {
     }
   }
 
+  /** 中枢聊天生成完成「查看插画/视频」：切换到对应章节并平滑滚动到插画位置（figure 带 media-<id> 锚点）。
+   *  rAF 短重试（最多 20 帧 ≈330ms）：目标 figure 渲染出现即滚动，避免固定延迟在慢设备上静默失败。 */
+  function goToChapterMedia(chapterIndex: number, mediaId: string) {
+    if (!world) return;
+    if (!world.chapters.some((c) => c.index === chapterIndex)) return;
+    setActiveIdx(chapterIndex);
+    let tries = 0;
+    const attempt = () => {
+      const el = document.getElementById(`media-${mediaId}`);
+      if (el) { el.scrollIntoView({ behavior: "smooth", block: "center" }); return; }
+      if (++tries < 20) requestAnimationFrame(attempt);
+    };
+    requestAnimationFrame(attempt);
+  }
+
   /** 持久化新角色提案区关闭状态（乐观更新，失败回滚）；供刷新/SSR 首帧正确渲染 */
   function savePropClosed(closed: boolean) {
     if (!world) return;
@@ -669,9 +684,16 @@ const Home: React.FC<HomeProps> = (props) => {
   }, []);
   /** 任务状态事件注册（阶段 3b+）：BrainCabin 挂载时注册 media task-status 处理器，
    *  媒体生成轮询据此在 WS 广播任务完成时提前收尾（减少 /media/status 冗余轮询）。 */
-  const taskStatusRef = useRef<((e: { kind: string; id?: string; status: string }) => void) | null>(null);
-  const registerTaskStatus = useCallback((fn: (e: { kind: string; id?: string; status: string }) => void) => {
+  const taskStatusRef = useRef<((e: { kind: string; id?: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[] }) => void) | null>(null);
+  const registerTaskStatus = useCallback((fn: (e: { kind: string; id?: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[] }) => void) => {
     taskStatusRef.current = fn;
+  }, []);
+  /** WS 连接状态注册：BrainCabin 挂载时注册，onStatusChange 转发——连接时聊天舱停 HTTP 轮询（事件驱动），断开降级 */
+  const wsStatusRef = useRef<((connected: boolean) => void) | null>(null);
+  const registerWsStatus = useCallback((fn: (connected: boolean) => void) => {
+    wsStatusRef.current = fn;
+    // 注册时立即上报当前状态（BrainCabin 挂载晚于 WS 建立时也能拿到真实连接态）
+    fn(wsConnectedRef.current);
   }, []);
   /** WS 连接状态（阶段 5）：连接=true 时事件驱动不轮询；断开=false 时 sysPoll 降级。
    *  ref 镜像供异步回调（startAutoRun finally）读最新值 */
@@ -696,6 +718,7 @@ const Home: React.FC<HomeProps> = (props) => {
     // 与连载 SSE 直连（startAutoRun stopSysPoll）叠加：WS 断 + 连载 SSE 在 → 仍不轮询（SSE 自身实时）。
     onStatusChange: (connected) => {
       wsConnectedRef.current = connected;
+      wsStatusRef.current?.(connected);
       if (connected) stopSysPoll();
       else if (!autoRunning) startSysPoll(); // 连载 SSE 直连时即使 WS 断也不轮询（SSE 实时）
     },
@@ -2801,6 +2824,8 @@ const Home: React.FC<HomeProps> = (props) => {
           sysTick={sysTick}
           registerCardPatch={registerCardPatch}
           registerTaskStatus={registerTaskStatus}
+          registerWsStatus={registerWsStatus}
+          onGoToMedia={goToChapterMedia}
         />
       )}
 

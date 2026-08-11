@@ -12,11 +12,11 @@ import { createNewStoryTask, completeNewStoryTask, failNewStoryTask, markNewStor
 import { buildAutoLore, mergeLore, sanitizeLore } from "./lore";
 import { generateImage, saveImage, readImage, deleteMediaFile, compressToJpeg } from "./images";
 import { pollVideoTask, downloadVideo, saveVideo } from "./videos";
-import { planScenes, generateSceneImage, createSceneVideo, styleAnchor, findCharacterRef, findVideoFirstFrame, generateCharacterPortrait, generateCharacterAvatar, mediaDataUri, mediaId, identityDress, MAX_IMAGES_PER_CHAPTER, markOrphanMedia } from "./media";
+import { planScenes, generateSceneImage, createSceneVideo, styleAnchor, findCharacterRef, findVideoFirstFrame, generateCharacterPortrait, generateCharacterAvatar, mediaDataUri, mediaId, identityDress, MAX_IMAGES_PER_CHAPTER, markOrphanMedia, type ScenePlan } from "./media";
 import { auditWorld, autoRepair, alignWorld, collectOrphanMediaFiles } from "./integrity";
 import { resetChapterLedger, settleChapter } from "./chronicler";
 import { applyStateChange, finalizeStateChange } from "./statechange";
-import { publishSync } from "./sync";
+import { publishSync, type SyncEvent } from "./sync";
 import { withTitleLock } from "./titlelock";
 import { deriveBrainState } from "./brain-state";
 import { brainChatStream } from "./brain-chat";
@@ -125,8 +125,40 @@ async function readBody(req: Request): Promise<Record<string, unknown>> {
   }
 }
 
-/** 插画异步生成任务表（内存态）：mediaId → 生成中；status 轮询据此区分“生成中”与“服务重启中断” */
-const imageGenTasks = new Map<string, boolean>();
+/** 插画异步生成任务表（内存态）：'user::mediaId' → {title, chapterIndex, at} 生成中任务；
+ *  status 轮询据此区分“生成中”与“服务重启中断”；WS 订阅快照据此推送该书进行中任务（前端免轮询） */
+type GenTask = { title: string; chapterIndex: number; at: number };
+const imageGenTasks = new Map<string, GenTask>();
+/** 视频生成并发防护（同书同章）：跨 tab 倒计时几乎同时触发 /media/generate 时拒绝重复生成（video 无 image 的配额上限兜底） */
+const videoGenBusy = new Set<string>();
+
+/** 分镜任务表（内存态）：planId → 任务。分镜是异步 LLM 调用（可能数十秒），前端轮询 /media/plan-status
+ *  恢复「分镜中」状态——关闭弹窗/刷新页面后重开，从会话卡读到 planId 继续轮询拿最新结果。
+ *  ready/failed 保留供刷新恢复；超出 PLAN_TASK_MAX 清最旧（含未完成即丢弃，前端轮询 notfound 提示重试），
+ *  pending 超时回收（服务重启/LLM 挂起无法恢复）。 */
+type PlanTask = { user: string; title: string; chapterIndex: number; kind: "image" | "video"; status: "pending" | "ready" | "failed"; scenes?: ScenePlan[]; error?: string; at: number; session?: { sessionId: string; messageId: string; cardIndex: number; cardId: string } };
+const planTasks = new Map<string, PlanTask>();
+const PLAN_TASK_MAX = 200; // 防膨胀上限：超出清最旧
+const PLAN_TASK_TIMEOUT = 5 * 60_000; // pending 超过 5 分钟视为中断（LLM 最坏约 3 分钟，留余量）
+function planId(): string { return `plan-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`; }
+
+/** WS 订阅快照：返回该用户该书所有「进行中」媒体任务（分镜 pending + 插画生成中），
+ *  供 sync-server 在订阅成功后推送——刷新/重开后前端据此恢复 loading 卡（免 HTTP 轮询）。 */
+export function listPendingMediaTasks(username: string, title: string): SyncEvent[] {
+  const now = Date.now();
+  const out: SyncEvent[] = [];
+  for (const [pid, t] of planTasks) {
+    if (t.user === username && t.title === title && t.status === "pending") {
+      out.push({ type: "task-status", title, kind: "media", sub: "plan", id: pid, status: "pending", at: now, user: username });
+    }
+  }
+  for (const [key, g] of imageGenTasks) {
+    if (g.title !== title || !key.startsWith(username + "::")) continue;
+    const mediaId = key.slice(username.length + 2);
+    out.push({ type: "task-status", title, kind: "media", id: mediaId, status: "pending", at: now, user: username });
+  }
+  return out;
+}
 
 /** 画面主体角色硬性描述（性别/年龄/身份/外貌/当前形象/身份服饰）——强制拼入插画/视频提示词，不依赖 LLM 转写；无主体或角色不存在时返回 undefined */
 function charHintFor(w: WorldState, subject?: string): string | undefined {
@@ -2117,7 +2149,9 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
     }
 
     case "/api/novel/media/plan": {
-      // 分镜：LLM 从全章挑选关键段落并提炼电影化场景描述（不生成）
+      // 分镜（异步任务化）：校验后立即返回 planId，后台 LLM 从全章挑选关键段落提炼场景描述（不生成）。
+      // 前端把「分镜中」running 卡落盘（带 planId），轮询 /media/plan-status 拿结果——
+      // 关闭弹窗/刷新页面后重开，从会话卡恢复轮询，始终看到最新分镜状态。
       if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
       const title = String(body.title ?? "").trim();
       const idx = Number(body.chapterIndex);
@@ -2127,13 +2161,106 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       if (kind !== "image" && kind !== "video") return json({ error: "kind 必须为 image/video" }, 400);
       const w = loadWorld(title);
       if (!w) return json({ error: "故事不存在: " + title }, 404);
-      try {
-        const scenes = await planScenes(w, idx, kind as "image" | "video", Number(body.count) || 1);
-        return json({ ok: true, scenes });
-      } catch (e) {
-        console.error("[api/novel/media/plan]", e);
-        return json({ error: e instanceof AppError ? e.message : "场景规划失败，请稍后重试" }, 502);
+      // 会话上下文（可选）：前端提交分镜时携带，服务端完成后直接落盘翻卡（权威），
+      // 关闭面板/刷新页面期间事件丢失也能从落盘卡恢复——不依赖前端消费 WS 事件。
+      const sessionCtx = (typeof body.session === "object" && body.session
+        ? {
+            sessionId: String((body.session as { sessionId?: unknown }).sessionId ?? "").trim(),
+            messageId: String((body.session as { messageId?: unknown }).messageId ?? "").trim(),
+            cardIndex: Number((body.session as { cardIndex?: unknown }).cardIndex),
+            cardId: String((body.session as { cardId?: unknown }).cardId ?? "").trim(),
+          }
+        : null);
+      const session = sessionCtx && sessionCtx.sessionId && sessionCtx.messageId && Number.isInteger(sessionCtx.cardIndex) && sessionCtx.cardId
+        ? sessionCtx : undefined;
+      const id = planId();
+      const task: PlanTask = { user: currentUser() ?? "", title, chapterIndex: idx, kind: kind as "image" | "video", status: "pending", at: Date.now(), session };
+      planTasks.set(id, task);
+      if (planTasks.size > PLAN_TASK_MAX) {
+        // 防膨胀：清最旧任务（未完成即丢弃，前端轮询到 notfound 会提示重试）
+        const oldest = [...planTasks.entries()].sort((a, b) => a[1].at - b[1].at)[0]?.[0];
+        if (oldest) planTasks.delete(oldest);
       }
+      // 锁外后台执行（分镜只读，不持锁不阻塞请求）；planScenes 内部已含 3 次重试
+      void (async () => {
+        const sess = task.session;
+        try {
+          const scenes = await planScenes(w, idx, kind as "image" | "video", Number(body.count) || 1);
+          const t = planTasks.get(id);
+          if (!t) return;
+          t.status = "ready";
+          t.scenes = scenes;
+          // ① 服务端权威落盘：带会话上下文时直接把会话卡翻成「分镜完成」确认卡——
+          //    刷新/重开面板读落盘卡即最新，不依赖前端消费事件（关闭面板期间 WS 事件会丢失）
+          if (sess) {
+            const valid = (scenes ?? []).filter((x) => x?.anchor?.trim() && x?.scene?.trim());
+            const card: Record<string, unknown> = {
+              kind: "preview",
+              cardId: sess.cardId,
+              title: kind === "image" ? `生成第 ${idx} 章插画（${valid.length} 张）` : `生成第 ${idx} 章视频`,
+              commandId: "CMD-M02",
+              level: "L0",
+              summary: kind === "image"
+                ? `已从第 ${idx} 章正文挑选 ${valid.length} 个关键场景，3 秒后自动生成，也可点击立即生成。`
+                : `已从第 ${idx} 章正文挑选 1 个关键场景，3 秒后自动生成视频。`,
+              scenes: valid,
+              countdownAt: Date.now() + 3000,
+              chapterIndex: idx,
+              mediaKind: kind,
+              action: { endpoint: "/api/novel/media/generate", method: "POST", body: { title, chapterIndex: idx, kind, scenes: valid } },
+              actionLabel: "立即生成",
+            };
+            const ok = replaceBrainMessageCard(title, sess.sessionId, sess.messageId, sess.cardIndex, card as never);
+            if (ok) {
+              // 落盘成功 → 广播 brain-append，其他已打开同会话的 tab 重拉显示最新卡
+              publishSync({ type: "brain-append", title, sessionId: sess.sessionId, messageId: sess.messageId, at: Date.now(), user: currentUser() ?? undefined });
+            }
+          }
+          // ② WS 广播（面板打开时实时就地翻卡，免轮询）
+          publishSync({ type: "task-status", title, kind: "media", sub: "plan", id, status: "ready", scenes, at: Date.now(), user: currentUser() ?? undefined });
+        } catch (e) {
+          console.error("[api/novel/media/plan] 分镜失败:", (e as Error).message);
+          const t = planTasks.get(id);
+          if (!t) return;
+          t.status = "failed";
+          t.error = e instanceof AppError ? e.message : "场景规划失败，请稍后重试";
+          // 服务端落盘失败卡（带会话上下文时）
+          if (sess) {
+            const ok = replaceBrainMessageCard(title, sess.sessionId, sess.messageId, sess.cardIndex, {
+              kind: "preview", cardId: sess.cardId,
+              title: "分镜失败",
+              summary: "场景规划失败", status: "failed",
+              detail: t.error ?? "分镜任务失败，请重新提交",
+            } as never);
+            if (ok) publishSync({ type: "brain-append", title, sessionId: sess.sessionId, messageId: sess.messageId, at: Date.now(), user: currentUser() ?? undefined });
+          }
+          // 分镜失败事件广播：前端就地翻 failed 卡（免轮询）
+          publishSync({ type: "task-status", title, kind: "media", sub: "plan", id, status: "failed", error: t.error, at: Date.now(), user: currentUser() ?? undefined });
+        }
+      })();
+      return json({ ok: true, planId: id });
+    }
+
+    case "/api/novel/media/plan-status": {
+      // 分镜任务状态查询（前端轮询）：pending → 继续等；ready → 返回场景（前端落盘到会话卡）；failed → 错误信息；
+      // notfound（服务重启任务表丢失/被回收）→ 前端提示重试。
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const pt = String(body.title ?? "").trim();
+      const planIdStr = String(body.planId ?? "").trim();
+      if (!pt || !planIdStr) return json({ error: "缺少 title/planId" }, 400);
+      const t = planTasks.get(planIdStr);
+      if (!t) return json({ ok: true, status: "notfound" });
+      // pending 超时回收：超过 5 分钟 → failed（服务重启/LLM 挂起，无法恢复）
+      if (t.status === "pending" && Date.now() - t.at > PLAN_TASK_TIMEOUT) {
+        t.status = "failed";
+        t.error = "分镜任务超时（AI 服务响应过慢或服务重启），请重试";
+      }
+      return json({
+        ok: true,
+        status: t.status,
+        scenes: t.status === "ready" ? t.scenes : undefined,
+        error: t.status === "failed" ? t.error : undefined,
+      });
     }
 
     case "/api/novel/media/generate": {
@@ -2157,38 +2284,46 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       if (!valid.length) return json({ error: "缺少有效的场景" }, 400);
       try {
         if (kind === "video") {
-          const scene = valid[0];
-          const sceneType = scene.type === "人物" || scene.type === "场景" || scene.type === "事件" ? scene.type : "事件";
-          const w0 = loadWorld(title);
-          if (!w0) return json({ error: "故事不存在: " + title }, 404);
-          // i2v 优先：首帧级联查找（同段落锚点插画 → 场景主体角色全局立绘 → 跨章角色插画）；
-          // 无图时后台补立绘并直接 t2v（不阻塞视频创建，立绘完成后下次自动 i2v）
-          const firstImg = findVideoFirstFrame(w0, idx, scene.anchor, scene.subject || undefined);
-          schedulePortraitFor(title, w0, scene.anchor);
-          const firstFrame = firstImg ? mediaDataUri(title, firstImg) : undefined;
-          let media: ChapterMedia;
-          const charHint = charHintFor(w0, scene.subject);
+          // 同书同章并发防护：跨 tab 倒计时几乎同时触发时拒绝重复（video 无配额上限，image 有锁内配额兜底）
+          const vGenKey = `${currentUser() ?? ""}::${slug(title)}::${idx}`;
+          if (videoGenBusy.has(vGenKey)) return json({ error: "该章视频正在生成中，请稍候再试" }, 409);
+          videoGenBusy.add(vGenKey);
           try {
-            media = await createSceneVideo(scene.scene, scene.anchor, { image: firstFrame, caption: scene.caption, sceneType, styleAnchor: styleAnchor(w0), charHint, roster: w0.characters.map((c) => c.name) });
-          } catch (e) {
-            if (firstFrame) {
-              console.warn("[media/generate] i2v 失败，回退 t2v:", (e as Error).message);
-              media = await createSceneVideo(scene.scene, scene.anchor, { caption: scene.caption, sceneType, styleAnchor: styleAnchor(w0), charHint, roster: w0.characters.map((c) => c.name) });
-            } else {
-              throw e;
+            const scene = valid[0];
+            const sceneType = scene.type === "人物" || scene.type === "场景" || scene.type === "事件" ? scene.type : "事件";
+            const w0 = loadWorld(title);
+            if (!w0) return json({ error: "故事不存在: " + title }, 404);
+            // i2v 优先：首帧级联查找（同段落锚点插画 → 场景主体角色全局立绘 → 跨章角色插画）；
+            // 无图时后台补立绘并直接 t2v（不阻塞视频创建，立绘完成后下次自动 i2v）
+            const firstImg = findVideoFirstFrame(w0, idx, scene.anchor, scene.subject || undefined);
+            schedulePortraitFor(title, w0, scene.anchor);
+            const firstFrame = firstImg ? mediaDataUri(title, firstImg) : undefined;
+            let media: ChapterMedia;
+            const charHint = charHintFor(w0, scene.subject);
+            try {
+              media = await createSceneVideo(scene.scene, scene.anchor, { image: firstFrame, caption: scene.caption, sceneType, styleAnchor: styleAnchor(w0), charHint, roster: w0.characters.map((c) => c.name) });
+            } catch (e) {
+              if (firstFrame) {
+                console.warn("[media/generate] i2v 失败，回退 t2v:", (e as Error).message);
+                media = await createSceneVideo(scene.scene, scene.anchor, { caption: scene.caption, sceneType, styleAnchor: styleAnchor(w0), charHint, roster: w0.characters.map((c) => c.name) });
+              } else {
+                throw e;
+              }
             }
+            await withTitleLock(slug(title), async () => {
+              const w = loadWorld(title);
+              if (!w) throw new AppError("故事不存在: " + title);
+              const ch = w.chapters.find((x) => x.index === idx);
+              if (!ch) throw new AppError("章节不存在");
+              ch.media = [...(ch.media ?? []), media];
+              touchChapter(w, idx);
+              applyStateChange(w, { actor: "user", commandId: "CMD-M03", field: "chapters[].media", reason: `生成第 ${idx} 章视频（${(media.caption ?? "").slice(0, 40) || media.anchor.slice(0, 20)}）`, chapter: idx });
+              saveWorld(w);
+            });
+            return json({ ok: true, mediaId: media.id, videoId: media.videoId, mode: firstFrame ? "i2v" : "t2v" });
+          } finally {
+            videoGenBusy.delete(vGenKey);
           }
-          await withTitleLock(slug(title), async () => {
-            const w = loadWorld(title);
-            if (!w) throw new AppError("故事不存在: " + title);
-            const ch = w.chapters.find((x) => x.index === idx);
-            if (!ch) throw new AppError("章节不存在");
-            ch.media = [...(ch.media ?? []), media];
-            touchChapter(w, idx);
-            applyStateChange(w, { actor: "user", commandId: "CMD-M03", field: "chapters[].media", reason: `生成第 ${idx} 章视频（${(media.caption ?? "").slice(0, 40) || media.anchor.slice(0, 20)}）`, chapter: idx });
-            saveWorld(w);
-          });
-          return json({ ok: true, mediaId: media.id, videoId: media.videoId, mode: firstFrame ? "i2v" : "t2v" });
         }
         // image：异步生成——锁内先落 pending 条目（刷新/中断可恢复轮询），锁外并行生成，完成后锁内更新 ready/failed；
         // 不阻塞请求：立即返回 mediaIds，前端轮询 /media/status
@@ -2237,7 +2372,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           const deleted = () => deletedStories.has(imgDelKey);
           await Promise.allSettled(created.map(async (item, i) => {
             const s = toAdd[i];
-            imageGenTasks.set(mediaKey(item.id), true);
+            imageGenTasks.set(mediaKey(item.id), { title, chapterIndex: idx, at: Date.now() });
             let mediaOk = false;
             let mediaErr = "";
             try {

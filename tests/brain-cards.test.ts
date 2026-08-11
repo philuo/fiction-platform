@@ -567,3 +567,105 @@ test("form 卡 onValuesChange：初始上报默认值，切换 select 后上报�
   expect(reported[0]).toEqual({ chapterIndex: "2", count: 1 });
   root.unmount();
 });
+
+test("preview 卡：分镜完成待自动生成态（场景列表 + 倒计时 + 立即生成）", async () => {
+  const base = {
+    kind: "preview" as const,
+    title: "生成第 1 章插画（2 张）",
+    commandId: "CMD-M02",
+    level: "L0" as const,
+    summary: "已从第 1 章正文挑选 2 个关键场景，3 秒后自动生成。",
+    cardId: "pv-scenes",
+    scenes: [
+      { anchor: "沈夜负剑立于城楼，眺望远方", scene: "月色城楼，沈夜负剑而立", caption: "沈夜夜登城楼" },
+      { anchor: "柳青霜提灯而来", scene: "柳青霜提灯递信", caption: "柳青霜递信" },
+    ],
+    countdownAt: Date.now() + 3000,
+    action: { endpoint: "/api/novel/media/generate", method: "POST" as const, body: { chapterIndex: 1, kind: "image", scenes: [] } },
+    actionLabel: "立即生成",
+  };
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root: Root = createRoot(mount);
+  root.render(React.createElement(BrainCardView, { card: base, onExecute: () => {} }));
+  await tick();
+  const t = mount.textContent ?? "";
+  // 选中的分镜场景呈现给用户（caption + anchor）
+  expect(t).toContain("沈夜夜登城楼");
+  expect(t).toContain("沈夜负剑立于城楼，眺望远方");
+  expect(t).toContain("柳青霜递信");
+  // 倒计时 + 立即生成按钮
+  expect(t).toContain("倒计时");
+  const btn = mount.querySelector("button") as HTMLButtonElement | null;
+  expect(btn?.textContent).toContain("立即生成");
+  root.unmount();
+});
+
+test("preview 卡：生成完成 → 「查看插画」按钮回调跳转章节", async () => {
+  const base = {
+    kind: "preview" as const,
+    title: "生成第 2 章插画（1 张）",
+    commandId: "CMD-M02",
+    level: "L0" as const,
+    summary: "已完成",
+    cardId: "pv-done",
+    status: "done" as const,
+    detail: "已完成 1 项",
+    mediaId: "media-abc",
+    chapterIndex: 2,
+  };
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root: Root = createRoot(mount);
+  const calls: Array<[number, string]> = [];
+  root.render(React.createElement(BrainCardView, { card: base, onExecute: () => {}, onGoToMedia: (ch, mid) => calls.push([ch, mid]) }));
+  await tick();
+  const t = mount.textContent ?? "";
+  expect(t).toContain("查看插画");
+  (mount.querySelector("button") as HTMLButtonElement).click();
+  await tick();
+  expect(calls).toEqual([[2, "media-abc"]]);
+  root.unmount();
+});
+
+test("媒体 form 卡：mediaQuota 动态张数下拉（切换章节后 options 跟随剩余额度）", async () => {
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root: Root = createRoot(mount);
+  // 第 1 章剩余 1 张、第 2 章剩余 3 张
+  const quota = (ch: number) => (ch === 1 ? 1 : 3);
+  const mediaForm = {
+    kind: "form" as const,
+    title: "生成章节插画",
+    commandId: "CMD-M02",
+    level: "L0" as const,
+    summary: "为「第 1 章」生成 1 张插画",
+    fields: [
+      { key: "chapterIndex", label: "章节", type: "select" as const, value: 1, options: [
+        { label: "第 1 章", value: "1" },
+        { label: "第 2 章", value: "2" },
+      ]},
+      { key: "count", label: "张数", type: "select" as const, value: 1, options: [
+        { label: "1 张", value: "1" }, { label: "2 张", value: "2" }, { label: "3 张", value: "3" },
+      ]},
+    ],
+    action: { endpoint: "/api/novel/media/plan", method: "POST", body: { title: "书", kind: "image" } },
+    submitLabel: "挑选场景并生成",
+  };
+  root.render(React.createElement(BrainCardView, { card: mediaForm, onFormSubmit: () => {}, mediaQuota: quota }));
+  await tick();
+  const selects = mount.querySelectorAll("select") as NodeListOf<HTMLSelectElement>;
+  expect(selects.length).toBe(2);
+  const countSelect = selects[1];
+  // 第 1 章：剩余 1 张 → 仅「1 张」选项 + label 显示剩余
+  expect(countSelect.options.length).toBe(1);
+  expect(countSelect.options[0].value).toBe("1");
+  expect(mount.textContent ?? "").toContain("还可生成 1 张");
+  // 切换章节到第 2 章 → 剩余 3 张 → 选项变为 1/2/3
+  Object.getOwnPropertyDescriptor(win.HTMLSelectElement.prototype, "value")!.set!.call(selects[0], "2");
+  selects[0]!.dispatchEvent(new win.Event("change", { bubbles: true }));
+  await tick();
+  expect(countSelect.options.length).toBe(3);
+  expect(mount.textContent ?? "").toContain("还可生成 3 张");
+  root.unmount();
+});

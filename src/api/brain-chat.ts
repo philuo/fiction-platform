@@ -20,7 +20,7 @@ import { logChange } from "./steering";
 import { withTitleLock } from "./titlelock";
 import { readEvalReport } from "./eval";
 import { isPendingForeshadow, targetChapterCount } from "./world";
-import { mediaDataUri } from "./media";
+import { mediaDataUri, MAX_IMAGES_PER_CHAPTER } from "./media";
 import { gachaGenerate as directorGachaGenerate } from "./director";
 import { uuid } from '../shared/uuid';
 import type { CardType } from "./cards";
@@ -1212,6 +1212,11 @@ export function buildMediaCard(
   const validIdx = idx != null && chapters.some((c) => c.index === idx) ? idx : null;
   // 张数：默认 1（需求 1）；video 恒 1 段
   const count = kind === "video" ? 1 : Math.max(1, Math.min(3, Number(params.count ?? 1) || 1));
+  // 剩余可生成张数（下拉选择依据）：每章上限 MAX_IMAGES_PER_CHAPTER，扣掉已有插画（含生成中的 pending）
+  // —— 前端切换章节时也会用 world 实时重算（brain-cards 动态 options），此处按默认章节兜底
+  const quotaCh = validIdx != null ? chapters.find((c) => c.index === validIdx) : undefined;
+  const existingImgs = (quotaCh?.media ?? []).filter((m) => m.kind === "image").length;
+  const remaining = Math.max(0, MAX_IMAGES_PER_CHAPTER - existingImgs);
   const fields: FormFieldDef[] = [
     {
       key: "chapterIndex",
@@ -1222,7 +1227,17 @@ export function buildMediaCard(
       required: true,
     },
   ];
-  if (kind === "image") fields.push({ key: "count", label: "张数（1-3）", type: "number", value: count });
+  if (kind === "image") {
+    fields.push({
+      key: "count",
+      label: `张数（还可生成 ${remaining} 张）`,
+      type: "select",
+      value: remaining > 0 ? Math.min(count, remaining) : 0,
+      options: remaining > 0
+        ? Array.from({ length: remaining }, (_, i) => ({ label: `${i + 1} 张`, value: String(i + 1) }))
+        : [{ label: "本章插画已满（上限 " + MAX_IMAGES_PER_CHAPTER + " 张）", value: "0" }],
+    });
+  }
   const target = validIdx != null ? `第 ${validIdx} 章` : "当前章节";
   return {
     kind: "form",

@@ -10,7 +10,7 @@ import { useEffect, useRef, useState } from "react";
 export type SyncChannelEvent =
   | { type: "world-changed"; title: string; version: number; reason?: string; regions?: string[]; at: number }
   | { type: "auto-status"; title: string; status: string; phase?: string; written?: number; updatedAt?: string; at: number }
-  | { type: "task-status"; title: string; kind: "build" | "advance" | "media" | "visual"; id?: string; status: string; error?: string; at: number }
+  | { type: "task-status"; title: string; kind: "build" | "advance" | "media" | "visual"; id?: string; sub?: "plan"; scenes?: { anchor: string; scene: string; caption?: string }[]; status: string; error?: string; at: number }
   | { type: "brain-note"; title: string; eventId: string; text: string; at: number }
   | { type: "card-update"; title: string; sessionId: string; messageId: string; cardId: string; patch: Record<string, unknown>; at: number }
   | { type: "brain-append"; title: string; sessionId: string; messageId: string; at: number }

@@ -14,6 +14,7 @@ import type { Server, ServerWebSocket } from "bun";
 import { userFromRequest, type AuthUser } from "./auth";
 import { currentUser, runAsUser, slugify, storyExists } from "./storage";
 import { subscribeSync, worldVersion, type SyncEvent } from "./sync";
+import { listPendingMediaTasks } from "./routes";
 
 /** WS 端点路径（dev/prod 共用） */
 export const SYNC_WS_PATH = "/api/sync";
@@ -99,6 +100,11 @@ export const syncWebsocket = {
     ws.subscribe(key);
     ws.data.channels.add(key);
     ws.send(JSON.stringify({ type: "subscribed", title, version: worldVersion(title) }));
+    // 订阅快照：推送该书当前「进行中」媒体任务（分镜 pending / 插画生成中），
+    // 刷新/重开后前端据此把对应卡标 loading——纯事件驱动，无需 HTTP 轮询
+    for (const e of listPendingMediaTasks(ws.data.user.username, title)) {
+      ws.send(JSON.stringify(e));
+    }
   },
   close(ws: ServerWebSocket<SyncWsData>) {
     allSockets.delete(ws);

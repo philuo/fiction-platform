@@ -124,7 +124,7 @@ const MediaBlock: React.FC<{ m: ChapterMedia; storyTitle: string; chapter: Chapt
   const caption = m.caption?.trim() || (m.anchor.length > 30 ? m.anchor.slice(0, 30) + "…" : m.anchor);
   const anchorBrief = m.anchor.length > 40 ? m.anchor.slice(0, 40) + "…" : m.anchor;
   return (
-    <figure className="chapter-media-fig">
+    <figure className="chapter-media-fig" id={`media-${m.id}`}>
       {(m.orphan || orphanHint) && (
         <div className="media-orphan-banner">⚠ 未能在正文中匹配到锚定句子，图文可能错位——可修改提示词重新生成或删除</div>
       )}

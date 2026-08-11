@@ -960,6 +960,46 @@ describe("buildMediaCard（生成插画/视频表单卡，需求 1）", () => {
     expect(card.kind).toBe("form");
   });
 });
+describe("buildMediaCard 张数下拉（按章节剩余额度生成 options）", () => {
+  test("count 为 select，options 按默认章节剩余额度（上限 3 扣已有）", () => {
+    const w = mkWorld();
+    w.chapters.push({ index: 2, title: "第二章", text: "……", review: null });
+    const card = buildMediaCard(w, "media_image", {}, "生成插画", { chapterIndex: 2 });
+    const countField = card.fields.find((f) => f.key === "count")!;
+    expect(countField.type).toBe("select");
+    expect(countField.options?.length).toBe(3);
+    expect(countField.options?.[0]).toEqual({ label: "1 张", value: "1" });
+    expect(countField.value).toBe(1);
+  });
+
+  test("已有插画扣减剩余额度：2 张已有 → 仅 1 张可生成", () => {
+    const w = mkWorld();
+    (w.chapters[0] as { media?: unknown[] }).media = [
+      { id: "m1", kind: "image", anchor: "a", prompt: "p", caption: "c", status: "ready", path: "images/m1.jpg" },
+      { id: "m2", kind: "image", anchor: "b", prompt: "p", caption: "c", status: "pending", path: "" },
+    ];
+    const card = buildMediaCard(w, "media_image", {}, "给第一章配张插画", { chapterIndex: 1 });
+    const countField = card.fields.find((f) => f.key === "count")!;
+    expect(countField.type).toBe("select");
+    expect(countField.options?.length).toBe(1);
+    expect(countField.options?.[0]?.value).toBe("1");
+    expect(countField.value).toBe(1);
+  });
+
+  test("已有 3 张（已满）→ options 仅「已满」占位，value 0", () => {
+    const w = mkWorld();
+    (w.chapters[0] as { media?: unknown[] }).media = [
+      { id: "m1", kind: "image", anchor: "a", prompt: "p", status: "ready", path: "x" },
+      { id: "m2", kind: "image", anchor: "b", prompt: "p", status: "ready", path: "x" },
+      { id: "m3", kind: "image", anchor: "c", prompt: "p", status: "ready", path: "x" },
+    ];
+    const card = buildMediaCard(w, "media_image", {}, "给第一章配张插画", { chapterIndex: 1 });
+    const countField = card.fields.find((f) => f.key === "count")!;
+    expect(countField.value).toBe(0);
+    expect(countField.options?.[0]?.label).toContain("已满");
+  });
+});
+
 
 
 // —— 回复文本与追问引导（聊天体验关键：空话检测 / 角色查询侧重 / 含糊章节追问） ——

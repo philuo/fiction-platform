@@ -2,7 +2,7 @@
 // 四类卡片：PreviewCard（操作预览）/ ConfirmCard（L2/L3 确认）/ ResultCard（执行结果）/ BrowseCard（浏览）
 // 卡片类型定义同时供 PHASE 4 意图识别编排器产出
 // 可选 image 字段：任意卡片可携带一张图（角色立绘/章节插画等），渲染在卡片内容上方
-import { useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { lensCn } from "../terms";
 
 // ============ 卡片数据类型 ============
@@ -37,6 +37,20 @@ export type PreviewCard = BrainCardBase & {
   statusLabel?: string;
   /** 操作按钮文案（缺省「执行」；媒体确认生成用「确认并生成」） */
   actionLabel?: string;
+  /** 分镜任务 id（分镜中 running 卡：轮询 /media/plan-status 恢复，刷新后重开继续轮询） */
+  planId?: string;
+  /** 分镜场景列表（分镜完成后呈现给用户；倒计时期间展示，确认后生成） */
+  scenes?: { anchor: string; scene: string; caption?: string }[];
+  /** 自动生成倒计时截止时间戳（ms）：3s 无手动操作自动生成；落盘跨刷新恢复对齐 */
+  countdownAt?: number;
+  /** 生成任务 mediaIds（生成中 running 卡：轮询 /media/status 恢复，刷新后重开继续轮询） */
+  mediaIds?: string[];
+  /** 目标章节（生成完成跳转左侧章节用） */
+  chapterIndex?: number;
+  /** 生成完成主 mediaId（跳转定位插画用） */
+  mediaId?: string;
+  /** 媒体类型（分镜中卡落盘供恢复扫描构建生成卡） */
+  mediaKind?: "image" | "video";
 };
 
 export type ConfirmCard = BrainCardBase & {
@@ -192,11 +206,31 @@ function CommandBadge({ commandId }: { commandId?: string }) {
 
 // ============ PreviewCard 操作预览卡 ============
 
-export const PreviewCardView: React.FC<{ card: PreviewCard; onExecute?: () => void; busy?: boolean; completed?: boolean }> = ({ card, onExecute, busy, completed }) => {
+export const PreviewCardView: React.FC<{
+  card: PreviewCard;
+  onExecute?: () => void;
+  busy?: boolean;
+  completed?: boolean;
+  /** 生成完成跳转（done 态「查看插画」按钮） */
+  onGoToMedia?: (chapterIndex: number, mediaId: string) => void;
+}> = ({ card, onExecute, busy, completed, onGoToMedia }) => {
   const running = card.status === "running";
   const failed = card.status === "failed";
   // failed 覆盖 completed 展示（任务失败时优先显示失败态，按钮保留可重试）
   const done = card.status === "done" || (completed && !failed);
+  // 分镜完成待自动生成（scenes + countdownAt，无 status）：展示场景 + 倒计时 + 立即生成按钮
+  const awaitingAuto = !!card.scenes?.length && !!card.countdownAt && !running && !failed && !done;
+  // 倒计时剩余秒：本地每秒刷新（countdownAt 为截止时间戳，跨刷新恢复后自动对齐）
+  const [left, setLeft] = useState(() => Math.max(0, Math.ceil(((card.countdownAt ?? 0) - Date.now()) / 1000)));
+  useEffect(() => {
+    if (!card.countdownAt) return;
+    const t = window.setInterval(() => {
+      const n = Math.max(0, Math.ceil(((card.countdownAt ?? 0) - Date.now()) / 1000));
+      setLeft(n);
+      if (n <= 0) window.clearInterval(t);
+    }, 500);
+    return () => window.clearInterval(t);
+  }, [card.countdownAt]);
   return (
     <div className={`brain-card brain-card-preview${done ? " bc-card-done" : ""}${card.status ? ` bc-preview-${card.status}` : ""}`}>
       <div className="brain-card-head">
@@ -206,6 +240,19 @@ export const PreviewCardView: React.FC<{ card: PreviewCard; onExecute?: () => vo
         {card.confirmRequired && !done && <span className="bc-confirm-tag">需确认</span>}
       </div>
       <p className="brain-card-body">{card.summary}</p>
+      {card.scenes?.length ? (
+        <div className="bc-scenes">
+          {card.scenes.map((sc, i) => (
+            <div className="bc-scene" key={i}>
+              <span className="bc-scene-idx">{i + 1}</span>
+              <div className="bc-scene-body">
+                <div className="bc-scene-caption">{sc.caption || sc.anchor}</div>
+                {sc.caption && sc.anchor ? <div className="bc-scene-anchor">「{sc.anchor}」</div> : null}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : null}
       {running && (
         <p className="bc-task-status bc-task-running">
           <span className="bc-progress-pill bc-progress-pill-running">{card.statusLabel ?? "生成中"}</span>
@@ -218,15 +265,23 @@ export const PreviewCardView: React.FC<{ card: PreviewCard; onExecute?: () => vo
           {card.detail ? `：${card.detail}` : ""}
         </p>
       )}
-      {card.action && onExecute && (
+      {awaitingAuto && (
+        <p className="bc-task-status bc-task-countdown">
+          <span className="bc-progress-pill bc-progress-pill-running">倒计时 {left}s</span>
+          ：{left > 0 ? "无操作将自动生成" : "即将自动生成…"}
+        </p>
+      )}
+      {(card.action && onExecute) || (done && card.mediaId && onGoToMedia) ? (
         <div className="brain-card-actions">
-          {done ? (
+          {done && card.mediaId && onGoToMedia ? (
+            <button className="btn-save btn-xs" onClick={() => onGoToMedia(card.chapterIndex ?? 1, card.mediaId as string)}>{card.mediaKind === "video" ? "🎬 查看视频" : "🖼 查看插画"}</button>
+          ) : done ? (
             <span className="bc-done-tag">{completed ? "✓ 已执行" : "✓ 已完成"}</span>
           ) : (
             <button className="btn-save btn-xs" disabled={busy || running} onClick={onExecute}>{running ? "处理中…" : (card.actionLabel ?? "执行")}</button>
           )}
         </div>
-      )}
+      ) : null}
     </div>
   );
 };
@@ -1050,7 +1105,9 @@ export const FormCardView: React.FC<{
   completed?: boolean;
   /** 值变化上报（供父组件动态正文跟随卡片选项；初始挂载也上报默认值） */
   onValuesChange?: (values: Record<string, unknown>) => void;
-}> = ({ card, onSubmit, busy, completed, onValuesChange }) => {
+  /** 媒体插画 form 卡：张数下拉的剩余额度回调（按所选章节动态计算，切换章节后 options 跟随） */
+  mediaQuota?: (chapterIndex: number) => number;
+}> = ({ card, onSubmit, busy, completed, onValuesChange, mediaQuota }) => {
   const [values, setValues] = useState<Record<string, unknown>>(() => {
     const init: Record<string, unknown> = {};
     for (const f of card.fields ?? []) init[f.key] = f.value ?? (f.type === "number" ? "" : f.type === "multiselect" ? [] : "");
@@ -1103,9 +1160,18 @@ export const FormCardView: React.FC<{
         <div className="bc-form-fields">
           {(card.fields ?? []).map((f) => {
             const id = `fld-${card.title}-${f.key}`;
+            // 媒体插画 form 卡：张数下拉按所选章节剩余额度动态生成（章节切换后 options 跟随；已满时禁用）
+            const isCountQuota = isMediaForm && f.key === "count" && !!mediaQuota && (card.action?.body?.kind ?? "image") === "image";
+            const quota = isCountQuota ? Math.max(0, mediaQuota!(Number(values.chapterIndex) || 0)) : null;
+            const fieldLabel = quota != null ? `张数（还可生成 ${quota} 张）` : f.label;
+            const selectOptions = quota != null
+              ? (quota > 0
+                ? Array.from({ length: quota }, (_, i) => ({ label: `${i + 1} 张`, value: String(i + 1) }))
+                : [{ label: "本章插画已满（上限 3 张）", value: "0" }])
+              : (f.options ?? []);
             return (
               <label className="bc-form-field" key={f.key} htmlFor={id}>
-                <span className="bc-form-label">{f.label}{f.required ? " *" : ""}</span>
+                <span className="bc-form-label">{fieldLabel}{f.required ? " *" : ""}</span>
                 {f.type === "textarea" ? (
                   <textarea
                     id={id} rows={2} className="bc-form-input" placeholder={f.placeholder}
@@ -1113,8 +1179,8 @@ export const FormCardView: React.FC<{
                     onChange={(e) => set(f.key, e.target.value)}
                   />
                 ) : f.type === "select" ? (
-                  <select id={id} className="bc-form-input" value={String(values[f.key] ?? "")} onChange={(e) => set(f.key, e.target.value)}>
-                    {(f.options ?? []).map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  <select id={id} className="bc-form-input" value={String(values[f.key] ?? "")} disabled={quota === 0} onChange={(e) => set(f.key, e.target.value)}>
+                    {selectOptions.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
                   </select>
                 ) : f.type === "multiselect" ? (
                   <div className="bc-form-checkgroup" id={id}>
@@ -1178,16 +1244,20 @@ export const BrainCardView: React.FC<{
   completedItems?: ReadonlySet<string>;
   /** 写作进度卡运行中取消（仅 kind=progress 使用） */
   onCancelProgress?: () => void;
-}> = ({ card, onExecute, onConfirmChoose, onOption, onFormSubmit, onFormValuesChange, busy, completed, completedItems, onCancelProgress }) => {
+  /** 生成完成跳转（preview 卡 done 态「查看插画」） */
+  onGoToMedia?: (chapterIndex: number, mediaId: string) => void;
+  /** 媒体 form 卡张数下拉的剩余额度回调（按所选章节动态计算 options） */
+  mediaQuota?: (chapterIndex: number) => number;
+}> = ({ card, onExecute, onConfirmChoose, onOption, onFormSubmit, onFormValuesChange, busy, completed, completedItems, onCancelProgress, onGoToMedia, mediaQuota }) => {
   const inner = (() => {
     switch (card.kind) {
-      case "preview": return <PreviewCardView card={card} onExecute={onExecute ? () => onExecute(card) : undefined} busy={busy} completed={completed} />;
+      case "preview": return <PreviewCardView card={card} onExecute={onExecute ? () => onExecute(card) : undefined} busy={busy} completed={completed} onGoToMedia={onGoToMedia} />;
       case "confirm": return <ConfirmCardView card={card} onChoose={onConfirmChoose} busy={busy} completed={completed} />;
       case "result": return <ResultCardView card={card} />;
       case "browse": return <BrowseCardView card={card} onAction={onExecute ? (action) => onExecute(card, action) : undefined} busy={busy} completedItems={completedItems} />;
       case "plan":
       case "opinion": return <ChoiceCardView card={card} onOption={onOption} busy={busy} />;
-      case "form": return <FormCardView card={card} onSubmit={onFormSubmit} onValuesChange={onFormValuesChange} busy={busy} completed={completed} />;
+      case "form": return <FormCardView card={card} onSubmit={onFormSubmit} onValuesChange={onFormValuesChange} busy={busy} completed={completed} mediaQuota={mediaQuota} />;
       case "progress": return <ProgressCardView card={card} onCancel={onCancelProgress} />;
       case "ask": return null; // 追问选择卡不渲染进聊天流（显示在输入框上方询问面板）
     }
