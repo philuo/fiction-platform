@@ -1151,6 +1151,39 @@ export const BrainCabin: React.FC<{
     // 清掉上一次任务的收起定时器，避免任务 A 结束后 2.5s 内启动任务 B 时把 B 的进度卡提前收起
     if (writingTimerRef.current) window.clearTimeout(writingTimerRef.current);
     setWriting({ title: cardTitle, phase: "start", text: "", status: "running" });
+
+    // 阶段 3b：创建服务端持久 progress 卡（带 cardId）——SSE 期间就地更新，完成后翻转 + 广播（多 tab 一致、刷新可见）。
+    // 失败建卡（无 activeId / 网络）则退化为纯瞬态（writing 仍展示），不阻塞任务。
+    let progressRef: { sessionId: string; messageId: string; cardId: string } | null = null;
+    const sid = activeId;
+    if (sid) {
+      try {
+        const pr = await apiFetch("/api/brain/sessions/progress", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title, sessionId: sid, cardTitle }),
+        });
+        if (pr.ok) {
+          const pd = (await pr.json()) as { messageId?: string; cardId?: string };
+          if (pd.messageId && pd.cardId) progressRef = { sessionId: sid, messageId: pd.messageId, cardId: pd.cardId };
+        }
+      } catch { /* 建卡失败：退化为瞬态 */ }
+    }
+    /** 本地就地更新 progress 卡（命中 active 会话即时可见）；静默 */
+    const patchProgressCard = (patch: Record<string, unknown>) => {
+      if (progressRef) patchCard(progressRef.sessionId, progressRef.messageId, progressRef.cardId, patch);
+    };
+    /** 完成后服务端翻转 + 广播（多 tab 一致）；失败静默（卡保持 running，重开会话仍可见过程） */
+    const finalizeProgressCard = (patch: Record<string, unknown>) => {
+      if (!progressRef) return;
+      patchProgressCard(patch);
+      void apiFetch("/api/brain/sessions/update-card", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, sessionId: progressRef.sessionId, messageId: progressRef.messageId, cardId: progressRef.cardId, patch }),
+      }).catch(() => {});
+    };
+
     let finalText = "";
     let ended: "done" | "failed" | "running" = "running"; // 流式终态跟踪
     type W = { title: string; phase: string; text: string; status: "running" | "done" | "failed"; detail?: string };
@@ -1168,6 +1201,7 @@ export const BrainCabin: React.FC<{
         const msg = String(err.error ?? `HTTP ${res.status}`);
         ended = "failed";
         patch({ status: "failed", detail: msg });
+        finalizeProgressCard({ status: "failed", phase: "failed", detail: msg });
         appendBrainMsg([{ kind: "result", title: cardTitle, success: false, detail: msg }]);
         return false;
       }
@@ -1188,34 +1222,42 @@ export const BrainCabin: React.FC<{
           if (phase === "delta") {
             finalText += String(obj.delta ?? "");
             patch({ phase, text: finalText });
+            patchProgressCard({ phase, text: finalText });
           } else if (phase === "result") {
             ended = "done";
             const r = (obj.result ?? {}) as { chapter?: { index?: number; title?: string } };
             patch({ phase, status: "done", text: finalText, detail: `第 ${r.chapter?.index ?? ""} 章《${r.chapter?.title ?? ""}》已完成` });
+            patchProgressCard({ phase, status: "done", text: finalText, detail: `第 ${r.chapter?.index ?? ""} 章《${r.chapter?.title ?? ""}》已完成` });
           } else if (phase === "auto-done") {
             ended = "done";
             const r = (obj.report ?? {}) as { written?: number; target?: number; reason?: string };
             patch({ phase, status: "done", text: finalText, detail: `连载完成：${r.written ?? 0}/${r.target ?? 0} 章（${String(r.reason ?? "")}）` });
+            patchProgressCard({ phase, status: "done", text: finalText, detail: `连载完成：${r.written ?? 0}/${r.target ?? 0} 章（${String(r.reason ?? "")}）` });
           } else if (phase === "pending-commit") {
             ended = "done";
             patch({ phase, status: "done", text: finalText, detail: `第 ${String(obj.chapterIndex ?? "")} 章审查已通过，等待确认入册` });
+            patchProgressCard({ phase, status: "done", text: finalText, detail: `第 ${String(obj.chapterIndex ?? "")} 章审查已通过，等待确认入册` });
           } else if (phase === "interrupted") {
             ended = "failed";
             patch({ phase, status: "failed", text: finalText, detail: "写作已中断（阶段边界丢弃草稿）" });
+            patchProgressCard({ phase, status: "failed", text: finalText, detail: "写作已中断（阶段边界丢弃草稿）" });
           } else if (phase === "start" || phase === "writing" || phase === "selfcheck" || phase === "reviewing" || phase === "patching" || phase === "settling" || phase === "saving" || phase === "auto-status") {
             patch({ phase, text: finalText });
+            patchProgressCard({ phase, text: finalText });
           }
         }
       }
       // 流正常关闭但未收到终态：任务已完成（SSE 在 result 后关闭）；兜底收尾
       if (ended === "running") ended = "done";
       patch((w) => (w!.status === "running" ? { status: "done", detail: "任务已结束" } : {}));
+      finalizeProgressCard({ status: "done", detail: "任务已结束" });
       appendBrainMsg([{ kind: "result", title: cardTitle, success: ended === "done", detail: ended === "done" ? "写作已完成，正文已更新" : "写作未完成" }]);
       return ended === "done";
     } catch (e) {
       const aborted = (e as Error).name === "AbortError";
       ended = "failed";
       patch(aborted ? { status: "failed", detail: "写作已中断" } : { status: "failed", detail: (e as Error).message });
+      finalizeProgressCard(aborted ? { status: "failed", phase: "failed", detail: "写作已中断" } : { status: "failed", phase: "failed", detail: (e as Error).message });
       if (!aborted) appendBrainMsg([{ kind: "result", title: cardTitle, success: false, detail: (e as Error).message }]);
       return false;
     } finally {

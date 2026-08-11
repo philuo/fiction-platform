@@ -549,8 +549,9 @@ Bun.serve({
 | `task-status:build-*` | 列表页 creating / 三栏构建徽章 | `fetchStories()` / 局部 `setBuildingStage` |
 | `auto-status:*` | 连载控制台 / 任务中心 / 中枢指示器 | `setAutoSession`（局部，无需全量） |
 | `brain-note` | 中枢聊天 | `reloadActive()`（幂等由服务端 eventId 去重） |
-| **`card-update`**（§2.3.6） | 中枢聊天**已有卡片** | 前端按 `(sessionId, messageId, cardId)` 就地替换卡片对象（`setMessages`），不重拉、不追加新消息；配套服务端 `updateMessageCard` 持久化 |
+| **`card-update`**（阶段 3a/3b 已落地） | 中枢聊天**已有卡片** | **基础设施**：BrainCard 加 `cardId`、`updateMessageCard` 服务端接口、`POST /api/brain/sessions/update-card` 路由、`card-update` 事件广播、前端 `patchCard` 就地替换（useBrainSession）+ `registerCardPatch` 注册（BrainCabin） |
 | **`brain-note`**（阶段 2a 已落地） | 中枢聊天（**多 tab 一致**） | 服务端 `appendSystemNote` 注入成功即广播 `brain-note` 事件 → 所有订阅该书连接收到 → Home `setSysTick+1` → BrainCabin `reloadActive`（复用现有 sysTick 链路，替代"仅发起 tab 重拉"的单一通道） |
+| **`progress` 进度卡**（阶段 3b 已落地） | 推进/连载的**持久进度卡** | 执行时 `POST /api/brain/sessions/progress` 建服务端持久 progress 卡（带 cardId，status:running）→ SSE 流式期间前端 `patchCard` 就地更新阶段/正文 → 完成后 `update-card` 翻转 done/failed + 广播 `card-update`（多 tab 一致、刷新可见；前端 writing 瞬态保留作动画） |
 
 区域级局部刷新（P11）作为第二阶段：COUPLING.md §2 的「指令→UI 区域映射账本」是现成设计依据。
 

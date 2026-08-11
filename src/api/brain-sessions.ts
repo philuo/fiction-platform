@@ -294,6 +294,24 @@ export function updateMessageCard(
   return hit;
 }
 
+/** 创建「任务进度消息」（阶段 3b：推进/连载的持久进度卡）。
+ *  追加一条 assistant 消息，cards 内放一张带 cardId 的 progress 卡（status:running）；
+ *  前端 SSE 流式期间就地更新，完成后经 update-card 翻转 + 广播（多 tab 一致，刷新可见）。
+ *  @returns { messageId, cardId }——调用方透传给更新/翻转链路。
+ */
+export function createProgressMessage(title: string, sessionId: string, cardTitle: string): { messageId: string; cardId: string } {
+  const messageId = uuid();
+  const cardId = `progress-${uuid()}`;
+  appendMessage(title, sessionId, {
+    id: messageId,
+    role: "assistant",
+    text: "",
+    at: Date.now(),
+    cards: [{ kind: "progress", cardId, title: cardTitle, phase: "start", text: "", status: "running" }],
+  });
+  return { messageId, cardId };
+}
+
 /** 会话最后一条未完成（pending=流式进行中 或 interrupted=被中断）消息；无则 null（resume 续流目标） */
 export function lastIncompleteMessage(s: BrainSession): BrainChatMsg | null {
   for (let i = s.messages.length - 1; i >= 0; i--) {

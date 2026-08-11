@@ -27,6 +27,7 @@ import {
   truncateSession,
   updateMessageCard,
   updateMessageText,
+  createProgressMessage,
 } from "../src/api/brain-sessions";
 
 const TITLE = "brain-sessions-test";
@@ -242,6 +243,27 @@ describe("卡片操作完成标记（markSessionCompleted）与 resume 定位工
     expect(JSON.stringify(getSession(TITLE, s.id)!.messages[1].cards)).toBe(before);
     // 消息不存在 → false
     expect(updateMessageCard(TITLE, s.id, "nomsg", "card-media-1", {})).toBe(false);
+  });
+
+  test("createProgressMessage：追加带 cardId 的 progress 卡消息（status:running）；updateMessageCard 可翻转", () => {
+    const s = createSession(TITLE, "进度卡测试");
+    sessionIds.push(s.id);
+    const { messageId, cardId } = createProgressMessage(TITLE, s.id, "推进剧情（写一章）");
+    expect(messageId).toBeTruthy();
+    expect(cardId).toContain("progress-");
+    const msg = getSession(TITLE, s.id)!.messages.find((m) => m.id === messageId)!;
+    expect(msg.role).toBe("assistant");
+    expect(msg.cards).toHaveLength(1);
+    const card = msg.cards![0] as { kind?: string; cardId?: string; status?: string; title?: string };
+    expect(card.kind).toBe("progress");
+    expect(card.cardId).toBe(cardId);
+    expect(card.status).toBe("running");
+    expect(card.title).toBe("推进剧情（写一章）");
+    // 翻转 → done（阶段 3b 完成路径）
+    expect(updateMessageCard(TITLE, s.id, messageId, cardId, { status: "done", phase: "result", detail: "第 1 章《风云》已完成" })).toBe(true);
+    const flipped = getSession(TITLE, s.id)!.messages.find((m) => m.id === messageId)!;
+    expect((flipped.cards![0] as { status?: string; detail?: string }).status).toBe("done");
+    expect((flipped.cards![0] as { detail?: string }).detail).toContain("第 1 章");
   });
 });
 

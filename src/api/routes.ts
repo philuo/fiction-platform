@@ -35,6 +35,7 @@ import {
   markSessionCompleted as markBrainSessionCompleted,
   appendSystemNote as appendBrainSystemNote,
   updateMessageCard as updateBrainMessageCard,
+  createProgressMessage as createBrainProgressMessage,
 } from "./brain-sessions";
 import { startAdvanceTask, updateAdvanceTaskPhase, completeAdvanceTask, failAdvanceTask, getAdvanceTaskForClient, clearAdvanceTask } from "./advancetask";
 import { migrateChapterMedia, touchChapter, genOf, type WorldState, type Character as WorldCharacter, type ChapterMedia, type ConsistencyFinding, type PendingChapter } from "./world";
@@ -632,6 +633,19 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       if (!bcTitle || !bcId || !bcKey) return json({ error: "缺少 title/id/key" }, 400);
       const ok = markBrainSessionCompleted(bcTitle, bcId, bcKey);
       return json({ ok });
+    }
+
+    case "/api/brain/sessions/progress": {
+      // 创建任务进度消息（阶段 3b）：推进/连载执行时建持久 progress 卡（带 cardId）。
+      // 返回 {messageId, cardId}，前端 SSE 流式期间就地更新，完成后经 update-card 翻转 + 广播。
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const pgBody = await readBody(req);
+      const pgTitle = String(pgBody.title ?? "").trim();
+      const pgSessionId = String(pgBody.sessionId ?? "").trim();
+      const pgCardTitle = String(pgBody.cardTitle ?? "写作任务").trim();
+      if (!pgTitle || !pgSessionId) return json({ error: "缺少 title/sessionId" }, 400);
+      const { messageId, cardId } = createBrainProgressMessage(pgTitle, pgSessionId, pgCardTitle);
+      return json({ ok: true, messageId, cardId });
     }
 
     case "/api/brain/sessions/update-card": {

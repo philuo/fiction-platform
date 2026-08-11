@@ -492,3 +492,42 @@ describe("update-card 路由（卡片就地更新，阶段 3a）", () => {
     expect(((await miss.json()) as { updated: boolean }).updated).toBe(false);
   });
 });
+
+describe("progress 路由（任务进度卡，阶段 3b）", () => {
+  test("创建进度消息 → 返回 messageId/cardId；detail 可见 progress 卡；update-card 翻转", async () => {
+    cookieA = await register("e2e_pg_" + Math.random().toString(36).slice(2, 8));
+    const sid = "e2e-pg-" + Math.random().toString(36).slice(2, 8);
+    const create = await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "推进剧情" }, cookieA);
+    expect(create.status).toBe(201);
+
+    const pg = await api("/api/brain/sessions/progress", "POST", { title: "e2e-book", sessionId: sid, cardTitle: "推进剧情（写一章）" }, cookieA);
+    expect(pg.status).toBe(200);
+    const pd = (await pg.json()) as { ok: boolean; messageId: string; cardId: string };
+    expect(pd.ok).toBe(true);
+    expect(pd.messageId).toBeTruthy();
+    expect(pd.cardId).toContain("progress-");
+
+    // detail 可见 progress 卡（status running）
+    const detail = await api("/api/brain/sessions/detail", "POST", { title: "e2e-book", id: sid }, cookieA);
+    const d = (await detail.json()) as { session: { messages: { id: string; cards?: { kind?: string; cardId?: string; status?: string }[] }[] } };
+    const msg = d.session.messages.find((m) => m.id === pd.messageId)!;
+    expect(msg.cards?.[0]?.kind).toBe("progress");
+    expect(msg.cards?.[0]?.cardId).toBe(pd.cardId);
+    expect(msg.cards?.[0]?.status).toBe("running");
+
+    // update-card 翻转 done（阶段 3b 完成路径）
+    const flip = await api("/api/brain/sessions/update-card", "POST", { title: "e2e-book", sessionId: sid, messageId: pd.messageId, cardId: pd.cardId, patch: { status: "done", phase: "result", detail: "第 1 章《风云》已完成" } }, cookieA);
+    expect(((await flip.json()) as { updated: boolean }).updated).toBe(true);
+    const detail2 = await api("/api/brain/sessions/detail", "POST", { title: "e2e-book", id: sid }, cookieA);
+    const d2 = (await detail2.json()) as { session: { messages: { id: string; cards?: { status?: string; detail?: string }[] }[] } };
+    const msg2 = d2.session.messages.find((m) => m.id === pd.messageId)!;
+    expect(msg2.cards?.[0]?.status).toBe("done");
+    expect(msg2.cards?.[0]?.detail).toContain("第 1 章");
+  });
+
+  test("缺参数 → 400", async () => {
+    cookieA = await register("e2e_pg2_" + Math.random().toString(36).slice(2, 8));
+    const bad = await api("/api/brain/sessions/progress", "POST", { title: "e2e-book", sessionId: "" }, cookieA);
+    expect(bad.status).toBe(400);
+  });
+});
