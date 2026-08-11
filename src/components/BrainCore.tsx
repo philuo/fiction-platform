@@ -72,7 +72,8 @@ export const BrainCore: React.FC<{
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    const DPR = 2;
+    // L16 修复：DPR 取设备真实值（effect 内访问 window，SSR 安全），避免高 DPI 屏模糊/低 DPI 屏过采样
+    const DPR = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
     canvas.width = 100 * DPR;
     canvas.height = 100 * DPR;
     ctx.scale(DPR, DPR);

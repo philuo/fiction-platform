@@ -244,6 +244,10 @@ const Home: React.FC<HomeProps> = (props) => {
   const [autoChapters, setAutoChapters] = useState(5);
   const sysPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoCheckedRef = useRef<string | null>(null);
+  // C7：当前选中书 title 的 ref 镜像。advance/startAutoRun 等长流闭包捕获点击时的 world，
+  // 流结束后若用户已切书，用此 ref 校验「仍是发起时的书」才写回 setWorld/setStoryUrl，避免旧书覆盖新书
+  const worldTitleRef = useRef("");
+  worldTitleRef.current = world?.title ?? "";
   /** 推进任务阶段（任务中心展示）：轮询从 /api/brain/context 同步——聊天中启动的推进任务本页也能看到进度 */
   const [advancePhase, setAdvancePhase] = useState("");
   /** 系统事件注入信号：injectSystemNote 成功后递增，透传 BrainCabin 重拉会话（聊天舱内实时显示【系统】条） */
@@ -636,13 +640,14 @@ const Home: React.FC<HomeProps> = (props) => {
     });
     const data = (await res.json()) as { world?: WorldState; visualPending?: boolean };
     const dw = data.world;
-    if (dw) setWorld(dw);
+    // C7 守卫：异步刷新返回时若用户已切到别的书/回首页，丢弃旧书结果，不覆盖当前书状态
+    if (dw && worldTitleRef.current === dw.title) setWorld(dw);
     // 区域级刷新：仅受影响区域变化时，跳过重副作用（如视觉轮询探测/媒体恢复）——
     // 但 world 是整包对象，React 按 props 引用重渲染子树；regions 用于「跳过无关副作用」决策
     // （缺省/全量：保留视觉轮询等既有副作用）
     const isFull = !regions || regions.length === 0 || regions.includes("U01");
     // 读时自愈/新增角色触发的视觉自动生成：启动轮询（中枢显示「自动生成角色头像/立绘中…」，完成后恢复待命）
-    if (dw && data.visualPending && isFull) startVisualPolling(dw.title);
+    if (dw && data.visualPending && isFull && worldTitleRef.current === dw.title) startVisualPolling(dw.title);
   }
 
   /** 全量状态即时刷新（聊天卡片执行后 / 连载 SSE 结束后调用）：
@@ -792,6 +797,9 @@ const Home: React.FC<HomeProps> = (props) => {
 
   async function advance() {
     if (!world || busy || buildingStage) return; // 世界构建中禁止手动推进（后台正在增强蓝图/章节）
+    // C7：捕获发起时的书 title，流收尾写回 state 前校验用户未切书，避免旧书结果覆盖新书
+    const startedTitle = world.title;
+    const stillSameBook = () => worldTitleRef.current === startedTitle;
     setBusy(true);
     setBusyPhase("导演写作中…");
     setLiveDraft("");
@@ -844,11 +852,14 @@ const Home: React.FC<HomeProps> = (props) => {
           if (ev.phase === "result" && ev.result) result = ev.result;
           if (ev.phase === "pending-commit") {
             // commitPolicy=confirm：审查通过已暂存，等人工确认入册
-            setPendingCommitIdx((ev as { chapterIndex?: number }).chapterIndex ?? null);
             setLiveDraft("");
             await refreshWorld();
-            showToast("本章审查通过，已暂存待你确认入册（可在任务中心确认或放弃）。");
-            setShowTaskCenter(true);
+            // C7：切书后不再为旧书弹任务中心/置待确认章
+            if (stillSameBook()) {
+              setPendingCommitIdx((ev as { chapterIndex?: number }).chapterIndex ?? null);
+              showToast("本章审查通过，已暂存待你确认入册（可在任务中心确认或放弃）。");
+              setShowTaskCenter(true);
+            }
             return; // 不走常规入册收尾
           }
         }
@@ -856,10 +867,13 @@ const Home: React.FC<HomeProps> = (props) => {
       setBusyPhase("存档中…");
       setLiveDraft("");
       await refreshWorld();
-      setActiveIdx(-1);
-      // 路由记录最新章节：刷新后回到写到的章节
-      setStoryUrl(world.title, result?.chapter?.index);
-      setCmd("");
+      // C7：流期间用户若切书，丢弃旧书的章节定位/路由/指令，不覆盖新书状态
+      if (stillSameBook()) {
+        setActiveIdx(-1);
+        // 路由记录最新章节：刷新后回到写到的章节
+        setStoryUrl(world.title, result?.chapter?.index);
+        setCmd("");
+      }
       const r = result?.review;
       showToast(
         r?.verdict === "pass"
@@ -1752,6 +1766,8 @@ const Home: React.FC<HomeProps> = (props) => {
   /** 查询连载会话与暂存区（刷新恢复 / 轮询 / SSE 结束后同步） */
   async function fetchAutoStatus() {
     if (!world) return null;
+    // C7 守卫：切书后旧闭包的回调不再写旧书的连载会话状态
+    if (worldTitleRef.current !== world.title) return null;
     try {
       const res = await apiFetch(`/api/novel/auto/status?title=${encodeURIComponent(world.title)}`);
       const d = (await res.json()) as { session?: AutoSessionView | null; pending?: PendingChapterView | null; error?: string };
@@ -1799,6 +1815,8 @@ const Home: React.FC<HomeProps> = (props) => {
   type SysCtx = { autoRunning?: boolean; advanceTaskRunning?: boolean; advancePhase?: string; advanceStartedAt?: string; mediaGenerating?: boolean; visualRunning?: boolean };
   async function pollSysStateOnce() {
     if (!world) return;
+    // C7 守卫：切书后旧闭包/旧轮询不再拉取或写入旧书系统状态
+    if (worldTitleRef.current !== world.title) return;
     const auto = await fetchAutoStatus().catch(() => null);
     let ctx: SysCtx | null = null;
     try {
@@ -1809,6 +1827,9 @@ const Home: React.FC<HomeProps> = (props) => {
       });
       if (res.ok) ctx = ((await res.json()) as { context?: SysCtx }).context ?? null;
     } catch { /* 网络抖动 */ }
+
+    // C7：await 期间用户可能已切书，再次校验后才写 state / 推进基线
+    if (worldTitleRef.current !== world.title) return;
 
     // 推进任务阶段同步（聊天中启动的任务在任务中心可见）；ctx 失败时保留旧值（防误释放运行锁）
     if (ctx) setAdvancePhase(ctx.advanceTaskRunning ? (ctx.advancePhase ?? "推进中") : "");
@@ -1877,7 +1898,14 @@ const Home: React.FC<HomeProps> = (props) => {
 
   // 打开小说 / 刷新恢复：启动统一状态轮询（常驻同步），并检查未完成会话（running/paused → 连载控制台）
   useEffect(() => {
-    if (!world || autoCheckedRef.current === world.title) return;
+    // L17 修复：回首页（world=null）时停止轮询并重置防重——否则定时器空转（闭包抓旧书），
+    // 且重开同一本书时 autoCheckedRef 仍命中旧 title 导致轮询不重启
+    if (!world) {
+      stopSysPoll();
+      autoCheckedRef.current = null;
+      return;
+    }
+    if (autoCheckedRef.current === world.title) return;
     autoCheckedRef.current = world.title;
     prevSysRef.current = null; // 重置变化检测基线（切书防串书误报：书 A 连载结束判定不能注入书 B）
     startSysPoll();
@@ -1898,6 +1926,9 @@ const Home: React.FC<HomeProps> = (props) => {
       showToast(`存在 ${reviseChapters.length} 章需修改（第 ${reviseChapters.map((c) => c.index).join("、")} 章），请先 AI 修复或手动修改后再连载。`);
       return;
     }
+    // C7：捕获发起时的书 title，流收尾前校验未切书，避免旧书连载结果覆盖新书
+    const startedTitle = world.title;
+    const stillSameBook = () => worldTitleRef.current === startedTitle;
     setAutoRunning(true);
     setBusy(true);
     setLiveDraft("");
@@ -1947,29 +1978,34 @@ const Home: React.FC<HomeProps> = (props) => {
           if (ev.phase === "auto-done" && ev.report) report = ev.report;
         }
       }
-      await refreshAllStates();
-      const reasonText: Record<string, string> = {
-        done: "已完成目标章数", complete: "全书完结", stopped: "已手动停止",
-        interrupted: "被干预打断", score: "评分熔断（连续低分）", quota: "额度/限流暂停", error: "连续失败暂停", review: "审查未通过暂停",
-      };
-      if (report?.reason === "review") {
-        setShowAutoPanel(true);
-        showToast(`连载暂停：第 ${report.failedChapter} 章审查未通过，问题已记账，请重试或跳过。`);
-      } else if (report) {
-        showToast(`自动连载结束：写了 ${report.written ?? 0} 章（${reasonText[report.reason ?? ""] ?? report.reason ?? ""}）${report.avgScore ? `，均分 ${report.avgScore.toFixed(1)}` : ""}`);
-      } else if (!interrupted) {
-        // 流正常结束但未收到 auto-done：连接中途断开，服务端可能仍在续写
-        showToast("连接中断：自动连载可能仍在服务端继续，请刷新后核对章节数。");
+      // C7：切书后丢弃旧书连载收尾（不再拉旧书状态/弹旧书 toast/面板），新书由其自身轮询/effect 管理
+      if (stillSameBook()) {
+        await refreshAllStates();
+        const reasonText: Record<string, string> = {
+          done: "已完成目标章数", complete: "全书完结", stopped: "已手动停止",
+          interrupted: "被干预打断", score: "评分熔断（连续低分）", quota: "额度/限流暂停", error: "连续失败暂停", review: "审查未通过暂停",
+        };
+        if (report?.reason === "review") {
+          setShowAutoPanel(true);
+          showToast(`连载暂停：第 ${report.failedChapter} 章审查未通过，问题已记账，请重试或跳过。`);
+        } else if (report) {
+          showToast(`自动连载结束：写了 ${report.written ?? 0} 章（${reasonText[report.reason ?? ""] ?? report.reason ?? ""}）${report.avgScore ? `，均分 ${report.avgScore.toFixed(1)}` : ""}`);
+        } else if (!interrupted) {
+          // 流正常结束但未收到 auto-done：连接中途断开，服务端可能仍在续写
+          showToast("连接中断：自动连载可能仍在服务端继续，请刷新后核对章节数。");
+        }
       }
     } catch (e) {
-      showToast("自动连载失败: " + (e as Error).message);
+      // C7：切书后不再为旧书弹失败 toast
+      if (stillSameBook()) showToast("自动连载失败: " + (e as Error).message);
     } finally {
       setAutoRunning(false);
       setBusy(false);
       setBusyPhase("");
       setLiveDraft("");
-      // SSE 断开：WS 连接时由事件驱动（task-status/auto-status 覆盖连载完成）；仅 WS 也断时恢复轮询兜底
-      if (mountedRef.current && !wsConnectedRef.current) startSysPoll();
+      // SSE 断开：WS 连接时由事件驱动（task-status/auto-status 覆盖连载完成）；仅 WS 也断时恢复轮询兜底。
+      // C7：仅当仍在发起时的书上才重启轮询——切书后旧 SSE 结束不能用旧闭包 pollSysStateOnce 覆盖新书轮询
+      if (mountedRef.current && !wsConnectedRef.current && stillSameBook()) startSysPoll();
     }
   }
 
@@ -2265,12 +2301,18 @@ const Home: React.FC<HomeProps> = (props) => {
     }
   }
 
-  // 弹窗打开时锁定 body 滚动 + Escape 关闭（仅客户端）
+  // 弹窗打开时锁定 body 滚动（M9：合并为单一 effect——任一弹窗/遮罩打开即锁，cleanup 只随「是否有弹窗」
+  // 这一布尔变化而跑，避免与下方键盘 effect 的无条件复位冲突，也补上 BrainCabin/任务中心/伏笔/评估/
+  // 干预/删章预览/一致性/媒体规划/重生成/立绘/记忆台账等弹窗的滚动锁）
   useEffect(() => {
     if (typeof document === "undefined") return;
-    const anyOpen = showGacha || showSettings || showVersions || !!relModal || showNewStory || reviewOpen || !!confirmMsg || showAutoPanel || showAutoStart;
+    const anyOpen = showGacha || showSettings || showVersions || !!relModal || showNewStory || reviewOpen
+      || !!confirmMsg || showAutoPanel || showAutoStart || showBrainCabin || showTaskCenter || showForeshadow
+      || showEval || !!intervene || !!deletePreview || !!integrityView || !!mediaPlan || !!regenMedia
+      || !!portraitView || showMemoryAudit;
     document.body.style.overflow = anyOpen ? "hidden" : "";
-  }, [showGacha, showSettings, showVersions, relModal, showNewStory, reviewOpen, confirmMsg, showAutoPanel, showAutoStart]);
+    return () => { document.body.style.overflow = ""; };
+  }, [showGacha, showSettings, showVersions, relModal, showNewStory, reviewOpen, confirmMsg, showAutoPanel, showAutoStart, showBrainCabin, showTaskCenter, showForeshadow, showEval, intervene, deletePreview, integrityView, mediaPlan, regenMedia, portraitView, showMemoryAudit]);
 
   // 全局键盘 / 点击外部 / 滚动关闭浮动菜单
   useEffect(() => {
@@ -2311,7 +2353,8 @@ const Home: React.FC<HomeProps> = (props) => {
       document.removeEventListener("keydown", keyHandler);
       document.removeEventListener("mousedown", clickOutsideHandler);
       document.removeEventListener("scroll", scrollHandler, true);
-      document.body.style.overflow = "";
+      // M9：不在此复位 body.overflow——滚动锁由上方单一 effect 统一管理，
+      // 否则 chapterMenu/advanceMenu 等非弹窗状态变化时 cleanup 会无条件解锁，与弹窗锁冲突
     };
   }, [chapterMenu, advanceMenu, confirmMsg, showNewStory, showGacha, showSettings, relModal, showVersions, reviewOpen, regenMedia, mediaPlan, deletePreview, integrityView]);
 
@@ -2662,7 +2705,13 @@ const Home: React.FC<HomeProps> = (props) => {
               placeholder="指令：让主角…（Enter 推进）"
               value={cmd}
               onChange={(e) => setCmd(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter" && !taskActive) advance(); }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !taskActive) {
+                  // M8 修复：中文输入法选词中的 Enter 不触发推进
+                  if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+                  advance();
+                }
+              }}
             />
             <button className="btn btn-ghost" onClick={() => setShowGacha(true)} disabled={taskActive} title={taskActive ? "任务运行中已禁用（抽卡属 AI 类操作）" : undefined}>
               <Dices size={15} /> 抽卡

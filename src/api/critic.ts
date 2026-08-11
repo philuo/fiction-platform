@@ -59,10 +59,8 @@ export function decideAction(
   const majors = findings.filter((f) => f.severity === "major");
   if (floorFail || majors.some((f) => f.fixScope === "chapter")) return { action: "rewrite", floorFail };
   if (majors.length) return { action: "patch", floorFail };
-  if (llmVerdict !== "pass") {
-    // LLM 判 revise 但无 major：尊重其意见做段落级修补（findings 仍可能含可修项）
-    return findings.length ? { action: "patch", floorFail } : { action: "pass", floorFail };
-  }
+  // 无 major（findings 全是 minor）且地板未失败：一律 pass（修 L2）。
+  // 不再因 LLM 判 revise 就走 patch——minor 由管线登记质量债务，不阻塞提交。
   return { action: "pass", floorFail };
 }
 

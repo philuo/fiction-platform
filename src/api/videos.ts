@@ -9,7 +9,8 @@ import { storyDir } from "./storage";
 import { videoLimiter } from "./limiter";
 
 const AGNES_VIDEO_BASE = (process.env.AGNES_BASE_URL ?? "https://api.agnes-ai.cn/v1").replace(/\/$/, "");
-const AGNES_VIDEO_HOST = AGNES_VIDEO_BASE.replace(/\/v1$/, ""); // https://api.agnes-ai.cn
+// 轮询与创建任务同源：统一以 AGNES_VIDEO_BASE 为前缀（创建走 /videos、轮询走 /agnesapi）；
+// 旧版另起 HOST 并剥 /v1，当 BASE 不以 /v1 结尾时会导致创建与轮询 host 不一致
 const AGNES_VIDEO_KEY = process.env.AGNES_API_KEY ?? "";
 // 模型硬绑定：不允许 env 覆盖（用户强制要求）
 const AGNES_VIDEO_MODEL = "agnes-video-v2.0";
@@ -108,7 +109,7 @@ export type VideoStatus = {
 
 /** 轮询视频任务状态。429 限流时返回 status=rate_limited（调用方应继续等待，不视为失败） */
 export async function pollVideoTask(videoId: string): Promise<VideoStatus> {
-  const res = await fetch(`${AGNES_VIDEO_HOST}/agnesapi?video_id=${encodeURIComponent(videoId)}`, {
+  const res = await fetch(`${AGNES_VIDEO_BASE}/agnesapi?video_id=${encodeURIComponent(videoId)}`, {
     headers: { Authorization: `Bearer ${AGNES_VIDEO_KEY}` },
     signal: AbortSignal.timeout(30_000),
   });
@@ -139,6 +140,11 @@ export async function pollVideoTask(videoId: string): Promise<VideoStatus> {
 export async function downloadVideo(url: string): Promise<Uint8Array> {
   const res = await fetch(url, { signal: AbortSignal.timeout(300_000) });
   if (!res.ok) throw new Error(`视频下载失败 HTTP ${res.status}`);
+  // 预判：响应头带 Content-Length 且超阈值时，在整包读入内存前直接拒绝
+  const contentLength = Number(res.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > MAX_VIDEO_BYTES) {
+    throw new Error("视频过大（限 100MB）");
+  }
   const buf = new Uint8Array(await res.arrayBuffer());
   if (buf.length > MAX_VIDEO_BYTES) throw new Error("视频过大（限 100MB）");
   return buf;
@@ -146,8 +152,13 @@ export async function downloadVideo(url: string): Promise<Uint8Array> {
 
 /** 保存视频到 data/<username>/<slug>/videos/，返回相对路径 videos/<name> */
 export function saveVideo(storyTitle: string, name: string, data: Uint8Array): string {
-  const dir = join(storyDir(storyTitle), "videos");
+  const base = storyDir(storyTitle);
+  const dir = join(base, "videos");
+  // 防路径穿越：resolve 后写入路径必须仍在 videos/ 目录内
+  const full = join(dir, name);
+  const norm = (p: string) => p.replace(/[\\/]+/g, "/");
+  if (!norm(full).startsWith(norm(dir) + "/")) throw new Error("非法路径：" + name);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, name), data);
+  writeFileSync(full, data);
   return `videos/${name}`;
 }

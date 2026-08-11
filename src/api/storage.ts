@@ -8,7 +8,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { Arc, ChapterVersion, PendingChapter, WorldState } from "./world";
+import type { Arc, ChangeLogEntry, ChapterVersion, PendingChapter, WorldState } from "./world";
 import type { EvalReport } from "./eval";
 import { notifyWorldSaved } from "./sync";
 
@@ -205,6 +205,14 @@ function pruneVersionFiles(title: string, referenced: Set<string>): void {
   }
 }
 
+/** 原子写 JSON：同目录 tmp 文件（<path>.tmp-<pid>）写完再 rename，避免写一半崩溃损坏存档
+ * （state.json/meta.json/pending/autosession 共用；tmp 命名与原 state.json 规则一致） */
+function atomicWriteJson(path: string, obj: unknown): void {
+  const tmp = `${path}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(obj, null, 2), "utf-8");
+  renameSync(tmp, path);
+}
+
 export function saveWorld(w: WorldState, regions?: string[]): string {
   const dir = storyDir(w.title);
   mkdirSync(dir, { recursive: true });
@@ -231,9 +239,7 @@ export function saveWorld(w: WorldState, regions?: string[]): string {
     }),
   };
   // 原子写：tmp + rename（修 G3：写一半崩溃不损坏存档）
-  const tmp = join(dir, `state.json.tmp-${process.pid}`);
-  writeFileSync(tmp, JSON.stringify(snapshot, null, 2), "utf-8");
-  renameSync(tmp, path);
+  atomicWriteJson(path, snapshot);
   // 孤儿版本文件收敛：state.json 已落盘，删除不再被引用的版本文件（去重/删章后的磁盘清理）
   pruneVersionFiles(
     w.title,
@@ -242,7 +248,7 @@ export function saveWorld(w: WorldState, regions?: string[]): string {
   // meta.json：列表页快读（修 G4）
   try {
     const meta = { slug: slugify(w.title), title: w.title, genre: w.genre ?? "", chapters: w.chapters?.length ?? 0, updatedAt: w.updatedAt, cover: w.cover };
-    writeFileSync(join(dir, "meta.json"), JSON.stringify(meta), "utf-8");
+    atomicWriteJson(join(dir, "meta.json"), meta);
   } catch {
     /* meta 写失败不影响主存档 */
   }
@@ -282,9 +288,34 @@ export function readLastCheckpoint(title: string): { step: string; chapter: numb
 }
 
 export function loadWorld(title: string): WorldState | null {
-  const path = join(storyDir(title), "state.json");
-  if (!existsSync(path)) return null;
-  const w = JSON.parse(readFileSync(path, "utf-8")) as WorldState;
+  const dir = storyDir(title);
+  const path = join(dir, "state.json");
+  if (!existsSync(path)) return null; // 存档不存在：返回 null（新建语义）
+  // 主存档损坏时回退 state.json.bak（saveWorld 每次写前备份）；bak 也损坏才抛错
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (e) {
+    const bak = join(dir, "state.json.bak");
+    if (existsSync(bak)) {
+      console.warn(`[storage] state.json 读取失败，回退 .bak：${path}`, (e as Error).message);
+      raw = readFileSync(bak, "utf-8"); // bak 读取/解析失败则向上抛错
+    } else {
+      throw e;
+    }
+  }
+  let w: WorldState;
+  try {
+    w = JSON.parse(raw) as WorldState;
+  } catch (e) {
+    const bak = join(dir, "state.json.bak");
+    if (existsSync(bak)) {
+      console.warn(`[storage] state.json 解析失败，回退 .bak：${path}`, (e as Error).message);
+      w = JSON.parse(readFileSync(bak, "utf-8")) as WorldState; // bak 解析失败则向上抛错
+    } else {
+      throw e;
+    }
+  }
   migrateWorld(w);
   hydrateVersions(w);
   dedupeVersions(w); // 存量版本表去重（纯内存，幂等；磁盘孤儿文件由下次 saveWorld 收敛）
@@ -309,6 +340,20 @@ export function mergeConcurrentMedia(w: WorldState): WorldState {
       if (!mc.portrait?.path && fc.portrait?.path) mc.portrait = fc.portrait;
       if (!mc.visualTriedAt && fc.visualTriedAt) mc.visualTriedAt = fc.visualTriedAt;
     }
+    // changeLog 合并：后台视觉任务落盘的审计日志不能被旧快照 saveWorld 覆盖。
+    // 磁盘版（fresh，含后台新写入）与内存快照合并，按整条去重，按时间排序（无 slice 上限，与 logChange 一致）。
+    if (fresh.changeLog?.length || w.changeLog?.length) {
+      const seen = new Set<string>();
+      const merged: ChangeLogEntry[] = [];
+      for (const e of [...(fresh.changeLog ?? []), ...(w.changeLog ?? [])]) {
+        const key = JSON.stringify(e);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push(e);
+      }
+      merged.sort((a, b) => (a.at ?? "").localeCompare(b.at ?? ""));
+      w.changeLog = merged;
+    }
   } catch {
     /* 读取失败：按快照原样保存（不阻塞落盘） */
   }
@@ -325,7 +370,7 @@ export function savePendingChapter(title: string, p: PendingChapter): void {
   try {
     const dir = storyDir(title);
     mkdirSync(dir, { recursive: true });
-    writeFileSync(pendingPath(title), JSON.stringify(p, null, 2), "utf-8");
+    atomicWriteJson(pendingPath(title), p);
   } catch (e) {
     console.warn("[storage] 暂存区草稿写入失败:", (e as Error).message);
   }
@@ -374,7 +419,7 @@ export function saveAutoSession(title: string, s: AutoSession): void {
   try {
     const dir = storyDir(title);
     mkdirSync(dir, { recursive: true });
-    writeFileSync(sessionPath(title), JSON.stringify(s, null, 2), "utf-8");
+    atomicWriteJson(sessionPath(title), s);
   } catch (e) {
     console.warn("[storage] 会话状态写入失败:", (e as Error).message);
   }
@@ -428,15 +473,23 @@ export function listStoriesMeta(username?: string): StoryMeta[] {
     if (!isStoryDirectory(storyPath)) continue; // 非书目录/文件（sqlite、会话记录等）跳过
     try {
       const metaPath = join(storyPath, "meta.json");
+      let meta: StoryMeta | null = null;
       if (existsSync(metaPath)) {
-        metas.push(JSON.parse(readFileSync(metaPath, "utf-8")) as StoryMeta);
-        continue;
+        try {
+          meta = JSON.parse(readFileSync(metaPath, "utf-8")) as StoryMeta;
+        } catch (e) {
+          // meta.json 损坏不致使书从书架消失：回退读 state.json 重建基本信息
+          console.warn(`[storage] meta.json 损坏，回退 state.json：${metaPath}`, (e as Error).message);
+        }
       }
-      const raw = readFileSync(join(storyPath, "state.json"), "utf-8");
-      const w = JSON.parse(raw) as WorldState;
-      metas.push({ slug: s, title: w.title, genre: w.genre ?? "", chapters: w.chapters?.length ?? 0, updatedAt: w.updatedAt ?? "", cover: w.cover });
+      if (!meta) {
+        const raw = readFileSync(join(storyPath, "state.json"), "utf-8");
+        const w = JSON.parse(raw) as WorldState;
+        meta = { slug: s, title: w.title, genre: w.genre ?? "", chapters: w.chapters?.length ?? 0, updatedAt: w.updatedAt ?? "", cover: w.cover };
+      }
+      metas.push(meta);
     } catch {
-      // 损坏的存档跳过（不把非书目录当书）
+      // meta 与 state 均损坏才跳过（不把非书目录当书）
     }
   }
   // 按更新时间倒序

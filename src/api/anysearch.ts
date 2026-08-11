@@ -49,12 +49,17 @@ async function call(tool: string, args: Record<string, unknown>, timeoutMs = 30_
   }
   const data = (await res.json().catch(() => null)) as {
     error?: { message?: string };
-    result?: { content?: { type: string; text?: string }[] };
+    result?: { content?: { type: string; text?: string; isError?: boolean }[] };
   } | null;
   if (!res.ok || data?.error) {
     throw new AnySearchError(`HTTP ${res.status}: ${data?.error?.message ?? "请求失败"}`);
   }
-  for (const item of data?.result?.content ?? []) {
+  const content = data?.result?.content ?? [];
+  // JSON-RPC 工具错误：某个 content item 标记 isError=true 时，把其文本作为错误抛出，使调用方可感知
+  for (const item of content) {
+    if (item.isError) throw new AnySearchError(item.text || "AnySearch 返回错误");
+  }
+  for (const item of content) {
     if (item.type === "text" && item.text) return item.text;
   }
   return JSON.stringify(data?.result ?? {}, null, 2);

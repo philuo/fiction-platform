@@ -118,6 +118,8 @@ export async function withSmartRetry(
   doCall: (attemptOpts: AgnesOptions) => Promise<unknown>,
   opts: AgnesOptions,
   maxRetries = 4,
+  /** 额外重试闸门：返回 false 时即便错误可重试也直接抛出（流式首字节已交付后用于禁止重放） */
+  canRetry?: (err: unknown) => boolean,
 ): Promise<unknown> {
   let lastErr: Error | null = null;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -126,6 +128,8 @@ export async function withSmartRetry(
     } catch (e) {
       lastErr = e as Error;
       if (!isRetryableError(lastErr)) throw lastErr;
+      // 流式首字节已交付则不再重试：前半段已通过 onChunk 发出，重试会整段重放导致重复累加
+      if (canRetry && !canRetry(lastErr)) throw lastErr;
       // 诊断分析：汇总错误特征供运维定位（不改变请求参数，仅常规指数退避重试）
       const diag: string[] = [`第${attempt + 1}/${maxRetries}次尝试失败`, `err=${lastErr.message.slice(0, 120)}`];
       if (lastErr instanceof LLMError) {
@@ -351,14 +355,22 @@ export async function chatStream(
   const retries = opts.retries ?? 4;
   const t0 = Date.now();
   const model = opts.model ?? MODEL;
+  // H7：流式一旦交付过首字节就禁止重试——前半段已通过回调发出，重试会整段重放，
+  // 导致前端重复文本、brain-chat 的 acc += delta 落库成"前半段+完整段"
+  let streamStarted = false;
+  const handleChunk = (delta: string) => { streamStarted = true; onChunk(delta); };
+  const handleReasoning = opts.onReasoning
+    ? (delta: string) => { streamStarted = true; opts.onReasoning!(delta); }
+    : undefined;
   try {
     const r = (await withSmartRetry(
       (attemptOpts) => {
         const streamOpts = { ...attemptOpts, stream: true };
-        return callOnce(model, messages, streamOpts).then((res) => readStream(res, onChunk, opts.onReasoning));
+        return callOnce(model, messages, streamOpts).then((res) => readStream(res, handleChunk, handleReasoning));
       },
       opts,
       retries,
+      () => !streamStarted,
     )) as string;
     console.log(`[agnes] chatStream 完成 耗时${((Date.now() - t0) / 1000).toFixed(1)}s model=${model} 重试上限${retries} msgChars=${messages.reduce((n, m) => n + (m.content?.length ?? 0), 0)}`);
     return r;

@@ -15,8 +15,9 @@
 import { chatJson } from "./jsonutil";
 import { chatStream } from "./agnes";
 import { taskOpts } from "./modelconfig";
-import { loadWorld, saveWorld } from "./storage";
+import { loadWorld, saveWorld, slugify as slug } from "./storage";
 import { logChange } from "./steering";
+import { withTitleLock } from "./titlelock";
 import { readEvalReport } from "./eval";
 import { isPendingForeshadow, targetChapterCount } from "./world";
 import { mediaDataUri } from "./media";
@@ -1547,13 +1548,7 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
         send({ type: "done", messageId });
         return;
       }
-      const wLive = brainChatDeps.loadWorld(title);
-      if (!wLive) {
-        markMessageDone(title, sessionId, messageId, []);
-        send({ type: "done", messageId });
-        return;
-      }
-      // 先发「评估中」提示（delta），再出结果——呈现 评估中 → 结果 的过程
+      // 先发「评估中」提示（delta），再出结果——呈现 评估中 → 结果 的过程（SSE 输出保持锁外）
       const assessing = reply || (intent === "relationship_edit" ? "正在评估关系与现状的冲突…" : `正在处理「${meta.title}」…`);
       if (assessing) {
         updateMessageText(title, sessionId, messageId, assessing, true);
@@ -1561,123 +1556,139 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
       }
       let result: BrainChatCard | null = null;
       let askCard: { kind: "ask"; question: string; options: { label: string; description?: string }[] } | null = null;
-      if (intent === "relationship_edit") {
-        const aName = String(params.nameA ?? params.a ?? "").trim();
-        const bName = String(params.nameB ?? params.b ?? "").trim();
-        const rel = typeof params.relation === "string" ? params.relation.trim() : "";
-        const remove = params.remove === true || params.action === "remove";
-        const a = aName ? wLive.characters.find((c) => c.name.includes(aName) || aName.includes(c.name)) : undefined;
-        const b = bName ? wLive.characters.find((c) => c.name.includes(bName) || bName.includes(c.name)) : undefined;
-        if (!aName || !bName || !rel) {
-          // 参数不足 → ask 追问（不轻易拒绝）
-          askCard = buildAskCard(wLive, "relationship_edit", params);
-        } else if (!a || !b) {
-          const missing = !a ? aName : bName;
-          result = {
-            kind: "result", title: "关系未建立", success: false,
-            detail: `「${missing}」还不在这本书里，暂时无法建立关系。可以让我「新建角色 ${missing}」，或从现有角色里选一个（现有：${wLive.characters.slice(0, 5).map((c) => c.name).join("、")}${wLive.characters.length > 5 ? "…" : ""}）。`,
-          };
-        } else if (a.id === b.id) {
-          result = { kind: "result", title: "关系未建立", success: false, detail: "不能与自己建立关系，请选择两个不同角色。" };
-        } else {
-          // 宽松评估：不轻易拒绝——已存在同值关系幂等确认；异值关系升级覆盖；无冲突直接建立
-          const existingA = a.relations?.[b.name];
-          const existingB = b.relations?.[a.name];
-          if (remove) {
-            const ra = { ...(a.relations ?? {}) };
-            delete ra[b.name];
-            a.relations = ra;
-            const rb = { ...(b.relations ?? {}) };
-            delete rb[a.name];
-            b.relations = rb;
+      // 只锁 world 读写事务（load→修改→save），与连载/其他写操作互斥，避免基于旧快照互相覆盖；
+      // 锁内重新 loadWorld 拿最新快照。上方软忙碌检测与 SSE 输出均在锁外。
+      await withTitleLock(slug(title), async () => {
+        const w = brainChatDeps.loadWorld(title);
+        if (!w) {
+          result = null;
+          askCard = null;
+          return;
+        }
+        if (intent === "relationship_edit") {
+          const aName = String(params.nameA ?? params.a ?? "").trim();
+          const bName = String(params.nameB ?? params.b ?? "").trim();
+          const rel = typeof params.relation === "string" ? params.relation.trim() : "";
+          const remove = params.remove === true || params.action === "remove";
+          const a = aName ? w.characters.find((c) => c.name.includes(aName) || aName.includes(c.name)) : undefined;
+          const b = bName ? w.characters.find((c) => c.name.includes(bName) || bName.includes(c.name)) : undefined;
+          if (!aName || !bName || !rel) {
+            // 参数不足 → ask 追问（不轻易拒绝）
+            askCard = buildAskCard(w, "relationship_edit", params);
+          } else if (!a || !b) {
+            const missing = !a ? aName : bName;
+            result = {
+              kind: "result", title: "关系未建立", success: false,
+              detail: `「${missing}」还不在这本书里，暂时无法建立关系。可以让我「新建角色 ${missing}」，或从现有角色里选一个（现有：${w.characters.slice(0, 5).map((c) => c.name).join("、")}${w.characters.length > 5 ? "…" : ""}）。`,
+            };
+          } else if (a.id === b.id) {
+            result = { kind: "result", title: "关系未建立", success: false, detail: "不能与自己建立关系，请选择两个不同角色。" };
           } else {
-            a.relations = { ...(a.relations ?? {}), [b.name]: rel };
-            b.relations = { ...(b.relations ?? {}), [a.name]: rel };
+            // 宽松评估：不轻易拒绝——已存在同值关系幂等确认；异值关系升级覆盖；无冲突直接建立
+            const existingA = a.relations?.[b.name];
+            const existingB = b.relations?.[a.name];
+            if (remove) {
+              const ra = { ...(a.relations ?? {}) };
+              delete ra[b.name];
+              a.relations = ra;
+              const rb = { ...(b.relations ?? {}) };
+              delete rb[a.name];
+              b.relations = rb;
+            } else {
+              a.relations = { ...(a.relations ?? {}), [b.name]: rel };
+              b.relations = { ...(b.relations ?? {}), [a.name]: rel };
+            }
+            logChange(w, {
+              chapter: w.nextChapter, actor: "user", kind: "relationship-edit",
+              detail: remove
+                ? `解除关系：${a.name}-(${existingA ?? "原关系"})-${b.name}`
+                : `${existingA ? `更新关系（原「${String(existingA).slice(0, 20)}」）` : "建立关系"}：${a.name}-(${rel})-${b.name}`,
+              commandId: "CMD-W12",
+            });
+            saveWorld(w);
+            result = {
+              kind: "result", title: remove ? "关系已解除" : "关系已建立", success: true,
+              detail: remove
+                ? `已解除关系：${a.name}-(${existingA ?? "原关系"})-${b.name}`
+                : `已建立关系：${a.name}-(${rel})-${b.name}${existingA ? `（原关系已更新）` : ""}${existingB ? `（反向关系 ${b.name}-(${existingB})-${a.name} 已同步更新）` : ""}`,
+            };
           }
-          logChange(wLive, {
-            chapter: wLive.nextChapter, actor: "user", kind: "relationship-edit",
-            detail: remove
-              ? `解除关系：${a.name}-(${existingA ?? "原关系"})-${b.name}`
-              : `${existingA ? `更新关系（原「${String(existingA).slice(0, 20)}」）` : "建立关系"}：${a.name}-(${rel})-${b.name}`,
-            commandId: "CMD-W12",
-          });
-          saveWorld(wLive);
-          result = {
-            kind: "result", title: remove ? "关系已解除" : "关系已建立", success: true,
-            detail: remove
-              ? `已解除关系：${a.name}-(${existingA ?? "原关系"})-${b.name}`
-              : `已建立关系：${a.name}-(${rel})-${b.name}${existingA ? `（原关系已更新）` : ""}${existingB ? `（反向关系 ${b.name}-(${existingB})-${a.name} 已同步更新）` : ""}`,
-          };
-        }
-      } else if (intent === "create_character") {
-        const cName = String(params.name ?? "").trim();
-        const role = String(params.role ?? "配角").trim();
-        if (!cName) {
-          askCard = buildAskCard(wLive, "create_character", params);
-        } else if (wLive.characters.some((c) => c.name === cName)) {
-          result = { kind: "result", title: "角色已存在", success: false, detail: `「${cName}」已经在这本书里了（${wLive.characters.find((c) => c.name === cName)?.role}）。可以让我「修改角色 ${cName}」或「查看 ${cName}」。` };
-        } else {
-          const id = `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-          wLive.characters.push({
-            id, name: cName, role, traits: [], motivation: String(params.motivation ?? ""),
-            status: String(params.status ?? "在世"), relations: {}, introducedAt: Date.now(),
-          });
-          logChange(wLive, { chapter: wLive.nextChapter, actor: "user", kind: "character-create", detail: `新建角色「${cName}」（${role}）`, commandId: "CMD-W12" });
-          saveWorld(wLive);
-          result = {
-            kind: "result", title: "角色已创建", success: true,
-            detail: `已创建角色：${cName}（定位：${role}）。可让我「为 ${cName} 生成立绘」「给 ${cName} 和某角色建立关系」，或在「打开设置-角色」页完善信息。`,
-          };
-        }
-      } else if (intent === "edit_character") {
-        const eName = String(params.name ?? "").trim();
-        const c = eName ? wLive.characters.find((x) => x.name.includes(eName) || eName.includes(x.name)) : undefined;
-        if (!eName || !c) {
-          // 缺名/找不到 → ask 追问（候选角色）或明确提示
-          if (eName) {
-            result = { kind: "result", title: "角色未找到", success: false, detail: `没有叫「${eName}」的角色。现有角色：${wLive.characters.slice(0, 5).map((x) => x.name).join("、")}${wLive.characters.length > 5 ? "…" : ""}` };
+        } else if (intent === "create_character") {
+          const cName = String(params.name ?? "").trim();
+          const role = String(params.role ?? "配角").trim();
+          if (!cName) {
+            askCard = buildAskCard(w, "create_character", params);
+          } else if (w.characters.some((c) => c.name === cName)) {
+            result = { kind: "result", title: "角色已存在", success: false, detail: `「${cName}」已经在这本书里了（${w.characters.find((c) => c.name === cName)?.role}）。可以让我「修改角色 ${cName}」或「查看 ${cName}」。` };
           } else {
-            askCard = buildAskCard(wLive, "edit_world", params);
+            const id = `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+            w.characters.push({
+              id, name: cName, role, traits: [], motivation: String(params.motivation ?? ""),
+              status: String(params.status ?? "在世"), relations: {}, introducedAt: Date.now(),
+            });
+            logChange(w, { chapter: w.nextChapter, actor: "user", kind: "character-create", detail: `新建角色「${cName}」（${role}）`, commandId: "CMD-W12" });
+            saveWorld(w);
+            result = {
+              kind: "result", title: "角色已创建", success: true,
+              detail: `已创建角色：${cName}（定位：${role}）。可让我「为 ${cName} 生成立绘」「给 ${cName} 和某角色建立关系」，或在「打开设置-角色」页完善信息。`,
+            };
           }
-        } else {
-          const updates: string[] = [];
-          if (params.role != null) { c.role = String(params.role); updates.push(`定位→${String(params.role)}`); }
-          if (params.status != null) { c.status = String(params.status); updates.push(`状态→${String(params.status)}`); }
-          if (params.age != null) { c.age = String(params.age); updates.push(`年龄→${String(params.age)}`); }
-          if (params.identity != null) { c.identity = String(params.identity); updates.push(`身份→${String(params.identity)}`); }
-          if (params.motivation != null) { c.motivation = String(params.motivation); updates.push(`动机→${String(params.motivation).slice(0, 20)}${String(params.motivation).length > 20 ? "…" : ""}`); }
-          if (params.look != null) { c.look = String(params.look); updates.push(`形象→${String(params.look).slice(0, 20)}`); }
-          if (params.voice != null) { c.voice = String(params.voice); updates.push(`声线→${String(params.voice)}`); }
-          if (!updates.length) {
-            result = { kind: "result", title: "未修改", success: false, detail: `请告诉我要修改「${c.name}」的哪一项（定位/状态/年龄/身份/动机/形象/声线），如「把 ${c.name} 的状态改成负伤」。` };
+        } else if (intent === "edit_character") {
+          const eName = String(params.name ?? "").trim();
+          const c = eName ? w.characters.find((x) => x.name.includes(eName) || eName.includes(x.name)) : undefined;
+          if (!eName || !c) {
+            // 缺名/找不到 → ask 追问（候选角色）或明确提示
+            if (eName) {
+              result = { kind: "result", title: "角色未找到", success: false, detail: `没有叫「${eName}」的角色。现有角色：${w.characters.slice(0, 5).map((x) => x.name).join("、")}${w.characters.length > 5 ? "…" : ""}` };
+            } else {
+              askCard = buildAskCard(w, "edit_world", params);
+            }
           } else {
-            logChange(wLive, { chapter: wLive.nextChapter, actor: "user", kind: "character-edit", detail: `修改角色「${c.name}」：${updates.join("、")}`, commandId: "CMD-W12" });
-            saveWorld(wLive);
-            result = { kind: "result", title: "角色已更新", success: true, detail: `已更新「${c.name}」：${updates.join("、")}。` };
+            const updates: string[] = [];
+            if (params.role != null) { c.role = String(params.role); updates.push(`定位→${String(params.role)}`); }
+            if (params.status != null) { c.status = String(params.status); updates.push(`状态→${String(params.status)}`); }
+            if (params.age != null) { c.age = String(params.age); updates.push(`年龄→${String(params.age)}`); }
+            if (params.identity != null) { c.identity = String(params.identity); updates.push(`身份→${String(params.identity)}`); }
+            if (params.motivation != null) { c.motivation = String(params.motivation); updates.push(`动机→${String(params.motivation).slice(0, 20)}${String(params.motivation).length > 20 ? "…" : ""}`); }
+            if (params.look != null) { c.look = String(params.look); updates.push(`形象→${String(params.look).slice(0, 20)}`); }
+            if (params.voice != null) { c.voice = String(params.voice); updates.push(`声线→${String(params.voice)}`); }
+            if (!updates.length) {
+              result = { kind: "result", title: "未修改", success: false, detail: `请告诉我要修改「${c.name}」的哪一项（定位/状态/年龄/身份/动机/形象/声线），如「把 ${c.name} 的状态改成负伤」。` };
+            } else {
+              logChange(w, { chapter: w.nextChapter, actor: "user", kind: "character-edit", detail: `修改角色「${c.name}」：${updates.join("、")}`, commandId: "CMD-W12" });
+              saveWorld(w);
+              result = { kind: "result", title: "角色已更新", success: true, detail: `已更新「${c.name}」：${updates.join("、")}。` };
+            }
+          }
+        } else if (intent === "delete_character") {
+          const dName = String(params.name ?? "").trim();
+          const c = dName ? w.characters.find((x) => x.name.includes(dName) || dName.includes(x.name)) : undefined;
+          if (!dName || !c) {
+            result = dName
+              ? { kind: "result", title: "角色未找到", success: false, detail: `没有叫「${dName}」的角色。现有角色：${w.characters.slice(0, 5).map((x) => x.name).join("、")}${w.characters.length > 5 ? "…" : ""}` }
+              : { kind: "result", title: "未删除", success: false, detail: "请告诉我要删除哪个角色，如「删除角色 刘二」。" };
+          } else if ((c.appearedIn ?? []).length || w.chapters.some((ch) => ch.text.includes(c.name))) {
+            result = { kind: "result", title: "无法删除", success: false, detail: `「${c.name}」已在 ${(c.appearedIn ?? []).length || "部分"} 个章节出场，删除会破坏已写剧情。建议改为「把 ${c.name} 的状态改成离场」或在关系图中解除其关系后继续使用。` };
+          } else {
+            const idx = w.characters.indexOf(c);
+            w.characters.splice(idx, 1);
+            logChange(w, { chapter: w.nextChapter, actor: "user", kind: "character-delete", detail: `删除角色「${c.name}」`, commandId: "CMD-W12" });
+            saveWorld(w);
+            result = { kind: "result", title: "角色已删除", success: true, detail: `已删除角色：${c.name}。` };
           }
         }
-      } else if (intent === "delete_character") {
-        const dName = String(params.name ?? "").trim();
-        const c = dName ? wLive.characters.find((x) => x.name.includes(dName) || dName.includes(x.name)) : undefined;
-        if (!dName || !c) {
-          result = dName
-            ? { kind: "result", title: "角色未找到", success: false, detail: `没有叫「${dName}」的角色。现有角色：${wLive.characters.slice(0, 5).map((x) => x.name).join("、")}${wLive.characters.length > 5 ? "…" : ""}` }
-            : { kind: "result", title: "未删除", success: false, detail: "请告诉我要删除哪个角色，如「删除角色 刘二」。" };
-        } else if ((c.appearedIn ?? []).length || wLive.chapters.some((ch) => ch.text.includes(c.name))) {
-          result = { kind: "result", title: "无法删除", success: false, detail: `「${c.name}」已在 ${(c.appearedIn ?? []).length || "部分"} 个章节出场，删除会破坏已写剧情。建议改为「把 ${c.name} 的状态改成离场」或在关系图中解除其关系后继续使用。` };
-        } else {
-          const idx = wLive.characters.indexOf(c);
-          wLive.characters.splice(idx, 1);
-          logChange(wLive, { chapter: wLive.nextChapter, actor: "user", kind: "character-delete", detail: `删除角色「${c.name}」`, commandId: "CMD-W12" });
-          saveWorld(wLive);
-          result = { kind: "result", title: "角色已删除", success: true, detail: `已删除角色：${c.name}。` };
-        }
+      });
+      // 锁内发现世界已不存在：保持原行为——仅收尾 done，不出卡片
+      if (!result && !askCard) {
+        markMessageDone(title, sessionId, messageId, []);
+        send({ type: "done", messageId });
+        return;
       }
       if (askCard) {
         markMessageDone(title, sessionId, messageId, [askCard]);
         send({ type: "card", messageId, card: askCard });
       } else {
-        const finalCard = result ?? { kind: "result" as const, title: meta.title, success: false, detail: "操作未完成，请重试或补充信息。" };
+        const finalCard = result!;
         markMessageDone(title, sessionId, messageId, [finalCard]);
         send({ type: "card", messageId, card: finalCard });
       }

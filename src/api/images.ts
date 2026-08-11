@@ -80,9 +80,14 @@ export async function compressToJpeg(buf: Uint8Array, width: number, height: num
 
 /** 保存图像到 data/<username>/<slug>/images/，返回相对路径 */
 export function saveImage(storyTitle: string, name: string, data: Uint8Array): string {
-  const dir = join(storyDir(storyTitle), "images");
+  const base = storyDir(storyTitle);
+  const dir = join(base, "images");
+  // 防路径穿越：resolve 后写入路径必须仍在 storyDir 内（与 readImage/deleteMediaFile 同款守卫）
+  const full = join(dir, name);
+  const norm = (p: string) => p.replace(/[\\/]+/g, "/");
+  if (!norm(full).startsWith(norm(dir) + "/")) throw new Error("非法路径：" + name);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, name), data);
+  writeFileSync(full, data);
   return `images/${name}`;
 }
 

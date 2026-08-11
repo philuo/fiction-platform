@@ -76,6 +76,13 @@ export const ForeshadowModal: React.FC<Props> = (p) => {
     if (ok) setConfirmDelId(null);
   }
 
+  // M8 修复：中文输入法选词时的 Enter（isComposing/keyCode 229）不应触发提交
+  function onEnterKeyDown(e: React.KeyboardEvent) {
+    if (e.key !== "Enter") return;
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+    void addForeshadow();
+  }
+
   const shown = list
     .filter((f) => filter === "all" || f.status === filter)
     .sort((a, b) => STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status) || a.plantedAt - b.plantedAt);
@@ -100,11 +107,11 @@ export const ForeshadowModal: React.FC<Props> = (p) => {
           {/* 新增表单：Enter 提交 */}
           <div className="fs-add">
             <input className="fs-add-text" placeholder="伏笔内容（必填）…" value={newText} onChange={(e) => setNewText(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") void addForeshadow(); }} disabled={busy || p.taskActive} />
+              onKeyDown={onEnterKeyDown} disabled={busy || p.taskActive} />
             <input className="fs-add-note" placeholder="备注（可选）" value={newNote} onChange={(e) => setNewNote(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") void addForeshadow(); }} disabled={busy || p.taskActive} />
+              onKeyDown={onEnterKeyDown} disabled={busy || p.taskActive} />
             <input className="fs-add-ch" placeholder="埋设章（默认最新章）" value={newPlantedAt} onChange={(e) => setNewPlantedAt(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") void addForeshadow(); }} disabled={busy || p.taskActive} inputMode="numeric" />
+              onKeyDown={onEnterKeyDown} disabled={busy || p.taskActive} inputMode="numeric" />
             <button className="btn btn-primary" style={{ overflow: 'hidden' }} onClick={addForeshadow} disabled={busy || p.taskActive || !newText.trim()}><Plus size={14} /> 新增</button>
           </div>
 

@@ -1,5 +1,5 @@
 // 抽卡弹层：候选卡池 → 选择/自动抽取 → 应用
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Dices, RefreshCw, X } from "../components/icons";
 import type { Card, WorldState } from "../api/world";
 import { apiFetch } from "../api/client";
@@ -22,6 +22,16 @@ export const GachaModal: React.FC<Props> = (p) => {
   const [msg, setMsg] = useState("");
   const [appliedCards, setAppliedCards] = useState<Card[] | null>(null);
   const [count, setCount] = useState(5);
+  // L18 修复：错峰揭晓 / 自动关闭的 setTimeout 卸载时清理，避免卸载后 setState/onClose
+  const revealTimersRef = useRef<number[]>([]);
+  const closeTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      revealTimersRef.current.forEach((t) => clearTimeout(t));
+      revealTimersRef.current = [];
+      if (closeTimerRef.current) { clearTimeout(closeTimerRef.current); closeTimerRef.current = null; }
+    };
+  }, []);
 
   function toggleType(t: string) {
     const s = new Set(types);
@@ -47,8 +57,10 @@ export const GachaModal: React.FC<Props> = (p) => {
       setPool(cards);
       setPicked(new Set<string>());
       setRevealed(new Set<string>());
-      cards.forEach((c, i) =>
-        setTimeout(() => {
+      // 清掉上一批错峰揭晓定时器（重新生成场景），再记录本次句柄供卸载清理
+      revealTimersRef.current.forEach((t) => clearTimeout(t));
+      revealTimersRef.current = cards.map((c, i) =>
+        window.setTimeout(() => {
           setRevealed((prev) => {
             const s = new Set(prev);
             s.add(c.id);
@@ -101,7 +113,8 @@ export const GachaModal: React.FC<Props> = (p) => {
       setAppliedCards(applied);
       setMsg(`✅ 已应用 ${applied.length} 张卡，指令已注入下一章写作`);
       p.onApplied(data.instructions ?? [], applied);
-      setTimeout(() => p.onClose(), 1800);
+      if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = window.setTimeout(() => p.onClose(), 1800);
     } catch (e) {
       setMsg("失败: " + (e as Error).message);
     } finally {

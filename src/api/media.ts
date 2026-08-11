@@ -4,6 +4,7 @@
 import { chatJson } from "./jsonutil";
 import { generateImage, saveImage, readImage, compressToJpeg } from "./images";
 import { createVideoTask, durationToNumFrames, VIDEO_MIN_SECONDS, VIDEO_MAX_SECONDS } from "./videos";
+import { uuid } from "../shared/uuid";
 import type { Chapter, ChapterMedia, Character, SceneType, WorldState } from "./world";
 
 /** 归一化：去空白、「」『』引号与全部中英文标点（与渲染端 ChapterView.norm 一致；LLM 摘抄 anchor 的标点差异不影响匹配） */
@@ -487,13 +488,16 @@ export function genderPhrase(c: Character): string {
   if (c.gender === "男") {
     const hay = `${c.age ?? ""}${c.identity ?? ""}`;
     if (/少年|十五|十六|十七|少年轻/.test(hay)) return "少年男子";
-    if (/中年|四十|五十|老年|六十|老妪|老丈/.test(hay)) return "成年男子";
+    if (/中年|四十|五十|老年|六十|老丈/.test(hay)) return "成年男子";
     return "青年男子";
   }
   if (c.gender === "女") {
     const hay = `${c.age ?? ""}${c.identity ?? ""}`;
     if (/少年|十五|十六|十七/.test(hay)) return "少女";
-    if (/中年|四十|五十|老年|六十/.test(hay)) return "成年女子";
+    // 中年女性：四十/五十/六十 → 成年女子（与男性「成年男子」对称）
+    if (/中年|四十|五十|六十/.test(hay)) return "成年女子";
+    // 真正老年女性：老妪/老妇/婆婆/老太/妪/七十/八十/老年 等称谓，避免落入「年轻女子」
+    if (/老年|老妪|七十|八十|老妇|婆婆|老太|妪/.test(hay)) return "年长女子";
     return "年轻女子";
   }
   return "";
@@ -716,7 +720,9 @@ export function findCharacterRef(w: WorldState, chapterIndex: number, anchor: st
   const names = w.characters.filter((c) => c.name && anchor.includes(c.name)).map((c) => c.name);
   if (subject) {
     const sc = w.characters.find((c) => c.name === subject);
-    if (sc?.portrait?.path) return portraitAsMedia(sc);
+    // 指定了画面主体但该角色无立绘：直接回退纯文生（返回 undefined），不向下借用其他角色头像（防换脸）
+    if (!sc?.portrait?.path) return undefined;
+    return portraitAsMedia(sc);
   }
   if (!names.length) return undefined;
   const portrait = w.characters.filter((c) => names.includes(c.name)).map(portraitAsMedia).find(Boolean);
@@ -752,7 +758,9 @@ export function findVideoFirstFrame(w: WorldState, chapterIndex: number, anchor:
   if (byAnchor) return byAnchor;
   if (subject) {
     const sc = w.characters.find((c) => c.name === subject);
-    if (sc?.portrait?.path) return portraitAsMedia(sc);
+    // 指定了画面主体但该角色无立绘：回退纯文生视频（返回 undefined），不向下借用其他角色头像（防换脸）
+    if (!sc?.portrait?.path) return undefined;
+    return portraitAsMedia(sc);
   }
   const names = w.characters.filter((c) => c.name && anchor.includes(c.name)).map((c) => c.name);
   if (!names.length) return undefined;
@@ -798,7 +806,7 @@ export async function generateCharacterPortrait(storyTitle: string, w: WorldStat
   // 默认：短改变 prompt（弱模型 i2i 保持参考图的关键）；改词：回退全量描述（不叠加容貌标识，避免与用户描述冲突）
   const baseAttrs = `性别 ${c.gender || "未知"}，年龄 ${c.age || "未知"}，身份 ${c.identity || "—"}`;
   const base = desc
-    ? `《${w.title}》角色「${c.name}」（${c.role}）的全身立绘：${baseAttrs}；外貌特征 ${desc}${genderPhrase(c) ? `；此人是${genderPhrase(c)}，必须画出鲜明的${genderPhrase(c)}相貌与体态，严禁画成异性` : ""}；时代背景 ${w.setting.time || "—"}、地点 ${w.setting.place || "—"}，时代服饰：${eraDress(w)}，无现代元素${idDress ? `；身份服饰：${idDress}${c}` : ""}；${headwearOf(c, w)}；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）；单人全身像，正面面向观者，神情姿态符合其身份与当前状态${poseExpr}，竖版全身构图`
+    ? `《${w.title}》角色「${c.name}」（${c.role}）的全身立绘：${baseAttrs}；外貌特征 ${desc}${genderPhrase(c) ? `；此人是${genderPhrase(c)}，必须画出鲜明的${genderPhrase(c)}相貌与体态，严禁画成异性` : ""}；时代背景 ${w.setting.time || "—"}、地点 ${w.setting.place || "—"}，时代服饰：${eraDress(w)}，无现代元素${idDress ? `；身份服饰：${idDress}` : ""}；${headwearOf(c, w)}；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）；单人全身像，正面面向观者，神情姿态符合其身份与当前状态${poseExpr}，竖版全身构图`
     : `《${w.title}》角色「${c.name}」（${c.role}）的全身立绘：与参考头像完全同一人，性别与参考头像一致，容貌、发型、服饰全部保持参考图原样不变；仅将头像特写改为竖版单人全身像：正面站立面向观者，全身完整入画，人物比例自然协调、面部不得拉伸变形，神情姿态符合其身份${poseExpr}；${headwearOf(c, w)}；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）`;
   const looks = desc || c.traits.slice(0, 4).join("、");
   const t2iPrompt = ensureStyleSuffix(base, styleAnchor(w));
@@ -842,7 +850,7 @@ export async function generateCharacterAvatar(storyTitle: string, w: WorldState,
   const gFace = genderFaceHint(c);
   const gClause = gp ? `；此人是${gp}，${gFace ? `${gFace}，` : ""}必须画出鲜明的${gp}相貌与体态，严禁画成异性` : "";
   const exprSlot = opts.expression ? `；表情${opts.expression}` : "";
-  const t2iPrompt = `${headwearLead(c, w)}${gLead}${c.name}（${c.role}）的方形头像：${baseAttrs}；外貌特征 ${looks || "结合角色姓名与身份推演"}；${distinctLookForRoster(c, w.characters)}${gClause}${exprSlot}；时代背景 ${w.setting.time || "—"}，时代服饰：${eraDress(w)}，无现代元素${idDress ? `；身份服饰：${idDress}${c}` : ""}；${headwearOf(c, w)}；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）；正面头像特写，面向观者，神情姿态符合其身份，${styleAnchor(w)}，画面中不要出现文字，无水印`;
+  const t2iPrompt = `${headwearLead(c, w)}${gLead}${c.name}（${c.role}）的方形头像：${baseAttrs}；外貌特征 ${looks || "结合角色姓名与身份推演"}；${distinctLookForRoster(c, w.characters)}${gClause}${exprSlot}；时代背景 ${w.setting.time || "—"}，时代服饰：${eraDress(w)}，无现代元素${idDress ? `；身份服饰：${idDress}` : ""}；${headwearOf(c, w)}；背景为干净的纯色背景（单一色调，无场景、无图案、无文字）；正面头像特写，面向观者，神情姿态符合其身份，${styleAnchor(w)}，画面中不要出现文字，无水印`;
   const buf = await generateImage(t2iPrompt, "768x768");
   let compressed = buf;
   try {
@@ -1092,7 +1100,8 @@ async function planScenesOnce(w: WorldState, ch: Chapter, kind: "image" | "video
 }
 
 export function mediaId(): string {
-  return `m${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  // m_ 前缀保证以字母开头（部分场景作 DOM/属性 id）；uuid 消除 Date.now()+Math.random() 的碰撞风险
+  return `m_${uuid()}`;
 }
 
 /**

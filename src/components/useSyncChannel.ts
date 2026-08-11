@@ -72,6 +72,9 @@ export function useSyncChannel(opts: UseSyncChannelOpts): { connected: boolean }
 
     const connect = () => {
       if (!mountedRef.current || closedByEffect) return;
+      // M10 修复：换书/重连建新连接时立即重置版本基线为 0——不要等收到 subscribed 才重置。
+      // 否则上一本书的高 version 会让新书 subscribed 到达前的 world-changed 事件被误判为旧版本而丢弃。
+      lastVersionRef.current = 0;
       // 协议相对：wss:// over https，ws:// over http
       const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
       const url = `${proto}//${window.location.host}/api/sync`;

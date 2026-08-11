@@ -231,11 +231,88 @@ export async function expandArc(w: WorldState, arcId: string): Promise<ChapterPl
   return plans;
 }
 
+/** 章号缺口补章纲（修 H2）：在指定 index 处补一条本章计划，绑定到缺口后第一条计划所属弧。
+ * 用于删尾章后重写——expandArc 会把新计划追加到尾部（返回更大章号），导致拿错章纲、
+ * markChapterDone 找不到 plan 而不触发弧边界。LLM 失败时降级用弧目标生成兜底计划，保证缺口处必有 plan。 */
+async function fillPlanGap(w: WorldState, index: number, arcId: string): Promise<ChapterPlan | null> {
+  const arc = (w.storyArcs ?? []).find((a) => a.id === arcId);
+  if (!arc) return null;
+  const plans = w.chapterPlans ?? [];
+  const nextPlan = plans.filter((p) => p.index > index).sort((a, b) => a.index - b.index)[0];
+  const prevPlan = plans.filter((p) => p.index < index).sort((a, b) => b.index - a.index)[0];
+  const summaries = (w.chapterSummaries ?? []).slice(-3).map((s) => `第${s.index}章：${s.summary}`).join("\n");
+  const userMsg = [
+    `[指南针] ${w.blueprint?.compass ?? ""}`,
+    `[弧目标] ${arc.title}：${arc.goal}（类型：${arc.arcType}）`,
+    summaries ? `[近 3 章摘要]\n${summaries}` : "",
+    prevPlan ? `[前一章计划] 第${prevPlan.index}章：${prevPlan.goal}` : "",
+    nextPlan ? `[后一章计划] 第${nextPlan.index}章：${nextPlan.goal}（须自然衔接，不得重复其情节）` : "",
+    `\n为第 ${index} 章生成 1 条章节计划填补章号缺口（只输出 JSON）。`,
+  ].filter(Boolean).join("\n");
+
+  let goal = "";
+  let beats: string[] = [];
+  let hookType: ChapterPlan["hookType"] = "悬念";
+  try {
+    const out = await chatJson<{ chapters?: { goal?: string; beats?: string[]; hookType?: string }[] }>(
+      [
+        { role: "system", content: EXPAND_SYSTEM },
+        { role: "user", content: userMsg },
+      ],
+      {
+        temperature: 0.8,
+        maxTokens: 60000,
+        timeoutMs: 180_000,
+        retries: 3,
+        schema: {
+          type: "object",
+          required: ["chapters"],
+          properties: {
+            chapters: {
+              type: "array",
+              items: { type: "object", required: ["goal"], properties: { goal: { type: "string" }, beats: { type: "array", items: { type: "string" } }, hookType: { type: "string" } } },
+            },
+          },
+        },
+      },
+    );
+    const c = Array.isArray(out.chapters) ? out.chapters[0] : undefined;
+    goal = String(c?.goal ?? "").trim().slice(0, 200);
+    beats = (Array.isArray(c?.beats) ? c!.beats : []).map(String).filter(Boolean).slice(0, 4).map((b) => b.slice(0, 120));
+    hookType = clampHook(c?.hookType);
+  } catch {
+    /* LLM 失败降级：用弧目标兜底，保证缺口处仍有 plan 可供核销/弧边界触发 */
+  }
+
+  const plan: ChapterPlan = {
+    index,
+    arcId: arc.id,
+    goal: goal || arc.goal,
+    beats: beats.length ? beats : ["推进弧目标"],
+    hookType,
+    status: "planned",
+  };
+  w.chapterPlans = [...plans, plan];
+  if (arc.status === "skeleton") arc.status = "expanded";
+  logCommandChange(w, { chapter: index, actor: "ai", kind: "arc-expand-gap", detail: `章号缺口补章纲：第 ${index} 章绑定弧「${arc.title}」`, commandId: "CMD-W05" });
+  mergeConcurrentMedia(w);
+  saveWorld(w);
+  return plan;
+}
+
 /** 确保某章有本章计划（缺失时自动展开当前写作弧） */
 export async function ensureChapterPlan(w: WorldState, index: number): Promise<ChapterPlan | null> {
   const plans = w.chapterPlans ?? [];
   const existing = plans.find((p) => p.index === index);
   if (existing) return existing;
+  // 章号缺口场景（修 H2）：目标 index 无 plan，但存在 index 更大的已有 plan（删尾章后重写）。
+  // expandArc 会把新计划追加到尾部（返回更大章号），导致拿错章纲、markChapterDone 找不到 plan。
+  // 必须在缺口处（index）补一条绑定同弧的计划。
+  const later = plans.filter((p) => p.index > index).sort((a, b) => a.index - b.index)[0];
+  if (later) {
+    const gapPlan = await fillPlanGap(w, index, later.arcId);
+    if (gapPlan) return gapPlan;
+  }
   // 找到当前应展开的弧：已展开/写作中的最后一个弧，否则第一个骨架弧
   const arcs = w.storyArcs ?? [];
   let target = arcs.find((a) => a.status === "expanded" || a.status === "writing") ?? arcs.find((a) => a.status === "skeleton");
@@ -279,7 +356,12 @@ export async function handleArcBoundary(w: WorldState, arcId: string): Promise<v
   const vol = (w.blueprint?.volumes ?? []).find((v) => v.id === arc.volumeId);
   const volArcs = arcs.filter((a) => a.volumeId === arc.volumeId);
   if (vol && volArcs.every((a) => a.id === arcId || a.status === "done")) {
-    vol.summary = await summarizeRange(w, from, Math.max(to, 1));
+    // 卷摘要覆盖全卷所有弧的章节区间（修 L1）：不能只用最后完成弧的 from/to，
+    // 多弧卷会漏掉前面弧的章节。取该卷所有弧计划的最小/最大 index。
+    const volPlans = (w.chapterPlans ?? []).filter((p) => volArcs.some((a) => a.id === p.arcId));
+    const volFrom = volPlans.length ? Math.min(...volPlans.map((p) => p.index)) : from;
+    const volTo = volPlans.length ? Math.max(...volPlans.map((p) => p.index)) : to;
+    vol.summary = await summarizeRange(w, volFrom, Math.max(volTo, 1));
     vol.status = "done";
     await updateCompass(w);
     // 下一卷进入写作

@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { BrainCard } from "./brain-cards";
 import { apiFetch } from "../api/client";
-import { cachePutSession, cacheClearBook } from "./brainCache";
+import { cachePutSession, cacheClearBook, cacheGetSession } from "./brainCache";
 import { uuid } from "../shared/uuid";
 
 export type ChatMessage = {
@@ -398,7 +398,19 @@ export function useBrainSession(title: string) {
     setMessages(cacheRef.current.get(id) ?? []);
     setStreaming(abortRef.current.has(id));
     setCompleted(completedRef.current.get(id) ?? new Set()); // 本会话已有完成记录：立即恢复
-    if (!force && cacheRef.current.has(id)) return; // 已有缓存：即时展示，不重复拉取/续流
+    if (!force && cacheRef.current.has(id)) return; // 已有内存缓存：即时展示，不重复拉取/续流
+    // C5 修复：内存缓存未命中时，并行读 indexeddb 缓存（首屏秒开）+ 拉服务端 detail（权威覆盖）。
+    // 不 await 缓存读取——网络请求立即发起不被阻塞；缓存先到先渲染，网络回来后无条件覆盖（服务端最新为准，
+    // 旧缓存不会永久覆盖新数据）。切换会话/网络已抢先填充内存缓存时放弃本次缓存渲染。
+    if (!force) {
+      void cacheGetSession(title, id).then((cached) => {
+        if (!cached || cacheRef.current.has(id) || activeIdRef.current !== id) return;
+        cacheRef.current.set(id, cached.msgs);
+        completedRef.current.set(id, new Set(cached.completed));
+        setMessages(cached.msgs);
+        setCompleted(new Set(cached.completed));
+      });
+    }
     try {
       const res = await apiFetch("/api/brain/sessions/detail", {
         method: "POST",
@@ -566,14 +578,20 @@ export function useBrainSession(title: string) {
   /** 挂载/切换书时恢复：清缓存 → 拉列表 → 打开最近会话（streaming 会话由 openSession 自动续流） */
   useEffect(() => {
     if (loadedTitleRef.current === title) return;
+    // C5 修复：先捕获旧 title 再更新 ref，cacheClearBook 清的是旧书而非新书
+    const oldTitle = loadedTitleRef.current;
     loadedTitleRef.current = title;
     cacheRef.current.clear();
+    completedRef.current.clear();
+    // C6 修复：切书时先逐个 abort 各会话 SSE（触发其 finally 清 idleTimer），再清空 map
+    for (const ctrl of abortRef.current.values()) ctrl.abort();
     abortRef.current.clear();
     setActive("");
     setMessages([]);
     setStreaming(false);
+    setCompleted(new Set());
     // Phase 4：切书时清上一本书的 indexeddb 缓存（防跨书串扰；当前书缓存由 openSession 拉 detail 时写回）
-    void cacheClearBook(loadedTitleRef.current);
+    if (oldTitle) void cacheClearBook(oldTitle);
     void (async () => {
       const list = await refreshList();
       const latest = list[0];
@@ -581,6 +599,15 @@ export function useBrainSession(title: string) {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [title]);
+
+  // C6 修复：卸载时 abort 所有 SSE 连接（各 connectOnce 的 finally 随之 clearInterval(idleTimer)），
+  // 避免 BrainCabin 卸载/切书后 SSE 悬挂、空闲定时器泄漏
+  useEffect(() => {
+    return () => {
+      for (const ctrl of abortRef.current.values()) ctrl.abort();
+      abortRef.current.clear();
+    };
+  }, []);
 
   return {
     sessions,

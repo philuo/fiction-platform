@@ -29,12 +29,13 @@ for (const m of metas) {
       const av = await generateCharacterAvatar(w.title, w, c);
       c.image = av.path;
       c.visualTriedAt = Date.now();
+      // 先落盘新头像路径，再删旧文件：硬中断于其间只会留下孤儿新文件，不会让存档指向已删旧文件
+      saveWorld(w);
       if (oldAvatar && oldAvatar !== av.path) deleteMediaFile(w.title, oldAvatar);
       console.log(`  [头像✓] ${c.name} → ${av.path}`);
     } catch (e) {
       fail++;
       console.error(`  [头像✗] ${c.name}: ${(e as Error).message}（立绘跳过）`);
-      saveWorld(w);
       continue;
     }
     // 2) 立绘：以新头像为容貌基准 i2i；仅当旧 looks 是用户改词过的描述（≠自动推导的 traits）才传入 description，
@@ -44,6 +45,8 @@ for (const m of metas) {
       const userLooks = c.portrait?.looks && c.portrait.looks !== autoLooks ? c.portrait.looks : undefined;
       const pt = await generateCharacterPortrait(w.title, w, c, userLooks ? { description: userLooks } : {});
       c.portrait = { mediaId: pt.mediaId, path: pt.path, prompt: pt.prompt, looks: pt.looks || undefined };
+      // 先落盘新立绘路径，再删旧文件（理由同头像：存档绝不指向已删文件）
+      saveWorld(w);
       if (oldPortrait && oldPortrait !== pt.path) deleteMediaFile(w.title, oldPortrait);
       console.log(`  [立绘✓] ${c.name} → ${pt.path}`);
       ok++;
@@ -51,7 +54,6 @@ for (const m of metas) {
       fail++;
       console.error(`  [立绘✗] ${c.name}: ${(e as Error).message}（头像已更新）`);
     }
-    saveWorld(w); // 每角色落盘一次：中断可重跑
     await sleep(500); // 串行温和节流
   }
 }

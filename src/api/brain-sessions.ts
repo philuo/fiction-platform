@@ -64,6 +64,23 @@ function cacheKey(title: string): string {
   return `${currentUser() ?? ""}::${slugify(title)}`;
 }
 
+/** 删书后清理当前用户上下文下该书的会话缓存（按 title；已知用户上下文时调用）。
+ *  同时清掉无用户前缀的遗留 key；删书时不知用户请用 invalidateStoryBySlug。 */
+export function invalidateStoryCache(title: string): void {
+  const slug = slugify(title);
+  cache.delete(cacheKey(title));
+  cache.delete(slug); // 兼容遗留/无用户上下文的裸 slug key
+}
+
+/** 按 slug 清理所有用户下该书的会话缓存（deleteStory 按 slug 删目录、可能不知用户名时调用）：
+ *  删除 key===slug 或以 ::<slug> 结尾的全部条目。 */
+export function invalidateStoryBySlug(slug: string): void {
+  const suffix = `::${slug}`;
+  for (const key of [...cache.keys()]) {
+    if (key === slug || key.endsWith(suffix)) cache.delete(key);
+  }
+}
+
 function sessionsPath(title: string): string {
   return join(sessionsDir(title), "brain-sessions.json");
 }

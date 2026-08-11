@@ -1,4 +1,5 @@
 // 报头（日式报纸 masthead）：左侧书单入口 + 标题 + 设置入口，右侧章号/更新时间/状态
+import { useEffect, useState } from "react";
 import type { Chapter, WorldState } from "../api/world";
 import { BookText, List, Settings } from "./icons";
 
@@ -16,12 +17,16 @@ export const Masthead: React.FC<{
   // 无章节时回退全书 updatedAt；数据均来自 SSR 注入的 world，hydrate 前后渲染一致
   const ts = p.chapter?.updatedAt ?? p.world.updatedAt;
   const date = ts ? new Date(ts) : null;
+  // M7 修复：toLocaleDateString/toLocaleTimeString 依赖运行时时区，SSR(UTC) 与客户端(本地)
+  // 渲染不一致会导致 hydration mismatch。首屏（SSR + 客户端首次渲染）不输出时间，挂载后再填本地时区时间。
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => { setMounted(true); }, []);
   return (
     <header className="masthead">
       <h1 className="masthead-title">{p.world.title}</h1>
       <div className="masthead-meta">
         {p.chapter && <div className="issue">第 {p.chapter.index} 章</div>}
-        {date && (
+        {mounted && date && (
           <div>
             {date.toLocaleDateString("zh-CN", { year: "numeric", month: "long", day: "numeric" })}{" "}
             {date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })}

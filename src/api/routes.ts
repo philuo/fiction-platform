@@ -36,6 +36,7 @@ import {
   appendSystemNote as appendBrainSystemNote,
   updateMessageCard as updateBrainMessageCard,
   createProgressMessage as createBrainProgressMessage,
+  invalidateStoryBySlug,
 } from "./brain-sessions";
 import { startAdvanceTask, updateAdvanceTaskPhase, completeAdvanceTask, failAdvanceTask, getAdvanceTaskForClient, clearAdvanceTask } from "./advancetask";
 import { migrateChapterMedia, touchChapter, genOf, type WorldState, type Character as WorldCharacter, type ChapterMedia, type ConsistencyFinding, type PendingChapter } from "./world";
@@ -136,7 +137,7 @@ function charHintFor(w: WorldState, subject?: string): string | undefined {
   const segs = [`画面主体角色「${c.name}」`, attrs];
   if (looks) segs.push(`外貌 ${looks}`);
   // 注意：不注入 c.look（当前形象）——look 是此前章节结算的瞬时状态，与所选段落可能不同时点，
-  if (idDress) segs.push(`身份服饰 ${idDress}${c}`);
+  if (idDress) segs.push(`身份服饰 ${idDress}`);
   return `${segs.filter(Boolean).join("：")}。`;
 }
 /** 媒体生成后确保出场角色视觉完整（fire-and-forget，不阻塞本次插画/视频）：委托 ensureCharacterVisuals——
@@ -158,6 +159,10 @@ const visualTasks = new Map<string, Map<string, VisualTaskResult>>();
 const visualInFlight = new Set<string>();
 /** 小说封面生成中集合（进程级去重：同一本书同时只允许一个自动封面任务） */
 const coverInFlight = new Set<string>();
+/** 视频重生成交换期注册表：swap 后保留旧 mp4 继续播放（不立即删/不清 path），
+ *  新视频落盘成功后删旧文件；失败/超时则回滚 videoId 为旧值并恢复 ready。
+ *  key：当前用户::slug(title)::chapterIndex::mediaId（mediaId 重生成前后不变） */
+const videoRegen = new Map<string, { oldVideoId?: string; oldPath?: string }>();
 /** 视觉自动重试冷却：失败/尝试后 1 分钟内不再自动触发（防高频烧配额；手动生成不受影响）。入口触发与中枢巡检共用 */
 const VISUAL_RETRY_COOLDOWN = 60_000;
 
@@ -227,6 +232,8 @@ function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter
       const avatarFresh = Boolean(avatar?.path) && avatar!.path !== c.image;
       const portraitFresh = Boolean(portrait?.path) && portrait!.path !== c.portrait?.path;
       if (avatarFresh || portraitFresh || failures.length) {
+        // 竞态输家（cc.image/cc.portrait 已被并发手动生成填充）：自动生成的新文件未被采用，锁外删盘避免孤儿
+        const orphanPaths: string[] = [];
         await withTitleLock(slug(title), async () => {
           const w = loadWorld(title);
           const cc = w?.characters.find((x) => x.id === c.id);
@@ -237,17 +244,26 @@ function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter
             if (aOk) {
               cc.image = avatar!.path;
               steering.logChange(w, { chapter: w.nextChapter, actor: "system", kind: "avatar-auto", detail: `自动生成头像（${cc.name}）`, commandId: "CMD-M08" });
+            } else if (avatarFresh && avatar!.path !== cc.image) {
+              orphanPaths.push(avatar!.path); // 输家：头像已被他处填充，丢弃本次新文件
             }
             if (pOk) {
               cc.portrait = portrait!;
               steering.logChange(w, { chapter: w.nextChapter, actor: "system", kind: "portrait-auto", detail: `自动生成立绘（${cc.name}${avatar?.path ? "，以头像为参考" : ""}）`, commandId: "CMD-M07" });
+            } else if (portraitFresh && portrait!.path !== cc.portrait?.path) {
+              orphanPaths.push(portrait!.path); // 输家：立绘已被他处填充，丢弃本次新文件
             }
             if (failures.length) {
               steering.logChange(w, { chapter: w.nextChapter, actor: "system", kind: "visual-fail", detail: `角色视觉自动生成失败（${cc.name}）：${failures.join("；")}`, commandId: avatarFresh ? "CMD-M07" : "CMD-M08" });
             }
             saveWorld(w);
+          } else if (avatarFresh || portraitFresh) {
+            // 书/角色已被删：丢弃产物，删盘避免孤儿
+            if (avatarFresh) orphanPaths.push(avatar!.path);
+            if (portraitFresh) orphanPaths.push(portrait!.path);
           }
         });
+        for (const p of orphanPaths) deleteMediaFile(title, p);
         console.log(`[media] 角色视觉自动生成结束: ${c.name}（${((Date.now() - t0) / 1000).toFixed(1)}s${failures.length ? `，失败: ${failures.join("；")}` : ""}）`);
       }
     } catch (e) {
@@ -303,7 +319,7 @@ function ensureCover(title: string, w: WorldState): void {
         const compressed = await compressToJpeg(buf, 768, 1086);
         const p = saveImage(title, `cover-${Date.now().toString(36)}.jpg`, compressed);
         const w2 = loadWorld(title);
-        if (!w2 || w2.cover) return { path: w2?.cover ?? p, oldRel: w2?.cover ? "" : p }; // 再次复查：落盘期间被手动生成则不覆盖
+        if (!w2 || w2.cover) return { path: w2?.cover ?? p, oldRel: p }; // 再次复查：落盘期间被手动生成/书已删 → 不覆盖，本次新图 p 由锁外删盘（oldRel 承载未采用的新文件）
         w2.cover = p;
         w2.coverTriedAt = Date.now(); // 成功也刷新尝试时间戳（与角色视觉 visualTriedAt 同策略）
         steering.logChange(w2, { chapter: w2.nextChapter, actor: "system", kind: "cover-auto", detail: "自动生成小说封面", commandId: "CMD-M09" });
@@ -534,16 +550,29 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       const encoder = new TextEncoder();
       const stream = new ReadableStream<Uint8Array>({
         async start(controller) {
+          // 客户端断开后 enqueue 会抛错：吞掉并标记停止，保证干净 close（对照 /api/brain/chat 的 sseStream）
+          let closed = false;
+          const send = (obj: unknown) => {
+            if (closed) return;
+            try {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+            } catch {
+              closed = true; // 客户端已断开，后续不再 enqueue
+            }
+          };
           try {
+            // 透传 req.signal：客户端断开时中止上游 LLM 流式请求，避免空转烧配额
             const full = await agnes.chatStream([{ role: "user", content: prompt }], (delta) => {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ delta })}\n\n`));
-            }, { maxTokens: 60000 });
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true, text: full })}\n\n`));
+              send({ delta });
+            }, { maxTokens: 60000, signal: req.signal });
+            send({ done: true, text: full });
           } catch (e) {
             console.error("[api/chat/stream]", e);
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: "生成失败，请稍后重试" })}\n\n`));
+            // 客户端主动断连不回错误（连接已关）；其余错误回提示
+            if (!req.signal.aborted) send({ error: "生成失败，请稍后重试" });
           } finally {
-            controller.close();
+            closed = true;
+            try { controller.close(); } catch { /* 已关闭 */ }
           }
         },
       });
@@ -903,36 +932,43 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
     case "/api/novel/state": {
       const title = String(body.title ?? "").trim();
       if (!title) return json({ error: "缺少 title" }, 400);
-      // 无锁读（saveWorld 原子写 tmp+rename：磁盘永远是完整一致快照，最多落后连载正在写的一章）。
-      // 修复：连载每章在锁内执行 writeOneChapter（5-15 分钟），state 若同步等锁会一直 pending；
-      // 读时自愈保存已后台化（scheduleReadSelfHeal，锁内 load 最新再 save，与连载互斥不覆盖）
-      const w = loadWorld(title);
-      if (!w) throw new AppError("故事不存在: " + title);
-      scheduleReadSelfHeal(title);
-      // 读时自愈②：视觉缺失的角色 → 后台补头像+立绘（fire-and-forget，不阻塞打开）。
-      // 触发条件：未自动尝试过，或上次尝试失败已过冷却期（visualTriedAt 防高频烧配额，也避免 dev 热重启丢任务后永久缺视觉）；
-      // 前端据 visualPending 启动轮询，中枢显示「自动生成角色头像/立绘中…」，完成后刷新恢复待命
-      const needy = w.characters.filter((c) => {
-        if (c.portrait?.path && c.image) return false;
-        if (!c.visualTriedAt) return true;
-        return Date.now() - c.visualTriedAt > VISUAL_RETRY_COOLDOWN;
-      });
-      for (const c of needy) ensureCharacterVisuals(w.title, w, c);
-      // 封面读时自愈（兜底）：cover 缺失且未尝试（或过冷却）→ 后台自动生成（与角色视觉同策略）。
-      // 修复「立项段 2 旧快照覆盖并发落盘」等历史丢封面场景——此前封面无自愈路径，丢了就永久缺
-      if (!w.cover && (!w.coverTriedAt || Date.now() - w.coverTriedAt > VISUAL_RETRY_COOLDOWN)) {
-        ensureCover(w.title, w);
+      try {
+        // 无锁读（saveWorld 原子写 tmp+rename：磁盘永远是完整一致快照，最多落后连载正在写的一章）。
+        // 修复：连载每章在锁内执行 writeOneChapter（5-15 分钟），state 若同步等锁会一直 pending；
+        // 读时自愈保存已后台化（scheduleReadSelfHeal，锁内 load 最新再 save，与连载互斥不覆盖）
+        const w = loadWorld(title);
+        if (!w) throw new AppError("故事不存在: " + title);
+        scheduleReadSelfHeal(title);
+        // 读时自愈②：视觉缺失的角色 → 后台补头像+立绘（fire-and-forget，不阻塞打开）。
+        // 触发条件：未自动尝试过，或上次尝试失败已过冷却期（visualTriedAt 防高频烧配额，也避免 dev 热重启丢任务后永久缺视觉）；
+        // 前端据 visualPending 启动轮询，中枢显示「自动生成角色头像/立绘中…」，完成后刷新恢复待命
+        const needy = w.characters.filter((c) => {
+          if (c.portrait?.path && c.image) return false;
+          if (!c.visualTriedAt) return true;
+          return Date.now() - c.visualTriedAt > VISUAL_RETRY_COOLDOWN;
+        });
+        for (const c of needy) ensureCharacterVisuals(w.title, w, c);
+        // 封面读时自愈（兜底）：cover 缺失且未尝试（或过冷却）→ 后台自动生成（与角色视觉同策略）。
+        // 修复「立项段 2 旧快照覆盖并发落盘」等历史丢封面场景——此前封面无自愈路径，丢了就永久缺
+        if (!w.cover && (!w.coverTriedAt || Date.now() - w.coverTriedAt > VISUAL_RETRY_COOLDOWN)) {
+          ensureCover(w.title, w);
+        }
+        // 中枢四维状态（轻量：复用落盘 eval，不含完整性扫描——完整扫描见 /api/brain/state）
+        const stSession = loadAutoSession(title);
+        const stAutoRunning = stSession?.status === "running";
+        const brainState = deriveBrainState(w, {
+          busy: stAutoRunning,
+          phase: stAutoRunning ? stSession?.phase : undefined,
+          autoRunning: stAutoRunning,
+          evalReport: readEvalReport(title),
+        });
+        return json({ world: sanitize(w), visualPending: needy.length > 0, brainState });
+      } catch (e) {
+        // 业务错误（故事不存在）回 404 JSON；其余异常回 500 JSON，避免 throw 逃逸成非 JSON 500
+        if (e instanceof AppError) return json({ error: e.message }, 404);
+        console.error("[api/novel/state]", e);
+        return json({ error: "加载故事状态失败，请稍后重试" }, 500);
       }
-      // 中枢四维状态（轻量：复用落盘 eval，不含完整性扫描——完整扫描见 /api/brain/state）
-      const stSession = loadAutoSession(title);
-      const stAutoRunning = stSession?.status === "running";
-      const brainState = deriveBrainState(w, {
-        busy: stAutoRunning,
-        phase: stAutoRunning ? stSession?.phase : undefined,
-        autoRunning: stAutoRunning,
-        evalReport: readEvalReport(title),
-      });
-      return json({ world: sanitize(w), visualPending: needy.length > 0, brainState });
     }
 
     case "/api/novel/list": {
@@ -961,6 +997,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           if (!storyExists(title)) throw new AppError("故事不存在: " + title);
           return deleteStory(title);
         });
+        // 删目录后清理该书所有用户上下文下的中枢会话缓存（防残留会话指向已删故事）
+        invalidateStoryBySlug(slug(title));
         activeAuto.delete(autoKey);
         // 该书正在后台生成的角色视觉任务：删除后无书可写，清理状态表（防 /visual/status 残留），
         // 并登记已删除标记让仍在锁外跑的任务在下一步写盘前自查（防向已删目录写孤儿媒体/继续烧配额）
@@ -1117,14 +1155,20 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const w = title ? loadWorld(title) : null;
       if (!w) return json({ error: "故事不存在: " + title }, 404);
       if (format === "epub") {
-        const blob = exportEpub(w);
-        const fn = encodeURIComponent(slug(w.title)); // ASCII 安全（RFC 5987）
-        return new Response(blob, {
-          headers: {
-            "Content-Type": "application/epub+zip",
-            "Content-Disposition": `attachment; filename="${fn}.epub"; filename*=UTF-8''${fn}.epub`,
-          },
-        });
+        try {
+          const blob = exportEpub(w);
+          const fn = encodeURIComponent(slug(w.title)); // ASCII 安全（RFC 5987）
+          return new Response(blob, {
+            headers: {
+              "Content-Type": "application/epub+zip",
+              "Content-Disposition": `attachment; filename="${fn}.epub"; filename*=UTF-8''${fn}.epub`,
+            },
+          });
+        } catch (e) {
+          // EPUB 打包失败（缺章节/字段异常等）：回 JSON 500，避免把异常堆栈当响应体
+          const msg = e instanceof Error ? e.message : String(e);
+          return json({ error: "EPUB 导出失败: " + msg }, 500);
+        }
       }
       const fn = encodeURIComponent(slug(w.title));
       return new Response(exportMarkdown(w), {
@@ -1152,7 +1196,12 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             if (!text) throw new AppError("伏笔内容不能为空");
             const id = `fs_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
             // 默认归属最新已写章节（手动登记属既有账目）；无章节时才落下一章（待埋设）
-            const plantedAt = typeof body.plantedAt === "number" ? body.plantedAt : latestChapter;
+            let plantedAt = latestChapter;
+            if (body.plantedAt !== undefined) {
+              const n = Number(body.plantedAt);
+              if (!Number.isInteger(n) || n < 1) throw new AppError("埋设章必须是 >=1 的正整数");
+              plantedAt = n;
+            }
             w.foreshadowing.push({ id, text, plantedAt, status: "planted", note: String(body.note ?? "") || undefined });
             fsDetail = `新增伏笔「${text.slice(0, 40)}」（埋设于第 ${plantedAt} 章）`;
           } else if (action === "update") {
@@ -1161,9 +1210,17 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             if (!f) throw new AppError("伏笔不存在: " + id);
             if (body.text !== undefined) f.text = String(body.text).trim();
             if (body.note !== undefined) f.note = String(body.note).trim() || undefined;
+            if (body.plantedAt !== undefined) {
+              const n = Number(body.plantedAt);
+              if (!Number.isInteger(n) || n < 1) throw new AppError("埋设章必须是 >=1 的正整数");
+              f.plantedAt = n;
+            }
             if (body.status !== undefined) {
-              const nextStatus = String(body.status) as "planted" | "active" | "resolved";
-              f.status = nextStatus;
+              const nextStatus = String(body.status);
+              if (!["planted", "active", "resolved"].includes(nextStatus)) {
+                throw new AppError("status 必须为 planted/active/resolved");
+              }
+              f.status = nextStatus as "planted" | "active" | "resolved";
               // 状态联动回收章（数据一致性）：标为已回收 → 自动填当前最新已写章节；解除已回收 → 清除回收记录
               if (nextStatus === "resolved") f.resolvedAt = f.resolvedAt ?? latestChapter;
               else delete f.resolvedAt;
@@ -1441,9 +1498,21 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           // 书名修改：slug 变化时先改名存档目录（媒体/版本随目录整体迁移），再落盘新 title
           const bookTitle = typeof body.bookTitle === "string" ? body.bookTitle.trim().slice(0, 60) : undefined;
           if (bookTitle && bookTitle !== updated.title) {
-            if (slug(bookTitle) !== slug(updated.title)) {
+            const oldTitle = updated.title;
+            const slugChanged = slug(bookTitle) !== slug(oldTitle);
+            if (slugChanged) {
               if (storyExists(bookTitle)) throw new AppError("书名已存在，请换一个：" + bookTitle);
-              renameSync(storyDir(updated.title), storyDir(bookTitle));
+              // slug 不变时目录不动，loadWorld(旧名)/runAuto 仍映射同一目录，连载可无感继续；
+              // slug 变化（目录迁移）时，runAuto 以闭包 const 持有旧 title、无法在不改 autorun 的前提下迁移到新名，
+              // 若放任其下一轮 loadWorld(旧名) 会因目录已搬走返回 null 而 error 终止。
+              // 采用更小的安全方案：改名前置停止标志，让运行中的连载在下一章边界干净停下
+              //（runAuto 在 loadWorld 之前先判 isStopped → finish reason=stopped，不会触发 error），
+              // stopped 状态写入随目录迁移的会话文件；用户可在新名下重新开始连载。
+              const oldAutoKey = `${currentUser() ?? ""}::${slug(oldTitle)}`;
+              if (activeAuto.has(oldAutoKey)) {
+                stopAuto(oldTitle);
+              }
+              renameSync(storyDir(oldTitle), storyDir(bookTitle));
             }
             updated.title = bookTitle;
           }
@@ -1782,6 +1851,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           if (!w) throw new AppError("故事不存在: " + title);
           const ch = w.chapters.find((c) => c.index === index);
           if (!ch) throw new AppError("章节不存在");
+          // 先撤账再结算：覆盖式重算前清除本章已记账的伏笔/角色状态，防伏笔重复埋设等残留（与 integrity resettle 同策略）
+          resetChapterLedger(w, index);
           const report = await settleChapter(w, ch, (w.chapterPlans ?? []).find((p) => p.index === index) ?? null);
           w.chapterDeltas = { ...(w.chapterDeltas ?? {}), [index]: report.delta };
           applyStateChange(w, { actor: "user", commandId: "CMD-L03", field: "chapterDeltas", reason: `重结算第 ${index} 章《${ch.title}》账本（摘要/伏笔/角色状态/时间线覆盖式重算）`, chapter: index });
@@ -1818,11 +1889,13 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
               await director.regenerateChapter(w, i, "按回溯重写队列重写，保持既定事实一致");
               rewritten++;
             } catch {
-              break; // 单章失败即停（含干预打断），剩余保留在队列
+              break; // 单章失败即停（含干预打断）
             }
           }
-          w.rewriteQueue = [];
-          applyStateChange(w, { actor: "user", commandId: "CMD-G06", field: "rewriteQueue", reason: `回溯重写队列消费完成（重写 ${rewritten} 章）`, chapter: w.nextChapter });
+          // 失败即停：失败章（索引 rewritten）连同其后未处理的尾段保留在队列，下次可重试；全部成功才清空
+          const interrupted = rewritten < queue.length;
+          w.rewriteQueue = interrupted ? queue.slice(rewritten) : [];
+          applyStateChange(w, { actor: "user", commandId: "CMD-G06", field: "rewriteQueue", reason: interrupted ? `回溯重写中断（已重写 ${rewritten} 章，失败章与尾段保留）` : `回溯重写队列消费完成（重写 ${rewritten} 章）`, chapter: w.nextChapter });
           finalizeStateChange(w, { ok: true });
           return { rewritten, world: sanitize(w) };
         });
@@ -1897,42 +1970,50 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       if (!title) return json({ error: "缺少 title" }, 400);
       if (!["cover", "character"].includes(kind)) return json({ error: "kind 必须为 cover/character（章节插画请用 media/* 接口）" }, 400);
       try {
-        const result = await withTitleLock(slug(title), async () => {
+        // 锁外读快照校验 + 生成（耗时生图不持锁，参照 /character/portrait 写法），锁内仅短事务落盘
+        const w0 = loadWorld(title);
+        if (!w0) return json({ error: "故事不存在: " + title }, 404);
+        const userPrompt = body.prompt ? String(body.prompt).slice(0, 300) : "";
+        let prompt = "";
+        let path = "";
+        let oldRel = ""; // 旧文件路径（重生成/替换后锁外删盘，避免本地残留）
+        if (kind === "cover") {
+          // A4 纸张宽高比 (210:297 ≈ 1:1.414)；中文提示词（与全书风格统一）
+          prompt = userPrompt || `${w0.title}（${w0.genre}）小说封面：${w0.setting.tone}，${w0.setting.time}，${w0.setting.place}，电影感光影，戏剧性构图，细节丰富的插画，画面中不要出现文字，无水印`;
+          const buf = await generateImage(prompt, "768x1086");
+          // Bun 图片压缩：等比缩到 A4 尺寸 + JPEG q82，体积降 ~90%（与自动封面/立绘一致）
+          const compressed = await compressToJpeg(buf, 768, 1086);
+          path = saveImage(title, `cover-${Date.now().toString(36)}.jpg`, compressed);
+          oldRel = w0.cover ?? "";
+        } else {
+          // 角色头像：仅供用户查看，中文提示词 + 全书画风锚点 + 小体积 JPEG；
+          // 头像先于立绘生成（纯文生，是立绘的容貌基准），不依赖立绘
+          const cid = String(body.characterId ?? "");
+          const c = w0.characters.find((x) => x.id === cid);
+          if (!c) return json({ error: "角色不存在" }, 404);
+          const avatar = await generateCharacterAvatar(title, w0, c);
+          path = avatar.path;
+          prompt = avatar.prompt;
+          oldRel = c.image ?? "";
+        }
+        // 锁内短事务落盘（生成已在锁外完成，不阻塞并发写作）
+        await withTitleLock(slug(title), async () => {
           const w = loadWorld(title);
-          if (!w) throw new AppError("故事不存在: " + title);
-          const userPrompt = body.prompt ? String(body.prompt).slice(0, 300) : "";
-          // cover | character：单张（章节插画已迁移到 media/* 接口，段落锚定）
-          let prompt = "";
-          let path = "";
-          let oldRel = ""; // 旧文件路径（重生成/替换后锁外删盘，避免本地残留）
+          if (!w) return; // 书已被删：新文件成为孤儿（与立绘同策略，best-effort 不回滚）
           if (kind === "cover") {
-            // A4 纸张宽高比 (210:297 ≈ 1:1.414)；中文提示词（与全书风格统一）
-            prompt = userPrompt || `${w.title}（${w.genre}）小说封面：${w.setting.tone}，${w.setting.time}，${w.setting.place}，电影感光影，戏剧性构图，细节丰富的插画，画面中不要出现文字，无水印`;
-            const buf = await generateImage(prompt, "768x1086");
-            // Bun 图片压缩：等比缩到 A4 尺寸 + JPEG q82，体积降 ~90%（与自动封面/立绘一致）
-            const compressed = await compressToJpeg(buf, 768, 1086);
-            path = saveImage(title, `cover-${Date.now().toString(36)}.jpg`, compressed);
-            oldRel = w.cover ?? "";
             w.cover = path;
           } else {
-            // 角色头像：仅供用户查看，中文提示词 + 全书画风锚点 + 小体积 JPEG；
-            // 头像先于立绘生成（纯文生，是立绘的容貌基准），不依赖立绘
             const cid = String(body.characterId ?? "");
             const c = w.characters.find((x) => x.id === cid);
-            if (!c) throw new AppError("角色不存在");
-            const avatar = await generateCharacterAvatar(title, w, c);
-            path = avatar.path;
-            prompt = avatar.prompt;
-            oldRel = c.image ?? "";
-            c.image = path;
+            if (c) c.image = path;
           }
           applyStateChange(w, { actor: "user", commandId: kind === "cover" ? "CMD-M09" : "CMD-M08", field: kind === "cover" ? "cover" : "characters", reason: kind === "cover" ? "生成小说封面" : "生成角色头像", chapter: w.nextChapter });
           finalizeStateChange(w, { ok: true });
-          return { path, prompt, oldRel };
+          saveWorld(w);
         });
         // 重生成/替换：删旧文件（与新文件不同路径时；best-effort，引用守卫在 deleteMediaFile 内）
-        if (result.oldRel && result.oldRel !== result.path) deleteMediaFile(title, result.oldRel);
-        return json({ ok: true, path: result.path, prompt: result.prompt });
+        if (oldRel && oldRel !== path) deleteMediaFile(title, oldRel);
+        return json({ ok: true, path, prompt });
       } catch (e) {
         console.error("[api/novel/image]", e);
         return json({ error: e instanceof AppError ? e.message : "图像生成失败（Agnes 云端不可用且本地回退失败），请稍后重试" }, 502);
@@ -2055,19 +2136,19 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         // 不阻塞请求：立即返回 mediaIds，前端轮询 /media/status
         const w0 = loadWorld(title);
         if (!w0) return json({ error: "故事不存在: " + title }, 404);
-        // 插画数量上限校验（用户确认：每章最多 3 张，超限需先删除）
-        const existingImgs = (w0.chapters.find((x) => x.index === idx)?.media ?? []).filter((m) => m.kind === "image").length;
         const toAdd = valid.slice(0, 3);
-        if (existingImgs + toAdd.length > MAX_IMAGES_PER_CHAPTER) {
-          return json({ error: `本章已有 ${existingImgs} 张插画，上限 ${MAX_IMAGES_PER_CHAPTER} 张，请先删除部分插画后再生成` }, 400);
-        }
         const style = styleAnchor(w0);
         // ① 锁内：创建 pending 条目并落盘（含 subject/最终 prompt 前缀；生成完成后覆盖 prompt 为最终值）
-        const created = await withTitleLock(slug(title), async () => {
+        // 插画数量上限校验放在锁内、重新 loadWorld 后对数，避免锁外读快照的 TOCTOU（两请求同时看到余量而双双超限）
+        const createRes = await withTitleLock(slug(title), async () => {
           const w = loadWorld(title);
           if (!w) throw new AppError("故事不存在: " + title);
           const ch = w.chapters.find((x) => x.index === idx);
           if (!ch) throw new AppError("章节不存在");
+          const existingImgs = (ch.media ?? []).filter((m) => m.kind === "image").length;
+          if (existingImgs + toAdd.length > MAX_IMAGES_PER_CHAPTER) {
+            return { error: `本章已有 ${existingImgs} 张插画，上限 ${MAX_IMAGES_PER_CHAPTER} 张，请先删除部分插画后再生成` };
+          }
           const items: ChapterMedia[] = toAdd.map((s) => {
             const sceneType = s.type === "人物" || s.type === "场景" || s.type === "事件" ? s.type : "事件";
             return {
@@ -2085,18 +2166,24 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           touchChapter(w, idx);
           applyStateChange(w, { actor: "user", commandId: "CMD-M02", field: "chapters[].media", reason: `创建第 ${idx} 章插画任务（${items.length} 张）`, chapter: idx });
           saveWorld(w);
-          return items;
+          return { items };
         });
+        if ("error" in createRes) return json({ error: createRes.error }, 400);
+        const created = createRes.items;
         // ② 锁外并行生成（多张并发 + 429 限流重试一次；失败不阻塞其余张），完成后锁内更新
         const t0 = Date.now();
         void (async () => {
           let ok = 0;
+          // 删除自查：书在生成期间被删时短路，避免继续烧 Agnes 配额/写孤儿媒体（对照 ensureCharacterVisuals/ensureCover）
+          const imgDelKey = `${currentUser() ?? ""}::${slug(title)}`;
+          const deleted = () => deletedStories.has(imgDelKey);
           await Promise.allSettled(created.map(async (item, i) => {
             const s = toAdd[i];
             imageGenTasks.set(mediaKey(item.id), true);
             let mediaOk = false;
             let mediaErr = "";
             try {
+              if (deleted()) return; // 书已删：放弃本次生成（pending 条目随书一起消失，无需落盘）
               // 参考图级联：主体角色立绘绝对优先 → 跨章角色插画（仅用已就绪图）；角色无任何图时后台补立绘，不阻塞本次插画
               const ref = findCharacterRef(w0, idx, s.anchor, s.subject || undefined);
               schedulePortraitFor(title, w0, s.anchor);
@@ -2191,9 +2278,12 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const media = (ch0?.media ?? []).find((m) => m.id === mediaId);
       if (!media) return json({ error: "媒体不存在" }, 404);
       if (media.status === "ready") return json({ ok: true, status: "ready", progress: 100, path: media.path });
+      // H10：视频/插画失败早返回（参照图片分支），避免无意义轮询；失败原因回传
+      if (media.status === "failed") return json({ ok: true, status: "failed", error: media.error ?? "媒体生成失败" });
+      // 视频重生成交换期注册表 key（mediaId 重生成前后不变）
+      const vKey = `${currentUser() ?? ""}::${slug(title)}::${idx}::${mediaId}`;
       if (!media.videoId) {
-        // 插画（或异常媒体）：ready/failed 直接返回；pending 查内存任务表区分生成中与中断
-        if (media.status === "failed") return json({ ok: true, status: "failed", error: media.error ?? "插画生成失败" });
+        // 插画（或异常媒体）：ready/failed 已在上方统一返回；pending 查内存任务表区分生成中与中断
         if (media.status === "pending") {
           if (imageGenTasks.has(mediaKey(mediaId))) return json({ ok: true, status: "pending", progress: 0 });
           // 服务重启/进程中断：标记 failed，前端提示重新生成
@@ -2215,54 +2305,108 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       }
       // 视频超时回收：pending 超过 30 分钟（视频正常 5-15s）→ 标记 failed，避免永久 pending
       if (media.status === "pending" && media.createdAt && Date.now() - media.createdAt > 30 * 60_000) {
-        await withTitleLock(slug(title), async () => {
+        const timeoutRes = await withTitleLock(slug(title), async () => {
           const w = loadWorld(title);
           const ch = w?.chapters.find((x) => x.index === idx);
           const m = (ch?.media ?? []).find((x) => x.id === mediaId);
-          if (w && m && m.status === "pending") {
-            m.status = "failed";
-            m.error = "视频生成超时（超过 30 分钟），请删除后重新生成";
+          if (!(w && m && m.status === "pending")) return null; // 状态已被并发改变
+          const regen = videoRegen.get(vKey);
+          if (regen) {
+            // 重生成超时：回滚旧视频（旧 mp4 swap 时保留未删，path 仍指向它）→ 恢复 ready
+            m.videoId = regen.oldVideoId;
+            m.status = "ready";
+            m.error = undefined;
             touchChapter(w, idx);
-            applyStateChange(w, { actor: "system", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章视频超时标记 failed（${mediaId}）`, chapter: idx });
+            applyStateChange(w, { actor: "system", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章视频重生成超时，回滚旧视频（${mediaId}）`, chapter: idx });
             saveWorld(w);
+            return { status: "ready" as const, path: m.path };
           }
+          m.status = "failed";
+          m.error = "视频生成超时（超过 30 分钟），请删除后重新生成";
+          touchChapter(w, idx);
+          applyStateChange(w, { actor: "system", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章视频超时标记 failed（${mediaId}）`, chapter: idx });
+          saveWorld(w);
+          return { status: "failed" as const, error: m.error };
         });
-        return json({ ok: true, status: "failed", error: "视频生成超时（超过 30 分钟），请删除后重新生成" });
+        if (timeoutRes) {
+          videoRegen.delete(vKey);
+          // M5：视频 ready/failed 翻转广播（其他 tab 即时刷新媒体区）
+          publishSync({ type: "task-status", title, kind: "media", id: mediaId, status: timeoutRes.status, error: timeoutRes.status === "failed" ? timeoutRes.error : undefined, at: Date.now(), user: currentUser() ?? undefined });
+          if (timeoutRes.status === "ready") return json({ ok: true, status: "ready", progress: 100, path: timeoutRes.path });
+          return json({ ok: true, status: "failed", error: timeoutRes.error });
+        }
+        // 状态已被并发改变：继续走轮询逻辑取最新状态
       }
       try {
         const st = await pollVideoTask(media.videoId);
         if (st.status === "rate_limited") return json({ ok: true, status: "pending", progress: -1, rateLimited: true });
         if (st.status === "failed") {
-          await withTitleLock(slug(title), async () => {
+          const failRes = await withTitleLock(slug(title), async () => {
             const w = loadWorld(title);
             const ch = w?.chapters.find((x) => x.index === idx);
             const m = (ch?.media ?? []).find((x) => x.id === mediaId);
-            if (m) m.status = "failed";
+            if (!m) return null;
+            const regen = videoRegen.get(vKey);
+            if (regen) {
+              // 重生成失败：回滚旧视频（旧 mp4 swap 时保留未删）→ 恢复 ready，不清 path
+              m.videoId = regen.oldVideoId;
+              m.status = "ready";
+              m.error = undefined;
+            } else if (m.path) {
+              // 非重生成但本地已有旧 mp4：保持可播放（不翻 failed）
+              m.status = "ready";
+              m.error = undefined;
+            } else {
+              m.status = "failed";
+              m.error = st.error ?? "视频生成失败";
+            }
             if (w) {
-              applyStateChange(w, { actor: "user", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章视频生成失败（${mediaId}）：${st.error ?? ""}`, chapter: idx });
+              applyStateChange(w, { actor: "user", commandId: "CMD-M04", field: "chapters[].media", reason: regen ? `第 ${idx} 章视频重生成失败，回滚旧视频（${mediaId}）` : `第 ${idx} 章视频生成失败（${mediaId}）：${st.error ?? ""}`, chapter: idx });
               saveWorld(w);
             }
+            return { status: m.status, path: m.path, error: m.error };
           });
+          if (failRes) {
+            videoRegen.delete(vKey);
+            // M5：视频 ready/failed 翻转广播
+            publishSync({ type: "task-status", title, kind: "media", id: mediaId, status: failRes.status, error: failRes.status === "failed" ? failRes.error ?? undefined : undefined, at: Date.now(), user: currentUser() ?? undefined });
+            if (failRes.status === "ready") return json({ ok: true, status: "ready", progress: 100, path: failRes.path });
+            return json({ ok: true, status: "failed", error: failRes.error ?? "视频生成失败" });
+          }
           return json({ ok: true, status: "failed", error: st.error ?? "视频生成失败" });
         }
         if (st.status === "completed" && st.url) {
+          // 锁外下载（网络 IO 不持锁）；落盘在锁内短事务
           const buf = await downloadVideo(st.url);
-          const path = await withTitleLock(slug(title), async () => {
+          const completeRes = await withTitleLock(slug(title), async () => {
             const w = loadWorld(title);
             if (!w) throw new AppError("故事不存在: " + title);
             const ch = w.chapters.find((x) => x.index === idx);
             const m = (ch?.media ?? []).find((x) => x.id === mediaId);
             if (!m) throw new AppError("媒体不存在");
+            // M4 落盘前复查：并发轮询已落盘/已 ready → 跳过本次，丢弃刚下载的缓冲（下载在内存，无临时文件需删）
+            if (m.status === "ready" && m.path) {
+              return { path: m.path, oldPath: undefined as string | undefined };
+            }
             // 时间戳文件名（cache-bust）：重生成后浏览器不会命中旧缓存
             const rel = saveVideo(title, `${mediaId}-${Date.now().toString(36)}.mp4`, buf);
+            // 重生成交换期：取登记的旧 mp4 路径，落盘后锁外删盘
+            const regen = videoRegen.get(vKey);
+            const oldPath = regen?.oldPath && regen.oldPath !== rel ? regen.oldPath : undefined;
             m.path = rel;
             m.status = "ready";
+            m.error = undefined;
             touchChapter(w, idx);
             applyStateChange(w, { actor: "user", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章视频生成完成（${mediaId}）`, chapter: idx });
             saveWorld(w);
-            return rel;
+            return { path: rel, oldPath };
           });
-          return json({ ok: true, status: "ready", progress: 100, path });
+          // 锁外删旧 mp4（重生成替换；引用守卫在 deleteMediaFile 内）
+          if (completeRes.oldPath) deleteMediaFile(title, completeRes.oldPath);
+          videoRegen.delete(vKey);
+          // M5：视频就绪广播
+          publishSync({ type: "task-status", title, kind: "media", id: mediaId, status: "ready", at: Date.now(), user: currentUser() ?? undefined });
+          return json({ ok: true, status: "ready", progress: 100, path: completeRes.path });
         }
         return json({ ok: true, status: "pending", progress: st.progress });
       } catch (e) {
@@ -2370,6 +2514,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           throw e;
         }
         // ③ 锁内短事务：按 mediaId 重新定位（防期间被删/回滚）后交换
+        // 视频重生成交换期 key（与 /media/status 一致；mediaId 重生成前后不变）
+        const vKey = `${currentUser() ?? ""}::${slug(title)}::${idx}::${mediaId}`;
         const swapped = await withTitleLock(slug(title), async () => {
           const w = loadWorld(title);
           const ch = w?.chapters.find((x) => x.index === idx);
@@ -2379,10 +2525,15 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           if (snap.kind === "image") {
             m.path = newMedia.path;
             m.status = "ready";
+            m.error = undefined;
           } else {
+            // 视频重生成：保留旧 mp4（m.path 不清空）继续播放，等新视频在 /media/status 落盘后再替换；
+            // 旧 videoId/path 登记到 videoRegen，失败/超时据此回滚为 ready（旧文件 swap 期不删）
+            videoRegen.set(vKey, { oldVideoId: m.videoId, oldPath: m.path });
             m.videoId = newMedia.videoId;
-            m.path = undefined;
             m.status = "pending";
+            m.createdAt = newMedia.createdAt; // 重置创建时间，超时回收从新任务起算
+            m.error = undefined;
           }
           steering.logChange(w, { chapter: idx, actor: "user", kind: "media-regenerate", detail: `改词重生成第 ${idx} 章${snap.kind === "image" ? "插画" : "视频"}：${(snap.prompt ?? "").slice(0, 60)}` });
           touchChapter(w, idx);
@@ -2392,11 +2543,13 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         });
         regenBusy.delete(mediaKey(mediaId));
         if (!swapped) {
-          if (snap.kind === "image" && snap.oldPath === undefined && newMedia.path) deleteMediaFile(title, newMedia.path);
+          // 媒体已被删除：丢弃新产物（图片/视频、无论 oldPath 是否存在，均删盘本次新文件，避免孤儿）
+          if (newMedia.path) deleteMediaFile(title, newMedia.path);
           return json({ error: "媒体已被删除，重生成结果已丢弃" }, 404);
         }
-        // ④ 锁外删旧文件（best-effort，引用守卫在 deleteMediaFile 内）
-        if (snap.oldPath) deleteMediaFile(title, snap.oldPath);
+        // ④ 锁外删旧文件（best-effort，引用守卫在 deleteMediaFile 内）；
+        // 视频旧 mp4 不在此删——延迟到 /media/status 新视频落盘成功后删除（失败则回滚继续用旧文件）
+        if (snap.kind === "image" && snap.oldPath) deleteMediaFile(title, snap.oldPath);
         return json({ ok: true, mediaId, status: snap.kind === "image" ? "ready" : "pending", videoId: newMedia.videoId });
       } catch (e) {
         regenBusy.delete(mediaKey(mediaId));

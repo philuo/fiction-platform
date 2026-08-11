@@ -10,7 +10,7 @@ import { allocateTitle, appendCheckpoint, clearPendingChapter, loadPendingChapte
 import { checkInterrupt, logChange } from "./steering";
 import { patchChapter } from "./patch";
 import { ensureChapterPlan, handleArcBoundary, healLegacyStory, markChapterDone, buildBlueprint, confirmBlueprint } from "./planner";
-import { recomputeAppearedIn, settleChapter } from "./chronicler";
+import { recomputeAppearedIn, resetChapterLedger, settleChapter } from "./chronicler";
 import { markOrphanMedia } from "./media";
 import { deleteMediaFile } from "./images";
 import { auditWorld, deleteChapterCascade } from "./integrity";
@@ -340,6 +340,14 @@ export async function writeOneChapter(
   let appliedCards: Card[] = [];
   const chapterIndex = idx;
 
+  // 打断检查（落盘步骤前）：autoGacha/ensureResearch/healLegacyStory/ensureChapterPlan 内部均可能 saveWorld，
+  // 若已置打断须在任何落盘前抛出，避免未 commit 的抽卡伏笔/考据在打断时已落盘（零污染）
+  let it = checkInterrupt(world.title);
+  if (it) {
+    onEvent?.({ phase: "interrupted", item: it });
+    throw new InterruptedError(it);
+  }
+
   // ① 自动抽卡（保留游戏化亮点；效果作为 L0 章节级指令注入）
   if (genOf(world).autoGacha) {
     try {
@@ -374,7 +382,7 @@ export async function writeOneChapter(
   }
 
   // 打断检查（写作前）
-  let it = checkInterrupt(world.title);
+  it = checkInterrupt(world.title);
   if (it) {
     onEvent?.({ phase: "interrupted", item: it });
     throw new InterruptedError(it);
@@ -395,6 +403,10 @@ export async function writeOneChapter(
 
   // ③ 确定性自检（零 LLM）
   onEvent?.({ phase: "selfcheck", aiToneHits: draft.aiToneHits, guard: draft.guard });
+
+  // 空正文闸门（修 L3）：writeChapter 内部已重试一次，仍为空则无条件抛错——
+  // step 模式（无 requirePass）下也不得 commit 空章，让上层返回失败而非写入空章节
+  if (!text.trim()) throw new Error(`第 ${chapterIndex} 章正文为空，已中止提交`);
 
   // 打断检查（写作后 / 审查前）
   it = checkInterrupt(world.title);
@@ -475,11 +487,16 @@ async function reviewFixLoop(
       onEvent?.({ phase: "patching", paragraphs: verdict.findings.filter((f) => f.severity === "major").length });
       const pr = await patchChapter(world, { index: chapterIndex, title, text, review: null }, verdict);
       if (pr.patched) {
+        rounds++; // 修补轮计入轮数（修 L6：与 rewrite 分支一致，patch 轮也计入 rounds/verdict.round）
         text = pr.text;
         // 修补后复审一次（修复闭环，修 C4）
         onEvent?.({ phase: "reviewing", round: rounds });
         verdict = await reviewChapter(world, text, title, chapterIndex, plan);
         verdict.round = rounds;
+      } else {
+        // patch 失败（命中段落>50%/定位不到段落，patch.ts 返回 patched=false）：
+        // 按约定回退整章重写——翻转 verdict.action，下一轮复用 rewrite 分支，避免空转两轮（修 H1）
+        verdict = { ...verdict, action: "rewrite" };
       }
     } else if (verdict.action === "rewrite") {
       rounds++;
@@ -694,8 +711,23 @@ export async function step(
 export async function confirmPendingChapter(world: WorldState): Promise<StepResult> {
   const pending = loadPendingChapter(world.title);
   if (!pending || !pending.pendingCommit) throw new Error("暂存区没有待确认入册的章节");
-  if (!pending.verdictJson) throw new Error("待确认章节缺少审查记录，无法入册");
-  const verdict = JSON.parse(pending.verdictJson) as CriticVerdict;
+  // 审查记录解析保护（修 L4）：verdictJson 缺失或损坏时不 502，console.warn 并按"无审查通过"入册
+  let verdict: CriticVerdict;
+  try {
+    verdict = JSON.parse(pending.verdictJson ?? "") as CriticVerdict;
+  } catch (e) {
+    console.warn(`[director] 第 ${pending.chapterIndex} 章待确认审查记录解析失败，按无审查 verdict 入册：`, (e as Error).message);
+    verdict = {
+      action: "pass",
+      llmVerdict: "pass",
+      scores: { coherence: 0, tension: 0, prose: 0, pacing: 0, dialogue: 0 },
+      criteria: [],
+      findings: [],
+      foreshadowNotes: "",
+      floorFail: false,
+      round: 0,
+    };
+  }
   const plan = (world.chapterPlans ?? []).find((p) => p.index === pending.chapterIndex) ?? null;
   // 健全闸门：消费旧暂存草稿标题时仍须过 isTitleLike（兼容修复前落盘的脏标题）
   const safeTitle = isTitleLike(pending.title) ? pending.title : `第${pending.chapterIndex}章`;
@@ -992,7 +1024,22 @@ export function editWorld(world: WorldState, patch: {
  * 角色重命名全局传播：保证改名后全书各处同步一致。
  */
 function applyRename(w: WorldState, from: string, to: string): void {
-  const rep = (s: string) => s.split(from).join(to);
+  // 边界感知替换（修 H4）：朴素 split(from).join(to) 会把"王林之"误改成"王虎之"。
+  // 收集书中其他专有名词（其他角色名/地名/情节弧线/故事弧/卷名），按长度降序组成最长匹配正则；
+  // 逐片段匹配时仅当片段精确等于 from 才替换为 to，更长的专有名词整体保留不动。
+  const protectedNames = new Set<string>();
+  for (const c of w.characters) {
+    if (c.name && c.name !== from) protectedNames.add(c.name);
+  }
+  if (w.setting.place) protectedNames.add(w.setting.place);
+  for (const a of w.plotThreads ?? []) if (a.name) protectedNames.add(a.name);
+  for (const a of w.storyArcs ?? []) if (a.title) protectedNames.add(a.title);
+  for (const v of w.blueprint?.volumes ?? []) if (v.title) protectedNames.add(v.title);
+  // 短于 from 的名词不可能把 from 作为子串包含，无需参与；按长度降序保证最长匹配优先
+  const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const nouns = [...protectedNames].filter((n) => n.length >= from.length).sort((a, b) => b.length - a.length);
+  const re = new RegExp([...nouns, from].map(escapeRe).join("|"), "g");
+  const rep = (s: string) => s.replace(re, (m) => (m === from ? to : m));
   for (const c of w.characters) {
     const rel: Record<string, string> = {};
     for (const [k, v] of Object.entries(c.relations ?? {})) {
@@ -1090,6 +1137,8 @@ export async function editChapter(world: WorldState, index: number, text: string
   }
   // 记账重算（编辑后账本跟随新正文：摘要/伏笔/角色状态/时间线；失败降级不阻塞保存）
   try {
+    // 先撤旧账再结算（修 C9）：与 integrity resettle 一致，避免伏笔重复埋设/时间线残留
+    resetChapterLedger(world, index);
     const settleReport = await settleChapter(world, ch, (world.chapterPlans ?? []).find((p) => p.index === index) ?? null);
     world.chapterDeltas = { ...(world.chapterDeltas ?? {}), [index]: settleReport.delta };
   } catch {
@@ -1135,6 +1184,8 @@ export async function rollbackChapter(world: WorldState, index: number, versionI
   }
   // 记账重算（回滚后账本跟随新正文：摘要/伏笔/角色状态/时间线；失败降级不阻塞回滚）
   try {
+    // 先撤旧账再结算（修 C9）：与 integrity resettle 一致，避免伏笔重复埋设/时间线残留
+    resetChapterLedger(world, index);
     const settleReport = await settleChapter(world, ch, (world.chapterPlans ?? []).find((p) => p.index === index) ?? null);
     world.chapterDeltas = { ...(world.chapterDeltas ?? {}), [index]: settleReport.delta };
   } catch {
@@ -1168,6 +1219,9 @@ export async function regenerateChapter(
     throw new InterruptedError(it);
   }
 
+  // 当前章计划（初次写作/rewrite/结算共用，修 L5：rewrite 分支不得硬编码 plan:null）
+  const plan = (world.chapterPlans ?? []).find((p) => p.index === index) ?? null;
+
   // 重写 = 在原位跑写作+审查+修补（不新增章节号）
   let rounds = 0;
   onEvent?.({ phase: "writing", round: ++rounds });
@@ -1175,7 +1229,7 @@ export async function regenerateChapter(
     world,
     instruction: baseInstruction,
     chapterIndex: index,
-    plan: (world.chapterPlans ?? []).find((p) => p.index === index) ?? null,
+    plan,
     onDelta: (delta) => onEvent?.({ phase: "delta", delta }),
   });
   let text = draft.text;
@@ -1204,7 +1258,7 @@ export async function regenerateChapter(
     rounds++;
     onEvent?.({ phase: "writing", round: rounds });
     const revisionNotes = verdict.findings.map((f) => `[${f.lens}/${f.severity}] ${f.issue}（原文：${f.evidence}）建议：${f.suggestion}`).join("\n");
-    const redo = await writeChapter({ world, instruction: baseInstruction, revisionNotes, draft: text, chapterIndex: index, plan: null });
+    const redo = await writeChapter({ world, instruction: baseInstruction, revisionNotes, draft: text, chapterIndex: index, plan });
     text = redo.text;
     title = isTitleLike(redo.title) ? redo.title : title;
     verdict = await reviewChapter(world, text, title, index, null);
@@ -1222,7 +1276,9 @@ export async function regenerateChapter(
     throw new InterruptedError(it);
   }
   // 重算该章状态（记账覆盖式，修 B4 时间线失配）
-  const settleReport = await settleChapter(world, ch, (world.chapterPlans ?? []).find((p) => p.index === index) ?? null);
+  // 先撤旧账再结算（修 C9）：与 integrity resettle 一致，避免伏笔重复埋设/时间线残留
+  resetChapterLedger(world, index);
+  const settleReport = await settleChapter(world, ch, plan);
   world.chapterDeltas = { ...(world.chapterDeltas ?? {}), [index]: settleReport.delta }; // 重写后覆盖该章变更快照
   registerDebt(world, index, verdict);
   onEvent?.({ phase: "saving" });

@@ -403,6 +403,12 @@ export const BrainCabin: React.FC<{
   const [writing, setWriting] = useState<{ title: string; phase: string; text: string; status: "running" | "done" | "failed"; detail?: string } | null>(null);
   const writingAbortRef = useRef<AbortController | null>(null);
   const writingTimerRef = useRef<number | null>(null);
+  // L18：媒体生成轮询 setInterval 提升为 ref，卸载时 clearInterval + 防卸载后 setState
+  const mediaPollRef = useRef<number | null>(null);
+  // L18：输入区拖拽进行中的清理函数（卸载时移除 window 监听 + 还原 body 样式）
+  const inputResizeCleanupRef = useRef<(() => void) | null>(null);
+  // L18：组件挂载态（BrainCabin 随弹窗开关挂载/卸载），异步回调写 state 前自检
+  const cabinMountedRef = useRef(true);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // —— 打字机渲染（流式感）：上游推理模型思考期零输出、完成后一次性吐出，React 批处理会让文本
@@ -564,6 +570,20 @@ export const BrainCabin: React.FC<{
     return () => { if (registerCardPatch) registerCardPatch(() => {}); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [registerCardPatch]);
+
+  // L18：卸载清理——媒体轮询 / 写作收起定时器 / 删除确认定时器 / 输入区拖拽监听，
+  // 避免 BrainCabin 关闭（卸载）后定时器空转、window 监听与 body cursor/userSelect 残留、卸载后 setState
+  useEffect(() => {
+    cabinMountedRef.current = true;
+    return () => {
+      cabinMountedRef.current = false;
+      if (mediaPollRef.current) { window.clearInterval(mediaPollRef.current); mediaPollRef.current = null; }
+      if (writingTimerRef.current) { window.clearTimeout(writingTimerRef.current); writingTimerRef.current = null; }
+      if (delTimerRef.current) { window.clearTimeout(delTimerRef.current); delTimerRef.current = null; }
+      inputResizeCleanupRef.current?.();
+      inputResizeCleanupRef.current = null;
+    };
+  }, []);
 
   function appendBrainMsg(cards: BrainCard[]) {
     if (!activeId) return;
@@ -838,9 +858,14 @@ export const BrainCabin: React.FC<{
                     <button className="bc-link-btn" onClick={retryInInput} disabled={streaming} title="把最后一个问题移到底部输入框，并从记录中移除本回合">移至输入 · 移除本回合</button>
                   </div>
                 )}
-                {msg.cards?.filter((c) => c.kind !== "ask").map((card, i) => (
+                {msg.cards?.map((card, i) => {
+                  // L19 修复：ask 卡不进聊天流；用「未过滤数组的原始下标 i」作 completed 键，
+                  // 与 ctx-bar/media-bar 的 lastCards.indexOf（原始下标）及 confirmChoose/executeCard
+                  // 标记侧保持一致（过滤后下标在含 ask 卡时会错位，导致完成态不匹配）。
+                  if (card.kind === "ask") return null;
+                  return (
                   <BrainCardView
-                    key={i}
+                    key={card.cardId ?? `${msg.id}::${i}`}
                     card={card}
                     busy={streaming || executing}
                     completed={completed.has(`${msg.id}:${i}`)}
@@ -850,7 +875,8 @@ export const BrainCabin: React.FC<{
                     onOption={handleOption}
                     onFormSubmit={(card2, values) => submitForm(card2, values, msg.id, i)}
                   />
-                ))}
+                  );
+                })}
                 {/* 消息操作区：时间戳 + 收起（可折叠消息展开态，位于时间之后、功能按钮之前）+ 复制（user 额外编辑）；pending 时不显示 */}
                 {!msg.pending && (msg.text || (msg.cards?.length ?? 0) > 0) && (
                   <div className="bc-msg-ops">
@@ -971,7 +997,11 @@ export const BrainCabin: React.FC<{
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void doSend(); }
+              if (e.key === "Enter" && !e.shiftKey) {
+                // M8 修复：中文输入法选词中的 Enter（isComposing/keyCode 229）不发送
+                if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+                e.preventDefault(); void doSend();
+              }
             }}
             placeholder={streaming ? "中枢正在回复…（可继续输入，生成结束后发送）" : "对中枢说点什么…（Enter 发送，Shift+Enter 换行）"}
             rows={2}
@@ -1012,6 +1042,8 @@ export const BrainCabin: React.FC<{
     e.preventDefault();
     const ta = inputRef.current;
     if (!ta) return;
+    // 清掉上一次拖拽的清理（防御 pointerup 未触发的残留）
+    inputResizeCleanupRef.current?.();
     const startY = e.clientY;
     const startH = ta.getBoundingClientRect().height;
     const MIN = 48, MAX = 176;
@@ -1019,11 +1051,15 @@ export const BrainCabin: React.FC<{
       const h = Math.min(MAX, Math.max(MIN, startH + (startY - ev.clientY)));
       ta.style.height = `${h}px`;
     };
-    const onUp = () => {
+    const cleanup = () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
+    };
+    const onUp = () => {
+      cleanup();
+      inputResizeCleanupRef.current = null;
       // 拖拽结束：保存输入区高度偏好（纯本地；服务端不感知，无一致性风险）
       const h = ta.getBoundingClientRect().height;
       writeCabinPrefs({ inputHeight: Math.round(h) });
@@ -1032,6 +1068,8 @@ export const BrainCabin: React.FC<{
     window.addEventListener("pointerup", onUp);
     document.body.style.cursor = "ns-resize";
     document.body.style.userSelect = "none";
+    // L18：记录清理函数，卸载时（拖拽中关弹窗）也能移除监听、还原 body 样式
+    inputResizeCleanupRef.current = cleanup;
   }
 
   /** 发送：无 activeId 时自动新建会话（直接输入即首次对话）；text 参数供空态快捷提问复用 */
@@ -1326,9 +1364,11 @@ export const BrainCabin: React.FC<{
   }
 
   /** 媒体生成进度轮询：全部 ready/failed 后刷新世界并追加结果卡（聊天内生成插画的进度闭环）。
-   *  非 2xx / 解析失败视为该项失败并结束轮询，防 setInterval 永久泄漏。 */
+   *  非 2xx / 解析失败视为该项失败并结束轮询，防 setInterval 永久泄漏。
+   *  L18：timer 提升为 ref，卸载时清理；回调内自检挂载态，避免卸载后 setState。 */
   function pollMediaGen(title: string, chapterIndex: number, mediaIds: string[], label: string) {
-    const timer = window.setInterval(async () => {
+    if (mediaPollRef.current) window.clearInterval(mediaPollRef.current);
+    mediaPollRef.current = window.setInterval(async () => {
       try {
         const sts = await Promise.all(mediaIds.map(async (id) => {
           const r = await apiFetch("/api/novel/media/status", {
@@ -1340,10 +1380,11 @@ export const BrainCabin: React.FC<{
           const d = (await r.json().catch(() => ({}))) as { status?: string };
           return d.status === "ready" || d.status === "failed" ? d.status : "pending";
         }));
+        if (!cabinMountedRef.current) return; // 卸载后：不再写 state（timer 已由 cleanup 清除，此处防御 in-flight 回调）
         const done = sts.filter((s) => s === "ready").length;
         const failed = sts.filter((s) => s === "failed").length;
         if (done + failed === mediaIds.length) {
-          window.clearInterval(timer);
+          if (mediaPollRef.current) { window.clearInterval(mediaPollRef.current); mediaPollRef.current = null; }
           appendBrainMsg([{ kind: "result", title: label, success: failed === 0, detail: failed === 0 ? `已完成（${done} 项）` : `${done} 项成功，${failed} 项失败` }]);
           onWorldUpdate?.();
         }
