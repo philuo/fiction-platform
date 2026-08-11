@@ -529,6 +529,20 @@ export function useBrainSession(title: string) {
     if (id === activeIdRef.current) setMessages([...arr]);
   }, []);
 
+  /** 追加一条卡片消息（preview/result 卡等）并持久化到服务端会话：
+   *  本地即时展示 + POST /api/brain/sessions/append 落盘（刷新后卡片消息不丢失，会话记录完整）；
+   *  服务端广播 brain-append → 其他 tab 重拉会话（多 tab 一致）。POST 失败静默——仅影响刷新恢复，不阻塞操作。 */
+  const appendCard = useCallback(async (sessionId: string, msg: ChatMessage) => {
+    appendMsg(sessionId, msg);
+    try {
+      await apiFetch("/api/brain/sessions/append", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, sessionId, message: msg }),
+      });
+    } catch { /* 静默：持久化失败仅影响刷新恢复 */ }
+  }, [title, appendMsg]);
+
   /** 就地更新某消息内指定卡片（阶段 3a）：按 cardId 替换卡片对象，不重拉会话。
    *  由 useSyncChannel 的 card-update 事件驱动（多 tab 一致）；命中返回 true。 */
   const patchCard = useCallback((sessionId: string, messageId: string, cardId: string, patch: Record<string, unknown>): boolean => {
@@ -549,6 +563,36 @@ export function useBrainSession(title: string) {
     if (sessionId === activeIdRef.current) setMessages(next);
     return true;
   }, []);
+
+  /** 就地替换某消息内指定下标的卡片（阶段 3b：媒体生成 form→preview 单面板流转）。
+   *  按「消息内下标」整体替换（含 kind/action 变更——patchCard 只能合并字段，无法改变卡片类型）。
+   *  本地即时替换 + POST /api/brain/sessions/replace-card 落盘（刷新后保持单面板状态）；
+   *  POST 失败静默——仅影响刷新恢复，不阻塞操作。
+   *  persist=false（如「分镜中」这类同步请求的中间态）：仅本地替换不落盘——分镜无服务端任务记录，
+   *  落盘后刷新/断线无恢复机制会永久悬死（与 patchMediaTaskStatus 对 running 中间态不落盘的原则一致）。 */
+  const replaceCard = useCallback(async (sessionId: string, messageId: string, cardIndex: number, card: BrainCard, persist = true) => {
+    const arr = cacheRef.current.get(sessionId);
+    if (!arr) return;
+    let hit = false;
+    const next = arr.map((m) => {
+      if (m.id !== messageId || !m.cards?.length) return m;
+      if (cardIndex < 0 || cardIndex >= m.cards.length) return m;
+      hit = true;
+      const cards = m.cards.map((c, i) => (i === cardIndex ? card : c));
+      return { ...m, cards };
+    });
+    if (!hit) return;
+    cacheRef.current.set(sessionId, next);
+    if (sessionId === activeIdRef.current) setMessages(next);
+    if (!persist) return;
+    try {
+      await apiFetch("/api/brain/sessions/replace-card", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, sessionId, messageId, cardIndex, card }),
+      });
+    } catch { /* 静默：持久化失败仅影响刷新恢复 */ }
+  }, [title]);
 
   /** 标记当前会话某卡片操作已完成（key：`消息id:卡片下标[:列表项id]`）。
    *  本地乐观更新（按钮即时反馈）+ 服务端持久化（刷新后恢复完成态）；POST 失败静默——仅影响刷新恢复，不阻塞操作。 */
@@ -620,7 +664,9 @@ export function useBrainSession(title: string) {
     removeSession,
     truncate,
     appendMsg,
+    appendCard,
     patchCard,
+    replaceCard,
     send,
     stop,
     refreshList,

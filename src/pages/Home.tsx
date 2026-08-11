@@ -667,6 +667,12 @@ const Home: React.FC<HomeProps> = (props) => {
   const registerCardPatch = useCallback((fn: (e: { sessionId: string; messageId: string; cardId: string; patch: Record<string, unknown> }) => void) => {
     cardPatchRef.current = fn;
   }, []);
+  /** 任务状态事件注册（阶段 3b+）：BrainCabin 挂载时注册 media task-status 处理器，
+   *  媒体生成轮询据此在 WS 广播任务完成时提前收尾（减少 /media/status 冗余轮询）。 */
+  const taskStatusRef = useRef<((e: { kind: string; id?: string; status: string }) => void) | null>(null);
+  const registerTaskStatus = useCallback((fn: (e: { kind: string; id?: string; status: string }) => void) => {
+    taskStatusRef.current = fn;
+  }, []);
   /** WS 连接状态（阶段 5）：连接=true 时事件驱动不轮询；断开=false 时 sysPoll 降级。
    *  ref 镜像供异步回调（startAutoRun finally）读最新值 */
   const wsConnectedRef = useRef(false);
@@ -678,10 +684,13 @@ const Home: React.FC<HomeProps> = (props) => {
       // 推进任务完成广播（kind:"advance"）→ 清 advancePhase 释放运行锁（覆盖底部按钮/聊天/多 tab 发起路径；
       // 轮询降级后此广播是唯一不依赖本页 SSE 的释放通道）
       if (e.kind === "advance") setAdvancePhase("");
+      // media/visual 等任务完成广播 → 转发聊天舱（媒体生成轮询提前收尾，减少 /media/status 冗余轮询）
+      taskStatusRef.current?.(e);
       void refreshWorld(e.kind === "advance" ? ["U03", "U06", "U08", "U10"] : undefined);
     },
     onAutoStatus: () => { void fetchAutoStatus(); },
     onBrainNote: () => setSysTick((t) => t + 1),
+    onBrainAppend: () => setSysTick((t) => t + 1),
     onCardUpdate: (e) => cardPatchRef.current?.(e),
     // 降级通道（阶段 5）：WS 连接时停 sysPoll（事件驱动）；WS 断开时启动 sysPoll（轮询兜底防漏事件）。
     // 与连载 SSE 直连（startAutoRun stopSysPoll）叠加：WS 断 + 连载 SSE 在 → 仍不轮询（SSE 自身实时）。
@@ -2791,6 +2800,7 @@ const Home: React.FC<HomeProps> = (props) => {
           buildingStage={buildingStage}
           sysTick={sysTick}
           registerCardPatch={registerCardPatch}
+          registerTaskStatus={registerTaskStatus}
         />
       )}
 

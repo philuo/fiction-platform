@@ -531,3 +531,43 @@ describe("progress 路由（任务进度卡，阶段 3b）", () => {
     expect(bad.status).toBe(400);
   });
 });
+
+describe("replace-card 路由（卡片整体替换，阶段 3b 单面板流转）", () => {
+  test("form→preview 整体替换并落盘；detail 可见替换后卡片；下标越界 → replaced:false", async () => {
+    cookieA = await register("e2e_rc_" + Math.random().toString(36).slice(2, 8));
+    const sid = "e2e-rc-" + Math.random().toString(36).slice(2, 8);
+    const create = await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "生成插画" }, cookieA);
+    expect(create.status).toBe(201);
+
+    // 先注入一张 form 卡消息（模拟中枢产出的媒体 form 卡）
+    const append = await api("/api/brain/sessions/append", "POST", {
+      title: "e2e-book", sessionId: sid,
+      message: { id: "rc1", role: "assistant", text: "", cards: [{ kind: "form", title: "生成章节插画", action: { endpoint: "/api/novel/media/plan" }, submitLabel: "挑选场景并生成" }] },
+    }, cookieA);
+    expect(append.status).toBe(200);
+
+    // 整体替换为 preview（分镜中）
+    const preview = {
+      kind: "preview", cardId: "media-rc1", title: "生成第 1 章插画（分镜中）", status: "running",
+      statusLabel: "分镜中", detail: "AI 分镜中…",
+    };
+    const rc = await api("/api/brain/sessions/replace-card", "POST", { title: "e2e-book", sessionId: sid, messageId: "rc1", cardIndex: 0, card: preview }, cookieA);
+    expect(rc.status).toBe(200);
+    expect(((await rc.json()) as { replaced: boolean }).replaced).toBe(true);
+
+    const detail = await api("/api/brain/sessions/detail", "POST", { title: "e2e-book", id: sid }, cookieA);
+    const d = (await detail.json()) as { session: { messages: { id: string; cards?: { kind?: string; cardId?: string; status?: string; submitLabel?: string }[] }[] } };
+    const msg = d.session.messages.find((m) => m.id === "rc1")!;
+    expect(msg.cards?.[0]?.kind).toBe("preview");
+    expect(msg.cards?.[0]?.cardId).toBe("media-rc1");
+    expect(msg.cards?.[0]?.status).toBe("running");
+    expect(msg.cards?.[0]?.submitLabel).toBeUndefined(); // 旧 form 字段整体清除
+
+    // 下标越界 → replaced:false（不破坏）
+    const outOfRange = await api("/api/brain/sessions/replace-card", "POST", { title: "e2e-book", sessionId: sid, messageId: "rc1", cardIndex: 9, card: preview }, cookieA);
+    expect(((await outOfRange.json()) as { replaced: boolean }).replaced).toBe(false);
+    // 缺参数 → 400
+    const bad = await api("/api/brain/sessions/replace-card", "POST", { title: "e2e-book", sessionId: sid, messageId: "rc1" }, cookieA);
+    expect(bad.status).toBe(400);
+  });
+});

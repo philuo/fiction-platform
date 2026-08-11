@@ -41,6 +41,22 @@ describe("jsonutil.extractJson", () => {
     const out = extractJson<{ t: string }>('{"t":"他说\\"你好\\""}');
     expect(out.t).toBe('他说"你好"');
   });
+  test("整体被英文引号包裹的对象可提取", () => {
+    const out = extractJson<{ a: number }>('"{"a":1}"');
+    expect(out.a).toBe(1);
+  });
+  test("顶层数组截取首个对象", () => {
+    const out = extractJson<{ a: number }>('[{"a":1},{"b":2}]');
+    expect(out.a).toBe(1);
+  });
+  test("对象后尾缀引号/杂文不破坏解析", () => {
+    expect(extractJson<{ a: number }>('{"a":1}"')).toEqual({ a: 1 });
+    expect(extractJson<{ a: number }>('{"a":1} 后面还有一段说明文字')).toEqual({ a: 1 });
+  });
+  test("无对象的字符串+尾缀（position 4 类残缺）抛错而非静默返回", () => {
+    expect(() => extractJson('"ab"x')).toThrow(/不是合法 JSON/);
+    expect(() => extractJson('完全不是 json')).toThrow();
+  });
   test("非法 JSON 抛错", () => {
     expect(() => extractJson("完全不是 json")).toThrow();
   });

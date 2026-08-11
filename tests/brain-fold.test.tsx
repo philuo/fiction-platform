@@ -5,8 +5,8 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import { Window } from "happy-dom";
 import React from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { isCollapsibleMsg, msgCollapseSummary, completedItemIdsOf, actionItemId, guardAction } from "../src/components/BrainCabin";
-import { BrainCardView, type ProgressCard } from "../src/components/brain-cards";
+import { isCollapsibleMsg, msgCollapseSummary, completedItemIdsOf, actionItemId, guardAction, mediaCardOf, mediaGuideText } from "../src/components/BrainCabin";
+import { BrainCardView, type ProgressCard, type FormCard } from "../src/components/brain-cards";
 import type { ChatMessage } from "../src/components/useBrainSession";
 
 let win: Window;
@@ -124,4 +124,50 @@ test("ProgressCardView：done 显示完成标记，无中断按钮", async () =>
   expect(t).toContain("第 4 章《夜探》已完成");
   expect(mount.querySelector("button")).toBeNull();
   root.unmount();
+});
+
+// —— 媒体生成 form 卡消息正文（mediaGuideText）：跟随卡片章节/张数选项实时更新，去「正在…生成」的误导 ——
+
+const mediaForm = (): FormCard => ({
+  kind: "form",
+  title: "生成章节插画",
+  commandId: "CMD-M02",
+  level: "L0",
+  summary: "为「第 1 章」生成 1 张插画",
+  fields: [
+    { key: "chapterIndex", label: "章节", type: "select", value: 1, options: [
+      { label: "第 1 章 · 跪尸巷", value: "1" },
+      { label: "第 2 章 · 梦引", value: "2" },
+    ]},
+    { key: "count", label: "张数（1-3）", type: "number", value: 1 },
+  ],
+  action: { endpoint: "/api/novel/media/plan", method: "POST", body: { title: "缄梦录", kind: "image" } },
+  submitLabel: "挑选场景并生成",
+});
+
+test("mediaGuideText：默认用卡字段值（去「正在」、提示确认），切换章节/张数后实时跟随", () => {
+  // 无 values → 用卡默认值（第 1 章 / 1 张）
+  expect(mediaGuideText(mediaForm())).toBe("为「第 1 章 · 跪尸巷」生成 1 张插画，确认后开始生成。");
+  expect(mediaGuideText(mediaForm())).not.toContain("正在");
+  // 跟随章节 select 变化
+  expect(mediaGuideText(mediaForm(), { chapterIndex: "2", count: 1 })).toBe("为「第 2 章 · 梦引」生成 1 张插画，确认后开始生成。");
+  // 跟随张数变化
+  expect(mediaGuideText(mediaForm(), { chapterIndex: "1", count: 3 })).toBe("为「第 1 章 · 跪尸巷」生成 3 张插画，确认后开始生成。");
+  // 张数超上限（服务端 clamp 3）→ 文案不显示超限值
+  expect(mediaGuideText(mediaForm(), { chapterIndex: "1", count: 9 })).toBe("为「第 1 章 · 跪尸巷」生成 3 张插画，确认后开始生成。");
+});
+
+test("mediaGuideText：video 恒 1 段；章节未选退化为提示语", () => {
+  const video = { ...mediaForm(), action: { ...mediaForm().action, body: { kind: "video" } }, fields: [mediaForm().fields[0]] } as FormCard;
+  expect(mediaGuideText(video, { chapterIndex: "2" })).toBe("为「第 2 章 · 梦引」生成 1 段视频，确认后开始生成。");
+  // 章节 select 无匹配（异常兜底）→ 提示语
+  const bad = { ...mediaForm(), fields: [{ ...mediaForm().fields[0], value: 99 }] } as FormCard;
+  expect(mediaGuideText(bad)).toBe("请选择生成插画的参数（章节与张数），确认后开始生成。");
+});
+
+test("mediaCardOf：含媒体 form 卡的消息返回卡；无卡/非媒体卡返回 undefined", () => {
+  const m = brainMsg([mediaForm()]);
+  expect(mediaCardOf(m)?.action.endpoint).toBe("/api/novel/media/plan");
+  expect(mediaCardOf(brainMsg([{ kind: "result", title: "已保存", success: true, detail: "ok" }]))).toBeUndefined();
+  expect(mediaCardOf(brainMsg([]))).toBeUndefined();
 });

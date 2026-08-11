@@ -433,3 +433,137 @@ test("form 卡 completed：提交按钮替换为 ✓ 已执行，无法再提交
   expect(submitted).toBe(false);
   root.unmount();
 });
+
+test("媒体 form 卡：切换章节/张数选项后提示文案实时更新", async () => {
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root: Root = createRoot(mount);
+  const mediaForm = {
+    kind: "form" as const,
+    title: "生成章节插画",
+    commandId: "CMD-M02",
+    level: "L0" as const,
+    summary: "为「第 1 章」生成 1 张插画：提交后 AI 先从正文挑选关键场景，确认后开始生成（未指定章节时默认选中章节，可改）",
+    fields: [
+      { key: "chapterIndex", label: "章节", type: "select" as const, value: 1, options: [
+        { label: "第 1 章 · 跪尸巷", value: "1" },
+        { label: "第 2 章 · 梦引", value: "2" },
+      ]},
+      { key: "count", label: "张数（1-3）", type: "number" as const, value: 1 },
+    ],
+    action: { endpoint: "/api/novel/media/plan", method: "POST", body: { title: "书", kind: "image" } },
+    submitLabel: "挑选场景并生成",
+  };
+  root.render(React.createElement(BrainCardView, { card: mediaForm, onFormSubmit: () => {} }));
+  await tick();
+  let t = mount.textContent ?? "";
+  // 初始文案：默认第 1 章 / 1 张
+  expect(t).toContain("为「第 1 章 · 跪尸巷」生成 1 张插画");
+  // 切换章节 select → 文案实时更新（React 受控 select 需原生 value setter）
+  const select = mount.querySelector("select") as HTMLSelectElement | null;
+  expect(select).not.toBeNull();
+  Object.getOwnPropertyDescriptor(win.HTMLSelectElement.prototype, "value")!.set!.call(select, "2");
+  select!.dispatchEvent(new win.Event("change", { bubbles: true }));
+  await tick();
+  t = mount.textContent ?? "";
+  expect(t).toContain("为「第 2 章 · 梦引」生成 1 张插画");
+  expect(t).not.toContain("为「第 1 章 · 跪尸巷」生成");
+  root.unmount();
+  // 张数影响文案（happy-dom 受控 number input 事件受限，用初始值渲染验证动态计算）
+  const m2 = document.createElement("div");
+  document.body.appendChild(m2);
+  const r2: Root = createRoot(m2);
+  r2.render(React.createElement(BrainCardView, {
+    card: { ...mediaForm, fields: [
+      { key: "chapterIndex", label: "章节", type: "select" as const, value: 2, options: [
+        { label: "第 1 章 · 跪尸巷", value: "1" },
+        { label: "第 2 章 · 梦引", value: "2" },
+      ]},
+      { key: "count", label: "张数（1-3）", type: "number" as const, value: 3 },
+    ] },
+    onFormSubmit: () => {},
+  }));
+  await tick();
+  t = m2.textContent ?? "";
+  expect(t).toContain("为「第 2 章 · 梦引」生成 3 张插画");
+  r2.unmount();
+});
+
+test("preview 卡：异步任务状态（生成中/失败/完成）就地呈现", async () => {
+  const base = {
+    kind: "preview" as const,
+    title: "生成第 1 章插画（1 张）",
+    commandId: "CMD-M02",
+    level: "L0" as const,
+    summary: "已从第 1 章正文挑选 1 个关键场景，确认后开始生成。",
+    action: { endpoint: "/api/novel/media/generate", method: "POST" as const, body: { chapterIndex: 1, kind: "image" } },
+    cardId: "pv-1",
+  };
+  // running：显示「生成中」+ 按钮禁用
+  const m1 = document.createElement("div");
+  document.body.appendChild(m1);
+  const r1: Root = createRoot(m1);
+  r1.render(React.createElement(BrainCardView, { card: { ...base, status: "running" as const, detail: "生成任务已提交，正在生成…" }, onExecute: () => {} }));
+  await tick();
+  let t = m1.textContent ?? "";
+  expect(t).toContain("生成中");
+  expect(t).toContain("生成任务已提交");
+  expect((m1.querySelector("button") as HTMLButtonElement | null)?.disabled).toBe(true);
+  r1.unmount();
+  // failed：显示「生成失败」+ 按钮保留（可重试）
+  const m2 = document.createElement("div");
+  document.body.appendChild(m2);
+  const r2: Root = createRoot(m2);
+  r2.render(React.createElement(BrainCardView, { card: { ...base, status: "failed" as const, detail: "生图失败：429" }, onExecute: () => {} }));
+  await tick();
+  t = m2.textContent ?? "";
+  expect(t).toContain("生成失败");
+  expect(t).toContain("生图失败：429");
+  expect((m2.querySelector("button") as HTMLButtonElement | null)?.disabled).toBe(false);
+  r2.unmount();
+  // done：显示「已完成」
+  const m3 = document.createElement("div");
+  document.body.appendChild(m3);
+  const r3: Root = createRoot(m3);
+  r3.render(React.createElement(BrainCardView, { card: { ...base, status: "done" as const, detail: "已完成 1 项" }, onExecute: () => {} }));
+  await tick();
+  t = m3.textContent ?? "";
+  expect(t).toContain("已完成");
+  r3.unmount();
+});
+
+test("form 卡 onValuesChange：初始上报默认值，切换 select 后上报新值（驱动消息正文跟随选项）", async () => {
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root: Root = createRoot(mount);
+  const reported: Record<string, unknown>[] = [];
+  const mediaForm = {
+    kind: "form" as const,
+    title: "生成章节插画",
+    commandId: "CMD-M02",
+    level: "L0" as const,
+    summary: "为「第 1 章」生成 1 张插画",
+    fields: [
+      { key: "chapterIndex", label: "章节", type: "select" as const, value: 1, options: [
+        { label: "第 1 章 · 跪尸巷", value: "1" },
+        { label: "第 2 章 · 梦引", value: "2" },
+      ]},
+      { key: "count", label: "张数（1-3）", type: "number" as const, value: 1 },
+    ],
+    action: { endpoint: "/api/novel/media/plan", method: "POST", body: { title: "书", kind: "image" } },
+    submitLabel: "挑选场景并生成",
+  };
+  root.render(React.createElement(BrainCardView, { card: mediaForm, onFormSubmit: () => {}, onFormValuesChange: (v) => reported.push({ ...v }) }));
+  await tick();
+  // 初始不上报（父组件用卡字段默认值兜底；无 effect 时序依赖）
+  expect(reported.length).toBe(0);
+  // 切换章节 select → 同步上报新值（消息正文据此实时更新）
+  const select = mount.querySelector("select") as HTMLSelectElement | null;
+  expect(select).not.toBeNull();
+  Object.getOwnPropertyDescriptor(win.HTMLSelectElement.prototype, "value")!.set!.call(select, "2");
+  select!.dispatchEvent(new win.Event("change", { bubbles: true }));
+  await tick();
+  expect(reported.length).toBe(1);
+  expect(reported[0]).toEqual({ chapterIndex: "2", count: 1 });
+  root.unmount();
+});

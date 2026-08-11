@@ -29,6 +29,10 @@ let chatEvents: Array<Record<string, unknown>> | null = null;
 const detailCompleted = new Map<string, string[]>();
 /** 记录 /api/brain/sessions/completed 调用（验证持久化请求） */
 const completedCalls: Array<{ id: string; key: string }> = [];
+/** 记录对 /api/brain/sessions/append 调用（验证卡片消息持久化请求） */
+const appendCalls: Array<{ id: string; messageId: string; cards: unknown[] }> = [];
+/** 记录对 /api/brain/sessions/replace-card 调用（验证单面板流转的卡片整体替换持久化） */
+const replaceCalls: Array<{ id: string; messageId: string; cardIndex: number; card: unknown }> = [];
 
 beforeAll(() => {
   win = new Window({ url: "http://localhost/?title=brain-session-hook-test" });
@@ -46,6 +50,26 @@ beforeAll(() => {
       const arr = detailCompleted.get(body.id) ?? [];
       if (!arr.includes(body.key)) detailCompleted.set(body.id, [...arr, body.key]);
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } }) as unknown as Response;
+    }
+    if (u.includes("/api/brain/sessions/append")) {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { sessionId: string; message: { id: string; cards?: unknown[] } };
+      appendCalls.push({ id: body.sessionId, messageId: body.message.id, cards: body.message.cards ?? [] });
+      // 持久化到 mock 会话存储：detail 可读到（模拟服务端落盘后刷新恢复）
+      const arr = created.get(body.sessionId) ?? [];
+      if (!arr.some((m) => m.id === body.message.id)) arr.push({ id: body.message.id, role: "assistant", cards: body.message.cards });
+      created.set(body.sessionId, arr);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } }) as unknown as Response;
+    }
+    if (u.includes("/api/brain/sessions/replace-card")) {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { sessionId: string; messageId: string; cardIndex: number; card: unknown };
+      replaceCalls.push({ id: body.sessionId, messageId: body.messageId, cardIndex: body.cardIndex, card: body.card });
+      // 持久化到 mock 会话存储（模拟服务端落盘后刷新恢复）
+      const arr = created.get(body.sessionId) ?? [];
+      const msg = arr.find((m) => m.id === body.messageId) as { cards?: { [k: string]: unknown }[] } | undefined;
+      if (msg && Array.isArray(msg.cards) && body.cardIndex >= 0 && body.cardIndex < msg.cards.length) {
+        msg.cards[body.cardIndex] = body.card as { [k: string]: unknown };
+      }
+      return new Response(JSON.stringify({ ok: true, replaced: true }), { status: 200, headers: { "Content-Type": "application/json" } }) as unknown as Response;
     }
     if (u.includes("/api/brain/sessions/detail")) {
       const body = JSON.parse(String(init?.body ?? "{}")) as { id: string };
@@ -116,7 +140,7 @@ const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 
 /** 复刻 BrainCabin.doSend 的发送入口（无 activeId → newSession → send） */
 function Harness() {
-  const { messages, activeId, newSession, openSession, send, completed, markCompleted } = useBrainSession("brain-session-hook-test");
+  const { messages, activeId, newSession, openSession, send, completed, markCompleted, appendCard, replaceCard } = useBrainSession("brain-session-hook-test");
   const msgRef = React.useRef(messages);
   msgRef.current = messages;
   const completedRef = React.useRef(completed);
@@ -140,11 +164,13 @@ function Harness() {
         await send({ prompt, sessionId: sid, ctx });
       },
       startNew: () => newSession(),
-      openSession: (id: string) => openSession(id),
+      openSession: (id: string, force?: boolean) => openSession(id, undefined, force),
       getMessages: () => msgRef.current,
       getActiveId: () => activeId,
       getCompleted: () => completedRef.current,
       markCompleted: (key: string) => markCompleted(key),
+      appendCard: (msg: { id: string; role: "brain"; cards: unknown[]; at: string }) => appendCard(activeId, msg),
+      replaceCard: (messageId: string, cardIndex: number, card: unknown, persist?: boolean) => replaceCard(activeId, messageId, cardIndex, card as never, persist ?? true),
     };
   });
   return <div>{messages.map((m) => `${m.role}:${m.text}`).join("|")}</div>;
@@ -159,6 +185,8 @@ async function mountHarness() {
   chatEvents = null;
   detailCompleted.clear();
   completedCalls.length = 0;
+  appendCalls.length = 0;
+  replaceCalls.length = 0;
   const mount = document.createElement("div");
   document.body.appendChild(mount);
   const root: Root = createRoot(mount);
@@ -166,7 +194,7 @@ async function mountHarness() {
   return { mount, root };
 }
 
-  const harness = () => (win as unknown as { __harness: { doSend: (p: string, ctx?: { chapterIndex?: number | null }) => Promise<void>; startNew: () => Promise<string>; getMessages: () => { role: string; text?: string; pending?: boolean }[]; getActiveId: () => string; openSession: (id: string) => Promise<void> } }).__harness;
+  const harness = () => (win as unknown as { __harness: { doSend: (p: string, ctx?: { chapterIndex?: number | null }) => Promise<void>; startNew: () => Promise<string>; getMessages: () => { role: string; text?: string; pending?: boolean }[]; getActiveId: () => string; openSession: (id: string, force?: boolean) => Promise<void>; replaceCard: (messageId: string, cardIndex: number, card: unknown, persist?: boolean) => Promise<void> } }).__harness;
 
 describe("useBrainSession 首次对话发送", () => {
   test("无 activeId 时发送：SSE 完成前用户消息已出现在对话列表（立即展示，不依赖流式完成）", async () => {
@@ -368,6 +396,112 @@ describe("useBrainSession 首次对话发送", () => {
     // reset 后 delta 从重放文本续写，最终完整文本不被清空
     expect(brain?.text).toBe("已生成一半，继续");
     expect(brain?.pending).toBe(false);
+    await p;
+    await act(() => root.unmount());
+  });
+
+  test("appendCard 本地即时展示 + 持久化到服务端（刷新后卡片消息不丢失）", async () => {
+    const { root } = await mountHarness();
+    await tick();
+    // 先建会话（有 activeId 才能 appendCard）
+    const p = harness().doSend("给当前章节配张插画");
+    await tick();
+    await tick();
+    const sid = harness().getActiveId();
+    expect(sid).not.toBe("");
+    // 模拟 submitForm 提交 form 卡成功后生成的 preview 卡（此前只存前端内存，刷新即丢）
+    const previewMsg = {
+      id: "preview-local-1",
+      role: "brain" as const,
+      cards: [{ kind: "preview", title: "生成第 1 章插画（2 张）", commandId: "CMD-M02", level: "L0", summary: "已挑选 2 个关键场景，确认后开始生成。", action: { endpoint: "/api/novel/media/generate", method: "POST", body: { chapterIndex: 1, kind: "image" } } }],
+      at: new Date().toISOString(),
+    };
+    await act(() => harness().appendCard(previewMsg));
+    await tick();
+    // 本地即时可见
+    const msgs = harness().getMessages();
+    expect(msgs.some((m) => m.role === "brain" && (m as { cards?: unknown[] }).cards?.length === 1)).toBe(true);
+    // 持久化请求已发出（服务端落盘）
+    expect(appendCalls).toContainEqual({ id: sid, messageId: "preview-local-1", cards: previewMsg.cards });
+    // 模拟刷新：openSession 重拉 detail → preview 卡从服务端恢复（不丢失）
+    await act(() => harness().openSession(sid));
+    await tick();
+    await tick();
+    const reloaded = harness().getMessages();
+    expect(reloaded.some((m) => (m as { cards?: unknown[] }).cards?.some((c) => (c as { kind?: string }).kind === "preview"))).toBe(true);
+    releaseChat?.();
+    await p;
+    await act(() => root.unmount());
+  });
+
+  test("replaceCard 就地整体替换消息内卡片（form→preview 单面板）并持久化到服务端", async () => {
+    const { root } = await mountHarness();
+    await tick();
+    const p = harness().doSend("给当前章节配张插画");
+    await tick();
+    await tick();
+    const sid = harness().getActiveId();
+    expect(sid).not.toBe("");
+    // 模拟中枢已返回一张媒体 form 卡消息（经 appendCard 本地展示 + 服务端落盘）
+    await act(() => harness().appendCard({
+      id: "media-msg-1",
+      role: "brain",
+      cards: [{ kind: "form", title: "生成章节插画", action: { endpoint: "/api/novel/media/plan" }, submitLabel: "挑选场景并生成" }],
+      at: new Date().toISOString(),
+    }));
+    await tick();
+    // 替换 form → preview（分镜中，单面板流转第一步）
+    const preview = { kind: "preview", cardId: "media-x", title: "生成第 1 章插画（分镜中）", status: "running", statusLabel: "分镜中", detail: "AI 分镜中…" };
+    await act(() => harness().replaceCard("media-msg-1", 0, preview));
+    await tick();
+    const msgs = harness().getMessages();
+    const target = msgs.find((m) => (m as { id?: string }).id === "media-msg-1") as { cards?: unknown[] };
+    const card = target?.cards?.[0] as { kind?: string; cardId?: string; submitLabel?: string };
+    expect(card.kind).toBe("preview");
+    expect(card.cardId).toBe("media-x");
+    expect(card.submitLabel).toBeUndefined(); // 整体替换清除旧 form 字段
+    // 持久化请求已发出（服务端落盘，刷新后恢复单面板状态）
+    expect(replaceCalls.some((c) => c.id === sid && c.messageId === "media-msg-1" && c.cardIndex === 0)).toBe(true);
+    // 模拟刷新：openSession 重拉 detail → preview 卡从服务端恢复
+    await act(() => harness().openSession(sid));
+    await tick();
+    await tick();
+    const reloaded = harness().getMessages();
+    const reloadedCard = (reloaded.find((m) => (m as { id?: string }).id === "media-msg-1") as { cards?: unknown[] })?.cards?.[0] as { kind?: string };
+    expect(reloadedCard.kind).toBe("preview");
+    releaseChat?.();
+    await p;
+    await act(() => root.unmount());
+  });
+
+  test("replaceCard persist=false：本地替换生效但不落盘（分镜中中间态防悬死）", async () => {
+    const { root } = await mountHarness();
+    await tick();
+    const p = harness().doSend("给当前章节配张插画");
+    await tick();
+    await tick();
+    const sid = harness().getActiveId();
+    expect(sid).not.toBe("");
+    await act(() => harness().appendCard({
+      id: "media-msg-persist-false",
+      role: "brain",
+      cards: [{ kind: "form", title: "生成章节插画", action: { endpoint: "/api/novel/media/plan" }, submitLabel: "挑选场景并生成" }],
+      at: new Date().toISOString(),
+    }));
+    await tick();
+    // 分镜中 running 中间态：persist=false → 本地即时替换为 preview
+    const preview = { kind: "preview", cardId: "media-y", title: "生成第 1 章插画（分镜中）", status: "running", statusLabel: "分镜中", detail: "AI 分镜中…" };
+    await act(() => harness().replaceCard("media-msg-persist-false", 0, preview, false));
+    await tick();
+    const msgs = harness().getMessages();
+    const target = msgs.find((m) => (m as { id?: string }).id === "media-msg-persist-false") as { cards?: unknown[] };
+    expect((target?.cards?.[0] as { kind?: string }).kind).toBe("preview");
+    // 未发出 replace-card 持久化请求（服务端仍是 form 卡）
+    expect(replaceCalls.some((c) => c.messageId === "media-msg-persist-false")).toBe(false);
+    // 模拟刷新：真实刷新 = 新 hook 实例缓存未命中 → 从服务端 detail 读取 → created 中仍是 form 卡（可重新提交）
+    const stored = (created.get(sid) ?? []).find((m) => (m as { id?: string }).id === "media-msg-persist-false") as { cards?: { kind?: string }[] } | undefined;
+    expect(stored?.cards?.[0]?.kind).toBe("form");
+    releaseChat?.();
     await p;
     await act(() => root.unmount());
   });

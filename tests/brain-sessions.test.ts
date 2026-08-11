@@ -26,6 +26,7 @@ import {
   registerSessionTask,
   truncateSession,
   updateMessageCard,
+  replaceMessageCard,
   updateMessageText,
   createProgressMessage,
 } from "../src/api/brain-sessions";
@@ -243,6 +244,36 @@ describe("卡片操作完成标记（markSessionCompleted）与 resume 定位工
     expect(JSON.stringify(getSession(TITLE, s.id)!.messages[1].cards)).toBe(before);
     // 消息不存在 → false
     expect(updateMessageCard(TITLE, s.id, "nomsg", "card-media-1", {})).toBe(false);
+  });
+
+  test("replaceMessageCard：按消息内下标整体替换卡片（含 kind/action 变更）；下标越界/无卡 → false", () => {
+    const s = createSession(TITLE, "卡片替换测试");
+    sessionIds.push(s.id);
+    appendMessage(TITLE, s.id, { id: "r0", role: "user", text: "生成插画", at: Date.now() });
+    appendMessage(TITLE, s.id, {
+      id: "r1", role: "assistant", text: "", at: Date.now(),
+      cards: [
+        { kind: "form", title: "生成章节插画", action: { endpoint: "/api/novel/media/plan" }, submitLabel: "挑选场景并生成" },
+      ],
+    });
+    // 整体替换：form → preview（含 kind/action 变更，updateMessageCard 合并无法做到）
+    const preview = {
+      kind: "preview", cardId: "media-r1", title: "生成第 1 章插画（分镜中）", status: "running",
+      statusLabel: "分镜中", detail: "AI 分镜中…",
+    };
+    const hit = replaceMessageCard(TITLE, s.id, "r1", 0, preview);
+    expect(hit).toBe(true);
+    const card = getSession(TITLE, s.id)!.messages[1].cards![0] as { kind?: string; cardId?: string; status?: string; submitLabel?: string };
+    expect(card.kind).toBe("preview");
+    expect(card.cardId).toBe("media-r1");
+    expect(card.status).toBe("running");
+    expect(card.submitLabel).toBeUndefined(); // 旧卡字段被整体替换清除
+    // 下标越界 / 负数 → false 且不破坏
+    const before = JSON.stringify(getSession(TITLE, s.id)!.messages[1].cards);
+    expect(replaceMessageCard(TITLE, s.id, "r1", 5, preview)).toBe(false);
+    expect(replaceMessageCard(TITLE, s.id, "r1", -1, preview)).toBe(false);
+    expect(replaceMessageCard(TITLE, s.id, "nomsg", 0, preview)).toBe(false);
+    expect(JSON.stringify(getSession(TITLE, s.id)!.messages[1].cards)).toBe(before);
   });
 
   test("createProgressMessage：追加带 cardId 的 progress 卡消息（status:running）；updateMessageCard 可翻转", () => {

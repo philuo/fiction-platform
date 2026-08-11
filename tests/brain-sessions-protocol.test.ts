@@ -124,4 +124,43 @@ describe("/api/brain/sessions POST 协议", () => {
     );
     expect(res!.status).toBe(405);
   });
+
+  test("append 卡片消息 → 持久化到会话；detail 可读到；缺参数 400", async () => {
+    const sid = "proto-append-0001";
+    await post("/api/brain/sessions", { title: TITLE, id: sid, prompt: "给当前章节配张插画" });
+    // 模拟前端 submitForm 提交 form 卡后生成的 preview 卡（此前只存前端内存，刷新即丢）
+    const msg = {
+      id: "preview-uuid-0001",
+      role: "brain",
+      text: "",
+      cards: [
+        {
+          kind: "preview",
+          title: "生成第 1 章插画（2 张）",
+          commandId: "CMD-M02",
+          level: "L0",
+          summary: "已从第 1 章正文挑选 2 个关键场景，确认后开始生成。",
+          action: { endpoint: "/api/novel/media/generate", method: "POST", body: { title: TITLE, chapterIndex: 1, kind: "image", scenes: [{ anchor: "a", scene: "s" }] } },
+        },
+      ],
+      at: new Date().toISOString(), // 前端 ChatMessage.at 为 ISO 字符串
+    };
+    const res = await post("/api/brain/sessions/append", { title: TITLE, sessionId: sid, message: msg });
+    expect(res!.status).toBe(200);
+    expect(((await res!.json()) as { ok?: boolean }).ok).toBe(true);
+    // detail 应读到该 preview 卡消息（role 归一为 assistant，at 转 epoch ms）
+    const detail = await post("/api/brain/sessions/detail", { title: TITLE, id: sid });
+    const d = (await detail!.json()) as { session?: { messages: { id: string; role: string; cards?: unknown[]; at: number }[] } };
+    const found = d.session?.messages.find((m) => m.id === "preview-uuid-0001");
+    expect(found?.role).toBe("assistant");
+    expect(Array.isArray(found?.cards)).toBe(true);
+    expect((found!.cards as unknown[]).length).toBe(1);
+    expect(typeof found?.at).toBe("number");
+    // 幂等：同 id 重复 append 不产生重复消息（appendMessage 追加，但 id 重复会导致两条——此处只验证协议返回 ok）
+    // 缺 message → 400
+    const bad = await post("/api/brain/sessions/append", { title: TITLE, sessionId: sid });
+    expect(bad!.status).toBe(400);
+    // 清理
+    await post("/api/brain/sessions/delete", { title: TITLE, id: sid });
+  });
 });

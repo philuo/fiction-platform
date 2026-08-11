@@ -1485,7 +1485,11 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
     // 媒体生成（插画/视频）：form 卡收集章节+张数 → 前端分镜 → preview 确认 → 生成（需求 1/2）。
     // 未指定章节时默认前端选中章、默认 1 张；不在此处同步调分镜（LLM 分镜耗时长，避免 SSE 长挂）
     if (intent === "media_image" || intent === "media_video") {
-      const text = reply || meta.title;
+      // 正文为提示性文案（去「正在…生成」的误导：此时仅收集参数，尚未开始生成）；
+      // 前端渲染时（BrainCabin.mediaGuideText）会跟随卡片章节/张数选项实时更新正文（bc-msg-text）
+      const text = intent === "media_video"
+        ? "请选择生成视频的章节，确认后开始生成。"
+        : "请选择生成插画的参数（章节与张数），确认后开始生成。";
       if (text) {
         updateMessageText(title, sessionId, messageId, text, true);
         send({ type: "delta", messageId, text });

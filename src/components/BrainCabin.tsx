@@ -7,7 +7,7 @@
 import { useEffect, useRef, useState } from "react";
 import { BrainCore } from "./BrainCore";
 import { History, Plus, Send, Square, X } from "./icons";
-import { BrainCardView, type BrainCard, type PreviewCard, type ChoiceOption, type FormCard, type FormField, type AskCard } from "./brain-cards";
+import { BrainCardView, mediaPlanDerived, type BrainCard, type PreviewCard, type ChoiceOption, type FormCard, type FormField, type AskCard } from "./brain-cards";
 import { MarkdownView } from "./MarkdownView";
 import { useBrainSession, type ChatMessage } from "./useBrainSession";
 import { apiFetch } from "../api/client";
@@ -22,6 +22,24 @@ import type { WorldState } from "../api/world";
 function findPreviewAction(cards?: BrainCard[]): PreviewCard["action"] | undefined {
   const p = cards?.find((c): c is PreviewCard => c.kind === "preview");
   return p?.action;
+}
+
+/** 消息中是否有媒体生成 form 卡（/api/novel/media/plan） */
+export function mediaCardOf(msg: ChatMessage): FormCard | undefined {
+  return msg.cards?.find((c): c is FormCard => c.kind === "form" && c.action?.endpoint === "/api/novel/media/plan");
+}
+
+/** 媒体生成 form 卡消息的提示性正文：跟随卡片当前选择的章节/张数动态生成（去「正在…生成」的误导——
+ *  此时仅收集参数，尚未开始生成）。推导复用 brain-cards.mediaPlanDerived（与卡内 summary 同源、同 clamp）；
+ *  章节未选（异常）时退化为提示语。 */
+export function mediaGuideText(card: FormCard, values?: Record<string, unknown>): string {
+  const { kind, chapterLabel, count } = mediaPlanDerived(card, values);
+  if (!chapterLabel) {
+    return kind === "video" ? "请选择生成视频的章节，确认后开始生成。" : "请选择生成插画的参数（章节与张数），确认后开始生成。";
+  }
+  return kind === "video"
+    ? `为「${chapterLabel}」生成 1 段视频，确认后开始生成。`
+    : `为「${chapterLabel}」生成 ${count} 张插画，确认后开始生成。`;
 }
 
 /** 表单值扁平化（与后端 brain-chat.ts flattenFormValues 一致：点路径 + array 拆分 + number/bool 转换） */
@@ -67,7 +85,7 @@ async function fetchAction(endpoint: string, method: string, body: Record<string
 
 // —— Phase 3：中枢本地偏好（localStorage，纯用户体验增强；服务端始终权威） ——
 const CABIN_PREFS_KEY = "fp_cabin_prefs";
-type CabinPrefs = { mediaCount?: number; inputHeight?: number; panelWidth?: number };
+type CabinPrefs = { inputHeight?: number; panelWidth?: number };
 
 function readCabinPrefs(): CabinPrefs {
   if (typeof window === "undefined") return {};
@@ -329,10 +347,14 @@ export const BrainCabin: React.FC<{
   /** 卡片就地更新注册（阶段 3a）：挂载时注册 patch 处理器，Home 的 useSyncChannel 收到 card-update 后调用。
    *  @param fn 处理器（接收 card-update 事件）；卸载时传入空函数解绑。 */
   registerCardPatch?: (fn: (e: { sessionId: string; messageId: string; cardId: string; patch: Record<string, unknown> }) => void) => void;
-}> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk, onOpenPanel, currentChapter, autoRunning, buildingStage, sysTick = 0, registerCardPatch }) => {
+  /** 任务状态事件注册（阶段 3b+）：挂载时注册处理器，Home 的 useSyncChannel 收到 task-status 后调用。
+   *  聊天舱内媒体生成轮询据此在 WS 广播任务完成时提前收尾，减少 /media/status 冗余轮询。
+   *  @param fn 处理器（接收 task-status 事件）；卸载时传入空函数解绑。 */
+  registerTaskStatus?: (fn: (e: { kind: string; id?: string; status: string }) => void) => void;
+}> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk, onOpenPanel, currentChapter, autoRunning, buildingStage, sysTick = 0, registerCardPatch, registerTaskStatus }) => {
   const {
     sessions, activeId, messages, streaming, thinking, reconnecting,
-    openSession, newSession, removeSession, truncate, appendMsg, patchCard, send, stop, isStreaming,
+    openSession, newSession, removeSession, truncate, appendCard, patchCard, replaceCard, send, stop, isStreaming,
     completed, markCompleted, reloadActive,
   } = useBrainSession(world.title);
 
@@ -345,12 +367,9 @@ export const BrainCabin: React.FC<{
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   /** 已执行完成的卡片 key（`消息id:卡片下标[:列表项id]`）：useBrainSession 管理，服务端持久化（刷新后恢复） */
   // completed / markCompleted 来自 useBrainSession
-  /** 媒体生成输入条：所选章节 / 张数（默认当前选中章 / 1 张；张数偏好持久化到 localStorage） */
-  const [mediaChapter, setMediaChapter] = useState<string>("");
-  const [mediaCount, setMediaCount] = useState<number>(() => {
-    const p = readCabinPrefs().mediaCount;
-    return p && Number.isInteger(p) ? Math.min(4, Math.max(1, p)) : 1;
-  });
+  // 媒体生成交互面板即聊天流中的 form 卡（切换章节/张数后文案实时更新），底部上方不再复刻选项区
+  /** 媒体 form 卡当前选中值（按消息 id）：驱动消息正文（bc-msg-text）跟随章节/张数选项实时更新 */
+  const [mediaFormValues, setMediaFormValues] = useState<Record<string, Record<string, unknown>>>({});
   /** 服务端系统状态快照（/api/brain/context 按需拉取）：自动连载/写作任务/媒体生成/视觉任务/待办——中枢全知的服务端权威部分 */
   const [serverCtx, setServerCtx] = useState<{
     autoRunning?: boolean; autoPhase?: string; pendingCommit?: { index: number | null; title: string } | null;
@@ -403,8 +422,13 @@ export const BrainCabin: React.FC<{
   const [writing, setWriting] = useState<{ title: string; phase: string; text: string; status: "running" | "done" | "failed"; detail?: string } | null>(null);
   const writingAbortRef = useRef<AbortController | null>(null);
   const writingTimerRef = useRef<number | null>(null);
-  // L18：媒体生成轮询 setInterval 提升为 ref，卸载时 clearInterval + 防卸载后 setState
-  const mediaPollRef = useRef<number | null>(null);
+  // L18：媒体生成轮询 setInterval 列表（多任务并发互不顶替），卸载时全部清理 + 防卸载后 setState
+  const mediaPollRef = useRef<number[]>([]);
+  /** 媒体轮询任务登记（阶段 3b+）：task-status(media) 事件命中后提前收尾，减少 /media/status 冗余轮询。
+   *  remaining：尚未 ready/failed 的 mediaId 集合——轮询与 WS 广播共同消费，清空即收尾。 */
+  const mediaPollJobsRef = useRef<Array<{
+    mediaIds: string[]; remaining: Set<string>; failedCount: number; msgId?: string; cardId?: string; timer: number;
+  }>>([]);
   // L18：输入区拖拽进行中的清理函数（卸载时移除 window 监听 + 还原 body 样式）
   const inputResizeCleanupRef = useRef<(() => void) | null>(null);
   // L18：组件挂载态（BrainCabin 随弹窗开关挂载/卸载），异步回调写 state 前自检
@@ -571,13 +595,25 @@ export const BrainCabin: React.FC<{
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [registerCardPatch]);
 
+  // 任务状态事件注册（阶段 3b+）：Home 的 useSyncChannel 收到 task-status(kind:media) 后转发，
+  // 媒体轮询据此提前收尾（WS 已广播完成，不必等下一轮 /media/status 轮询）
+  const taskStatusRef = useRef<((e: { kind: string; id?: string; status: string }) => void) | null>(null);
+  taskStatusRef.current = (e) => { if (e.kind === "media") handleMediaTaskStatus(e); };
+  useEffect(() => {
+    if (registerTaskStatus) registerTaskStatus((e) => taskStatusRef.current?.(e));
+    return () => { if (registerTaskStatus) registerTaskStatus(() => {}); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [registerTaskStatus]);
+
   // L18：卸载清理——媒体轮询 / 写作收起定时器 / 删除确认定时器 / 输入区拖拽监听，
   // 避免 BrainCabin 关闭（卸载）后定时器空转、window 监听与 body cursor/userSelect 残留、卸载后 setState
   useEffect(() => {
     cabinMountedRef.current = true;
     return () => {
       cabinMountedRef.current = false;
-      if (mediaPollRef.current) { window.clearInterval(mediaPollRef.current); mediaPollRef.current = null; }
+      for (const t of mediaPollRef.current) window.clearInterval(t);
+      mediaPollRef.current = [];
+      mediaPollJobsRef.current = [];
       if (writingTimerRef.current) { window.clearTimeout(writingTimerRef.current); writingTimerRef.current = null; }
       if (delTimerRef.current) { window.clearTimeout(delTimerRef.current); delTimerRef.current = null; }
       inputResizeCleanupRef.current?.();
@@ -585,9 +621,11 @@ export const BrainCabin: React.FC<{
     };
   }, []);
 
+  /** 追加卡片消息（preview/result 卡等）：本地即时展示 + 服务端持久化（刷新后卡片消息不丢失）。
+   *  修复根因：preview 卡（如插画确认生成卡）此前只存前端内存，刷新即丢，用户无法确认生成 → 任务从未真正执行。 */
   function appendBrainMsg(cards: BrainCard[]) {
     if (!activeId) return;
-    appendMsg(activeId, { id: uuid(), role: "brain", cards, at: new Date().toISOString() });
+    void appendCard(activeId, { id: uuid(), role: "brain", cards, at: new Date().toISOString() });
   }
 
   if (!open) return null;
@@ -616,22 +654,6 @@ export const BrainCabin: React.FC<{
   const ctxCardIdx = ctxCard ? lastCards.indexOf(ctxCard) : -1;
   /** ctx-bar 对应卡片是否已完成（confirm 已处理 / preview 已执行）：完成则禁用，防重复触发后端操作 */
   const ctxCardDone = ctxCardIdx >= 0 && !!lastBrainMsg && completed.has(`${lastBrainMsg.id}:${ctxCardIdx}`);
-  /** 媒体生成输入条：识别最后一条消息中的媒体 form 卡（「帮我生成插画」→ 输入区上方出现章节/张数选择） */
-  const mediaCtxCard = (() => {
-    if (!lastBrainMsg) return undefined;
-    const c = lastBrainMsg.cards?.[lastBrainMsg.cards.length - 1];
-    if (c?.kind === "form" && c.action.endpoint === "/api/novel/media/plan") return c as FormCard;
-    return undefined;
-  })();
-  const mediaCtxIdx = mediaCtxCard && lastBrainMsg ? lastBrainMsg.cards!.indexOf(mediaCtxCard) : -1;
-  const mediaCtxDone = mediaCtxIdx >= 0 && !!lastBrainMsg && completed.has(`${lastBrainMsg.id}:${mediaCtxIdx}`);
-  // 新卡出现（或默认值变化）时重置选择为默认（默认当前选中章 / 1 张；服务端 buildMediaCard 已兜底）
-  useEffect(() => {
-    if (mediaCtxCard) {
-      setMediaChapter(String(mediaCtxCard.fields[0]?.value ?? ""));
-      setMediaCount(Number(mediaCtxCard.fields[1]?.value ?? 1));
-    }
-  }, [mediaCtxCard?.title, mediaCtxCard?.fields?.[0]?.value, mediaCtxCard?.fields?.[1]?.value]);
   const ctxBusy = streaming || executing;
   /** 追问选择面板：最后一条含 ask 卡（未选择）的中枢消息 → 输入框上方询问；选择后作为新输入继续（sessionStorage 持久化已答，刷新恢复未答） */
   const [askAnswered, setAskAnswered] = useState<Set<string>>(() => {
@@ -801,6 +823,9 @@ export const BrainCabin: React.FC<{
             const folded = (collapsible || longText) && !msg.pending && !hasConfirm && !expandedMsgs.has(msg.id);
             // 打字机显示：pending 消息按 reveal 节奏显示（流式感），非 pending 显示完整文本
             const shownText = msg.pending ? (msg.text ?? "").slice(0, reveal[msg.id] ?? 0) : (msg.text ?? "");
+            // 媒体生成 form 卡消息：正文跟随卡片当前选择的章节/张数动态生成（去「正在…生成」的误导）
+            const mediaCard = mediaCardOf(msg);
+            const displayText = mediaCard ? mediaGuideText(mediaCard, mediaFormValues[msg.id]) : shownText;
             // 滚动吸附：每条用户提问 sticky 吸顶（CSS 处理），当前视口内 AI 回复对应的提问自然吸附在顶部
             const isSysNote = msg.kind === "system";
             return (
@@ -845,9 +870,9 @@ export const BrainCabin: React.FC<{
                     )}
                   </div>
                 ) : null}
-                {shownText ? (
+                {displayText ? (
                   <div className={`bc-msg-text${msg.pending ? " bc-typing" : ""}`}>
-                    <MarkdownView text={shownText} />
+                    <MarkdownView text={displayText} />
                     {msg.pending && <span className="bc-cursor">▋</span>}
                   </div>
                 ) : null}
@@ -874,6 +899,10 @@ export const BrainCabin: React.FC<{
                     onConfirmChoose={(opt) => confirmChoose(opt, msg, i)}
                     onOption={handleOption}
                     onFormSubmit={(card2, values) => submitForm(card2, values, msg.id, i)}
+                    onFormValuesChange={(vals) => {
+                      // 仅媒体 form 卡写入（非媒体卡如 settings/edit_world 不污染 state、不触发无谓重渲染）
+                      if (mediaCardOf(msg)) setMediaFormValues((prev) => ({ ...prev, [msg.id]: vals }));
+                    }}
                   />
                   );
                 })}
@@ -887,7 +916,7 @@ export const BrainCabin: React.FC<{
                     {msg.role === "user" && (
                       <button className="bc-msg-op" onClick={() => editPrompt(msg)} disabled={streaming || thinking} title="编辑并重发（截断后续对话）">✎ 编辑</button>
                     )}
-                    <button className="bc-msg-op" onClick={() => void copyText(msg.text ?? "")} disabled={!msg.text} title="复制消息内容">⧉ 复制</button>
+                    <button className="bc-msg-op" onClick={() => void copyText(displayText ?? msg.text ?? "")} disabled={!(displayText || msg.text)} title="复制消息内容">⧉ 复制</button>
                   </div>
                 )}
                   </>
@@ -908,49 +937,13 @@ export const BrainCabin: React.FC<{
         )}
 
         {/* 输入框上方上下文操作区：会话话题 + 媒体生成输入条 + 二次确认/意见征询按钮；无内容时整条隐藏 */}
-        {!showHistory && (activeSessionTitle || ctxCard || mediaCtxCard || runningStatus) && (
+        {!showHistory && (activeSessionTitle || ctxCard || runningStatus) && (
           <div className="bc-context-bar">
             <div className="bc-context-main">
               {activeSessionTitle && <span className="bc-context-session" title="当前会话">{activeSessionTitle}</span>}
               {runningStatus && <span className={`bc-context-status${reconnecting ? " bc-status-warn" : ""}`}>{runningStatus}</span>}
             </div>
-            {mediaCtxCard && (
-              <div className="bc-media-bar">
-                <span className="bc-context-label">{mediaCtxDone ? "✓ 已生成" : "生成插画"}</span>
-                <label className="bc-media-field">章节
-                  <select
-                    value={mediaChapter}
-                    disabled={ctxBusy || mediaCtxDone}
-                    onChange={(e) => setMediaChapter(e.target.value)}
-                    title="选择要生成插画的章节"
-                  >
-                    {(mediaCtxCard.fields[0]?.options ?? []).map((o) => (
-                      <option key={o.value} value={o.value}>{o.label}</option>
-                    ))}
-                  </select>
-                </label>
-                <label className="bc-media-field">张数
-                  <input
-                    type="number" min={1} max={4} value={mediaCount}
-                    disabled={ctxBusy || mediaCtxDone}
-                    onChange={(e) => {
-                      const v = Math.max(1, Math.min(4, Number(e.target.value) || 1));
-                      setMediaCount(v);
-                      writeCabinPrefs({ mediaCount: v }); // 偏好持久化（纯本地，服务端不受影响）
-                    }}
-                    title="生成张数（1-4）"
-                  />
-                </label>
-                <button
-                  className="bc-ctx-btn primary"
-                  disabled={ctxBusy || mediaCtxDone || !lastBrainMsg || mediaCtxIdx < 0}
-                  onClick={() => lastBrainMsg && mediaCtxIdx >= 0 && submitForm(mediaCtxCard, { chapterIndex: mediaChapter, count: mediaCount }, lastBrainMsg.id, mediaCtxIdx)}
-                  title="按所选章节与张数生成插画（生成前校验时机，中断不影响系统）"
-                >
-                  生成
-                </button>
-              </div>
-            )}
+
             {pendingAsk && (
               <div className="bc-ask-bar">
                 <span className="bc-context-label">需要确认</span>
@@ -1321,8 +1314,13 @@ export const BrainCabin: React.FC<{
         onWorldUpdate?.();
         return;
       }
-      // 媒体生成（插画/视频）：image 为异步任务，提交后轮询 /media/status，完成后刷新世界并回执
+      // 媒体生成（插画/视频）：image 为异步任务，提交后轮询 /media/status，完成后刷新世界；
+      // 单面板：任务状态就地更新到被操作的 preview 卡（status: running→done/failed，update-card 持久化 + 广播），
+      // 不追加「已提交/已完成」结果卡——预览卡即唯一状态面板
       if (act.endpoint === "/api/novel/media/generate") {
+        const mediaCardId = (card as { cardId?: string }).cardId;
+        // running 中间态仅本地展示（不落盘）：刷新/关闭后卡回到可执行态，避免无轮询恢复的永久「生成中」悬死
+        patchMediaTaskStatus(msgId, mediaCardId, { status: "running", detail: "生成任务已提交，正在生成…" }, false);
         const res = await apiFetch(act.endpoint, {
           method: act.method ?? "POST",
           headers: { "Content-Type": "application/json" },
@@ -1330,18 +1328,18 @@ export const BrainCabin: React.FC<{
         });
         const data = (await res.json().catch(() => ({}))) as { ok?: boolean; mediaIds?: string[]; mediaId?: string; error?: string };
         if (!res.ok || data.error) {
-          appendBrainMsg([{ kind: "result", title: cardTitle, success: false, detail: String(data.error ?? `HTTP ${res.status}`) }]);
+          const msg = String(data.error ?? `HTTP ${res.status}`);
+          patchMediaTaskStatus(msgId, mediaCardId, { status: "failed", detail: msg });
+          appendBrainMsg([{ kind: "result", title: cardTitle, success: false, detail: msg }]);
           return;
         }
         const ids = data.mediaIds ?? (data.mediaId ? [data.mediaId] : []);
         const chapterIndex = Number(act.body.chapterIndex);
         if (ids.length) {
-          appendBrainMsg([{ kind: "result", title: cardTitle, success: true, detail: `生成任务已提交（${ids.length} 项），完成后自动显示` }]);
-          pollMediaGen(world.title, chapterIndex, ids, cardTitle);
+          pollMediaGen(world.title, chapterIndex, ids, cardTitle, msgId, mediaCardId);
         } else {
-          appendBrainMsg([{ kind: "result", title: cardTitle, success: true, detail: "已提交生成任务" }]);
+          patchMediaTaskStatus(msgId, mediaCardId, { status: "done", detail: "已提交生成任务" });
         }
-        markCardDone(msgId, cardIndex);
         onWorldUpdate?.();
         return;
       }
@@ -1357,39 +1355,113 @@ export const BrainCabin: React.FC<{
         onWorldUpdate?.();
       }
     } catch (e) {
+      // media/generate 网络异常：预览卡翻转 failed（持久化，按钮保留可重试）
+      if (act.endpoint === "/api/novel/media/generate") {
+        patchMediaTaskStatus(msgId, (card as { cardId?: string }).cardId, { status: "failed", detail: (e as Error).message.slice(0, 200) });
+      }
       appendBrainMsg([{ kind: "result", title: cardTitle, success: false, detail: (e as Error).message }]);
     } finally {
       setExecuting(false);
     }
   }
 
-  /** 媒体生成进度轮询：全部 ready/failed 后刷新世界并追加结果卡（聊天内生成插画的进度闭环）。
+  /** 就地更新被操作预览卡的任务状态：本地即时（patchCard）+ 服务端 update-card 持久化并广播（多 tab 一致、刷新可见）。
+   *  无 cardId（旧卡/服务端未落 cardId）时跳过——退化为只追加 result 卡的原行为。 */
+  function patchMediaTaskStatus(msgId: string | undefined, cardId: string | undefined, patch: { status: "running" | "done" | "failed"; detail?: string }, persist = true) {
+    if (!msgId || !cardId) return;
+    const sid = activeId;
+    if (!sid) return;
+    patchCard(sid, msgId, cardId, patch);
+    // running 中间态不落盘：刷新/关闭后卡回到初始可执行态（避免「生成中」卡无轮询恢复的悬死）；终态才持久化
+    if (!persist) return;
+    void apiFetch("/api/brain/sessions/update-card", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: world.title, sessionId: sid, messageId: msgId, cardId, patch }),
+    }).catch(() => {});
+  }
+
+  /** 媒体轮询任务收尾：停轮询 + 就地翻转预览卡终态 + 刷新世界（单面板，不追加结果卡）。 */
+  function finalizeMediaJob(job: { mediaIds: string[]; remaining: Set<string>; failedCount: number; msgId?: string; cardId?: string; timer: number }) {
+    const i = mediaPollJobsRef.current.indexOf(job);
+    if (i >= 0) mediaPollJobsRef.current.splice(i, 1);
+    const ti = mediaPollRef.current.indexOf(job.timer);
+    if (ti >= 0) mediaPollRef.current.splice(ti, 1);
+    window.clearInterval(job.timer);
+    const done = job.mediaIds.length - job.failedCount;
+    if (job.msgId && job.cardId) {
+      patchMediaTaskStatus(job.msgId, job.cardId, job.failedCount === 0
+        ? { status: "done", detail: `已完成 ${done} 项` }
+        : { status: "failed", detail: `${done} 项成功，${job.failedCount} 项失败` });
+    }
+    onWorldUpdate?.();
+  }
+
+  /** WS task-status(kind:media) 事件：媒体任务完成广播 → 从对应轮询任务消费该 mediaId；
+   *  全部 ready/failed 即提前收尾（WS 已广播完成，不必等下一轮 /media/status 轮询——减少冗余轮询）。 */
+  function handleMediaTaskStatus(e: { id?: string; status: string }) {
+    if (!e.id) return;
+    for (const job of mediaPollJobsRef.current) {
+      if (job.remaining.has(e.id)) {
+        job.remaining.delete(e.id);
+        if (e.status === "failed") job.failedCount++;
+        if (job.remaining.size === 0) finalizeMediaJob(job);
+        return;
+      }
+    }
+  }
+
+  /** 媒体生成进度轮询：轮询 /media/status 与 WS task-status 广播共同消费 remaining——
+   *  每 3s 查一次尚未收尾的 mediaId，全部 ready/failed 后收尾（单面板，就地翻转 preview 卡，不追加结果卡）。
    *  非 2xx / 解析失败视为该项失败并结束轮询，防 setInterval 永久泄漏。
    *  L18：timer 提升为 ref，卸载时清理；回调内自检挂载态，避免卸载后 setState。 */
-  function pollMediaGen(title: string, chapterIndex: number, mediaIds: string[], label: string) {
-    if (mediaPollRef.current) window.clearInterval(mediaPollRef.current);
-    mediaPollRef.current = window.setInterval(async () => {
+  function pollMediaGen(title: string, chapterIndex: number, mediaIds: string[], label: string, msgId?: string, cardId?: string) {
+    let fails = 0; // 连续查询失败计数：超过阈值翻转 failed 结束轮询，防断网下 interval 永久空转
+    const remaining = new Set(mediaIds); // 尚未 ready/failed 的 mediaId（WS 广播与轮询共同消费）
+    let failedCount = 0;
+    const timer = window.setInterval(async () => {
       try {
-        const sts = await Promise.all(mediaIds.map(async (id) => {
+        const pending = [...remaining];
+        if (!pending.length) return;
+        const sts = await Promise.all(pending.map(async (id) => {
           const r = await apiFetch("/api/novel/media/status", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ title, chapterIndex, mediaId: id }),
           });
-          if (!r.ok) return "failed"; // 媒体不存在/参数错误：按失败收尾，不再无限轮询
+          if (!r.ok) return { id, status: "failed" }; // 媒体不存在/参数错误：按失败收尾，不再无限轮询
           const d = (await r.json().catch(() => ({}))) as { status?: string };
-          return d.status === "ready" || d.status === "failed" ? d.status : "pending";
+          return { id, status: d.status === "ready" || d.status === "failed" ? d.status : "pending" };
         }));
-        if (!cabinMountedRef.current) return; // 卸载后：不再写 state（timer 已由 cleanup 清除，此处防御 in-flight 回调）
-        const done = sts.filter((s) => s === "ready").length;
-        const failed = sts.filter((s) => s === "failed").length;
-        if (done + failed === mediaIds.length) {
-          if (mediaPollRef.current) { window.clearInterval(mediaPollRef.current); mediaPollRef.current = null; }
-          appendBrainMsg([{ kind: "result", title: label, success: failed === 0, detail: failed === 0 ? `已完成（${done} 项）` : `${done} 项成功，${failed} 项失败` }]);
-          onWorldUpdate?.();
+        fails = 0; // 查询成功：重置失败计数
+        for (const s of sts) {
+          if (s.status === "ready") remaining.delete(s.id);
+          else if (s.status === "failed") { remaining.delete(s.id); failedCount++; }
         }
-      } catch { /* 网络抖动：继续轮询 */ }
+        if (!cabinMountedRef.current) return; // 卸载后：不再写 state（timer 已由 cleanup 清除，此处防御 in-flight 回调）
+        const done = mediaIds.length - remaining.size - failedCount;
+        if (remaining.size === 0) {
+          finalizeMediaJob(job);
+        } else if (msgId && cardId) {
+          // 中间态仅本地展示（不落盘）：刷新/关闭后卡回到可执行态，避免无轮询恢复的永久「生成中」悬死
+          patchMediaTaskStatus(msgId, cardId, { status: "running", detail: `生成中 ${done}/${mediaIds.length}…` }, false);
+        }
+      } catch {
+        if (!cabinMountedRef.current) return;
+        fails++;
+        if (fails >= 3 && msgId && cardId) {
+          patchMediaTaskStatus(msgId, cardId, { status: "failed", detail: "状态查询多次失败，任务可能仍在后台进行" });
+          const i = mediaPollJobsRef.current.indexOf(job);
+          if (i >= 0) mediaPollJobsRef.current.splice(i, 1);
+          const ti = mediaPollRef.current.indexOf(timer);
+          if (ti >= 0) mediaPollRef.current.splice(ti, 1);
+          window.clearInterval(timer);
+        }
+      }
     }, 3000);
+    const job = { mediaIds, remaining, failedCount, msgId, cardId, timer };
+    mediaPollJobsRef.current.push(job);
+    mediaPollRef.current.push(timer);
   }
 
   /** ConfirmCard 确认（L2/L3 三选一；msg/cardIndex 供成功后标记 confirm 与 preview 卡完成态） */
@@ -1440,30 +1512,63 @@ export const BrainCabin: React.FC<{
     if (guardBlocked(card.action, card.title)) return; // 前置校验：系统忙/写作运行中拦截
     const flat = flattenFormValues(card.fields ?? [], values);
     const body: Record<string, unknown> = { ...(card.action.body ?? {}), ...flat, title: world.title };
+    const isMediaPlan = card.action.endpoint === "/api/novel/media/plan";
+    const chapterIndex = Number(body.chapterIndex);
+    const kind = String(body.kind ?? "image");
+    // 媒体分镜（单面板流转）：点击「挑选场景并生成」立即把 form 卡就地替换为「分镜中」preview 卡——
+    // 既有即时 loading 反馈（不靠全局 executing 禁用按钮），又避免「关闭弹窗再开仍是可点 form」的重复提交。
+    // 后续成功 → 就地更新为「确认生成」preview；失败 → 就地更新为 failed。
+    let mediaCardId: string | undefined;
+    if (isMediaPlan && msgId != null && cardIndex != null) {
+      mediaCardId = `media-${uuid()}`;
+      void replaceCard(activeId, msgId, cardIndex, {
+        kind: "preview",
+        cardId: mediaCardId,
+        title: kind === "image" ? `生成第 ${chapterIndex} 章插画（分镜中）` : `生成第 ${chapterIndex} 章视频（分镜中）`,
+        summary: "AI 正在从正文挑选关键场景…",
+        status: "running",
+        statusLabel: "分镜中",
+        detail: "AI 分镜中（挑选关键场景）…",
+      }, false); // 分镜中为同步请求的中间态：不落盘（刷新/断线后回到 form 卡可重试），防「分镜中」卡永久悬死
+    }
     setExecuting(true);
+    // 表单/分镜请求前端超时：服务端 LLM 最坏可达数分钟（150s 超时 × 多层重试），
+    // 无超时则网络挂起/服务重启时卡片无限「分镜中」（实测出现 Failed to fetch + 永久 running）
+    const formCtrl = new AbortController();
+    const formTimer = window.setTimeout(() => formCtrl.abort(), 120_000);
     try {
       const res = await apiFetch(card.action.endpoint, {
         method: card.action.method ?? "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
+        signal: formCtrl.signal,
       });
       const data = await res.json().catch(() => ({})) as Record<string, unknown>;
       if (!res.ok || data.error) {
-        appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: String(data.error ?? `HTTP ${res.status}`) }]);
+        const msg = String(data.error ?? `HTTP ${res.status}`);
+        if (isMediaPlan && mediaCardId && msgId != null && cardIndex != null) {
+          void replaceCard(activeId, msgId, cardIndex, { kind: "preview", cardId: mediaCardId, title: "生成插画失败", summary: "分镜失败", status: "failed", detail: msg });
+        } else {
+          appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: msg }]);
+        }
         return;
       }
-      // 媒体生成表单（/api/novel/media/plan）：分镜 → 本地追加 preview 卡（确认场景后生成，聊天内闭环）
-      if (card.action.endpoint === "/api/novel/media/plan") {
+      // 媒体生成表单（/api/novel/media/plan）：分镜 → 就地更新 preview 卡（确认场景后生成，聊天内闭环）
+      if (isMediaPlan) {
         const scenes = data.scenes as { anchor?: string; scene?: string; caption?: string; type?: string; subject?: string }[] | undefined;
-        if (!data.ok || !Array.isArray(scenes) || !scenes.length) {
-          appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: String(data.error ?? "场景规划失败，请重试") }]);
+        if (!Array.isArray(scenes) || !scenes.length) {
+          const msg = String(data.error ?? "场景规划失败，请重试");
+          if (mediaCardId && msgId != null && cardIndex != null) {
+            void replaceCard(activeId, msgId, cardIndex, { kind: "preview", cardId: mediaCardId, title: "场景规划失败", summary: msg, status: "failed", detail: msg });
+          } else {
+            appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: msg }]);
+          }
           return;
         }
-        const chapterIndex = Number(body.chapterIndex);
-        const kind = String(body.kind ?? "image");
         // 视频后端只取第一个场景（valid[0]）生成 1 段，文案据 kind 区分
         const preview: PreviewCard = {
           kind: "preview",
+          cardId: mediaCardId ?? `media-${uuid()}`, // 稳定标识：提交生成后可就地更新任务状态（update-card 持久化 + 广播）
           title: kind === "image" ? `生成第 ${chapterIndex} 章插画（${scenes.length} 张）` : `生成第 ${chapterIndex} 章视频`,
           commandId: card.commandId,
           level: card.level ?? "L0",
@@ -1471,9 +1576,10 @@ export const BrainCabin: React.FC<{
             ? `已从第 ${chapterIndex} 章正文挑选 ${scenes.length} 个关键场景，确认后开始生成。`
             : `已从第 ${chapterIndex} 章正文挑选 1 个关键场景，确认后开始生成视频。`,
           action: { endpoint: "/api/novel/media/generate", method: "POST", body: { title: world.title, chapterIndex, kind, scenes } },
+          actionLabel: "确认并生成",
         };
-        markCardDone(msgId, cardIndex); // 表单已完成，追加 preview 卡
-        appendBrainMsg([preview]);
+        if (msgId != null && cardIndex != null) void replaceCard(activeId, msgId, cardIndex, preview);
+        else appendBrainMsg([preview]);
         return;
       }
       if (data.needIntervention && data.report) {
@@ -1504,8 +1610,19 @@ export const BrainCabin: React.FC<{
       appendBrainMsg([{ kind: "result", title: card.title, success: true, detail: "已保存" }]);
       onWorldUpdate?.();
     } catch (e) {
-      appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: (e as Error).message }]);
+      const aborted = (e as Error).name === "AbortError";
+      const msg = aborted
+        ? (isMediaPlan ? "分镜超时（AI 服务响应过慢），请重试" : "请求超时，请重试")
+        : (e as Error).message;
+      if (isMediaPlan && mediaCardId && msgId != null && cardIndex != null) {
+        // 超时（aborted）：仅本地展示 failed、不落盘——前端 abort 只断连接，服务端 LLM 分镜可能仍在后台完成，
+        // 落盘 failed 会与真实状态不同步（刷新后回到 form 卡可重试）；非超时异常（如 Failed to fetch）才是确定性失败，落盘
+        void replaceCard(activeId, msgId, cardIndex, { kind: "preview", cardId: mediaCardId, title: "生成插画失败", summary: aborted ? "分镜超时" : "请求异常", status: "failed", detail: msg }, !aborted);
+      } else {
+        appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: msg }]);
+      }
     } finally {
+      window.clearTimeout(formTimer);
       setExecuting(false);
     }
   }

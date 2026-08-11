@@ -13,6 +13,7 @@ export type SyncChannelEvent =
   | { type: "task-status"; title: string; kind: "build" | "advance" | "media" | "visual"; id?: string; status: string; error?: string; at: number }
   | { type: "brain-note"; title: string; eventId: string; text: string; at: number }
   | { type: "card-update"; title: string; sessionId: string; messageId: string; cardId: string; patch: Record<string, unknown>; at: number }
+  | { type: "brain-append"; title: string; sessionId: string; messageId: string; at: number }
   | { type: "subscribed"; title: string; version: number }
   | { type: "pong" }
   | { type: "error"; error: string };
@@ -27,6 +28,8 @@ export type UseSyncChannelOpts = {
   onBrainNote?: (e: Extract<SyncChannelEvent, { type: "brain-note" }>) => void;
   /** 卡片就地更新（card-update）：按 messageId+cardId 就地替换卡片对象，不重拉会话 */
   onCardUpdate?: (e: Extract<SyncChannelEvent, { type: "card-update" }>) => void;
+  /** 卡片消息追加（brain-append）：其他 tab 在会话中追加了卡片消息（preview/result 卡），重拉会话显示 */
+  onBrainAppend?: (e: Extract<SyncChannelEvent, { type: "brain-append" }>) => void;
   /** 连接状态变化：true=已连接，false=断线（前端可据此决定降级轮询策略） */
   onStatusChange?: (connected: boolean) => void;
   /** 重连成功后触发（前端应做一次全量补偿 refreshAllStates） */
@@ -136,6 +139,10 @@ export function useSyncChannel(opts: UseSyncChannelOpts): { connected: boolean }
         }
         if (obj.type === "card-update") {
           optsRef.current.onCardUpdate?.(obj);
+          return;
+        }
+        if (obj.type === "brain-append") {
+          optsRef.current.onBrainAppend?.(obj);
           return;
         }
         // pong / error：心跳无需处理 / 订阅失败等静默（onopen 重订阅会处理）

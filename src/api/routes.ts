@@ -32,9 +32,11 @@ import {
   listSessions as listBrainSessions,
   registerSessionTask,
   truncateSession as truncateBrainSession,
+  appendMessage as appendBrainMessage,
   markSessionCompleted as markBrainSessionCompleted,
   appendSystemNote as appendBrainSystemNote,
   updateMessageCard as updateBrainMessageCard,
+  replaceMessageCard as replaceBrainMessageCard,
   createProgressMessage as createBrainProgressMessage,
   invalidateStoryBySlug,
 } from "./brain-sessions";
@@ -664,6 +666,34 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       return json({ ok });
     }
 
+    case "/api/brain/sessions/append": {
+      // 前端本地追加的卡片消息（preview/result 卡）持久化到会话：刷新后卡片消息不丢失（会话记录完整）。
+      // 之前 preview/result 卡只存前端内存（appendMsg），刷新即丢——插画 form 提交后的 preview 确认卡
+      // 丢失导致用户无法确认生成，任务从未真正执行。
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const apBody = await readBody(req);
+      const apTitle = String(apBody.title ?? "").trim();
+      const apSessionId = String(apBody.sessionId ?? "").trim();
+      const apMsg = (apBody.message ?? null) as {
+        id?: string; role?: string; text?: string; cards?: unknown[]; at?: number | string;
+      } | null;
+      if (!apTitle || !apSessionId || !apMsg?.id || !Array.isArray(apMsg.cards)) {
+        return json({ error: "缺少 title/sessionId/message" }, 400);
+      }
+      // 前端 ChatMessage.at 为 ISO 字符串；服务端 BrainChatMsg.at 为 epoch ms
+      const at = typeof apMsg.at === "string" ? Date.parse(apMsg.at) : Number(apMsg.at) || Date.now();
+      appendBrainMessage(apTitle, apSessionId, {
+        id: String(apMsg.id),
+        role: apMsg.role === "user" ? "user" : "assistant", // 前端 "brain" → "assistant"
+        text: String(apMsg.text ?? ""),
+        cards: apMsg.cards as Record<string, unknown>[],
+        at,
+      });
+      // 广播：其他 tab 收到后重拉会话，显示新追加的卡片消息（多 tab 一致）
+      publishSync({ type: "brain-append", title: apTitle, sessionId: apSessionId, messageId: String(apMsg.id), at, user: currentUser() ?? undefined });
+      return json({ ok: true });
+    }
+
     case "/api/brain/sessions/progress": {
       // 创建任务进度消息（阶段 3b）：推进/连载执行时建持久 progress 卡（带 cardId）。
       // 返回 {messageId, cardId}，前端 SSE 流式期间就地更新，完成后经 update-card 翻转 + 广播。
@@ -704,6 +734,34 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
         });
       }
       return json({ ok: true, updated });
+    }
+
+    case "/api/brain/sessions/replace-card": {
+      // 卡片就地整体替换（阶段 3b：媒体生成 form→preview 单面板流转，含 kind/action 变更）。
+      // 按「消息内下标」替换；update-card 只能按 cardId 合并字段，无法改变卡片类型。
+      // 成功后广播 brain-append → 其他连接前端重拉会话显示新卡片（多 tab 一致）。
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const rcBody = await readBody(req);
+      const rcTitle = String(rcBody.title ?? "").trim();
+      const rcSessionId = String(rcBody.sessionId ?? "").trim();
+      const rcMessageId = String(rcBody.messageId ?? "").trim();
+      const rcCardIndex = Number(rcBody.cardIndex);
+      const rcCard = (rcBody.card ?? null) as Record<string, unknown> | null;
+      if (!rcTitle || !rcSessionId || !rcMessageId || !rcCard || typeof rcCard !== "object") {
+        return json({ error: "缺少 title/sessionId/messageId/card" }, 400);
+      }
+      const replaced = replaceBrainMessageCard(rcTitle, rcSessionId, rcMessageId, rcCardIndex, rcCard);
+      if (replaced) {
+        publishSync({
+          type: "brain-append",
+          title: rcTitle,
+          sessionId: rcSessionId,
+          messageId: rcMessageId,
+          at: Date.now(),
+          user: currentUser() ?? undefined,
+        });
+      }
+      return json({ ok: true, replaced });
     }
 
     case "/api/brain/sessions/system-note": {
@@ -2591,7 +2649,9 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
     }
 
     case "/api/novel/asset": {
-      // 读取图片：?title=&path=images/cover.png
+      // 读取图片/视频：?title=&path=images/ill-xxx.jpg
+      // 缓存：nginx 前置层负责协商缓存（ETag/304），此处只需给图片/视频带上 30d max-age，
+      // 让浏览器/nginx 直接命中缓存。媒体文件名含时间戳+随机串（重生成=新 URL、内容不可变），长缓存安全。
       const u = new URL(req.url, "http://localhost");
       const title = String(u.searchParams.get("title") ?? "").trim();
       const path = String(u.searchParams.get("path") ?? "").trim();
@@ -2602,8 +2662,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       return new Response(Buffer.from(buf), {
         headers: {
           "Content-Type": ext === "png" ? "image/png" : ext === "jpg" || ext === "jpeg" ? "image/jpeg" : ext === "mp4" ? "video/mp4" : "application/octet-stream",
-          // 媒体可被重生成/替换：禁止长缓存，避免重生成后浏览器仍显示旧图（每次回源验证）
-          "Cache-Control": "no-cache",
+          // 30 天：前端/nginx 缓存（nginx 层用 ETag 做回源验证；重生成=新文件名，不会命中旧缓存）
+          "Cache-Control": "public, max-age=2592000",
         },
       });
     }

@@ -2,7 +2,7 @@
 // 四类卡片：PreviewCard（操作预览）/ ConfirmCard（L2/L3 确认）/ ResultCard（执行结果）/ BrowseCard（浏览）
 // 卡片类型定义同时供 PHASE 4 意图识别编排器产出
 // 可选 image 字段：任意卡片可携带一张图（角色立绘/章节插画等），渲染在卡片内容上方
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { lensCn } from "../terms";
 
 // ============ 卡片数据类型 ============
@@ -29,6 +29,14 @@ export type PreviewCard = BrainCardBase & {
   action?: { endpoint: string; method?: string; body: Record<string, unknown> };
   /** 附图（如写操作影响章节的主插画预览） */
   image?: CardImage;
+  /** 异步任务状态（插画/视频生成：提交后轮询期间就地更新，呈现在被操作的预览卡上） */
+  status?: "running" | "done" | "failed";
+  /** 任务状态详情（进度/错误信息） */
+  detail?: string;
+  /** running 态状态徽章文案（缺省「生成中」；分镜阶段用「分镜中」等） */
+  statusLabel?: string;
+  /** 操作按钮文案（缺省「执行」；媒体确认生成用「确认并生成」） */
+  actionLabel?: string;
 };
 
 export type ConfirmCard = BrainCardBase & {
@@ -98,6 +106,24 @@ export type ChoiceCard = BrainCardBase & {
 
 // ============ 表单卡（FormCard）：结构化字段 → 填写 → 提交 ============
 
+/** 媒体生成 form 卡（/api/novel/media/plan）当前选择的推导：章节 label + 张数（与后端 buildMediaCard 上限一致 clamp 3）。
+ *  供卡片 summary（liveSummary）与消息正文（BrainCabin.mediaGuideText）共用，避免两处推导不一致。 */
+export function mediaPlanDerived(card: { action?: { body?: Record<string, unknown> }; fields?: FormField[] }, values?: Record<string, unknown>): {
+  kind: string;
+  chapterLabel?: string;
+  count: number;
+} {
+  const kind = String(card.action?.body?.kind ?? "image");
+  const chapterField = card.fields?.[0];
+  const countField = card.fields?.[1];
+  const chapterValue = values?.[chapterField?.key ?? ""] ?? chapterField?.value;
+  const chapterLabel = chapterField?.type === "select"
+    ? chapterField.options?.find((o) => String(o.value) === String(chapterValue))?.label
+    : undefined;
+  const count = Math.max(1, Math.min(3, Number(values?.[countField?.key ?? ""] ?? countField?.value ?? 1) || 1)); // 与 buildMediaCard Math.min(3, count) 一致
+  return { kind, chapterLabel, count };
+}
+
 /** 表单字段定义（与后端 brain-chat.ts FormFieldDef 结构一致） */
 export type FormField = {
   key: string;
@@ -166,26 +192,44 @@ function CommandBadge({ commandId }: { commandId?: string }) {
 
 // ============ PreviewCard 操作预览卡 ============
 
-export const PreviewCardView: React.FC<{ card: PreviewCard; onExecute?: () => void; busy?: boolean; completed?: boolean }> = ({ card, onExecute, busy, completed }) => (
-  <div className={`brain-card brain-card-preview${completed ? " bc-card-done" : ""}`}>
-    <div className="brain-card-head">
-      <span className="brain-card-title">{completed ? "✓ " : ""}{card.title}</span>
-      <CommandBadge commandId={card.commandId} />
-      <LevelBadge level={card.level} />
-      {card.confirmRequired && !completed && <span className="bc-confirm-tag">需确认</span>}
-    </div>
-    <p className="brain-card-body">{card.summary}</p>
-    {card.action && onExecute && (
-      <div className="brain-card-actions">
-        {completed ? (
-          <span className="bc-done-tag">✓ 已执行</span>
-        ) : (
-          <button className="btn-save btn-xs" disabled={busy} onClick={onExecute}>执行</button>
-        )}
+export const PreviewCardView: React.FC<{ card: PreviewCard; onExecute?: () => void; busy?: boolean; completed?: boolean }> = ({ card, onExecute, busy, completed }) => {
+  const running = card.status === "running";
+  const failed = card.status === "failed";
+  // failed 覆盖 completed 展示（任务失败时优先显示失败态，按钮保留可重试）
+  const done = card.status === "done" || (completed && !failed);
+  return (
+    <div className={`brain-card brain-card-preview${done ? " bc-card-done" : ""}${card.status ? ` bc-preview-${card.status}` : ""}`}>
+      <div className="brain-card-head">
+        <span className="brain-card-title">{done ? "✓ " : ""}{card.title}</span>
+        <CommandBadge commandId={card.commandId} />
+        <LevelBadge level={card.level} />
+        {card.confirmRequired && !done && <span className="bc-confirm-tag">需确认</span>}
       </div>
-    )}
-  </div>
-);
+      <p className="brain-card-body">{card.summary}</p>
+      {running && (
+        <p className="bc-task-status bc-task-running">
+          <span className="bc-progress-pill bc-progress-pill-running">{card.statusLabel ?? "生成中"}</span>
+          {card.detail ? `：${card.detail}` : "…"}
+        </p>
+      )}
+      {failed && (
+        <p className="bc-task-status bc-task-failed">
+          <span className="bc-progress-pill bc-progress-pill-failed">生成失败</span>
+          {card.detail ? `：${card.detail}` : ""}
+        </p>
+      )}
+      {card.action && onExecute && (
+        <div className="brain-card-actions">
+          {done ? (
+            <span className="bc-done-tag">{completed ? "✓ 已执行" : "✓ 已完成"}</span>
+          ) : (
+            <button className="btn-save btn-xs" disabled={busy || running} onClick={onExecute}>{running ? "处理中…" : (card.actionLabel ?? "执行")}</button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
 
 // ============ ConfirmCard 确认卡（L2/L3 三选一） ============
 
@@ -1004,13 +1048,33 @@ export const FormCardView: React.FC<{
   onSubmit?: (card: FormCard, values: Record<string, unknown>) => void;
   busy?: boolean;
   completed?: boolean;
-}> = ({ card, onSubmit, busy, completed }) => {
+  /** 值变化上报（供父组件动态正文跟随卡片选项；初始挂载也上报默认值） */
+  onValuesChange?: (values: Record<string, unknown>) => void;
+}> = ({ card, onSubmit, busy, completed, onValuesChange }) => {
   const [values, setValues] = useState<Record<string, unknown>>(() => {
     const init: Record<string, unknown> = {};
     for (const f of card.fields ?? []) init[f.key] = f.value ?? (f.type === "number" ? "" : f.type === "multiselect" ? [] : "");
     return init;
   });
-  const set = (key: string, v: unknown) => setValues((prev) => ({ ...prev, [key]: v }));
+  // 值变化同步上报（ref 存最新回调）：驱动父组件消息正文跟随卡片选项；
+  // 初始值不上报（父组件用卡字段默认值兜底，避免 effect 时序依赖）
+  const onValuesChangeRef = useRef(onValuesChange);
+  onValuesChangeRef.current = onValuesChange;
+  const set = (key: string, v: unknown) => {
+    const next = { ...values, [key]: v };
+    setValues(next);
+    onValuesChangeRef.current?.(next);
+  };
+
+  // 生成插画/视频表单（action 指向 /api/novel/media/plan）：切换「章节/张数」选项后提示文案实时更新
+  const isMediaForm = card.action?.endpoint === "/api/novel/media/plan";
+  const liveSummary = isMediaForm ? (() => {
+    const { kind, chapterLabel, count } = mediaPlanDerived(card, values);
+    const target = chapterLabel ?? "所选章节";
+    return kind === "video"
+      ? `为「${target}」生成 1 段视频：提交后 AI 先从正文挑选关键场景，确认后开始生成。`
+      : `为「${target}」生成 ${count} 张插画：提交后 AI 先从正文挑选关键场景，确认后开始生成。`;
+  })() : card.summary;
 
   const submit = () => {
     // required 校验：空字符串 / null 视为未填
@@ -1032,7 +1096,7 @@ export const FormCardView: React.FC<{
         <LevelBadge level={card.level} />
         {card.confirmRequired && <span className="bc-confirm-tag">需确认</span>}
       </div>
-      {card.summary && <p className="brain-card-body">{card.summary}</p>}
+      {liveSummary && <p className="brain-card-body">{liveSummary}</p>}
       {(card.fields ?? []).length === 0 ? (
         <p className="bc-browse-meta">无需填写字段，直接提交执行。</p>
       ) : (
@@ -1105,6 +1169,8 @@ export const BrainCardView: React.FC<{
   onConfirmChoose?: (opt: "merge" | "rewrite" | "abort") => void;
   onOption?: (option: ChoiceOption) => void;
   onFormSubmit?: (card: FormCard, values: Record<string, unknown>) => void;
+  /** form 卡值变化上报（供父组件动态正文跟随选项） */
+  onFormValuesChange?: (values: Record<string, unknown>) => void;
   busy?: boolean;
   /** 已执行完成（preview/form 卡：按钮替换为完成标记，防重复提交） */
   completed?: boolean;
@@ -1112,7 +1178,7 @@ export const BrainCardView: React.FC<{
   completedItems?: ReadonlySet<string>;
   /** 写作进度卡运行中取消（仅 kind=progress 使用） */
   onCancelProgress?: () => void;
-}> = ({ card, onExecute, onConfirmChoose, onOption, onFormSubmit, busy, completed, completedItems, onCancelProgress }) => {
+}> = ({ card, onExecute, onConfirmChoose, onOption, onFormSubmit, onFormValuesChange, busy, completed, completedItems, onCancelProgress }) => {
   const inner = (() => {
     switch (card.kind) {
       case "preview": return <PreviewCardView card={card} onExecute={onExecute ? () => onExecute(card) : undefined} busy={busy} completed={completed} />;
@@ -1121,7 +1187,7 @@ export const BrainCardView: React.FC<{
       case "browse": return <BrowseCardView card={card} onAction={onExecute ? (action) => onExecute(card, action) : undefined} busy={busy} completedItems={completedItems} />;
       case "plan":
       case "opinion": return <ChoiceCardView card={card} onOption={onOption} busy={busy} />;
-      case "form": return <FormCardView card={card} onSubmit={onFormSubmit} busy={busy} completed={completed} />;
+      case "form": return <FormCardView card={card} onSubmit={onFormSubmit} onValuesChange={onFormValuesChange} busy={busy} completed={completed} />;
       case "progress": return <ProgressCardView card={card} onCancel={onCancelProgress} />;
       case "ask": return null; // 追问选择卡不渲染进聊天流（显示在输入框上方询问面板）
     }

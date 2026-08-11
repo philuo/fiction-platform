@@ -311,6 +311,29 @@ export function updateMessageCard(
   return hit;
 }
 
+/** 就地替换某消息内指定下标的卡片（阶段 3b 补充：媒体生成 form→preview 单面板流转）。
+ *  与 updateMessageCard 的区别：按「消息内下标」整体替换卡片对象（含 kind/action 变更），
+ *  而非按 cardId 合并字段——媒体分镜提交后 form 卡整体变为 preview 卡，合并无法改变卡片类型。
+ *  @returns 是否命中（消息不存在 / 下标越界 → false）
+ */
+export function replaceMessageCard(
+  title: string,
+  sessionId: string,
+  messageId: string,
+  cardIndex: number,
+  card: BrainChatCard,
+): boolean {
+  let hit = false;
+  mutateSession(title, sessionId, (s) => {
+    const m = s.messages.find((x) => x.id === messageId);
+    if (!m || !Array.isArray(m.cards)) return;
+    if (!Number.isInteger(cardIndex) || cardIndex < 0 || cardIndex >= m.cards.length) return;
+    m.cards[cardIndex] = card;
+    hit = true;
+  });
+  return hit;
+}
+
 /** 创建「任务进度消息」（阶段 3b：推进/连载的持久进度卡）。
  *  追加一条 assistant 消息，cards 内放一张带 cardId 的 progress 卡（status:running）；
  *  前端 SSE 流式期间就地更新，完成后经 update-card 翻转 + 广播（多 tab 一致，刷新可见）。

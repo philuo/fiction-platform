@@ -65,6 +65,13 @@ export type SyncEvent = {
       patch: Record<string, unknown>;
       at: number;
     }
+  | {
+      type: "brain-append";
+      title: string;
+      sessionId: string;
+      messageId: string;
+      at: number;
+    }
 );
 
 // ============ 订阅注册 ============
