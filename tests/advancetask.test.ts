@@ -17,9 +17,12 @@ beforeAll(() => {
   // advancetask 用 process.cwd()/data/<slug>，切到临时目录
   mkdirSync(join(tmp, "data"), { recursive: true });
   process.chdir(tmp);
+  // progress 卡翻转写 brain-sessions：隔离到临时目录（防污染真实会话）
+  process.env.BRAIN_SESSIONS_DATA_DIR = join(tmp, "brain-sessions");
 });
 afterAll(() => {
   process.chdir(origCwd);
+  delete process.env.BRAIN_SESSIONS_DATA_DIR;
   rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -113,5 +116,40 @@ describe("advancetask 任务状态机", () => {
     clearAdvanceTask(TITLE);
     expect(loadAdvanceTask(TITLE)).toBeNull();
     expect(getAdvanceTaskForClient(TITLE)).toBeNull();
+  });
+});
+
+describe("HA3：任务完成时服务端翻转 running progress 卡（刷新/断线兜底）", () => {
+  test("completeAdvanceTask 翻转最近 running progress 卡为 done 并广播", () => {
+    const { createSession, createProgressMessage } = require("../src/api/brain-sessions") as typeof import("../src/api/brain-sessions");
+    const { subscribeSync, flushSyncPending, resetSyncState, clearSyncPending } = require("../src/api/sync") as typeof import("../src/api/sync");
+    // 建会话 + running progress 卡
+    const s = createSession(TITLE, "推进剧情");
+    const { messageId, cardId } = createProgressMessage(TITLE, s.id, "推进剧情（写一章）");
+    expect(cardId).toContain("progress-");
+
+    // 订阅广播，断言收到 card-update
+    const got: unknown[] = [];
+    const unsub = subscribeSync((e) => got.push(e));
+
+    completeAdvanceTask(TITLE, { chapterIndex: 3, verdict: "pass", rounds: 1 });
+    flushSyncPending();
+
+    // 卡片已翻转 done
+    const { getSession } = require("../src/api/brain-sessions") as typeof import("../src/api/brain-sessions");
+    const msg = getSession(TITLE, s.id)!.messages.find((m) => m.id === messageId)!;
+    expect((msg.cards![0] as { status?: string }).status).toBe("done");
+    expect((msg.cards![0] as { detail?: string }).detail).toContain("第 3 章");
+    // 广播 card-update
+    expect(got.some((e) => (e as { type?: string }).type === "card-update")).toBe(true);
+    unsub();
+    resetSyncState();
+    clearSyncPending();
+  });
+
+  test("无 running progress 卡 → 不崩（静默跳过）", () => {
+    completeAdvanceTask(TITLE, { chapterIndex: 4 });
+    failAdvanceTask(TITLE, "测试失败");
+    expect(true).toBe(true); // 未抛错即通过
   });
 });

@@ -4,8 +4,10 @@
 // 与连载会话（autorun-session.json）同规范：原子写、服务重启可恢复/清理。
 import { mkdirSync, readFileSync, writeFileSync, existsSync, renameSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { storyDir, runAsUser, userDir } from "./storage";
+import { storyDir, runAsUser, userDir, currentUser } from "./storage";
 import { listUsernames } from "./auth";
+import { loadSessions, updateMessageCard } from "./brain-sessions";
+import { publishCardUpdate } from "./sync";
 
 export type AdvanceTaskStatus = "running" | "done" | "failed";
 
@@ -95,6 +97,8 @@ export function completeAdvanceTask(title: string, r: { chapterIndex: number; ve
     rounds: r.rounds,
     pendingCommit: r.pendingCommit,
   });
+  // HA3：刷新后 SSE 断开、任务由轮询感知完成 → 服务端主动翻转最近会话的 running progress 卡（多 tab 一致）
+  finalizeProgressForTask(title, { status: "done", phase: "result", detail: `第 ${r.chapterIndex} 章已完成${r.pendingCommit ? "（等待确认入册）" : ""}` });
 }
 
 /** 任务失败 */
@@ -102,6 +106,36 @@ export function failAdvanceTask(title: string, error: string): void {
   const t = loadAdvanceTask(title);
   if (!t) return;
   saveAdvanceTask(title, { ...t, status: "failed", phase: "failed", error, updatedAt: new Date().toISOString() });
+  // HA3：同上，翻转 running progress 卡为 failed
+  finalizeProgressForTask(title, { status: "failed", phase: "failed", detail: error.slice(0, 200) });
+}
+
+/**
+ * HA3：把「最近更新会话中最后一张 running 的 progress 卡」翻转为终态（服务端主动）。
+ * 推进任务由前端 SSE 直连发起时，前端自己 finalize；刷新/断线后由本函数兜底（任务完成轮询感知）。
+ * 无 running progress 卡（未从聊天发起 / 已翻转）→ 无操作。
+ */
+function finalizeProgressForTask(title: string, patch: { status: string; phase: string; detail: string }): void {
+  try {
+    const user = currentUser() ?? undefined;
+    const sessions = loadSessions(title);
+    for (const s of sessions) {
+      for (const m of s.messages) {
+        for (const c of m.cards ?? []) {
+          const card = c as { kind?: string; cardId?: string; status?: string };
+          if (card.kind === "progress" && card.cardId && card.status === "running") {
+            const updated = updateMessageCard(title, s.id, m.id, card.cardId, patch);
+            if (updated) {
+              publishCardUpdate(title, s.id, m.id, card.cardId, patch, user);
+              return; // 只翻转最近一张
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    /* 无 progress 卡 / 模块异常：静默（前端已处理大部分场景） */
+  }
 }
 
 /** 查询：陈旧 running（服务重启中断，超 STALE_MS 无更新）→ 返回时直接标记 failed */

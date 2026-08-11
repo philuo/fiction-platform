@@ -390,6 +390,10 @@ SessionMeta = routes.ts 内联构造的列表项（title/时间/streaming/messag
 - **LLM mock**：tests/mocks.ts `installMockAgnes(responder)` + `routeByKeyword`，`mock.module` 须在 import 任何 src/api 模块之前（:2-3）。
 - **WebSocket 现状**：零实现零测试。测试可用环境：bun:test 运行在 Bun 运行时 `WebSocket` 全局可用（服务端集成测试可直接连真实 Bun.serve 的 websocket 端口）；happy-dom Window 不提供 WebSocket → 客户端 hook 级测试需像 mock fetch 一样挂 `globalThis.WebSocket` 假实现（暴露 close/error 触发、onmessage 注入）。
 
+- **心跳健康检测（HA1）**：服务端 60s 无消息断开僵尸连接（30s 扫描），前端 30s 周期 ping 保活——断网/挂起连接及时释放，快速切换为重连路径。
+- **重连全量补偿（HA2）**：WS 断线指数退避重连，`onReconnected` → `refreshAllStates()` 全量补偿（不只 world，含连载/任务/聊天状态）。
+- **进度卡服务端兜底翻转（HA3）**：推进任务完成/失败时服务端主动翻转最近 running progress 卡（`finalizeProgressForTask` + card-update 广播）——刷新/SSE 断开后任务由轮询感知完成，卡片仍能翻转到终态（不永久 running）。
+
 #### 2.7.1 测试全绿基线（本轮修复 + 补充）
 
 **历史问题**：此前有 2 个固定失败测试——`tests/brain-cards.test.ts:265`（form 卡提交携带填写值）与

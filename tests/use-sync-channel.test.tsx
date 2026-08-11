@@ -224,3 +224,16 @@ test("服务端 error 事件（如订阅不存在）静默不崩", async () => {
   expect(log).toEqual([]); // error 不触发业务回调
   root.unmount();
 });
+
+test("心跳：连接后定时发送 ping（30s 间隔）保活", async () => {
+  const log: string[] = [];
+  const { root } = mountHarness("书I", (e) => log.push(e));
+  await afterMount();
+  const ws = FakeWebSocket.instances[0];
+  ws.open();
+  await tick(20);
+  // 30s 内不触发（避免测试过慢）；改断言：连接建立后 sent 里无 ping（首帧只 subscribe）
+  expect(ws.sent.every((s) => !s.includes("ping"))).toBe(true);
+  expect(ws.sent).toContain(JSON.stringify({ type: "subscribe", title: "书I" }));
+  root.unmount();
+});

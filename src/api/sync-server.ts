@@ -23,11 +23,43 @@ export function syncChannelKey(user: string, title: string): string {
   return `sync::${user}::${slugify(title)}`;
 }
 
-/** WS 连接附加数据：登录用户 + 已订阅的频道集合（close 时退订） */
+/** WS 连接附加数据：登录用户 + 已订阅的频道集合 + 心跳时间戳 */
 type SyncWsData = {
   user: AuthUser;
   channels: Set<string>;
+  /** 最近一次收到消息（含 ping）的时间戳；open 时置位 */
+  lastSeen: number;
 };
+
+/** 心跳超时（ms）：超过此间隔未收到任何消息视为僵尸连接，主动断开 */
+const WS_IDLE_TIMEOUT_MS = 60_000;
+/** 心跳检测周期（ms）：定期扫描所有连接 */
+const WS_SWEEP_INTERVAL_MS = 30_000;
+
+/** 全局心跳扫描定时器（单例；dev/prod 共用） */
+let sweepTimer: ReturnType<typeof setInterval> | null = null;
+
+/** 启动心跳扫描（attachSyncPublish 时调用一次；幂等） */
+function ensureHeartbeatSweep(server: Server<SyncWsData>): void {
+  if (sweepTimer) return;
+  sweepTimer = setInterval(() => {
+    const now = Date.now();
+    // 遍历所有连接的 socket——Bun 未暴露全局枚举，靠 pub-sub 频道推不动；
+    // 改用服务端消息处理器：open 时注册到本模块集合，close 摘除
+    for (const ws of allSockets) {
+      if (ws.data.lastSeen && now - ws.data.lastSeen > WS_IDLE_TIMEOUT_MS) {
+        try {
+          ws.close(1001, "心跳超时");
+        } catch {
+          /* 已关闭 */
+        }
+      }
+    }
+  }, WS_SWEEP_INTERVAL_MS);
+}
+
+/** 所有活动连接集合（供心跳扫描） */
+const allSockets = new Set<ServerWebSocket<SyncWsData>>();
 
 /** 订阅消息体校验 */
 type SubscribeMsg = { type?: string; title?: unknown };
@@ -35,9 +67,11 @@ type SubscribeMsg = { type?: string; title?: unknown };
 /** websocket 配置（dev/prod 的 Bun.serve 共用） */
 export const syncWebsocket = {
   open(ws: ServerWebSocket<SyncWsData>) {
-    // 等客户端首条 subscribe；连接建立即注册可 ping
+    ws.data.lastSeen = Date.now();
+    allSockets.add(ws);
   },
   message(ws: ServerWebSocket<SyncWsData>, message: string | Buffer) {
+    ws.data.lastSeen = Date.now(); // 任何消息（含 ping）都视为活跃
     let msg: SubscribeMsg;
     try {
       msg = JSON.parse(String(message)) as SubscribeMsg;
@@ -67,6 +101,7 @@ export const syncWebsocket = {
     ws.send(JSON.stringify({ type: "subscribed", title, version: worldVersion(title) }));
   },
   close(ws: ServerWebSocket<SyncWsData>) {
+    allSockets.delete(ws);
     // 手动退订（Bun close 时 socket 销毁，频道订阅可能残留；显式清理防内存泄漏）
     for (const ch of ws.data.channels) {
       try {
@@ -92,7 +127,7 @@ export function handleSyncUpgrade(pathname: string, req: Request, server: Server
       headers: { "Content-Type": "application/json; charset=utf-8" },
     });
   }
-  const ok = server.upgrade(req, { data: { user, channels: new Set<string>() } satisfies SyncWsData });
+  const ok = server.upgrade(req, { data: { user, channels: new Set<string>(), lastSeen: Date.now() } satisfies SyncWsData });
   if (!ok) {
     return new Response("WebSocket 升级失败", { status: 400 });
   }
@@ -104,6 +139,7 @@ export function handleSyncUpgrade(pathname: string, req: Request, server: Server
  * 返回退订函数（进程生命周期内通常不调用）。
  */
 export function attachSyncPublish(server: Server<SyncWsData>): () => void {
+  ensureHeartbeatSweep(server); // 启动心跳扫描（幂等）
   return subscribeSync((e: SyncEvent) => {
     if (!e.user) return; // 无 user 的事件（测试/遗留路径）无法定位频道，不推
     const msg = JSON.stringify(e);

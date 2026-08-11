@@ -47,6 +47,7 @@ export function useSyncChannel(opts: UseSyncChannelOpts): { connected: boolean }
   // 每本书的 lastVersion 去重（title 切换时重置）
   const lastVersionRef = useRef<number>(0);
   const wsRef = useRef<WebSocket | null>(null);
+  const pingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const retryMsRef = useRef(1000);
   const mountedRef = useRef(true);
@@ -89,6 +90,15 @@ export function useSyncChannel(opts: UseSyncChannelOpts): { connected: boolean }
         optsRef.current.onStatusChange?.(true);
         // 订阅当前书
         ws.send(JSON.stringify({ type: "subscribe", title: t }));
+        // 心跳：周期 ping 保活（服务端 60s 无消息断开，30s ping 间隔留有裕量）
+        pingTimerRef.current = setInterval(() => {
+          const cur = wsRef.current;
+          if (cur && cur.readyState === WebSocket.OPEN) {
+            try {
+              cur.send(JSON.stringify({ type: "ping" }));
+            } catch { /* 连接已断，onclose 处理 */ }
+          }
+        }, 30_000);
       };
       ws.onmessage = (ev) => {
         let obj: SyncChannelEvent;
@@ -129,6 +139,7 @@ export function useSyncChannel(opts: UseSyncChannelOpts): { connected: boolean }
       };
       ws.onclose = () => {
         wsRef.current = null;
+        if (pingTimerRef.current) { clearInterval(pingTimerRef.current); pingTimerRef.current = null; }
         if (closedByEffect) return;
         setConnected(false);
         optsRef.current.onStatusChange?.(false);
@@ -157,6 +168,7 @@ export function useSyncChannel(opts: UseSyncChannelOpts): { connected: boolean }
       closedByEffect = true;
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
       retryTimerRef.current = null;
+      if (pingTimerRef.current) { clearInterval(pingTimerRef.current); pingTimerRef.current = null; }
       const ws = wsRef.current;
       wsRef.current = null;
       if (ws) {
