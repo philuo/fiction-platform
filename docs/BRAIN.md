@@ -1,108 +1,94 @@
 # 墨枢中枢与同步架构
 
-## 1. 职责边界
+> 本文区分“当前已实施”与“后续演进”。中枢只负责意图、预览、命令和状态展示，不拥有第二份世界状态，也不通过弹窗生命周期控制同步连接。
 
-中枢负责理解意图、生成预览、提交 Harness 指令、展示权威状态和治理结果。它不拥有第二份世界状态，也不通过弹窗生命周期控制任务或同步连接。
+## 1. 当前已实施架构
 
-系统采用控制面/内容面分离：
+系统按三层组织：SQLite 控制面保存 command/job/revision/outbox/world journal；`state.json`、会话 JSON 和媒体文件保存大内容；HTTP 提交动作，sync WS 发布权威状态，SSE 只提供聊天/写作的低延迟文本增量。前端统一 store 是服务端投影缓存，组件局部 state 只负责临时交互。
 
-- 控制面：SQLite 保存命令回执、任务生命周期、同步 revision/outbox、世界提交 journal。
-- 内容面：`state.json`、章节版本、会话正文与媒体文件保存大对象。
-- 传输面：HTTP 提交命令，sync WS 发布权威投影，SSE 只传实时文本增量。
-- 客户端：统一 store 是服务端投影缓存；组件局部 state 只负责交互。
+登录态在应用根部立即建立一根用户级 `/api/sync`。打开或关闭中枢、切换会话 Tab 不创建或关闭它；切书在同一 socket 上订阅/退订故事 scope。服务端鉴权并按用户隔离频道。
 
-## 2. 状态分类
+### 1.1 状态分类
 
-| 类别 | 示例 | 重启语义 |
+| 类别 | 当前示例 | 重启语义 |
 |---|---|---|
-| 持久权威事实 | WorldState、会话消息、command、job、revision、取消意图、providerId | 必须恢复或明确收敛终态 |
-| 可重建运行态 | 书架元信息、待办统计、中枢 context、任务卡投影 | 从权威事实重建，不独立写入 |
-| 进程执行句柄 | Promise 锁、AbortController、socket、listener、provider timer | 可丢失，由 job 恢复策略重新建立或收敛 |
-| UI 状态/缓存 | 当前 Tab、展开消息、草稿输入、IndexedDB 文本缓存 | 可丢失，不参与业务一致性 |
+| 持久权威事实 | WorldState、会话消息、command receipt、job、revision/hash、world journal、outbox | 恢复或明确收敛终态 |
+| 可重建投影 | 书架、故事 system snapshot、中枢 session snapshot、任务卡 | 从持久事实和遗留存储重建 |
+| 进程执行句柄 | socket/listener、Promise 锁、AbortController、provider timer、SSE emitter | 可丢失；不能单独证明业务成功 |
+| 纯 UI 状态 | 当前 Tab、展开项、临时表单、短暂 submitting | 可丢失；不得成为服务端终态 |
 
-## 3. 命令和任务状态机
+### 1.2 当前 sync 协议
+
+服务端首先发送 `hello { serverInstanceId, ready }`，随后按订阅发送带 `scope/document/revision/hash/cursor/data` 的 `library-snapshot`、`system-snapshot` 和 `brain-snapshot`。world commit 同事务写入 outbox 的 `document-changed`；客户端收到后拉取对应完整投影。连接可发送 `resume { cursor }` 补取 outbox；游标不可连续时服务端发送 `resync-required`，客户端重新订阅获得完整快照。
+
+客户端遵循以下收敛规则：
+
+1. 服务纪元变化时清空旧投影并等待新快照。
+2. 旧 socket 的晚到 open/message/close 被世代检查丢弃。
+3. 较旧 revision 被忽略；同 revision 但 hash 不同视为冲突并 resync；缺口同样 resync。
+4. 完整任务集合采用覆盖语义，移除没有持久活动任务支撑的本地 loading/pending。
+5. 中枢会话、任务卡和 system runtime 经 sync 更新；SSE 的断开或结束不定义权威 loading。
+6. `brain-sessions.json` 采用唯一临时文件原子替换；Windows 短暂 `EPERM/EBUSY/EACCES` 会有限退避重试，失败继续向调用方传播。
+
+当前尚不发送 RFC 6902 patch；`document-changed + snapshot/resync` 是可靠但带宽更高的过渡协议。
+
+### 1.3 世界提交与启动屏障
+
+世界写入流程为：登记 prepared `world_commits` → 原子替换 `state.json` → SQLite 事务提交 revision、hash、outbox 和 journal 终态。启动时磁盘 hash 等于新值则补提交，等于旧值则中止；既不匹配新旧值则标 conflict，禁止静默覆盖未知内容。
+
+启动顺序为：数据库迁移 → journal 恢复 → 孤儿 job 收敛 → 媒体/连载恢复钩子 → ready → 监听。可安全恢复的视频 watcher 和自动连载保留恢复态；无法证明完成的孤儿任务标 `interrupted`。WS 不在恢复屏障前提供业务快照。
+
+## 2. 命令与任务状态机
 
 ```text
 received -> queued -> running -> waiting_external -> succeeded
-                    |              |                 
+                    |              |
                     +-> paused     +-> failed
                     +-> interrupted/cancelled/failed
 ```
 
-- 命令先以 `commandId + requestHash` 持久化，再允许执行外部调用。
-- 同 commandId、同 hash 返回已有回执；不同 hash 冲突。
-- 活动任务持有租约和 heartbeat。进程死亡后，恢复器按 job kind 判断安全续跑或核对后失败。
-- 所有终态都写入 job、投影 revision 和 outbox；UI 不从“内存里是否还有 Promise”推导终态。
-- 覆盖性命令使用 `expectedRevision`，防止旧 Tab 覆盖新事实。
+`commandId + requestHash` 支持同内容重试返回原回执、不同内容冲突；job 活动态由 SQLite 部分唯一索引仲裁。`createJob` 同时处理“先查后插”的跨进程竞争，唯一索引命中后返回胜出的既有 job。视频创建已用此约束替代进程内 busy Set。
 
-## 4. 世界提交 Unit of Work
+当前只有部分入口接入命令/任务账本，并非所有旧 HTTP 命令都已经统一成 `CommandRequest/CommandReceipt`。覆盖性命令的 `expectedRevision` 也尚未在所有旧入口强制执行。
 
-1. 在书级锁内加载最新世界并校验 expectedRevision。
-2. 将新世界、旧/新 hash、目标 revision 记录为 prepared `world_commits`。
-3. 原子替换 `state.json`，必要时保存版本/媒体引用。
-4. 在 SQLite 事务内标记 journal committed，推进 `sync_scopes.revision` 并写 outbox。
-5. 发布器读取 outbox 发送 patch；失败留在 outbox，重连可补发。
+## 3. SSE 与中枢恢复
 
-启动时若发现 prepared journal：磁盘 hash 等于新 hash 则补提交，等于旧 hash 则中止；其他情况进入恢复失败并拒绝对该书发布不可信快照。
+- `/api/brain/chat` 的 SSE 只传 reset/delta/done/error；断线移除订阅者，不应把业务终态改为成功。
+- 会话正文和消息检查点持久化；sync 发布会话列表、消息状态、卡片状态和 completed keys。
+- 打开/关闭中枢以及切换会话只改变 UI 选择，不请求已删除的 `/api/brain/context`。
+- 刷新后以 sync 快照恢复权威状态；只有服务端仍显示活动任务时才允许继续附着文本流。
+- 服务重启后无法安全续跑的模型调用标 interrupted，不自动重复消耗额度。
 
-## 5. sync 协议
+## 4. 内存对象与遗留存储审计
 
-登录后立即建立一根用户级连接。连接与书架页面、中枢弹窗、会话 Tab 无关；打开书仅改变订阅集合。
+| 对象 | 当前用途 | 风险/结论 |
+|---|---|---|
+| `titleLocks` | 单进程书级串行化 | 可留作执行优化；跨进程冲突必须靠 revision/job 约束 |
+| sync socket/listener/throttle timer、`videoWatchers` timer | 连接、合并通知、provider 查询句柄 | 可留内存；重启由持久 provider id/job 重建或收敛 |
+| brain task emitter/AbortController、前端 abort/cache/展开集合 | 流式执行和 UI 缓存 | 可留内存；会话检查点/job 才能决定用户可见终态 |
+| `activeAuto`、autorun stop/pause flags | 连载执行镜像及控制意图 | 仍有遗留风险；会话 JSON/部分 job 已持久，但应彻底迁入 job 与持久取消意图 |
+| `planTasks`、`imageGenTasks` | 分镜/生图执行句柄和部分结果 | 已有 job/世界 pending 投影，但 Map 仍混合业务结果；需缩减为 jobId→句柄 |
+| `visualTasks`、`visualInFlight`、`coverInFlight` | 视觉终态缓存与并发控制 | 部分接入 job，仍应移除终态缓存并用数据库唯一约束 |
+| `videoRegen`、`regenBusy` | 视频回滚上下文、重生成互斥 | 高风险遗留；旧 id/path 和交换阶段必须完全存入 recovery JSON |
+| `deletedStories`、读自愈 Set | 删除墓碑/短期去重 | 删除墓碑应持久化；纯自愈执行锁可留内存 |
+| 前端 countdown/trackedCards/stuckMedia | 自动生成倒计时和展示跟踪 | 仍存在客户端调度风险；倒计时应迁为服务端持久计划，前端仅显示 deadline |
+| new-story/advance/autorun JSON | 旧业务事实 | 当前仍参与恢复；后续迁入统一 job/command 账本并提供兼容迁移 |
 
-```ts
-type ServerFrame =
-  | { type: "hello"; serverInstanceId: string; ready: boolean }
-  | { type: "snapshot"; scope: string; document: string; revision: number; hash: string; data: unknown }
-  | { type: "patch"; scope: string; document: string; baseRevision: number; revision: number; hash: string; ops: JsonPatch[] }
-  | { type: "pong" }
-  | { type: "error"; code: string; error: string };
-```
+由此可见，“内存中存在 Set/Map”本身不是问题；风险取决于它是否是用户可见业务事实的唯一副本。连接、锁和执行句柄可以留内存，任务状态、幂等键、取消意图、倒计时、provider id、删除墓碑和回滚数据必须持久化。
 
-投影文档：
+## 5. 多 Tab、故障和一致性不变量
 
-- `user/library`：书架和立项任务。
-- `story/<slug>/system`：世界、autorun、pending chapter、advance 和所有活动/终态任务。
-- `story/<slug>/brain`：会话元数据、消息检查点、卡片状态、completed keys。
+- 每个 Tab 可有自己的用户级 WS，但单个应用实例只维持一根；所有 Tab 共享服务端 revision，命令靠幂等键和唯一活动 job 防重。
+- logout/token 失效关闭 WS 并清空 store；订阅 scope 必须验证所有权。
+- 任意完整快照后，本地不得保留服务端不存在的活动任务。
+- 世界 revision 只在文件写成功后推进；world outbox 与 revision 同一 SQLite 事务提交。
+- 持久化失败必须传播为任务失败，不能只打印 warning 后返回成功。
+- 数据损坏或 revision/hash 冲突必须显式报错，不能用空对象覆盖客户端有效状态。
 
-客户端规则：
+## 6. 后续演进顺序
 
-- snapshot 无条件替换同纪元、同文档旧状态。
-- patch 仅在 `baseRevision === localRevision` 时应用；重复 revision 忽略，缺口或 hash 不符发送 resync。
-- serverInstanceId 变化后先冻结交互，等待新 snapshot，不接受旧连接晚到帧。
-- 完整任务集合是覆盖语义；本地多出的 pending/loading 必须删除。
-- 大正文不随任务心跳重复传输。world、system runtime 和 brain 分文档发布。
-
-## 6. SSE 与聊天恢复
-
-- `/api/brain/chat` 和写作 SSE 只提供低延迟 delta，不拥有任务状态。
-- 客户端断开只移除 emitter；任务继续执行并定期保存消息检查点。
-- sync 推送 message pending/terminal 和持久正文检查点。刷新后先恢复 sync；任务仍活跃时才重新 attach SSE。
-- 服务重启后未完成文本标 interrupted，保留最后检查点，不重新调用模型。
-- 关闭中枢只卸载视图；不会断开 sync、取消任务或丢失卡片终态。
-
-## 7. 启动恢复屏障
-
-启动严格按以下顺序执行：数据库迁移 → world journal 恢复 → 孤儿 job 租约回收 → 媒体/会话卡核对 → autorun 安全续跑 → 构建初始投影 → ready → `Bun.serve`。
-
-恢复规则：
-
-- autorun 从最后已提交章节边界恢复。
-- provider 视频凭 videoId 恢复 watcher；视频重生成恢复旧资源上下文。
-- 分镜、生图、视觉、封面核对产物后成功或失败，不自动重耗额度。
-- advance/new-story 核对目标事实，无法证明完成则失败。
-- 无持久 job 对应的所有 pending/running 会话卡统一收敛为 interrupted/failed。
-
-## 8. 多 Tab、切书与鉴权
-
-- scope 包含 userId；logout/token 失效时关闭 WS 并清空 store。
-- 多 Tab 共享服务端 revision，各 Tab 独立 cursor；命令依靠 commandId 和唯一活动 job 防重。
-- 切书先订阅新 scope，收到首个 snapshot 后再解除旧 scope，避免 UI 空窗。
-- 服务端校验订阅所有权和 WS 上行命令的 scope，不信任客户端 title。
-
-## 9. 可观测与失效安全
-
-- health 暴露 ready、恢复错误数、未提交 journal、活动/过期 job、outbox backlog。
-- 任务日志至少包含 commandId/jobId/user/title/kind/status/revision，禁止记录密钥和完整正文。
-- 数据损坏或 revision/hash 冲突时停止该 scope 写入并返回明确错误，不以空对象覆盖有效客户端状态。
-- 定期清理终态 job/outbox，但保留审计窗口；内存执行句柄在终态立即删除。
-
+1. 先迁移 `videoRegen/regenBusy`、客户端倒计时、删除墓碑和取消意图。
+2. 再迁移 `activeAuto/planTasks/imageGenTasks/visualTasks`，确保 Map 只保存执行句柄。
+3. 将所有写入口统一为命令回执和 expectedRevision，并把非 world 终态与 outbox 事务绑定。
+4. 按文档拆分 world/runtime/brain，生成并校验 RFC 6902 patch，避免任务心跳重发大正文。
+5. 增加租约续期、outbox 压缩/保留策略、故障注入和登录态浏览器网络验收，为多进程部署做准备。

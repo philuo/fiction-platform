@@ -1,6 +1,6 @@
 # 墨枢系统指令总表
 
-本文是系统指令的运行契约。代码注册表位于 `src/api/harness.ts`；凡会读取或改变小说、任务、会话、媒体、审计数据的入口，都必须先登记再接入执行器。HTTP 是命令提交通道，sync WebSocket 是状态发布通道，SSE 只传输可丢弃的文本增量。
+本文是系统指令的运行契约。代码注册表位于 `src/api/harness.ts`；凡会读取或改变小说、任务、会话、媒体、审计数据的入口，都必须先登记再接入执行器。HTTP 是命令提交通道，sync WebSocket 是状态发布通道，SSE 只传输可丢弃的文本增量。注册表当前为 88 条（N16/W18/L13/M12/G08/S11/Q10），但测试从注册表动态计算分类和总数，不再把 88 当作不可变协议。
 
 ## 1. 通用指令契约
 
@@ -86,8 +86,35 @@
 | `subscribe` | 在登录后单连接上订阅 user/story/brain 文档 | 服务端校验用户所有权；重复订阅幂等 |
 | `unsubscribe` | 切书时移除不再需要的故事文档 | 不影响后台任务 |
 | `resync` | revision 缺口/hash 不符时请求完整快照 | 只读、幂等 |
+| `resume { cursor }` | 重连后请求补发该用户 cursor 之后的 outbox | 只读、幂等；缺口或不可补发时返回 `resync-required` |
 | `media-form-values` | 保存中枢媒体表单值 | 转换为持久命令，按 commandId 去重 |
 | `ping` | 保活 | 不改变业务状态 |
+
+### 3.1 当前服务端帧
+
+| 帧 | 含义 |
+|---|---|
+| `hello { serverInstanceId, ready }` | 声明服务纪元和恢复屏障状态 |
+| `library-snapshot/system-snapshot/brain-snapshot` | 带 `scope/document/revision/hash/cursor/data` 的权威完整投影 |
+| `document-changed` | outbox 中的轻量变更信号；客户端按 revision 拉取/重订阅完整投影 |
+| `resync-required` | cursor 不连续、revision 缺口或 hash 冲突时要求完整重同步 |
+| `pong/error` | 心跳或明确协议错误 |
+
+目标协议中的 RFC 6902 `patch` 尚未实施；当前不得把 `document-changed` 描述为 patch。M04 是服务端 provider watcher 的内部指令，不存在公开媒体状态查询 API。
+
+### 3.2 已删除的状态读取接口
+
+下列路径固定返回 404，且客户端不得引用：
+
+- `/api/novel/list`
+- `/api/novel/new/status`
+- `/api/novel/step/status`、`/api/novel/step/clear`
+- `/api/novel/auto/status`
+- `/api/novel/media/plan-status`
+- `/api/novel/media/status`、`/api/novel/media/status-batch`
+- `/api/novel/state`
+- `/api/novel/visual/status`
+- `/api/brain/context`
 
 ## 4. 内部状态与内存对象审计
 
@@ -97,15 +124,20 @@
 | WS socket、listener、timer | 连接句柄 | 可留内存；close 必须清理 |
 | AbortController、SSE emitter、流式 delta buffer | 执行句柄 | 可留内存；持久 job/message checkpoint 决定终态 |
 | React 展开项、选中项、临时表单 | UI 状态 | 可留内存或本地缓存，不得表示服务端任务终态 |
-| `activeAuto/planTasks/imageGenTasks/visualTasks/videoRegen` 等 | 业务事实 | 迁入 SQLite jobs；内存只保留 jobId→执行句柄镜像 |
-| 删除墓碑、倒计时、取消意图、幂等记录 | 业务事实 | 必须持久化 |
+| `activeAuto/planTasks/imageGenTasks/visualTasks/videoRegen/regenBusy` 等 | 混合业务事实与句柄 | 已部分接入 SQLite jobs，但仍是迁移项；最终内存只保留 jobId→执行句柄镜像 |
+| 删除墓碑、客户端倒计时、取消意图、幂等记录 | 业务事实 | 幂等记录已持久化；其余仍需完整迁移，不能依赖进程内 Set/Timer |
 
 ## 5. 一致性不变量
 
-1. 任意用户可见 `pending/running` 都必须对应一条非终态持久 job。
+1. 目标不变量：任意用户可见 `pending/running` 都必须对应一条非终态持久 job；遗留任务尚在迁移，新增代码不得扩大例外。
 2. 完整快照中不存在的活动任务会清除客户端 loading。
 3. 世界 revision 只在文件提交成功后增加；outbox 与 revision 同一数据库事务提交。
-4. 同一 commandId 不会重复产生外部调用或世界写入。
+4. 已接入命令账本的入口中，同一 commandId 不会重复产生外部调用或世界写入；旧入口仍需统一迁移。
 5. 服务启动恢复完成前不监听业务请求、不发送业务快照。
 6. sync 是状态唯一来源；HTTP/SSE 不能直接覆盖客户端权威 store。
 
+## 6. 当前实现边界
+
+- 已实现：状态接口移除、登录级 sync、持久 revision/hash/outbox cursor、服务纪元、完整快照覆盖收敛、world journal、部分任务账本和数据库唯一活动任务约束。
+- 尚未实现：真正 RFC 6902 patch、所有入口的统一 `CommandRequest/CommandReceipt`、所有任务/取消/倒计时/墓碑持久化、所有投影终态与 outbox 的事务绑定。
+- 因此 Harness 既是当前入口目录，也是迁移检查表；表中目标字段并不表示每个旧入口已完全满足统一命令契约。
