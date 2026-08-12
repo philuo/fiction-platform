@@ -19,7 +19,7 @@
 
 ### 1.2 当前 sync 协议
 
-服务端首先发送 `hello { serverInstanceId, ready }`，随后按订阅发送带 `scope/document/revision/hash/cursor/data` 的 `library-snapshot`、`system-snapshot` 和 `brain-snapshot`。world commit 同事务写入 outbox 的 `document-changed`；客户端收到后拉取对应完整投影。连接可发送 `resume { cursor }` 补取 outbox；游标不可连续时服务端发送 `resync-required`，客户端重新订阅获得完整快照。
+服务端首先发送 `hello { serverInstanceId, ready }`，随后按订阅发送带 `scope/document/revision/hash/cursor/data` 的 `library-snapshot`、`system-snapshot` 和 `brain-snapshot`。后续 library/system/brain 变化以 RFC 6902 `patch` 增量发送；world commit 仍以同事务 `document-changed` 通知触发完整 system 投影更新。连接可发送 `resume { cursor }` 补取 outbox；游标不可连续时服务端发送 `resync-required`，客户端重新订阅获得完整快照。
 
 客户端遵循以下收敛规则：
 
@@ -30,7 +30,7 @@
 5. 中枢会话、任务卡和 system runtime 经 sync 更新；SSE 的断开或结束不定义权威 loading。
 6. `brain-sessions.json` 采用唯一临时文件原子替换；Windows 短暂 `EPERM/EBUSY/EACCES` 会有限退避重试，失败继续向调用方传播。
 
-当前尚不发送 RFC 6902 patch；`document-changed + snapshot/resync` 是可靠但带宽更高的过渡协议。
+投影正文以规范化 JSON 存入 `sync_scopes.document_json`，正文、revision/hash 和 patch outbox 在同一事务提交。客户端仅在 `baseRevision` 连续时应用 add/remove/replace，并重新计算 SHA-256；数组作为原子值替换，保证正确性并避免运行态心跳重复携带未变化的 world 正文。
 
 ### 1.3 世界提交与启动屏障
 
@@ -49,7 +49,7 @@ received -> queued -> running -> waiting_external -> succeeded
 
 `commandId + requestHash` 支持同内容重试返回原回执、不同内容冲突；job 活动态由 SQLite 部分唯一索引仲裁。`createJob` 同时处理“先查后插”的跨进程竞争，唯一索引命中后返回胜出的既有 job。视频创建已用此约束替代进程内 busy Set。
 
-当前只有部分入口接入命令/任务账本，并非所有旧 HTTP 命令都已经统一成 `CommandRequest/CommandReceipt`。覆盖性命令的 `expectedRevision` 也尚未在所有旧入口强制执行。
+`POST /api/commands` 已提供严格白名单的统一入口，当前开放 N01/M01/M02：请求先登记 `commandId + requestHash`，同内容重试返回原回执，不同内容或跨用户复用返回 409，后台执行与 HTTP 连接解耦。其余旧 HTTP 命令尚未全部迁入，覆盖性命令的 `expectedRevision` 也尚未在所有旧入口强制执行。
 
 ## 3. SSE 与中枢恢复
 
@@ -69,9 +69,9 @@ received -> queued -> running -> waiting_external -> succeeded
 | `activeAuto`、autorun stop/pause flags | 连载执行镜像及控制意图 | 仍有遗留风险；会话 JSON/部分 job 已持久，但应彻底迁入 job 与持久取消意图 |
 | `planTasks`、`imageGenTasks` | 分镜/生图执行句柄和部分结果 | 已有 job/世界 pending 投影，但 Map 仍混合业务结果；需缩减为 jobId→句柄 |
 | `visualTasks`、`visualInFlight`、`coverInFlight` | 视觉终态缓存与并发控制 | 部分接入 job，仍应移除终态缓存并用数据库唯一约束 |
-| `videoRegen`、`regenBusy` | 视频回滚上下文、重生成互斥 | 高风险遗留；旧 id/path 和交换阶段必须完全存入 recovery JSON |
+| 视频重生成 recovery job | 视频回滚上下文、重生成互斥 | 已迁入 SQLite；watcher 重启后按 dedupeKey 读取旧 id/path，成功/失败/超时收敛 job |
 | `deletedStories`、读自愈 Set | 删除墓碑/短期去重 | 删除墓碑应持久化；纯自愈执行锁可留内存 |
-| 前端 countdown/trackedCards/stuckMedia | 自动生成倒计时和展示跟踪 | 仍存在客户端调度风险；倒计时应迁为服务端持久计划，前端仅显示 deadline |
+| `media-auto-generate` job / 前端倒计时展示 | 自动生成 deadline 与展示 | deadline/scenes/session 已持久并由服务端恢复；前端 interval 只更新剩余秒数，不触发业务命令 |
 | new-story/advance/autorun JSON | 旧业务事实 | 当前仍参与恢复；后续迁入统一 job/command 账本并提供兼容迁移 |
 
 由此可见，“内存中存在 Set/Map”本身不是问题；风险取决于它是否是用户可见业务事实的唯一副本。连接、锁和执行句柄可以留内存，任务状态、幂等键、取消意图、倒计时、provider id、删除墓碑和回滚数据必须持久化。
@@ -87,8 +87,7 @@ received -> queued -> running -> waiting_external -> succeeded
 
 ## 6. 后续演进顺序
 
-1. 先迁移 `videoRegen/regenBusy`、客户端倒计时、删除墓碑和取消意图。
-2. 再迁移 `activeAuto/planTasks/imageGenTasks/visualTasks`，确保 Map 只保存执行句柄。
-3. 将所有写入口统一为命令回执和 expectedRevision，并把非 world 终态与 outbox 事务绑定。
-4. 按文档拆分 world/runtime/brain，生成并校验 RFC 6902 patch，避免任务心跳重发大正文。
-5. 增加租约续期、outbox 压缩/保留策略、故障注入和登录态浏览器网络验收，为多进程部署做准备。
+1. 迁移删除墓碑和剩余取消意图，避免后台任务在进程重启后误写已删 scope。
+2. 迁移 `activeAuto/planTasks/imageGenTasks/visualTasks`，确保 Map 只保存执行句柄。
+3. 将剩余写入口纳入 `/api/commands` 并强制 expectedRevision。
+4. 增加租约续期、outbox 压缩/保留策略、故障注入和登录态浏览器网络验收，为多进程部署做准备。

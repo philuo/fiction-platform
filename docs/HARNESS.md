@@ -97,10 +97,11 @@
 | `hello { serverInstanceId, ready }` | 声明服务纪元和恢复屏障状态 |
 | `library-snapshot/system-snapshot/brain-snapshot` | 带 `scope/document/revision/hash/cursor/data` 的权威完整投影 |
 | `document-changed` | outbox 中的轻量变更信号；客户端按 revision 拉取/重订阅完整投影 |
+| `patch` | library/system/brain 的 RFC 6902 增量；携带 baseRevision/revision/hash/ops/cursor |
 | `resync-required` | cursor 不连续、revision 缺口或 hash 冲突时要求完整重同步 |
 | `pong/error` | 心跳或明确协议错误 |
 
-目标协议中的 RFC 6902 `patch` 尚未实施；当前不得把 `document-changed` 描述为 patch。M04 是服务端 provider watcher 的内部指令，不存在公开媒体状态查询 API。
+RFC 6902 `patch` 已用于 library/system/brain；world 文件提交仍发送 `document-changed`，两者语义不可混用。M04 是服务端 provider watcher 的内部指令，不存在公开媒体状态查询 API。
 
 ### 3.2 已删除的状态读取接口
 
@@ -124,8 +125,9 @@
 | WS socket、listener、timer | 连接句柄 | 可留内存；close 必须清理 |
 | AbortController、SSE emitter、流式 delta buffer | 执行句柄 | 可留内存；持久 job/message checkpoint 决定终态 |
 | React 展开项、选中项、临时表单 | UI 状态 | 可留内存或本地缓存，不得表示服务端任务终态 |
-| `activeAuto/planTasks/imageGenTasks/visualTasks/videoRegen/regenBusy` 等 | 混合业务事实与句柄 | 已部分接入 SQLite jobs，但仍是迁移项；最终内存只保留 jobId→执行句柄镜像 |
-| 删除墓碑、客户端倒计时、取消意图、幂等记录 | 业务事实 | 幂等记录已持久化；其余仍需完整迁移，不能依赖进程内 Set/Timer |
+| `activeAuto/planTasks/imageGenTasks/visualTasks` 等 | 混合业务事实与句柄 | 已部分接入 SQLite jobs，但仍是迁移项；最终内存只保留 jobId→执行句柄镜像 |
+| 视频重生成回滚、自动生成 deadline、幂等记录 | 业务事实 | 已进入 job recovery/command receipts；重启可恢复或收敛 |
+| 删除墓碑、剩余取消意图 | 业务事实 | 仍需完整迁移，不能依赖进程内 Set/Map |
 
 ## 5. 一致性不变量
 
@@ -138,6 +140,6 @@
 
 ## 6. 当前实现边界
 
-- 已实现：状态接口移除、登录级 sync、持久 revision/hash/outbox cursor、服务纪元、完整快照覆盖收敛、world journal、部分任务账本和数据库唯一活动任务约束。
-- 尚未实现：真正 RFC 6902 patch、所有入口的统一 `CommandRequest/CommandReceipt`、所有任务/取消/倒计时/墓碑持久化、所有投影终态与 outbox 的事务绑定。
+- 已实现：状态接口移除、登录级 sync、持久 revision/hash/outbox cursor、服务纪元、完整快照覆盖收敛、RFC 6902 patch、world journal、非 world 投影事务 outbox、统一命令入口骨架、视频回滚与自动生成 deadline 持久化。
+- 尚未实现：所有入口迁入统一 `CommandRequest/CommandReceipt`、所有遗留任务/取消/墓碑持久化，以及旧写入口全面强制 expectedRevision。
 - 因此 Harness 既是当前入口目录，也是迁移检查表；表中目标字段并不表示每个旧入口已完全满足统一命令契约。
