@@ -10,8 +10,8 @@ import { acceptServerInstance, setBrainSyncState, setLibrarySyncState, setSystem
 /** 事件类型（与 src/api/sync.ts SyncEvent 一致；服务端透传原样 JSON） */
 export type SyncChannelEvent =
   | { type: "hello"; serverInstanceId: string; ready: boolean }
-  | { type: "library-snapshot"; scope: "user"; document: "library"; revision: number; hash: string; data: { stories: { slug: string; title: string; genre: string; chapters: number; updatedAt: string; cover?: string }[]; tasks: { id: string; idea: string; genre: string; status: string; title?: string; stage?: string; error?: string; createdAt: string; updatedAt: string }[] } }
-  | { type: "system-snapshot"; title: string; world: Record<string, unknown>; visual: { running: boolean; pending: { id: string; name: string }[]; failed: { id: string; name: string; reason?: string }[] }; autoSession: Record<string, unknown> | null; autoPending: Record<string, unknown> | null; advanceTask: Record<string, unknown> | null; at: number }
+  | { type: "library-snapshot"; scope: "user"; document: "library"; revision: number; hash: string; cursor?: number; data: { stories: { slug: string; title: string; genre: string; chapters: number; updatedAt: string; cover?: string }[]; tasks: { id: string; idea: string; genre: string; status: string; title?: string; stage?: string; error?: string; createdAt: string; updatedAt: string }[] } }
+  | { type: "system-snapshot"; title: string; world: Record<string, unknown>; visual: { running: boolean; pending: { id: string; name: string }[]; failed: { id: string; name: string; reason?: string }[] }; autoSession: Record<string, unknown> | null; autoPending: Record<string, unknown> | null; advanceTask: Record<string, unknown> | null; at: number; revision?: number; hash?: string; cursor?: number }
   | { type: "world-changed"; title: string; version: number; reason?: string; regions?: string[]; at: number }
   | { type: "auto-status"; title: string; status: string; phase?: string; written?: number; updatedAt?: string; at: number }
   | { type: "task-status"; title: string; kind: "build" | "advance" | "media" | "visual"; id?: string; sub?: "plan"; scenes?: { anchor: string; scene: string; caption?: string }[]; status: string; error?: string; at: number }
@@ -19,9 +19,11 @@ export type SyncChannelEvent =
   | { type: "card-update"; title: string; sessionId: string; messageId: string; cardId: string; patch: Record<string, unknown>; at: number }
   | { type: "card-replaced"; title: string; sessionId: string; messageId: string; cardIndex: number; card: Record<string, unknown>; at: number }
   | { type: "brain-append"; title: string; sessionId: string; messageId: string; at: number }
-  | { type: "brain-status"; title: string; full?: boolean; sessions: { id: string; sessionTitle: string; createdAt: number; streaming: boolean; updatedAt: number; messages?: Record<string, unknown>[]; messageStates?: Record<string, unknown>[]; messageCount?: number; completed?: string[] }[]; tasks: { id: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[] }[]; at: number }
+  | { type: "brain-status"; title: string; full?: boolean; sessions: { id: string; sessionTitle: string; createdAt: number; streaming: boolean; updatedAt: number; messages?: Record<string, unknown>[]; messageStates?: Record<string, unknown>[]; messageCount?: number; completed?: string[] }[]; tasks: { id: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[] }[]; at: number; revision?: number; hash?: string; cursor?: number }
   | { type: "subscribed"; title: string; version: number }
   | { type: "pong" }
+  | { type: "document-changed"; scope: string; document: string; baseRevision: number; revision: number; hash: string; cursor: number }
+  | { type: "resync-required"; cursor: number }
   | { type: "error"; error: string };
 
 export type UseSyncChannelOpts = {
@@ -68,6 +70,7 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
   const pingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const retryMsRef = useRef(1000);
+  const cursorRef = useRef(0);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -108,6 +111,7 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
         if (!mountedRef.current || closedByEffect) return;
         setConnected(true);
         optsRef.current.onStatusChange?.(true);
+        if (cursorRef.current > 0) ws.send(JSON.stringify({ type: "resume", cursor: cursorRef.current }));
         const selectedTitle = optsRef.current.title;
         if (selectedTitle) ws.send(JSON.stringify({ type: "subscribe", title: selectedTitle }));
         // 心跳：周期 ping 保活（服务端 60s 无消息断开，30s ping 间隔留有裕量）
@@ -137,11 +141,13 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
           return;
         }
         if (obj.type === "library-snapshot") {
-          setLibrarySyncState({ ...obj.data, revision: obj.revision, hash: obj.hash });
+          if (typeof obj.cursor === "number") cursorRef.current = Math.max(cursorRef.current, obj.cursor);
+          if (setLibrarySyncState({ ...obj.data, revision: obj.revision, hash: obj.hash }) === "conflict") requestCurrentSnapshot();
           return;
         }
         if (obj.type === "system-snapshot") {
-          setSystemSyncState(obj as unknown as SystemSyncState);
+          if (typeof obj.cursor === "number") cursorRef.current = Math.max(cursorRef.current, obj.cursor);
+          if (setSystemSyncState(obj as unknown as SystemSyncState) === "conflict") { requestCurrentSnapshot(); return; }
           optsRef.current.onSystemSnapshot?.(obj);
           return;
         }
@@ -177,8 +183,14 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
           return;
         }
         if (obj.type === "brain-status") {
-          setBrainSyncState({ title: obj.title, sessions: obj.sessions, tasks: obj.tasks, at: obj.at });
+          if (typeof obj.cursor === "number") cursorRef.current = Math.max(cursorRef.current, obj.cursor);
+          if (setBrainSyncState({ title: obj.title, sessions: obj.sessions, tasks: obj.tasks, at: obj.at, revision: obj.revision, hash: obj.hash }) === "conflict") { requestCurrentSnapshot(); return; }
           optsRef.current.onBrainStatus?.(obj);
+          return;
+        }
+        if (obj.type === "document-changed" || obj.type === "resync-required") {
+          cursorRef.current = Math.max(cursorRef.current, obj.cursor);
+          requestCurrentSnapshot();
           return;
         }
         // pong / error：心跳无需处理 / 订阅失败等静默（onopen 重订阅会处理）
@@ -206,6 +218,11 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
         // 指数退避，上限 8s
         retryMsRef.current = Math.min(retryMsRef.current * 2, MAX_RETRY_MS);
       }, retryMsRef.current);
+    };
+
+    const requestCurrentSnapshot = () => {
+      const cur = wsRef.current;
+      if (cur?.readyState === WebSocket.OPEN) cur.send(JSON.stringify({ type: "snapshot", title: optsRef.current.title ?? "" }));
     };
 
     connect();

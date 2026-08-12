@@ -146,7 +146,7 @@ const imageGenTasks = new Map<string, GenTask>();
 /** 视频生成并发防护（同书同章）：跨 tab 倒计时几乎同时触发 /media/generate 时拒绝重复生成（video 无 image 的配额上限兜底） */
 const videoGenBusy = new Set<string>();
 
-/** 分镜任务表（内存态）：planId → 任务。分镜是异步 LLM 调用（可能数十秒），前端轮询 /media/plan-status
+/** 分镜执行句柄表（内存态）：planId → controller/timer；权威状态在 SQLite jobs 并经 sync 投影。
  *  恢复「分镜中」状态——关闭弹窗/刷新页面后重开，从会话卡读到 planId 继续轮询拿最新结果。
  *  controller/timer 实现真超时与外部取消；LRU 只淘汰终态，绝不丢弃 pending。 */
 type PlanTask = {
@@ -2804,7 +2804,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           }
         }
         // image：异步生成——锁内先落 pending 条目（刷新/中断可恢复轮询），锁外并行生成，完成后锁内更新 ready/failed；
-        // 不阻塞请求：立即返回 mediaIds，前端轮询 /media/status
+        // 不阻塞请求：立即返回回执；客户端只经 sync 接收任务状态。
         const w0 = loadWorld(title);
         if (!w0) return json({ error: "故事不存在: " + title }, 404);
         const toAdd = valid.slice(0, 3);

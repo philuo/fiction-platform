@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { getDb } from "../src/api/db";
 import {
   acceptCommand, CommandConflictError, commitWorldCommit, contentHash, createJob, getJob,
-  listJobs, prepareWorldCommit, recoverPreparedWorldCommits, settleOrphanedJobs, syncRevision, updateJob,
+  latestOutboxCursor, listJobs, prepareWorldCommit, recoverPreparedWorldCommits, settleOrphanedJobs, syncRevision, updateJob, userOutboxAfter,
 } from "../src/api/control-plane";
 
 const root = join(tmpdir(), `control-plane-${crypto.randomUUID()}`);
@@ -77,6 +77,9 @@ describe("world commit journal", () => {
     const recovered = recoverPreparedWorldCommits();
     expect(recovered.committed).toBe(1);
     expect(syncRevision("alice", "story/恢复书", "world")).toEqual({ revision: prepared.targetRevision, hash: contentHash(newJson) });
+    expect(latestOutboxCursor("alice")).toBeGreaterThan(0);
+    const replay = userOutboxAfter("alice", 0);
+    expect(replay.some((item) => item.frame.document === "world" && item.frame.revision === prepared.targetRevision)).toBe(true);
   });
 
   test("文件仍为旧版本时中止 prepared，不推进 revision", () => {

@@ -20,7 +20,7 @@ import { MAX_IMAGES_PER_CHAPTER, imageOccupiesQuota } from "../shared/media-cons
 import { runtimeReadiness } from "./runtime-readiness";
 import { listStoriesMeta } from "./storage";
 import { loadNewStoryTasks } from "./newtask";
-import { recordProjectionSnapshot } from "./control-plane";
+import { latestOutboxCursor, recordProjectionSnapshot, userOutboxAfter } from "./control-plane";
 
 /** WS 端点路径（dev/prod 共用） */
 export const SYNC_WS_PATH = "/api/sync";
@@ -43,7 +43,7 @@ function sendLibrarySnapshot(ws: ServerWebSocket<SyncWsData>): void {
     })),
   }));
   const version = recordProjectionSnapshot(ws.data.user.username, "user", "library", data);
-  ws.send(JSON.stringify({ type: "library-snapshot", scope: "user", document: "library", ...version, data }));
+  ws.send(JSON.stringify({ type: "library-snapshot", scope: "user", document: "library", ...version, cursor: latestOutboxCursor(ws.data.user.username), data }));
 }
 
 /** WS 连接附加数据：登录用户 + 已订阅的频道集合 + 心跳时间戳 */
@@ -107,21 +107,21 @@ function sendBrainStatus(ws: ServerWebSocket<SyncWsData>, title: string): boolea
   const payload = brainStatusPayload(ws, title, true);
   const { at: _at, ...stable } = payload;
   const version = recordProjectionSnapshot(ws.data.user.username, `story/${title}`, "brain", stable);
-  ws.send(JSON.stringify({ ...payload, ...version }));
+    ws.send(JSON.stringify({ ...payload, ...version, cursor: latestOutboxCursor(ws.data.user.username) }));
   return payload.active;
 }
 
 function sendBrainStatusFrame(ws: ServerWebSocket<SyncWsData>, payload: ReturnType<typeof brainStatusPayload>): void {
   const { at: _at, ...stable } = payload;
   const version = recordProjectionSnapshot(ws.data.user.username, `story/${payload.title}`, "brain", stable);
-  ws.send(JSON.stringify({ ...payload, ...version }));
+  ws.send(JSON.stringify({ ...payload, ...version, cursor: latestOutboxCursor(ws.data.user.username) }));
 }
 
 function sendSystemSnapshot(ws: ServerWebSocket<SyncWsData>, title: string, heal = false): void {
   const snapshot = runAsUser(ws.data.user.username, () => getSystemSyncSnapshot(title, heal));
   if (snapshot) {
     const version = recordProjectionSnapshot(ws.data.user.username, `story/${title}`, "system", snapshot);
-    ws.send(JSON.stringify({ type: "system-snapshot", scope: `story/${title}`, document: "system", ...version, ...snapshot, at: Date.now() }));
+    ws.send(JSON.stringify({ type: "system-snapshot", scope: `story/${title}`, document: "system", ...version, cursor: latestOutboxCursor(ws.data.user.username), ...snapshot, at: Date.now() }));
   }
 }
 
@@ -133,6 +133,7 @@ type SubscribeMsg = {
   messageId?: unknown;
   cardIndex?: unknown;
   values?: { chapterIndex?: unknown; count?: unknown };
+  cursor?: unknown;
 };
 
 function unsubscribeStoryChannels(ws: ServerWebSocket<SyncWsData>): void {
@@ -171,6 +172,21 @@ export const syncWebsocket = {
     }
     if (msg.type === "ping") {
       ws.send(JSON.stringify({ type: "pong" }));
+      return;
+    }
+    if (msg.type === "resume") {
+      const cursor = Number(msg.cursor);
+      if (!Number.isSafeInteger(cursor) || cursor < 0) {
+        ws.send(JSON.stringify({ type: "error", error: "非法 sync cursor" }));
+        return;
+      }
+      const frames = userOutboxAfter(ws.data.user.username, cursor, 501);
+      if (frames.length > 500) {
+        // 游标落后过多时不发送不完整增量；客户端收到信号后按当前订阅请求完整快照。
+        ws.send(JSON.stringify({ type: "resync-required", cursor: latestOutboxCursor(ws.data.user.username) }));
+        return;
+      }
+      for (const item of frames) ws.send(JSON.stringify({ ...item.frame, cursor: item.id }));
       return;
     }
     if (msg.type === "media-form-values") {

@@ -144,7 +144,8 @@ export function saveSessions(title: string, sessions: BrainSession[]): void {
   const dir = sessionsDir(title);
   mkdirSync(dir, { recursive: true });
   const p = sessionsPath(title);
-  const tmp = `${p}.tmp`;
+  // 多 Tab/后台任务可能在相邻 tick 写同一会话文件；固定 .tmp 会在 Windows 上争用并 rename EPERM。
+  const tmp = `${p}.tmp-${process.pid}-${crypto.randomUUID()}`;
   writeFileSync(tmp, JSON.stringify({ sessions }, null, 2), "utf-8");
   renameSync(tmp, p);
 }

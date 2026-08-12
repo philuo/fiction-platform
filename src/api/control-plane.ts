@@ -308,3 +308,15 @@ export function pendingOutbox(afterId = 0, limit = 500): { id: number; frame: un
   return (getDb().query("SELECT id,frame_json FROM sync_outbox WHERE id>? ORDER BY id LIMIT ?").all(afterId, limit) as { id: number; frame_json: string }[])
     .map((row) => ({ id: row.id, frame: JSON.parse(row.frame_json) as unknown }));
 }
+
+export function latestOutboxCursor(user: string | null): number {
+  const row = getDb().query("SELECT COALESCE(MAX(id),0) AS id FROM sync_outbox WHERE user_name=?")
+    .get(durableUser(user)) as { id: number };
+  return Number(row.id ?? 0);
+}
+
+export function userOutboxAfter(user: string | null, afterId: number, limit = 500): { id: number; frame: Record<string, unknown> }[] {
+  return (getDb().query("SELECT id,frame_json FROM sync_outbox WHERE user_name=? AND id>? ORDER BY id LIMIT ?")
+    .all(durableUser(user), Math.max(0, afterId), limit) as { id: number; frame_json: string }[])
+    .map((row) => ({ id: row.id, frame: JSON.parse(row.frame_json) as Record<string, unknown> }));
+}

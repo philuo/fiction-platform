@@ -105,7 +105,7 @@ export const COMMANDS: HarnessCommand[] = [
   C("CMD-M01", "分镜规划 planScenes", "Media", "user", "/api/novel/media/plan → media.ts:819", "LLM 从正文挑段转写视觉 prompt（候选池去重）", "只读（返回 ScenePlan[]）", "exec", "L0", "3 次重试", ["none"], ["U19"]),
   C("CMD-M02", "生成章节插画 generateSceneImage", "Media", "user", "/api/novel/media/generate → media.ts:952", "i2i 前缀+人数守卫+画风后缀→图像 API", "chapters[].media", "image", "L0", "异步失败置 error", ["audit", "schedule"], ["U06", "U07"]),
   C("CMD-M03", "生成章节视频 createSceneVideo", "Media", "user", "media.ts:989", "i2v 首帧/t2v，5-15s", "chapters[].media(videoId)", "video", "L0", "异步轮询", ["audit", "schedule"], ["U06", "U07"]),
-  C("CMD-M04", "媒体状态回写 media/status", "Media", "user", "/api/novel/media/status", "轮询视频任务结果回写", "chapters[].media[].status/error/path", "none", "L0", "429 返 rate_limited", ["audit"], ["U06", "U07"]),
+  C("CMD-M04", "服务端媒体状态收敛", "Media", "system", "server video watcher", "服务端查询 provider 并回写任务终态", "chapters[].media[].status/error/path + jobs", "none", "L0", "限流继续 waiting_external；超时/确定失败落终态", ["audit"], ["U06", "U07"]),
   C("CMD-M05", "改词重生成 media/regenerate", "Media", "user", "/api/novel/media/regenerate", "改 prompt 重生成", "media[].prompt/path/status", "image", "L0", "—", ["audit"], ["U06", "U07"]),
   C("CMD-M06", "删除媒体 media/delete", "Media", "user", "/api/novel/media/delete", "删除媒体条目+磁盘文件", "chapters[].media", "none", "L0", "—", ["audit"], ["U06"]),
   C("CMD-M07", "生成角色立绘 generateCharacterPortrait", "Media", "user", "/api/novel/character/portrait → media.ts:628", "i2i 参考（必须参考头像）→竖版立绘（角色创建后自动触发，actor=system）", "characters[].portrait", "image", "L0", "—", ["audit"], ["U13", "U19"]),
@@ -140,10 +140,10 @@ export const COMMANDS: HarnessCommand[] = [
 
   // ===== 2.7 查询只读类（Query）=====
   C("CMD-Q01", "同步世界状态", "Query", "user", "sync system-snapshot", "订阅即推世界+运行态", "只读（条件写见 S08）", "none", "L0", "—", ["none"], ["U03", "U06", "U08"]),
-  C("CMD-Q02", "故事列表", "Query", "user", "/api/novel/list", "列表", "只读", "none", "L0", "—", ["none"], ["U01"]),
+  C("CMD-Q02", "书架投影", "Query", "system", "sync user/library snapshot", "登录连接后推送书架和立项任务", "只读投影", "none", "L0", "断线重连发送完整快照", ["none"], ["U01"]),
   C("CMD-Q03", "导出 md/epub", "Query", "user", "/api/novel/export", "导出", "只读", "none", "L0", "—", ["none"], []),
   C("CMD-Q04", "变更日志", "Query", "user", "/api/novel/changelog", "审计日志读", "只读", "none", "L0", "—", ["none"], ["U20"]),
-  C("CMD-Q05", "连载状态", "Query", "user", "/api/novel/auto/status", "会话/暂存区查询", "只读", "none", "L0", "—", ["none"], ["U16"]),
+  C("CMD-Q05", "连载状态投影", "Query", "system", "sync story/system snapshot", "推送会话、暂存区与任务阶段", "只读投影", "none", "L0", "完整快照清除客户端幽灵 loading", ["none"], ["U16"]),
   C("CMD-Q06", "媒体资产读取", "Query", "user", "/api/novel/asset", "读图片/视频文件", "只读", "none", "L0", "—", ["none"], ["U06", "U13"]),
   C("CMD-Q07", "健康检查", "Query", "user", "/api/health", "key 配置检查", "只读", "none", "L0", "—", ["none"], []),
   C("CMD-Q08", "单轮对话", "Query", "user", "/api/chat", "通用对话", "无 WorldState", "exec", "L0", "—", ["none"], []),

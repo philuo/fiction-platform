@@ -16,6 +16,14 @@ describe("sync projection store", () => {
     expect(getSystemSyncState("书")?.world.nextChapter).toBe(9);
   });
 
+  test("同 revision 不同 hash 拒绝分叉快照并报告 conflict", () => {
+    const first = emptyWorld(); first.title = "分叉书"; first.nextChapter = 3;
+    const fork = emptyWorld(); fork.title = "分叉书"; fork.nextChapter = 99;
+    expect(setSystemSyncState({ title: "分叉书", world: first, visual: { running: false, pending: [], failed: [] }, autoSession: null, autoPending: null, advanceTask: null, at: 1, revision: 4, hash: "hash-a" })).toBe("accepted");
+    expect(setSystemSyncState({ title: "分叉书", world: fork, visual: { running: false, pending: [], failed: [] }, autoSession: null, autoPending: null, advanceTask: null, at: 2, revision: 4, hash: "hash-b" })).toBe("conflict");
+    expect(getSystemSyncState("分叉书")?.world.nextChapter).toBe(3);
+  });
+
   test("服务纪元变化清空旧投影，避免重启后沿用旧 revision", () => {
     acceptServerInstance("instance-a");
     setLibrarySyncState({ stories: [], tasks: [], revision: 3, hash: "a" });

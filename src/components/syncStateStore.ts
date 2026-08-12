@@ -35,28 +35,42 @@ let libraryState: LibrarySyncState | null = null;
 let serverInstanceId: string | null = null;
 const listeners = new Set<() => void>();
 
-export function setSystemSyncState(state: SystemSyncState): void {
+export type ProjectionWrite = "accepted" | "stale" | "conflict";
+
+export function setSystemSyncState(state: SystemSyncState): ProjectionWrite {
   const previous = states.get(state.title);
-  if (previous?.revision != null && state.revision != null && state.revision < previous.revision) return;
+  if (previous?.revision != null && state.revision != null) {
+    if (state.revision < previous.revision) return "stale";
+    if (state.revision === previous.revision && previous.hash && state.hash && previous.hash !== state.hash) return "conflict";
+  }
   states.set(state.title, state);
   for (const listener of [...listeners]) listener();
+  return "accepted";
 }
 
 export function getSystemSyncState(title: string | null): SystemSyncState | null {
   return title ? states.get(title) ?? null : null;
 }
 
-export function setBrainSyncState(state: BrainSyncState): void {
+export function setBrainSyncState(state: BrainSyncState): ProjectionWrite {
   const previous = brainStates.get(state.title);
-  if (previous?.revision != null && state.revision != null && state.revision < previous.revision) return;
+  if (previous?.revision != null && state.revision != null) {
+    if (state.revision < previous.revision) return "stale";
+    if (state.revision === previous.revision && previous.hash && state.hash && previous.hash !== state.hash) return "conflict";
+  }
   brainStates.set(state.title, state);
   for (const listener of [...listeners]) listener();
+  return "accepted";
 }
 
-export function setLibrarySyncState(state: LibrarySyncState): void {
-  if (libraryState && state.revision < libraryState.revision) return;
+export function setLibrarySyncState(state: LibrarySyncState): ProjectionWrite {
+  if (libraryState) {
+    if (state.revision < libraryState.revision) return "stale";
+    if (state.revision === libraryState.revision && libraryState.hash && state.hash && libraryState.hash !== state.hash) return "conflict";
+  }
   libraryState = state;
   for (const listener of [...listeners]) listener();
+  return "accepted";
 }
 
 export function acceptServerInstance(next: string): void {

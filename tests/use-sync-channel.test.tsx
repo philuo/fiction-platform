@@ -229,6 +229,25 @@ test("断线后自动重连：新连接 + 重新 subscribe + onReconnected 触�
   root.unmount();
 });
 
+test("断线期间 outbox 游标重放后请求权威快照", async () => {
+  const { root } = mountHarness("游标书", () => {});
+  await afterMount();
+  const ws1 = FakeWebSocket.instances[0];
+  ws1.open();
+  ws1.emit({ type: "system-snapshot", title: "游标书", world: { title: "游标书", chapters: [] }, visual: { running: false, pending: [], failed: [] }, autoSession: null, autoPending: null, advanceTask: null, revision: 2, hash: "h2", cursor: 7, at: 1 });
+  await tick(20);
+  ws1.drop();
+  await tick(1100);
+  const ws2 = FakeWebSocket.instances[1];
+  ws2.open();
+  await tick(20);
+  expect(ws2.sent).toContain(JSON.stringify({ type: "resume", cursor: 7 }));
+  ws2.emit({ type: "document-changed", scope: "story/游标书", document: "world", baseRevision: 2, revision: 3, hash: "h3", cursor: 8 });
+  await tick(20);
+  expect(ws2.sent.at(-1)).toBe(JSON.stringify({ type: "snapshot", title: "游标书" }));
+  root.unmount();
+});
+
 test("title 变化 → 复用用户级连接并切换故事订阅", async () => {
   const log: string[] = [];
   const mount = document.createElement("div");

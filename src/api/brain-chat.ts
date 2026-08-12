@@ -302,7 +302,7 @@ async function recognizeIntent(w: WorldState, prompt: string, ctx?: BrainChatCon
     if (ctx?.writingRunning) sysState.push("写作任务进行中");
     if (ctx?.systemStatus) sysState.push(ctx.systemStatus);
     if (ctx?.activity && ctx.activity !== "idle") sysState.push(`中枢活动：${ctx.activity}`);
-    // 服务端权威快照（/api/brain/context）：写作任务/媒体生成/视觉任务/待办——中枢知道系统正在做什么
+    // 服务端权威 system 投影：写作任务/媒体生成/视觉任务/待办——中枢知道系统正在做什么
     const sv = ctx?.server;
     if (sv) {
       if (sv.advanceTaskRunning) sysState.push(`推进任务进行中${sv.advancePhase ? `（${sv.advancePhase}）` : ""}`);
@@ -741,7 +741,7 @@ export type BrainChatContext = {
     presence?: string | null;
     activity?: string | null;
     autoRunning?: boolean;
-    /** 服务端状态快照（/api/brain/context）：自动连载/写作任务/媒体生成/视觉任务/待办——索引式全知 */
+    /** 服务端 system 投影：自动连载/写作任务/媒体生成/视觉任务/待办——索引式全知 */
     server?: Record<string, unknown>;
   };
 };
