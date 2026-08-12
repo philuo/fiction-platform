@@ -296,12 +296,63 @@ describe("WS 订阅快照（listPendingMediaTasks：进行中任务由后端状�
       await Bun.sleep(50);
       const snap1 = runAsUser(USER, () => listPendingMediaTasks(USER, TITLE));
       expect(snap1.some((e) => e.type === "task-status" && (e as { sub?: string }).sub === "plan" && e.id === planId)).toBe(true);
-      // 等任务结束（3 次重试 ~3.5s）→ 快照不再含
+      // 等任务结束（外层 2 次重试 + 退避 ~2.4s）→ 快照不再含
       await Bun.sleep(3800);
       const snap2 = runAsUser(USER, () => listPendingMediaTasks(USER, TITLE));
       expect(snap2.some((e) => e.id === planId)).toBe(false);
     } finally {
       planFailScenes = false;
     }
+  });
+});
+
+describe("/api/novel/media/cancel 幂等取消", () => {
+  test("缺 title → 400；不存在的 planId/items 幂等返回 ok", async () => {
+    const r1 = await runAsUser(USER, () => api("/api/novel/media/cancel", { planId: "plan-nope" } as Record<string, unknown>));
+    expect(r1.status).toBe(400);
+    const r2 = await runAsUser(USER, () => api("/api/novel/media/cancel", {
+      title: TITLE, planId: "plan-nope", items: [{ chapterIndex: 1, mediaId: "m-nope" }],
+    }));
+    expect(r2.status).toBe(200);
+    expect(r2.data.ok).toBe(true);
+  });
+
+  test("取消进行中的分镜 → plan-status 立即 failed，且晚到结果不覆盖 failed", async () => {
+    // planFailScenes=true 让分镜外层重试 ~2.4s，期间有充足窗口取消
+    planFailScenes = true;
+    try {
+      const p = await runAsUser(USER, () => api("/api/novel/media/plan", { title: TITLE, chapterIndex: 1, kind: "image", count: 1 }));
+      const planId = String(p.data.planId ?? "");
+      expect(planId).not.toBe("");
+      await Bun.sleep(50);
+      const c = await runAsUser(USER, () => api("/api/novel/media/cancel", { title: TITLE, planId, reason: "用户取消" }));
+      expect(c.status).toBe(200);
+      // 立即查：应为 failed
+      const s = await runAsUser(USER, () => api("/api/novel/media/plan-status", { title: TITLE, planId }));
+      expect(s.data.status).toBe("failed");
+      // 等后台重试全部跑完（~2.4s），晚到结果不得把 failed 翻回 ready
+      await Bun.sleep(2800);
+      const s2 = await runAsUser(USER, () => api("/api/novel/media/plan-status", { title: TITLE, planId }));
+      expect(s2.data.status).toBe("failed");
+    } finally {
+      planFailScenes = false;
+    }
+  });
+
+  test("对已终态（ready）的 planId 取消为 no-op，不翻回 failed", async () => {
+    const p = await runAsUser(USER, () => api("/api/novel/media/plan", { title: TITLE, chapterIndex: 1, kind: "image", count: 1 }));
+    const planId = String(p.data.planId ?? "");
+    // 等 ready
+    let ready = false;
+    for (let i = 0; i < 40; i++) {
+      const s = await runAsUser(USER, () => api("/api/novel/media/plan-status", { title: TITLE, planId }));
+      if (s.data.status === "ready") { ready = true; break; }
+      await Bun.sleep(25);
+    }
+    expect(ready).toBe(true);
+    const c = await runAsUser(USER, () => api("/api/novel/media/cancel", { title: TITLE, planId }));
+    expect(c.status).toBe(200);
+    const s = await runAsUser(USER, () => api("/api/novel/media/plan-status", { title: TITLE, planId }));
+    expect(s.data.status).toBe("ready");
   });
 });

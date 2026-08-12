@@ -10,6 +10,7 @@ import { handleApi, migrateLegacyOnBoot, resumeAutoSessions, startVisualSweep } 
 import { handleSyncUpgrade, syncWebsocket, attachSyncPublish } from "../src/api/sync-server";
 import { cleanupStaleAdvanceTasks } from "../src/api/advancetask";
 import { cleanupNewStoryTasks } from "../src/api/newtask";
+import { cleanupStaleMediaTasksOnBoot } from "../src/api/media-recovery";
 import { loadWorld, runAsUser } from "../src/api/storage";
 import { userFromRequest, getPropClosed } from "../src/api/auth";
 // 仅注册到 --hot 监听图（客户端代码 / CSS 变化触发重建）；SSR 环境下无副作用（内部有 window 保护）
@@ -196,5 +197,12 @@ setTimeout(() => {
     cleanupNewStoryTasks();
   } catch (e) {
     console.error("[dev] 立项任务清理失败:", e);
+  }
+  // 章节媒体/中枢卡片：重启后内存任务表丢失，收敛 state.json 残留 pending 与 brain-sessions running 卡
+  // （图片无 path → failed，有 path → ready；视频按 videoId/path/超时判定；分镜 running 卡 → failed）
+  try {
+    cleanupStaleMediaTasksOnBoot();
+  } catch (e) {
+    console.error("[dev] 媒体任务恢复失败:", e);
   }
 }, 0);

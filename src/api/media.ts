@@ -2,7 +2,7 @@
 // 挑选最具画面感的关键段落（planScenes），再生成插画（generateSceneImage）或视频（createSceneVideo，5~15s）。
 // 一致性机制：画风锚点（styleAnchor，全书统一）+ 角色参考图图生图（findCharacterRef）+ 视频 i2v 首帧（findAnchorImage）。
 import { chatJson } from "./jsonutil";
-import { generateImage, saveImage, readImage, compressToJpeg } from "./images";
+import { generateImage, saveImage, readImage, compressToJpeg, deleteMediaFile } from "./images";
 import { createVideoTask, durationToNumFrames, VIDEO_MIN_SECONDS, VIDEO_MAX_SECONDS } from "./videos";
 import { uuid } from "../shared/uuid";
 import type { Chapter, ChapterMedia, Character, SceneType, WorldState } from "./world";
@@ -862,6 +862,18 @@ export async function generateCharacterAvatar(storyTitle: string, w: WorldState,
   return { path: saveImage(storyTitle, name, compressed), prompt: t2iPrompt };
 }
 
+// 分镜端到端总超时（ms）：弱模型 + 免费渠道繁忙下的上限，超时由 AbortSignal 中止底层 LLM 请求
+// （单次 Agnes 70s + 内层补齐 + 外层 1 次重试留余量）；与服务端 PlanTask 真超时一致
+const PLAN_SCENE_TIMEOUT_MS = 180_000;
+
+// 一组通用虚拟示例（不引用任何真实书/角色）：弱模型 few-shot 优于密集规则。
+// 演示三件事：anchor 逐字复制正文、scene 是视觉转写而非摘抄、caption/type/subject 的格式。
+const PLAN_FEWSHOT = `【输出示例（仅示范格式，不要照搬其中的人名/情节）】
+若某章正文写：
+林舟立在城门洞下，雨水顺着铁盔的边沿成串落下。他抬眼望向雨夜尽头那一点摇晃的灯笼，握刀的手紧了紧。
+则可输出：
+{"scenes":[{"anchor":"林舟立在城门洞下，雨水顺着铁盔的边沿成串落下","scene":"身披残破甲胄的青年武将独自立在拱形城门洞下，铁盔边沿雨水成串垂落，身后是漆黑雨夜与远处一点昏黄灯笼光，电影感冷色调，侧逆光勾勒湿润甲片轮廓，画面中不要出现文字，无水印","caption":"守将林舟立于城门雨幕之中","type":"事件","subject":"林舟"}]}`;
+
 // —— 分镜系统提示词：忠于正文 + 官方提示词结构（agnes-image-2.1-flash Prompting Guide）+ 分型策略 ——
 // scene 结构对齐官方：[主体]+[场景/环境]+[风格]+[光照]+[构图]+[质量要求]；条款精简去重，降低思考负担
 function planSystem(kind: "image" | "video"): string {
@@ -978,16 +990,18 @@ export function normalizeScenePlans(
 }
 
 /**
- * 让 LLM 从章节正文挑选 count 个关键段落并转写视觉描述（循环分镜，失败自动重试 3 次，不做模板降级）：
+ * 让 LLM 从章节正文挑选 count 个关键段落并转写视觉描述（循环分镜，失败自动重试 2 次，不做模板降级）：
  * - 每轮让 LLM 输出剩余数量的场景，并附已选段落防重复；不足 n 时自动追加一轮（选 2/3 张 ≈ 连续多次“生成一张”的分镜合并，更快）
- * - 失败语义：单次尝试失败（空内容/超时/JSON 错/无有效场景）自动重试，最多 3 次（800ms 指数退避）；3 次均失败才抛错；
+ * - 失败语义：单次尝试失败（空内容/超时/JSON 错/无有效场景）自动重试，最多 2 次（800ms 指数退避）；2 次均失败才抛错；
  *   已有部分场景时直接返回已收集的 LLM 场景（部分成功不重试）
+ * - 端到端 180s deadline（opts.signal 与内部超时合并）：超时/取消中止底层 LLM，避免弱模型下重试乘积超过 5 分钟
  */
 export async function planScenes(
   w: WorldState,
   chapterIndex: number,
   kind: "image" | "video",
   count: number,
+  opts: { signal?: AbortSignal } = {},
 ): Promise<ScenePlan[]> {
   const ch = w.chapters.find((c) => c.index === chapterIndex);
   if (!ch) throw new Error("章节不存在");
@@ -996,36 +1010,41 @@ export async function planScenes(
   // （含同段不同切法，由 normalizeScenePlans 段落级去重兜底）
   const existingAnchors = (ch.media ?? []).filter((m) => m.kind === kind).map((m) => m.anchor);
   const t0 = Date.now(); // 分镜耗时统计
+  // 总 deadline：180s（弱模型 + 免费渠道繁忙下的端到端上限），与外部取消信号合并，任一触发即中止
+  const deadline = AbortSignal.any([opts.signal, AbortSignal.timeout(PLAN_SCENE_TIMEOUT_MS)].filter(Boolean) as AbortSignal[]);
   let lastErr: Error | null = null;
   let emptyCount = 0; // 空内容/渠道繁忙类失败计数（诊断与文案用）
-  for (let retry = 0; retry < 3; retry++) {
+  const MAX_RETRY = 2; // 外层 2 次尝试（收紧：避免重试乘积超过总 deadline）
+  for (let retry = 0; retry < MAX_RETRY; retry++) {
+    if (deadline.aborted) throw new DOMException("aborted", "AbortError");
     try {
-      const scenes = await planScenesOnce(w, ch, kind, n, existingAnchors);
+      const scenes = await planScenesOnce(w, ch, kind, n, existingAnchors, deadline);
       if (scenes.length) {
         console.log(`[media/plan] 分镜完成（${kind}）：${scenes.length}/${n} 个场景，耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s${retry ? `（第 ${retry + 1} 次尝试成功）` : ""}`);
         return scenes;
       }
       lastErr = new Error("分镜未产出有效场景（LLM 输出无法匹配正文）");
     } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") throw e;
       lastErr = e as Error;
       if (lastErr.message.includes("空内容") || lastErr.message.includes("繁忙")) emptyCount++;
     }
-    console.warn(`[media/plan] 分镜失败（第 ${retry + 1}/3 次）：${lastErr.message}${retry < 2 ? `，${800 * (retry + 1)}ms 后自动重试` : "，3 次均失败"}${emptyCount ? `（空内容/繁忙 ${emptyCount} 次）` : ""}`);
-    if (retry < 2) await Bun.sleep(800 * (retry + 1)); // 指数退避
+    console.warn(`[media/plan] 分镜失败（第 ${retry + 1}/${MAX_RETRY} 次）：${lastErr.message}${retry < MAX_RETRY - 1 ? `，${800 * (retry + 1)}ms 后自动重试` : "，均失败"}${emptyCount ? `（空内容/繁忙 ${emptyCount} 次）` : ""}`);
+    if (retry < MAX_RETRY - 1) await Bun.sleep(800 * (retry + 1)); // 指数退避
   }
-  // 3 次均失败：渠道类（空内容/繁忙）给出明确文案，其余透传原始错误
-  if (emptyCount) throw new Error("分镜失败：AI 服务暂时无输出（免费渠道繁忙），已自动重试 3 次，请稍后重试");
+  if (emptyCount) throw new Error("分镜失败：AI 服务暂时无输出（免费渠道繁忙），已自动重试，请稍后重试");
   throw lastErr ?? new Error("分镜失败，请重试");
 }
 
 /** 单次分镜尝试：循环让 LLM 补充剩余场景；首轮 LLM 失败抛错（由外层重试），已有部分场景时返回已收集的 */
-async function planScenesOnce(w: WorldState, ch: Chapter, kind: "image" | "video", n: number, existingAnchors: string[] = []): Promise<ScenePlan[]> {
+async function planScenesOnce(w: WorldState, ch: Chapter, kind: "image" | "video", n: number, existingAnchors: string[] = [], signal?: AbortSignal): Promise<ScenePlan[]> {
   const chapterIndex = ch.index;
   const scenes: ScenePlan[] = [];
   // 跨次去重：初始含该章已有媒体 anchor（让 LLM 避开已选段落）+ 本轮已选；存原文（LLM 消息可读，normalizeScenePlans 内部归一化）
   const usedAnchors: string[] = [...existingAnchors];
-  const maxAttempts = n + 2; // 防失控：最多比目标多 2 轮
+  const maxAttempts = n; // 收紧：最多补齐目标张数轮（n+2 会让重试乘积超过总 deadline）；候选数已 ≥3 兜底
   for (let attempt = 0; scenes.length < n && attempt < maxAttempts; attempt++) {
+    if (signal?.aborted) throw new DOMException("aborted", "AbortError");
     const remaining = n - scenes.length;
     // 候选池：每轮让 LLM 至少输出 3 个候选（单张也一次交互挑多处），供 normalize 去重后择优
     // （防 LLM 只挑最显眼同一句：首选与已选用段落重复时，第 2/3 候选兑底，避免补轮/失败）
@@ -1039,6 +1058,7 @@ async function planScenesOnce(w: WorldState, ch: Chapter, kind: "image" | "video
         ? `\n注意：以下段落已被选用，请改选其他段落，严禁重复（同一段落内的其他句子也视为重复，不得再选）：\n${usedAnchors.map((a) => `- ${a}`).join("\n")}`
         : "",
       `\n请从中挑选 ${candidate} 个最具画面感的关键段落（候选数多于最终采用数，系统会择优），各转写一句电影化中文视觉描述（画面元素必须忠于正文，不得虚构外推），并给出中文 caption 与画面类型（只输出 JSON）。anchor 必须逐字摘抄正文原文（12~40 字连续片段），不得改写语序或合并句子。要求：1) 候选之间互不重复（不同段落）；2) 按画面感从强到弱排列（最强排最前，系统会优先采用靠前的候选）；3) 不得选择上面列出的已选用段落（同一段落内其他句子也视为重复，不得再选）。`,
+      PLAN_FEWSHOT,
     ].join("\n");
     let out: { scenes?: (ScenePlan & { type?: string })[] };
     try {
@@ -1047,14 +1067,15 @@ async function planScenesOnce(w: WorldState, ch: Chapter, kind: "image" | "video
           { role: "system", content: planSystem(kind) },
           { role: "user", content: userMsg },
         ],
-        // 思考型模型预算：若文本模型为思考型（如 agnes-2.5-flash），reasoning 与正文共享 max_tokens（默认思考实测 1000~8000+，波动大），
-        // 预算不足会空输出（finish_reason=length, text=0）或 JSON 截断；60000 给思考与多场景正文留足余量；
-        // 实测成功 13~50s，超时 150s（内部 1 次重试预算）
+        // 分镜是小 JSON 输出（非长推理）：关闭思考 + maxTokens 4000，避免思考型模型把预算耗在 reasoning 上
+        // 导致空内容/incomplete/重试爆炸；单次 70s（Agnes retries=1），总 deadline 180s 由 signal 兜底
         {
-          temperature: 0.5,
-          maxTokens: 60000,
-          timeoutMs: 150_000,
-          retries: 2,
+          temperature: 0.4,
+          maxTokens: 4000,
+          timeoutMs: 70_000,
+          retries: 1,
+          thinking: "disabled",
+          signal,
           schema: {
             type: "object",
             required: ["scenes"],
@@ -1075,6 +1096,7 @@ async function planScenesOnce(w: WorldState, ch: Chapter, kind: "image" | "video
         },
       );
     } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") throw e;
       if (scenes.length) break; // 已有部分场景：停止补充，返回已收集的 LLM 场景
       throw e; // 首轮失败：交由外层自动重试
     }
@@ -1135,11 +1157,14 @@ export type SceneMediaOpts = {
   charHint?: string;
   /** 当前章角色名册（人数守卫子句用）：非空时按 scene 出现角色数自动追加「共 N 人/仅一人」消歧，只影响生成、不写入 m.prompt */
   roster?: string[];
+  /** 外部取消信号：abort 时停止生成（i2i 失败不降级继续烧配额）；若已落盘则删除刚存文件并抛 AbortError */
+  signal?: AbortSignal;
 };
 
 /** 生成插画（新文件名，cache-bust）。返回就绪的 image 媒体；prompt 存最终生效提示词（不含 charHint，供用户编辑）。
  * 落盘压缩为 JPEG（896x560 q82）：PNG 可达 1-2MB，JPEG 通常 100-250KB，保存/读取/作参考图上传均更快 */
 export async function generateSceneImage(storyTitle: string, scene: string, anchor: string, opts: SceneMediaOpts = {}): Promise<ChapterMedia> {
+  if (opts.signal?.aborted) throw new DOMException("aborted", "AbortError");
   const prompt = opts.styleAnchor ? ensureStyleSuffix(scene, opts.styleAnchor) : scene;
   // 人数守卫子句：仅作用于生成（不进 m.prompt），按 scene 出现角色数消歧多人/单人状态归属
   const guard = opts.roster ? sceneGuardClause(scene, opts.roster) : "";
@@ -1149,14 +1174,17 @@ export async function generateSceneImage(storyTitle: string, scene: string, anch
   let buf: Uint8Array;
   if (opts.refImage) {
     try {
-      buf = await generateImage(i2iPrompt, "896x560", { images: [opts.refImage] });
+      buf = await generateImage(i2iPrompt, "896x560", { images: [opts.refImage], signal: opts.signal });
     } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") throw e;
+      if (opts.signal?.aborted) throw new DOMException("aborted", "AbortError");
       console.warn("[media] 参考图生图失败，降级纯文生图:", (e as Error).message);
-      buf = await generateImage(fullPrompt, "896x560");
+      buf = await generateImage(fullPrompt, "896x560", { signal: opts.signal });
     }
   } else {
-    buf = await generateImage(fullPrompt, "896x560");
+    buf = await generateImage(fullPrompt, "896x560", { signal: opts.signal });
   }
+  if (opts.signal?.aborted) throw new DOMException("aborted", "AbortError");
   let compressed = buf;
   try {
     compressed = await compressToJpeg(buf, 896, 560);
@@ -1165,6 +1193,11 @@ export async function generateSceneImage(storyTitle: string, scene: string, anch
   }
   const name = `ill-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}.jpg`;
   const path = saveImage(storyTitle, name, compressed);
+  // 取消发生在落盘之后：删除刚生成的孤儿文件并抛 AbortError（调用方据此不写 ChapterMedia）
+  if (opts.signal?.aborted) {
+    deleteMediaFile(storyTitle, path);
+    throw new DOMException("aborted", "AbortError");
+  }
   return { id: mediaId(), kind: "image", anchor, prompt, caption: opts.caption, sceneType: opts.sceneType, path, status: "ready" };
 }
 
@@ -1182,6 +1215,6 @@ export async function createSceneVideo(scene: string, anchor: string, opts: Scen
   const guard = opts.roster ? sceneGuardClause(scene, opts.roster) : "";
   const fullPrompt = (opts.charHint ? `${opts.charHint}${prompt}` : prompt) + guard;
   const durationSec = opts.durationSec ?? VIDEO_MIN_SECONDS + Math.floor(Math.random() * (VIDEO_MAX_SECONDS - VIDEO_MIN_SECONDS + 1));
-  const task = await createVideoTask(fullPrompt, { image: opts.image, numFrames: durationToNumFrames(durationSec) });
+  const task = await createVideoTask(fullPrompt, { image: opts.image, numFrames: durationToNumFrames(durationSec), signal: opts.signal });
   return { id: mediaId(), kind: "video", anchor, prompt, caption: opts.caption, sceneType: opts.sceneType, videoId: task.videoId, status: "pending", createdAt: Date.now() };
 }

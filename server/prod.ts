@@ -4,6 +4,7 @@ import { handleApi, migrateLegacyOnBoot, resumeAutoSessions, startVisualSweep } 
 import { handleSyncUpgrade, syncWebsocket, attachSyncPublish } from "../src/api/sync-server";
 import { cleanupStaleAdvanceTasks } from "../src/api/advancetask";
 import { cleanupNewStoryTasks } from "../src/api/newtask";
+import { cleanupStaleMediaTasksOnBoot } from "../src/api/media-recovery";
 import { loadWorld, runAsUser } from "../src/api/storage";
 import { userFromRequest, getPropClosed } from "../src/api/auth";
 import { buildHtml } from "./render";
@@ -134,5 +135,11 @@ setTimeout(() => {
     cleanupNewStoryTasks();
   } catch (e) {
     console.error("[prod] 立项任务清理失败:", e);
+  }
+  // 章节媒体/中枢卡片：重启后收敛 state.json 残留 pending 与 brain-sessions running 卡
+  try {
+    cleanupStaleMediaTasksOnBoot();
+  } catch (e) {
+    console.error("[prod] 媒体任务恢复失败:", e);
   }
 }, 0);

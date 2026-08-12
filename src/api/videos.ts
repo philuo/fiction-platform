@@ -48,6 +48,8 @@ export type CreateVideoOpts = {
   width?: number;
   height?: number;
   negativePrompt?: string;
+  /** 外部取消信号：仅取消"创建视频任务"的 HTTP 请求；已拿到 videoId 的远端任务无法中止 */
+  signal?: AbortSignal;
 };
 
 export type VideoTask = {
@@ -70,12 +72,16 @@ export async function createVideoTask(prompt: string, opts: CreateVideoOpts = {}
   if (opts.image) body.image = opts.image;
   if (opts.negativePrompt) body.negative_prompt = opts.negativePrompt;
 
+  if (opts.signal?.aborted) throw new DOMException("aborted", "AbortError");
+  const signal = opts.signal
+    ? AbortSignal.any([opts.signal, AbortSignal.timeout(60_000)])
+    : AbortSignal.timeout(60_000);
   const res = await videoLimiter.run(() =>
     fetch(`${AGNES_VIDEO_BASE}/videos`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${AGNES_VIDEO_KEY}` },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(60_000),
+      signal,
     }),
   );
   const data = (await res.json().catch(() => null)) as {

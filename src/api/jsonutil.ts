@@ -155,11 +155,15 @@ import { chat, chatStream, isRetryableError } from "./agnes";
 
 /** 单次 JSON 生成调用：流式优先（长任务流式聚合，规避非流式网关 504）。
  * 但 tokenrhythm 等上游对流式有 ~30s 无首字节断开（ECONNRESET，推理模型思考期常见）——
- * 流式失败（可重试网络错误）时降级非流式 chat 兜底（非流式 504 同样走其内部重试），最大化成功率。 */
+ * 流式失败（可重试网络错误）时降级非流式 chat 兜底（非流式 504 同样走其内部重试），最大化成功率。
+ * 外部 abort（opts.signal）直接抛出，不降级、不修复重试。 */
 async function jsonCallOnce(msgs: ChatMessage[], opts: ChatJsonOpts): Promise<string> {
+  if (opts.signal?.aborted) throw new DOMException("aborted", "AbortError");
   try {
     return await chatStream(msgs, () => {}, opts);
   } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") throw e;
+    if (opts.signal?.aborted) throw new DOMException("aborted", "AbortError");
     if (isRetryableError(e)) {
       console.warn(`[jsonutil] 流式调用失败，降级非流式 chat 兜底: ${(e as Error).message.slice(0, 120)}`);
       return await chat(msgs, opts);
@@ -178,6 +182,10 @@ export type ChatJsonOpts = {
   retries?: number;
   /** JSON Schema（draft-07 子集）：注入 prompt 强制输出结构 + 校验失败自动修复重试 */
   schema?: JsonSchema;
+  /** 外部取消信号：abort 时终止底层 LLM 请求，且不走降级/JSON 修复重试 */
+  signal?: AbortSignal;
+  /** DeepSeek 思考模式开关（"disabled" 可让首字节提速、避免思考吃光 maxTokens 预算） */
+  thinking?: "enabled" | "disabled";
 };
 
 /** 把 schema 文本化追加进最后一条 user 消息（不新增轮次，最小扰动） */
@@ -194,6 +202,7 @@ export async function chatJson<T>(
 ): Promise<T> {
   let msgs = opts.schema ? injectSchema(messages, opts.schema) : messages;
   for (let attempt = 0; attempt < 2; attempt++) {
+    if (opts.signal?.aborted) throw new DOMException("aborted", "AbortError");
     // 流式聚合（chatStream）替代非流式 chat：流式持续返回数据，避开上游网关对长时非流式请求的空闲超时（504）——
     // 审查/记账/评估等 JSON 任务耗时可达数分钟，非流式极易被网关切断。
     // 流式失败（ECONNRESET 等）由 jsonCallOnce 降级非流式兜底（见上）
@@ -202,6 +211,8 @@ export async function chatJson<T>(
     try {
       parsed = extractJson<T>(raw);
     } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") throw e;
+      if (opts.signal?.aborted) throw new DOMException("aborted", "AbortError");
       if (attempt === 0) {
         msgs = [
           ...messages,

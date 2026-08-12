@@ -455,3 +455,84 @@ export function isSessionRunning(title: string, sessionId: string): boolean {
   const t = tasks.get(taskKey(title, sessionId));
   return !!t && t.running;
 }
+
+/** 外部取消会话的进行中流式回合（删除/截断会话时调用）：abort 任务自身的 controller。
+ *  正在跑的 brain-chat 循环会感知 AbortError 并自行 finishSessionTask；幂等（无任务/no-op）。
+ *  注意：这只取消 SSE 文本回合，章节媒体/分镜的后台 Promise 由 routes 的 cancelMediaTasks 单独取消。 */
+export function abortSessionTask(title: string, sessionId: string): boolean {
+  const t = tasks.get(taskKey(title, sessionId));
+  if (!t) return false;
+  if (!t.abort.signal.aborted) t.abort.abort();
+  return true;
+}
+
+/** 启动恢复：扫描本书所有会话的 preview 卡，把服务重启后失去后台依托的 running 卡收敛到终态。
+ *  只翻状态、不重启任何 LLM/生图。终态通过 updateMessageCard 落盘（调用方负责随后广播 WS）。
+ *  @param mediaStatusById 重启后由 state.json 扫描得到的 mediaId → "pending"|"ready"|"failed" 映射；
+ *                         map 中缺失的 mediaId 视为孤儿 → failed。
+ *  @returns 每类收敛数量（供启动日志） */
+export function recoverRunningMediaCards(
+  title: string,
+  mediaStatusById: Map<string, string>,
+): { planFailed: number; mediaDone: number; mediaFailed: number; stuckFailed: number; kept: number } {
+  const result = { planFailed: 0, mediaDone: 0, mediaFailed: 0, stuckFailed: 0, kept: 0 };
+  const sessions = loadSessions(title);
+  let mutated = false;
+
+  for (const s of sessions) {
+    for (const m of s.messages) {
+      const cards = m.cards;
+      if (!Array.isArray(cards)) continue;
+      for (let i = 0; i < cards.length; i++) {
+        const c = cards[i] as BrainChatCard & {
+          cardId?: string; kind?: string; status?: string;
+          planId?: string; mediaIds?: unknown; scenes?: unknown;
+        };
+        if (c.kind !== "preview" || c.status !== "running" || !c.cardId) continue;
+
+        // 1) 分镜中卡：planTasks 是纯内存态，重启必失 → 失败
+        if (c.planId) {
+          cards[i] = { ...c, status: "failed", detail: "分镜任务因服务重启中断，请重新发起" };
+          result.planFailed++;
+          mutated = true;
+          continue;
+        }
+
+        // 2) 媒体生成中卡：按 mediaIds 的真实状态收敛
+        const mediaIds = Array.isArray(c.mediaIds) ? (c.mediaIds as string[]).filter((x) => typeof x === "string" && x) : [];
+        if (mediaIds.length) {
+          let ready = 0, failed = 0, pending = 0;
+          for (const id of mediaIds) {
+            const st = mediaStatusById.get(id);
+            if (st === "ready") ready++;
+            else if (st === "pending" || st === "in_progress") pending++;
+            else failed++; // 缺失/failed 都算失败
+          }
+          if (pending > 0) { result.kept++; continue; } // 仍有在途：保留 running，交 WS/一次性核对收敛
+          if (failed > 0 && ready > 0) {
+            cards[i] = { ...c, status: "failed", detail: `部分生成失败（成功 ${ready}，失败 ${failed}），请重新生成失败项` };
+            result.mediaFailed++;
+          } else if (failed > 0) {
+            cards[i] = { ...c, status: "failed", detail: "生成任务因服务重启中断，请重新发起" };
+            result.mediaFailed++;
+          } else {
+            cards[i] = { ...c, status: "done", detail: "生成完成" };
+            result.mediaDone++;
+          }
+          mutated = true;
+          continue;
+        }
+
+        // 3) 既无 planId 也无 mediaIds/scenes：提交中断的悬死卡 → 失败；有 scenes（倒计时卡）保留
+        if (!c.scenes) {
+          cards[i] = { ...c, status: "failed", detail: "任务因服务重启中断，请重新发起" };
+          result.stuckFailed++;
+          mutated = true;
+        }
+      }
+    }
+  }
+
+  if (mutated) saveSessions(title, sessions);
+  return result;
+}

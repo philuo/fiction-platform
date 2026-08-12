@@ -100,9 +100,11 @@ export const syncWebsocket = {
     ws.subscribe(key);
     ws.data.channels.add(key);
     ws.send(JSON.stringify({ type: "subscribed", title, version: worldVersion(title) }));
-    // 订阅快照：推送该书当前「进行中」媒体任务（分镜 pending / 插画生成中），
-    // 刷新/重开后前端据此把对应卡标 loading——纯事件驱动，无需 HTTP 轮询
-    for (const e of listPendingMediaTasks(ws.data.user.username, title)) {
+    // 订阅快照：推送该书当前「进行中」媒体任务（分镜 pending / 插画生成中 / state.json pending），
+    // 刷新/重开后前端据此把对应卡标 loading——纯事件驱动，无需 HTTP 轮询。
+    // runAsUser 包裹：快照新增的 state.json 扫描依赖 currentUser() 做账号目录隔离。
+    const pending = runAsUser(ws.data.user.username, () => listPendingMediaTasks(ws.data.user.username, title));
+    for (const e of pending) {
       ws.send(JSON.stringify(e));
     }
   },

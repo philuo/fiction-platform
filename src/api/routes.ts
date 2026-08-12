@@ -39,6 +39,7 @@ import {
   replaceMessageCard as replaceBrainMessageCard,
   createProgressMessage as createBrainProgressMessage,
   invalidateStoryBySlug,
+  abortSessionTask,
 } from "./brain-sessions";
 import { startAdvanceTask, updateAdvanceTaskPhase, completeAdvanceTask, failAdvanceTask, getAdvanceTaskForClient, clearAdvanceTask } from "./advancetask";
 import { migrateChapterMedia, touchChapter, genOf, type WorldState, type Character as WorldCharacter, type ChapterMedia, type ConsistencyFinding, type PendingChapter } from "./world";
@@ -125,39 +126,440 @@ async function readBody(req: Request): Promise<Record<string, unknown>> {
   }
 }
 
-/** 插画异步生成任务表（内存态）：'user::mediaId' → {title, chapterIndex, at} 生成中任务；
- *  status 轮询据此区分“生成中”与“服务重启中断”；WS 订阅快照据此推送该书进行中任务（前端免轮询） */
-type GenTask = { title: string; chapterIndex: number; at: number };
+/** 插画/视频异步生成任务表（内存态）：'user::mediaId' → 生成中任务；
+ *  status 轮询据此区分“生成中”与“服务重启中断”；WS 订阅快照据此推送该书进行中任务（前端免轮询）。
+ *  controller 支持删除会话/卡片消失时中止底层 fetch；session 用于反向定位要取消的卡片。 */
+type GenTask = {
+  title: string;
+  chapterIndex: number;
+  at: number;
+  kind: "image" | "video";
+  mediaId: string;
+  controller: AbortController;
+  session?: { sessionId: string; messageId: string; cardIndex: number; cardId: string };
+};
 const imageGenTasks = new Map<string, GenTask>();
 /** 视频生成并发防护（同书同章）：跨 tab 倒计时几乎同时触发 /media/generate 时拒绝重复生成（video 无 image 的配额上限兜底） */
 const videoGenBusy = new Set<string>();
 
 /** 分镜任务表（内存态）：planId → 任务。分镜是异步 LLM 调用（可能数十秒），前端轮询 /media/plan-status
  *  恢复「分镜中」状态——关闭弹窗/刷新页面后重开，从会话卡读到 planId 继续轮询拿最新结果。
- *  ready/failed 保留供刷新恢复；超出 PLAN_TASK_MAX 清最旧（含未完成即丢弃，前端轮询 notfound 提示重试），
- *  pending 超时回收（服务重启/LLM 挂起无法恢复）。 */
-type PlanTask = { user: string; title: string; chapterIndex: number; kind: "image" | "video"; status: "pending" | "ready" | "failed"; scenes?: ScenePlan[]; error?: string; at: number; session?: { sessionId: string; messageId: string; cardIndex: number; cardId: string } };
+ *  controller/timer 实现真超时与外部取消；LRU 只淘汰终态，绝不丢弃 pending。 */
+type PlanTask = {
+  user: string;
+  title: string;
+  chapterIndex: number;
+  kind: "image" | "video";
+  count: number;
+  status: "pending" | "ready" | "failed";
+  scenes?: ScenePlan[];
+  error?: string;
+  at: number;
+  controller: AbortController;
+  timer?: ReturnType<typeof setTimeout>;
+  session?: { sessionId: string; messageId: string; cardIndex: number; cardId: string };
+};
 const planTasks = new Map<string, PlanTask>();
-const PLAN_TASK_MAX = 200; // 防膨胀上限：超出清最旧
-const PLAN_TASK_TIMEOUT = 5 * 60_000; // pending 超过 5 分钟视为中断（LLM 最坏约 3 分钟，留余量）
+const PLAN_TASK_MAX = 200; // 防膨胀上限：超出只清最旧终态
+const PLAN_TASK_TIMEOUT = 180_000; // pending 真超时：180s（与 media.ts PLAN_SCENE_TIMEOUT_MS 对齐），到点 abort
 function planId(): string { return `plan-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`; }
 
-/** WS 订阅快照：返回该用户该书所有「进行中」媒体任务（分镜 pending + 插画生成中），
- *  供 sync-server 在订阅成功后推送——刷新/重开后前端据此恢复 loading 卡（免 HTTP 轮询）。 */
+/** WS 订阅快照：返回该用户该书所有「进行中」媒体任务（分镜 pending + 插画/视频生成中），
+ *  供 sync-server 在订阅成功后推送——刷新/重开后前端据此恢复 loading 卡（免 HTTP 轮询）。
+ *  除内存 Map 外补扫 state.json 的 ChapterMedia.status==="pending"：服务重启后内存清空，
+ *  仍在途（如视频 poll 中）的任务需据此重建快照，配合前端一次性核对收敛终态。 */
 export function listPendingMediaTasks(username: string, title: string): SyncEvent[] {
   const now = Date.now();
   const out: SyncEvent[] = [];
+  const seen = new Set<string>();
   for (const [pid, t] of planTasks) {
     if (t.user === username && t.title === title && t.status === "pending") {
       out.push({ type: "task-status", title, kind: "media", sub: "plan", id: pid, status: "pending", at: now, user: username });
+      seen.add(`plan::${pid}`);
     }
   }
+  const pushMedia = (mediaId: string) => {
+    if (seen.has(`media::${mediaId}`)) return;
+    seen.add(`media::${mediaId}`);
+    out.push({ type: "task-status", title, kind: "media", id: mediaId, status: "pending", at: now, user: username });
+  };
   for (const [key, g] of imageGenTasks) {
     if (g.title !== title || !key.startsWith(username + "::")) continue;
-    const mediaId = key.slice(username.length + 2);
-    out.push({ type: "task-status", title, kind: "media", id: mediaId, status: "pending", at: now, user: username });
+    pushMedia(g.mediaId || key.slice(username.length + 2));
+  }
+  // 补扫磁盘：重启后内存任务表为空，但 state.json 里可能有 pending 媒体（视频 poll 中 / 中断待收敛）
+  try {
+    const w = loadWorld(title);
+    if (w) {
+      for (const ch of w.chapters) {
+        for (const m of ch.media ?? []) {
+          if (m.status === "pending" && m.id) pushMedia(m.id);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn(`[sync] 扫描 ${title} pending 媒体失败（快照降级为仅内存）:`, (e as Error).message);
   }
   return out;
+}
+
+// —— 分镜任务生命周期：真超时 / 失败翻转 / LRU（只淘汰终态，不丢 pending） ——
+
+/** 把分镜任务翻为 failed（幂等）：清超时定时器、按需 abort 后台 LLM、落盘失败卡、WS 广播。
+ *  晚到的 planScenes 结果必须在调用前检查 t.status/controller.signal，不得再覆盖回 ready。 */
+function failPlanTask(id: string, error: string, opts: { abort?: boolean } = {}): void {
+  const t = planTasks.get(id);
+  if (!t) return;
+  if (t.timer) { clearTimeout(t.timer); t.timer = undefined; }
+  const wasPending = t.status === "pending";
+  t.status = "failed";
+  t.error = error;
+  if (opts.abort && !t.controller.signal.aborted) t.controller.abort();
+  if (!wasPending) return; // 终态不重复落盘/广播
+  const sess = t.session;
+  if (sess) {
+    const ok = replaceBrainMessageCard(t.title, sess.sessionId, sess.messageId, sess.cardIndex, {
+      kind: "preview", cardId: sess.cardId,
+      title: "分镜失败",
+      summary: "场景规划失败", status: "failed",
+      detail: error ?? "分镜任务失败，请重新提交",
+    } as never);
+    if (ok) publishSync({ type: "brain-append", title: t.title, sessionId: sess.sessionId, messageId: sess.messageId, at: Date.now(), user: t.user || undefined });
+  }
+  publishSync({ type: "task-status", title: t.title, kind: "media", sub: "plan", id, status: "failed", error, at: Date.now(), user: t.user || undefined });
+}
+
+/** 超 PLAN_TASK_MAX 时只淘汰最旧的终态任务；无终态可淘汰则保留 pending（宁可超上限也不丢在途任务）并告警 */
+function evictFinishedPlanTasks(): void {
+  if (planTasks.size <= PLAN_TASK_MAX) return;
+  const finished = [...planTasks.entries()]
+    .filter(([, t]) => t.status !== "pending")
+    .sort((a, b) => a[1].at - b[1].at);
+  let removed = 0;
+  while (planTasks.size > PLAN_TASK_MAX && removed < finished.length) {
+    planTasks.delete(finished[removed][0]);
+    removed++;
+  }
+  if (planTasks.size > PLAN_TASK_MAX) {
+    console.warn(`[media/plan] 任务表 ${planTasks.size} 超上限 ${PLAN_TASK_MAX}，但全部 pending，无法淘汰（保留在途任务）`);
+  }
+}
+
+// —— 单媒体状态查询（/media/status 与 /media/status-batch 共用；含视频下载落盘、中断置 failed 等副作用） ——
+
+type MediaStatusResult =
+  | { ok: true; status: "ready"; progress: 100; path?: string }
+  | { ok: true; status: "failed"; error: string }
+  | { ok: true; status: "pending"; progress: number; rateLimited?: boolean }
+  | { ok: false; error: string; httpStatus: number };
+
+async function getMediaStatus(title: string, idx: number, id: string): Promise<MediaStatusResult> {
+  const w0 = loadWorld(title);
+  const ch0 = w0?.chapters.find((x) => x.index === idx);
+  const media = (ch0?.media ?? []).find((m) => m.id === id);
+  if (!media) return { ok: false, error: "媒体不存在", httpStatus: 404 };
+  if (media.status === "ready") return { ok: true, status: "ready", progress: 100, path: media.path };
+  if (media.status === "failed") return { ok: true, status: "failed", error: media.error ?? "媒体生成失败" };
+  const vKey = `${currentUser() ?? ""}::${slug(title)}::${idx}::${id}`;
+  if (!media.videoId) {
+    // 插画（或异常媒体）：pending 查内存任务表区分生成中与中断
+    if (media.status === "pending") {
+      if (imageGenTasks.has(mediaKey(id))) return { ok: true, status: "pending", progress: 0 };
+      // 服务重启/进程中断：标记 failed 并【广播】（旧代码此处缺广播，是刷新后永久 pending 的直接原因）
+      let flipped = false;
+      await withTitleLock(slug(title), async () => {
+        const w = loadWorld(title);
+        const ch = w?.chapters.find((x) => x.index === idx);
+        const m = (ch?.media ?? []).find((x) => x.id === id);
+        if (w && m && m.status === "pending") {
+          m.status = "failed";
+          m.error = "生成任务已中断（服务重启），请删除后重新生成";
+          touchChapter(w, idx);
+          applyStateChange(w, { actor: "system", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章媒体任务中断标记 failed（${id}）`, chapter: idx });
+          saveWorld(w);
+          flipped = true;
+        }
+      });
+      if (flipped) publishSync({ type: "task-status", title, kind: "media", id, status: "failed", error: "生成任务已中断（服务重启），请删除后重新生成", at: Date.now(), user: currentUser() ?? undefined });
+      return { ok: true, status: "failed", error: "生成任务已中断（服务重启），请删除后重新生成" };
+    }
+    return { ok: true, status: "failed", error: "无视频任务" };
+  }
+  // 视频超时回收：pending 超过 30 分钟 → failed（重生成期则回滚旧视频）
+  if (media.status === "pending" && media.createdAt && Date.now() - media.createdAt > 30 * 60_000) {
+    const timeoutRes = await withTitleLock(slug(title), async () => {
+      const w = loadWorld(title);
+      const ch = w?.chapters.find((x) => x.index === idx);
+      const m = (ch?.media ?? []).find((x) => x.id === id);
+      if (!(w && m && m.status === "pending")) return null;
+      const regen = videoRegen.get(vKey);
+      if (regen) {
+        m.videoId = regen.oldVideoId;
+        m.status = "ready";
+        m.error = undefined;
+        touchChapter(w, idx);
+        applyStateChange(w, { actor: "system", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章视频重生成超时，回滚旧视频（${id}）`, chapter: idx });
+        saveWorld(w);
+        return { status: "ready" as const, path: m.path };
+      }
+      m.status = "failed";
+      m.error = "视频生成超时（超过 30 分钟），请删除后重新生成";
+      touchChapter(w, idx);
+      applyStateChange(w, { actor: "system", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章视频超时标记 failed（${id}）`, chapter: idx });
+      saveWorld(w);
+      return { status: "failed" as const, error: m.error };
+    });
+    if (timeoutRes) {
+      videoRegen.delete(vKey);
+      publishSync({ type: "task-status", title, kind: "media", id, status: timeoutRes.status, error: timeoutRes.status === "failed" ? timeoutRes.error : undefined, at: Date.now(), user: currentUser() ?? undefined });
+      if (timeoutRes.status === "ready") return { ok: true, status: "ready", progress: 100, path: timeoutRes.path };
+      return { ok: true, status: "failed", error: timeoutRes.error };
+    }
+  }
+  try {
+    const st = await pollVideoTask(media.videoId);
+    if (st.status === "rate_limited") return { ok: true, status: "pending", progress: -1, rateLimited: true };
+    if (st.status === "failed") {
+      const failRes = await withTitleLock(slug(title), async () => {
+        const w = loadWorld(title);
+        const ch = w?.chapters.find((x) => x.index === idx);
+        const m = (ch?.media ?? []).find((x) => x.id === id);
+        if (!m) return null;
+        const regen = videoRegen.get(vKey);
+        if (regen) {
+          m.videoId = regen.oldVideoId;
+          m.status = "ready";
+          m.error = undefined;
+        } else if (m.path) {
+          m.status = "ready";
+          m.error = undefined;
+        } else {
+          m.status = "failed";
+          m.error = st.error ?? "视频生成失败";
+        }
+        if (w) {
+          applyStateChange(w, { actor: "user", commandId: "CMD-M04", field: "chapters[].media", reason: regen ? `第 ${idx} 章视频重生成失败，回滚旧视频（${id}）` : `第 ${idx} 章视频生成失败（${id}）：${st.error ?? ""}`, chapter: idx });
+          saveWorld(w);
+        }
+        return { status: m.status, path: m.path, error: m.error };
+      });
+      if (failRes) {
+        videoRegen.delete(vKey);
+        publishSync({ type: "task-status", title, kind: "media", id, status: failRes.status, error: failRes.status === "failed" ? failRes.error ?? undefined : undefined, at: Date.now(), user: currentUser() ?? undefined });
+        if (failRes.status === "ready") return { ok: true, status: "ready", progress: 100, path: failRes.path };
+        return { ok: true, status: "failed", error: failRes.error ?? "视频生成失败" };
+      }
+      return { ok: true, status: "failed", error: st.error ?? "视频生成失败" };
+    }
+    if (st.status === "completed" && st.url) {
+      const buf = await downloadVideo(st.url);
+      const completeRes = await withTitleLock(slug(title), async () => {
+        const w = loadWorld(title);
+        if (!w) throw new AppError("故事不存在: " + title);
+        const ch = w.chapters.find((x) => x.index === idx);
+        const m = (ch?.media ?? []).find((x) => x.id === id);
+        if (!m) throw new AppError("媒体不存在");
+        if (m.status === "ready" && m.path) return { path: m.path, oldPath: undefined as string | undefined };
+        const rel = saveVideo(title, `${id}-${Date.now().toString(36)}.mp4`, buf);
+        const regen = videoRegen.get(vKey);
+        const oldPath = regen?.oldPath && regen.oldPath !== rel ? regen.oldPath : undefined;
+        m.path = rel;
+        m.status = "ready";
+        m.error = undefined;
+        touchChapter(w, idx);
+        applyStateChange(w, { actor: "user", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章视频生成完成（${id}）`, chapter: idx });
+        saveWorld(w);
+        return { path: rel, oldPath };
+      });
+      if (completeRes.oldPath) deleteMediaFile(title, completeRes.oldPath);
+      videoRegen.delete(vKey);
+      publishSync({ type: "task-status", title, kind: "media", id, status: "ready", at: Date.now(), user: currentUser() ?? undefined });
+      return { ok: true, status: "ready", progress: 100, path: completeRes.path };
+    }
+    return { ok: true, status: "pending", progress: st.progress };
+  } catch (e) {
+    console.error("[api/novel/media/status]", e);
+    return { ok: false, error: e instanceof AppError ? e.message : "查询视频状态失败", httpStatus: 502 };
+  }
+}
+
+// —— 视频远端任务服务端轮询（Agnes 视频为异步任务，无回调；前端改为 WS 驱动后，由此在服务端
+//    周期 poll provider → 落盘 ready/failed → publishSync 广播，前端零轮询收敛）——
+const VIDEO_WATCH_INTERVAL_MS = 15_000; // provider 查询间歇（视频 RPM=2，留裕量；429 自动跳过本轮）
+const videoWatchers = new Map<string, { title: string; idx: number; id: string; timer?: ReturnType<typeof setTimeout> }>();
+
+/** 开始（或复用）一个视频 pending 任务的服务端轮询；幂等。getMediaStatus 负责落盘 + 广播终态。
+ *  插画不进此表（后台 Promise 完成时直接落盘广播），视频拿 videoId 后才需要持续查询远端。 */
+export function watchVideoTask(title: string, idx: number, id: string): void {
+  const key = mediaKey(id);
+  if (videoWatchers.has(key)) return; // 已在轮询
+  const entry = { title, idx, id } as { title: string; idx: number; id: string; timer?: ReturnType<typeof setTimeout> };
+  videoWatchers.set(key, entry);
+  const tick = async () => {
+    if (!videoWatchers.has(key)) return; // 已停止（终态/删除/取消）
+    try {
+      const res = await getMediaStatus(title, idx, id);
+      if (res.ok && (res.status === "ready" || res.status === "failed")) {
+        videoWatchers.delete(key); // 终态：停止轮询（getMediaStatus 已落盘 + 广播）
+        return;
+      }
+      // pending / rate_limited / 临时错误：继续轮询
+    } catch (e) {
+      console.warn(`[media/video-watch] 轮询失败（${id}），下轮重试:`, (e as Error).message);
+    }
+    if (videoWatchers.has(key)) entry.timer = setTimeout(tick, VIDEO_WATCH_INTERVAL_MS);
+  };
+  // 首次延迟 3s（给 provider 一点出结果时间，避免刚创建就空查），随后按固定间隔
+  entry.timer = setTimeout(tick, 3000);
+}
+
+/** 启动恢复：扫描 world 中所有 pending 视频（有 videoId）并续上服务端轮询。
+ *  供 media-recovery 在启动收敛后调用；幂等（已在轮询的跳过）。 */
+export function resumePendingVideoWatches(title: string): void {
+  const w = loadWorld(title);
+  if (!w) return;
+  for (const ch of w.chapters) {
+    for (const m of ch.media ?? []) {
+      if (m.kind === "video" && m.status === "pending" && m.videoId) {
+        watchVideoTask(title, ch.index, m.id);
+      }
+    }
+  }
+}
+
+/** 锁内把指定 pending 章节媒体翻为 failed（幂等：非 pending 不动）。true=本次翻转，需调用方广播 */
+async function markMediaFailedInLock(title: string, idx: number, id: string, error: string, reason: string): Promise<boolean> {
+  let flipped = false;
+  await withTitleLock(slug(title), async () => {
+    const w = loadWorld(title);
+    const ch = w?.chapters.find((x) => x.index === idx);
+    const m = (ch?.media ?? []).find((x) => x.id === id);
+    if (w && m && m.status === "pending") {
+      m.status = "failed";
+      m.error = error;
+      touchChapter(w, idx);
+      applyStateChange(w, { actor: "system", commandId: "CMD-M04", field: "chapters[].media", reason, chapter: idx });
+      saveWorld(w);
+      flipped = true;
+    }
+  });
+  return flipped;
+}
+
+type CancelTarget = {
+  title: string;
+  reason?: string;
+  planId?: string;
+  items?: { chapterIndex: number; mediaId: string }[];
+  session?: { sessionId: string; messageId: string; cardIndex: number; cardId: string };
+};
+type CancelResult = { planIds: string[]; mediaIds: string[]; notCancellable: string[] };
+
+/** 取消进行中的分镜/插画任务（删除会话/卡片消失/取消端点共用，全部幂等）：
+ *  - 分镜：abort 后台 LLM + 翻 failed（仅 pending）；
+ *  - 插画：有内存任务则 abort（其 catch 负责落 failed + 广播）；无内存任务但磁盘 pending 则直接翻 failed；
+ *  - 视频：创建中（无 videoId）可 abort；已拿到 videoId 的远端任务不可取消，记入 notCancellable，
+ *    由查询/30 分钟超时收敛（不删除已就绪媒体）。
+ *  不触碰已 ready/failed 的媒体（保留成品）。 */
+async function cancelMediaTargets(target: CancelTarget): Promise<CancelResult> {
+  const result: CancelResult = { planIds: [], mediaIds: [], notCancellable: [] };
+  const reason = target.reason ?? "用户取消";
+  const username = currentUser() ?? "";
+
+  // 1) 指定 planId
+  if (target.planId) {
+    const t = planTasks.get(target.planId);
+    if (t && t.title === target.title && t.status === "pending") {
+      failPlanTask(target.planId, reason, { abort: true });
+      result.planIds.push(target.planId);
+    }
+  }
+
+  // 2) 指定 media 条目
+  for (const item of target.items ?? []) {
+    const key = mediaKey(item.mediaId);
+    const g = imageGenTasks.get(key);
+    if (g) {
+      // 在途：abort，后台 promise 的 catch/finally 会落 failed + 广播
+      if (!g.controller.signal.aborted) g.controller.abort();
+      result.mediaIds.push(item.mediaId);
+      continue;
+    }
+    // 无内存任务：查磁盘真实状态
+    const w = loadWorld(target.title);
+    const ch = w?.chapters.find((x) => x.index === item.chapterIndex);
+    const m = (ch?.media ?? []).find((x) => x.id === item.mediaId);
+    if (!m) continue; // 已删/不存在：no-op
+    if (m.status !== "pending") continue; // 已 ready/failed：保留（成品不删）
+    if (m.kind === "video" && m.videoId) {
+      // 远端任务已创建，无法取消
+      result.notCancellable.push(item.mediaId);
+      continue;
+    }
+    const flipped = await markMediaFailedInLock(
+      target.title, item.chapterIndex, item.mediaId, reason,
+      `第 ${item.chapterIndex} 章媒体任务被取消（${item.mediaId}）`,
+    );
+    if (flipped) {
+      publishSync({ type: "task-status", title: target.title, kind: "media", id: item.mediaId, status: "failed", error: reason, at: Date.now(), user: username || undefined });
+      result.mediaIds.push(item.mediaId);
+    }
+  }
+
+  // 3) 按会话上下文扫描（删除/截断会话时）：匹配 sessionId + cardId 的 plan/image 任务
+  if (target.session) {
+    const { sessionId, cardId } = target.session;
+    for (const [pid, t] of planTasks) {
+      if (t.title === target.title && t.status === "pending"
+        && t.session?.sessionId === sessionId && t.session?.cardId === cardId) {
+        failPlanTask(pid, reason, { abort: true });
+        result.planIds.push(pid);
+      }
+    }
+    for (const [, g] of imageGenTasks) {
+      if (g.title === target.title && g.session?.sessionId === sessionId && g.session?.cardId === cardId) {
+        if (!g.controller.signal.aborted) g.controller.abort();
+        if (!result.mediaIds.includes(g.mediaId)) result.mediaIds.push(g.mediaId);
+      }
+    }
+  }
+  return result;
+}
+
+/** 从一组会话消息中收集所有「running 态 preview 卡」上的分镜/媒体锚点（删除/截断会话时取消其后台任务用）。
+ *  只收集带 planId 或 mediaIds 的卡；chapterIndex 缺失的媒体条目不收集（无法定位状态）。 */
+function collectRunningCardTargets(messages: { cards?: unknown }[]): { planIds: string[]; items: { chapterIndex: number; mediaId: string }[] } {
+  const planIds: string[] = [];
+  const items: { chapterIndex: number; mediaId: string }[] = [];
+  for (const m of messages) {
+    const cards = Array.isArray(m.cards) ? m.cards as Record<string, unknown>[] : [];
+    for (const c of cards) {
+      if (c?.kind !== "preview" || c.status !== "running") continue;
+      const planId = typeof c.planId === "string" ? c.planId.trim() : "";
+      if (planId) planIds.push(planId);
+      const chapterIndex = Number(c.chapterIndex);
+      if (Array.isArray(c.mediaIds) && Number.isInteger(chapterIndex) && chapterIndex >= 1) {
+        for (const id of c.mediaIds) {
+          if (typeof id === "string" && id.trim()) items.push({ chapterIndex, mediaId: id.trim() });
+        }
+      }
+    }
+  }
+  return { planIds, items };
+}
+
+/** 取消一批分镜/媒体锚点对应的后台任务（删除/截断会话时调用）：逐个 planId 取消，媒体合并去重后取消 */
+async function cancelRunningCardTasks(title: string, targets: { planIds: string[]; items: { chapterIndex: number; mediaId: string }[] }, reason: string): Promise<void> {
+  const seenMedia = new Set<string>();
+  const items = targets.items.filter((it) => {
+    if (seenMedia.has(it.mediaId)) return false;
+    seenMedia.add(it.mediaId);
+    return true;
+  });
+  for (const planId of targets.planIds) {
+    await cancelMediaTargets({ title, reason, planId, items: [] });
+  }
+  if (items.length) await cancelMediaTargets({ title, reason, items });
 }
 
 /** 画面主体角色硬性描述（性别/年龄/身份/外貌/当前形象/身份服饰）——强制拼入插画/视频提示词，不依赖 LLM 转写；无主体或角色不存在时返回 undefined */
@@ -664,12 +1066,20 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
     }
 
     case "/api/brain/sessions/delete": {
-      // DELETE /api/brain/sessions/:id 用 POST + body.id（handleApi 无 path 参数解析，统一走 body）
+      // DELETE /api/brain/sessions/:id 用 POST + body.id（handleApi 无 path 参数解析，统一走 body）。
+      // 删除前先取消该会话内 running 卡对应的分镜/插画后台任务（abort + pending 置 failed），
+      // 避免火并忘记的 Promise 继续烧配额、并尝试给已删会话翻卡；已就绪的章节媒体保留。
       if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
       const bsBody = await readBody(req);
       const bsTitle = String(bsBody.title ?? "").trim();
       const bsId = String(bsBody.id ?? "").trim();
       if (!bsTitle || !bsId) return json({ error: "缺少 title/id" }, 400);
+      const existing = getBrainSession(bsTitle, bsId);
+      if (existing) {
+        abortSessionTask(bsTitle, bsId); // 取消进行中的 SSE 文本回合
+        const targets = collectRunningCardTargets(existing.messages);
+        await cancelRunningCardTasks(bsTitle, targets, "会话已删除，任务取消");
+      }
       const ok = deleteBrainSession(bsTitle, bsId);
       return json({ ok });
     }
@@ -815,13 +1225,24 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
     }
 
     case "/api/brain/sessions/truncate": {
-      // 编辑重发前置：删除 fromMessageId 及其后的消息（截断会话）
+      // 编辑重发前置：删除 fromMessageId 及其后的消息（截断会话）。
+      // 截断前先取消这些消息里 running 卡对应的后台分镜/插画任务（abort + pending 置 failed），
+      // 已就绪章节媒体保留；与删除会话同语义。
       if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
       const bsBody = await readBody(req);
       const bsTitle = String(bsBody.title ?? "").trim();
       const bsId = String(bsBody.id ?? "").trim();
       const bsMsgId = String(bsBody.messageId ?? "").trim();
       if (!bsTitle || !bsId || !bsMsgId) return json({ error: "缺少 title/id/messageId" }, 400);
+      const existing = getBrainSession(bsTitle, bsId);
+      if (existing) {
+        const idx = existing.messages.findIndex((m) => m.id === bsMsgId);
+        if (idx >= 0) {
+          const tail = existing.messages.slice(idx);
+          const targets = collectRunningCardTargets(tail);
+          await cancelRunningCardTasks(bsTitle, targets, "消息已截断，任务取消");
+        }
+      }
       const ok = truncateBrainSession(bsTitle, bsId, bsMsgId);
       return json({ ok });
     }
@@ -2174,20 +2595,23 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const session = sessionCtx && sessionCtx.sessionId && sessionCtx.messageId && Number.isInteger(sessionCtx.cardIndex) && sessionCtx.cardId
         ? sessionCtx : undefined;
       const id = planId();
-      const task: PlanTask = { user: currentUser() ?? "", title, chapterIndex: idx, kind: kind as "image" | "video", status: "pending", at: Date.now(), session };
+      const controller = new AbortController();
+      const count = Number(body.count) || 1;
+      const user = currentUser() ?? "";
+      const task: PlanTask = { user, title, chapterIndex: idx, kind: kind as "image" | "video", count, status: "pending", at: Date.now(), controller, session };
+      // 真超时：180s 到点 abort 后台 LLM 并翻 failed（旧版是懒超时，不 abort，晚到结果还会覆盖回 ready）
+      task.timer = setTimeout(() => failPlanTask(id, "分镜任务超时（AI 服务响应过慢），请重试", { abort: true }), PLAN_TASK_TIMEOUT);
       planTasks.set(id, task);
-      if (planTasks.size > PLAN_TASK_MAX) {
-        // 防膨胀：清最旧任务（未完成即丢弃，前端轮询到 notfound 会提示重试）
-        const oldest = [...planTasks.entries()].sort((a, b) => a[1].at - b[1].at)[0]?.[0];
-        if (oldest) planTasks.delete(oldest);
-      }
-      // 锁外后台执行（分镜只读，不持锁不阻塞请求）；planScenes 内部已含 3 次重试
+      evictFinishedPlanTasks();
+      // 锁外后台执行（分镜只读，不持锁不阻塞请求）；planScenes 内部已含 2 次重试 + 180s deadline
       void (async () => {
         const sess = task.session;
         try {
-          const scenes = await planScenes(w, idx, kind as "image" | "video", Number(body.count) || 1);
+          const scenes = await planScenes(w, idx, kind as "image" | "video", count, { signal: controller.signal });
+          // 晚到结果守卫：任务已被超时/取消翻 failed（controller 已 abort）或被删 → 不得覆盖回 ready
           const t = planTasks.get(id);
-          if (!t) return;
+          if (!t || t.status !== "pending" || controller.signal.aborted) return;
+          if (t.timer) { clearTimeout(t.timer); t.timer = undefined; }
           t.status = "ready";
           t.scenes = scenes;
           // ① 服务端权威落盘：带会话上下文时直接把会话卡翻成「分镜完成」确认卡——
@@ -2213,48 +2637,33 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             const ok = replaceBrainMessageCard(title, sess.sessionId, sess.messageId, sess.cardIndex, card as never);
             if (ok) {
               // 落盘成功 → 广播 brain-append，其他已打开同会话的 tab 重拉显示最新卡
-              publishSync({ type: "brain-append", title, sessionId: sess.sessionId, messageId: sess.messageId, at: Date.now(), user: currentUser() ?? undefined });
+              publishSync({ type: "brain-append", title, sessionId: sess.sessionId, messageId: sess.messageId, at: Date.now(), user: user || undefined });
             }
           }
           // ② WS 广播（面板打开时实时就地翻卡，免轮询）
-          publishSync({ type: "task-status", title, kind: "media", sub: "plan", id, status: "ready", scenes, at: Date.now(), user: currentUser() ?? undefined });
+          publishSync({ type: "task-status", title, kind: "media", sub: "plan", id, status: "ready", scenes, at: Date.now(), user: user || undefined });
         } catch (e) {
-          console.error("[api/novel/media/plan] 分镜失败:", (e as Error).message);
-          const t = planTasks.get(id);
-          if (!t) return;
-          t.status = "failed";
-          t.error = e instanceof AppError ? e.message : "场景规划失败，请稍后重试";
-          // 服务端落盘失败卡（带会话上下文时）
-          if (sess) {
-            const ok = replaceBrainMessageCard(title, sess.sessionId, sess.messageId, sess.cardIndex, {
-              kind: "preview", cardId: sess.cardId,
-              title: "分镜失败",
-              summary: "场景规划失败", status: "failed",
-              detail: t.error ?? "分镜任务失败，请重新提交",
-            } as never);
-            if (ok) publishSync({ type: "brain-append", title, sessionId: sess.sessionId, messageId: sess.messageId, at: Date.now(), user: currentUser() ?? undefined });
+          if (e instanceof DOMException && e.name === "AbortError") {
+            // 超时/取消触发的 abort：failPlanTask 已负责翻状态（若尚未翻则这里补一次）
+            failPlanTask(id, task.error ?? "分镜任务已取消", { abort: true });
+            return;
           }
-          // 分镜失败事件广播：前端就地翻 failed 卡（免轮询）
-          publishSync({ type: "task-status", title, kind: "media", sub: "plan", id, status: "failed", error: t.error, at: Date.now(), user: currentUser() ?? undefined });
+          console.error("[api/novel/media/plan] 分镜失败:", (e as Error).message);
+          failPlanTask(id, e instanceof AppError ? e.message : "场景规划失败，请稍后重试");
         }
       })();
       return json({ ok: true, planId: id });
     }
 
     case "/api/novel/media/plan-status": {
-      // 分镜任务状态查询（前端轮询）：pending → 继续等；ready → 返回场景（前端落盘到会话卡）；failed → 错误信息；
-      // notfound（服务重启任务表丢失/被回收）→ 前端提示重试。
+      // 分镜任务状态查询（前端一次性核对）：pending → 继续等；ready → 返回场景；failed → 错误信息；
+      // notfound（服务重启任务表丢失）→ 前端提示重试。超时已由 setTimeout 真超时处理，此处不再懒判。
       if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
       const pt = String(body.title ?? "").trim();
       const planIdStr = String(body.planId ?? "").trim();
       if (!pt || !planIdStr) return json({ error: "缺少 title/planId" }, 400);
       const t = planTasks.get(planIdStr);
       if (!t) return json({ ok: true, status: "notfound" });
-      // pending 超时回收：超过 5 分钟 → failed（服务重启/LLM 挂起，无法恢复）
-      if (t.status === "pending" && Date.now() - t.at > PLAN_TASK_TIMEOUT) {
-        t.status = "failed";
-        t.error = "分镜任务超时（AI 服务响应过慢或服务重启），请重试";
-      }
       return json({
         ok: true,
         status: t.status,
@@ -2282,6 +2691,18 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           subject: String(s.subject ?? "").trim(),
         }));
       if (!valid.length) return json({ error: "缺少有效的场景" }, 400);
+      // 会话上下文（可选）：前端提交生成时携带，全部媒体完成后服务端权威把会话卡翻为终态
+      // （关面板/切 tab/断线期间也能在会话记录里保持 done/failed，不依赖前端消费 WS 事件）。
+      const genSessionCtx = (typeof body.session === "object" && body.session
+        ? {
+            sessionId: String((body.session as { sessionId?: unknown }).sessionId ?? "").trim(),
+            messageId: String((body.session as { messageId?: unknown }).messageId ?? "").trim(),
+            cardIndex: Number((body.session as { cardIndex?: unknown }).cardIndex),
+            cardId: String((body.session as { cardId?: unknown }).cardId ?? "").trim(),
+          }
+        : null);
+      const genSession = genSessionCtx && genSessionCtx.sessionId && genSessionCtx.messageId && Number.isInteger(genSessionCtx.cardIndex) && genSessionCtx.cardId
+        ? genSessionCtx : undefined;
       try {
         if (kind === "video") {
           // 同书同章并发防护：跨 tab 倒计时几乎同时触发时拒绝重复（video 无配额上限，image 有锁内配额兜底）
@@ -2320,7 +2741,20 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
               applyStateChange(w, { actor: "user", commandId: "CMD-M03", field: "chapters[].media", reason: `生成第 ${idx} 章视频（${(media.caption ?? "").slice(0, 40) || media.anchor.slice(0, 20)}）`, chapter: idx });
               saveWorld(w);
             });
-            return json({ ok: true, mediaId: media.id, videoId: media.videoId, mode: firstFrame ? "i2v" : "t2v" });
+            // 视频远端任务已创建（chapter media 落盘为 pending）：启动服务端轮询，由 getMediaStatus
+            // 落盘 ready/failed 并广播 task-status（前端 WS 驱动收敛，零轮询）。
+            watchVideoTask(title, idx, media.id);
+            // 会话卡保持 running + mediaIds（视频为异步任务，真正完成由 watcher 广播翻转，
+            // 不再在「仅创建远端任务」时误标 done——那会造成卡片已完成而章节媒体仍 pending 的状态不同步）
+            if (genSession) {
+              replaceBrainMessageCard(title, genSession.sessionId, genSession.messageId, genSession.cardIndex, {
+                kind: "preview", cardId: genSession.cardId,
+                title: `生成第 ${idx} 章视频`, summary: "视频生成中", status: "running",
+                detail: "视频生成中…", mediaIds: [media.id], chapterIndex: idx, mediaKind: "video",
+              } as never);
+              publishSync({ type: "brain-append", title, sessionId: genSession.sessionId, messageId: genSession.messageId, at: Date.now(), user: currentUser() ?? undefined });
+            }
+            return json({ ok: true, mediaId: media.id, mediaIds: [media.id], videoId: media.videoId, mode: firstFrame ? "i2v" : "t2v" });
           } finally {
             videoGenBusy.delete(vGenKey);
           }
@@ -2353,6 +2787,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
               sceneType,
               subject: s.subject || undefined,
               status: "pending" as const,
+              createdAt: Date.now(),
             };
           });
           ch.media = [...(ch.media ?? []), ...items];
@@ -2367,12 +2802,16 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         const t0 = Date.now();
         void (async () => {
           let ok = 0;
+          const okIds: string[] = [];
+          let failed = 0;
           // 删除自查：书在生成期间被删时短路，避免继续烧 Agnes 配额/写孤儿媒体（对照 ensureCharacterVisuals/ensureCover）
           const imgDelKey = `${currentUser() ?? ""}::${slug(title)}`;
           const deleted = () => deletedStories.has(imgDelKey);
           await Promise.allSettled(created.map(async (item, i) => {
             const s = toAdd[i];
-            imageGenTasks.set(mediaKey(item.id), { title, chapterIndex: idx, at: Date.now() });
+            // 每张图独立 controller：删除会话/卡片消失时可单独 abort 底层 fetch
+            const controller = new AbortController();
+            imageGenTasks.set(mediaKey(item.id), { title, chapterIndex: idx, at: Date.now(), kind: "image", mediaId: item.id, controller, session: genSession });
             let mediaOk = false;
             let mediaErr = "";
             try {
@@ -2382,15 +2821,18 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
               schedulePortraitFor(title, w0, s.anchor);
               let media: ChapterMedia | undefined;
               for (let attempt = 0; ; attempt++) {
+                if (controller.signal.aborted) throw new DOMException("aborted", "AbortError");
                 try {
                   media = await generateSceneImage(title, s.scene, s.anchor, {
                     caption: s.caption, sceneType: item.sceneType, styleAnchor: style,
                     refImage: ref ? mediaDataUri(title, ref) : undefined,
                     charHint: charHintFor(w0, s.subject),
                     roster: w0.characters.map((c) => c.name),
+                    signal: controller.signal,
                   });
                   break;
                 } catch (e) {
+                  if (e instanceof DOMException && e.name === "AbortError") throw e;
                   const st = (e as { status?: number }).status;
                   if (st === 429 && attempt === 0) {
                     console.warn("[media/generate] 生图 429 限流，4s 后重试:", s.anchor.slice(0, 20));
@@ -2418,17 +2860,21 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
                 saveWorld(w, ["U06", "U07"]); // 区域级刷新：仅正文媒体区 + 媒体进度区
               });
               ok++;
+              okIds.push(item.id);
               mediaOk = true;
             } catch (e) {
-              console.warn(`[media/generate] 插画生成失败（${item.id}）:`, (e as Error).message);
-              mediaErr = (e as Error).message.slice(0, 200);
+              const aborted = e instanceof DOMException && e.name === "AbortError";
+              const msg = aborted ? "生成任务已取消" : (e as Error).message;
+              console.warn(`[media/generate] 插画生成失败（${item.id}）:`, msg);
+              failed++;
+              mediaErr = msg.slice(0, 200);
               await withTitleLock(slug(title), async () => {
                 const w = loadWorld(title);
                 const ch = w?.chapters.find((x) => x.index === idx);
                 const m = (ch?.media ?? []).find((x) => x.id === item.id);
                 if (w && m && m.status === "pending") {
                   m.status = "failed";
-                  m.error = (e as Error).message;
+                  m.error = msg;
                   touchChapter(w, idx);
                   applyStateChange(w, { actor: "user", commandId: "CMD-M02", field: "chapters[].media", reason: `第 ${idx} 章插画生成失败（${item.id}）：${(e as Error).message.slice(0, 60)}`, chapter: idx });
                   saveWorld(w, ["U06", "U07"]); // 区域级刷新
@@ -2449,6 +2895,23 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
               });
             }
           }));
+          // 服务端权威翻卡：全部媒体处理完后把会话 preview 卡置为终态（关面板/切 tab/断线期间也保持正确状态，
+          // 不依赖前端消费 WS 事件）。ok+failed=0 表示生成中书被删等异常短路，跳过（会话已随之消失）。
+          if (genSession && ok + failed > 0) {
+            const allOk = failed === 0;
+            const replaced = replaceBrainMessageCard(title, genSession.sessionId, genSession.messageId, genSession.cardIndex, {
+              kind: "preview", cardId: genSession.cardId,
+              title: `生成第 ${idx} 章插画（${okIds.length} 张）`,
+              summary: allOk ? "插画已生成" : "部分插画生成失败",
+              status: allOk ? "done" : "failed",
+              detail: allOk ? `已完成 ${ok} 项` : `${ok} 项成功，${failed} 项失败`,
+              mediaIds: created.map((x) => x.id),
+              mediaId: okIds[0],
+              chapterIndex: idx,
+              mediaKind: "image",
+            } as never);
+            if (replaced) publishSync({ type: "brain-append", title, sessionId: genSession.sessionId, messageId: genSession.messageId, at: Date.now(), user: currentUser() ?? undefined });
+          }
           console.log(`[media/generate] 插画后台完成 ${ok}/${created.length}，总耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
         })();
         return json({ ok: true, mediaIds: created.map((x) => x.id) });
@@ -2460,152 +2923,58 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
     }
 
     case "/api/novel/media/status": {
-      // 轮询视频媒体任务；completed 时下载落盘并置 ready（429 容忍）
+      // 单个媒体状态查询（插画 pending/ready/failed；视频 completed 时下载落盘并置 ready，429 容忍）。
+      // 逻辑抽到 getMediaStatus，供 /media/status-batch 复用
       const title = String(body.title ?? "").trim();
       const idx = Number(body.chapterIndex);
       const mediaId = String(body.mediaId ?? "").trim();
       if (!title || !mediaId) return json({ error: "缺少参数" }, 400);
       if (!Number.isInteger(idx) || idx < 1) return json({ error: "缺少有效的章节号" }, 400);
-      const w0 = loadWorld(title);
-      const ch0 = w0?.chapters.find((x) => x.index === idx);
-      const media = (ch0?.media ?? []).find((m) => m.id === mediaId);
-      if (!media) return json({ error: "媒体不存在" }, 404);
-      if (media.status === "ready") return json({ ok: true, status: "ready", progress: 100, path: media.path });
-      // H10：视频/插画失败早返回（参照图片分支），避免无意义轮询；失败原因回传
-      if (media.status === "failed") return json({ ok: true, status: "failed", error: media.error ?? "媒体生成失败" });
-      // 视频重生成交换期注册表 key（mediaId 重生成前后不变）
-      const vKey = `${currentUser() ?? ""}::${slug(title)}::${idx}::${mediaId}`;
-      if (!media.videoId) {
-        // 插画（或异常媒体）：ready/failed 已在上方统一返回；pending 查内存任务表区分生成中与中断
-        if (media.status === "pending") {
-          if (imageGenTasks.has(mediaKey(mediaId))) return json({ ok: true, status: "pending", progress: 0 });
-          // 服务重启/进程中断：标记 failed，前端提示重新生成
-          await withTitleLock(slug(title), async () => {
-            const w = loadWorld(title);
-            const ch = w?.chapters.find((x) => x.index === idx);
-            const m = (ch?.media ?? []).find((x) => x.id === mediaId);
-            if (w && m && m.status === "pending") {
-              m.status = "failed";
-              m.error = "生成任务已中断（服务重启），请删除后重新生成";
-              touchChapter(w, idx);
-              applyStateChange(w, { actor: "system", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章媒体任务中断标记 failed（${mediaId}）`, chapter: idx });
-              saveWorld(w);
-            }
-          });
-          return json({ ok: true, status: "failed", error: "生成任务已中断（服务重启），请删除后重新生成" });
-        }
-        return json({ ok: true, status: media.status ?? "failed", error: "无视频任务" });
+      const res = await getMediaStatus(title, idx, mediaId);
+      if (!res.ok) return json({ error: res.error }, res.httpStatus);
+      return json(res);
+    }
+
+    case "/api/novel/media/status-batch": {
+      // 一次性批量核对媒体状态（前端卡片生命周期/左侧章节视图刷新后调用，不做轮询）。
+      // 顺序执行：图片最多 3 张即时返回；视频避免 provider 429，逐个查询。
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const title = String(body.title ?? "").trim();
+      const items = Array.isArray(body.items) ? body.items as { chapterIndex?: unknown; mediaId?: unknown }[] : [];
+      if (!title) return json({ error: "缺少 title" }, 400);
+      const results: Record<string, { status: string; progress?: number; path?: string; error?: string; rateLimited?: boolean }> = {};
+      for (const it of items) {
+        const idx = Number(it.chapterIndex);
+        const id = String(it.mediaId ?? "").trim();
+        if (!id || !Number.isInteger(idx) || idx < 1) continue;
+        const res = await getMediaStatus(title, idx, id);
+        if (res.ok) results[id] = { status: res.status, ...(res.status === "ready" ? { progress: 100, path: res.path } : {}), ...(res.status === "failed" ? { error: res.error } : {}), ...(res.status === "pending" ? { progress: res.progress, ...(res.rateLimited ? { rateLimited: true } : {}) } : {}) };
       }
-      // 视频超时回收：pending 超过 30 分钟（视频正常 5-15s）→ 标记 failed，避免永久 pending
-      if (media.status === "pending" && media.createdAt && Date.now() - media.createdAt > 30 * 60_000) {
-        const timeoutRes = await withTitleLock(slug(title), async () => {
-          const w = loadWorld(title);
-          const ch = w?.chapters.find((x) => x.index === idx);
-          const m = (ch?.media ?? []).find((x) => x.id === mediaId);
-          if (!(w && m && m.status === "pending")) return null; // 状态已被并发改变
-          const regen = videoRegen.get(vKey);
-          if (regen) {
-            // 重生成超时：回滚旧视频（旧 mp4 swap 时保留未删，path 仍指向它）→ 恢复 ready
-            m.videoId = regen.oldVideoId;
-            m.status = "ready";
-            m.error = undefined;
-            touchChapter(w, idx);
-            applyStateChange(w, { actor: "system", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章视频重生成超时，回滚旧视频（${mediaId}）`, chapter: idx });
-            saveWorld(w);
-            return { status: "ready" as const, path: m.path };
+      return json({ ok: true, results });
+    }
+
+    case "/api/novel/media/cancel": {
+      // 取消进行中的分镜/插画任务（前端卡片消失兜底；幂等）。已就绪媒体保留；已拿 videoId 的视频不可取消。
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const title = String(body.title ?? "").trim();
+      if (!title) return json({ error: "缺少 title" }, 400);
+      const reason = String(body.reason ?? "").trim() || "用户取消";
+      const planId = String(body.planId ?? "").trim() || undefined;
+      const rawItems = Array.isArray(body.items) ? body.items as { chapterIndex?: unknown; mediaId?: unknown }[] : [];
+      const items = rawItems
+        .map((it) => ({ chapterIndex: Number(it.chapterIndex), mediaId: String(it.mediaId ?? "").trim() }))
+        .filter((it) => it.mediaId && Number.isInteger(it.chapterIndex) && it.chapterIndex >= 1);
+      const sessionObj = (typeof body.session === "object" && body.session
+        ? {
+            sessionId: String((body.session as { sessionId?: unknown }).sessionId ?? "").trim(),
+            messageId: String((body.session as { messageId?: unknown }).messageId ?? "").trim(),
+            cardIndex: Number((body.session as { cardIndex?: unknown }).cardIndex),
+            cardId: String((body.session as { cardId?: unknown }).cardId ?? "").trim(),
           }
-          m.status = "failed";
-          m.error = "视频生成超时（超过 30 分钟），请删除后重新生成";
-          touchChapter(w, idx);
-          applyStateChange(w, { actor: "system", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章视频超时标记 failed（${mediaId}）`, chapter: idx });
-          saveWorld(w);
-          return { status: "failed" as const, error: m.error };
-        });
-        if (timeoutRes) {
-          videoRegen.delete(vKey);
-          // M5：视频 ready/failed 翻转广播（其他 tab 即时刷新媒体区）
-          publishSync({ type: "task-status", title, kind: "media", id: mediaId, status: timeoutRes.status, error: timeoutRes.status === "failed" ? timeoutRes.error : undefined, at: Date.now(), user: currentUser() ?? undefined });
-          if (timeoutRes.status === "ready") return json({ ok: true, status: "ready", progress: 100, path: timeoutRes.path });
-          return json({ ok: true, status: "failed", error: timeoutRes.error });
-        }
-        // 状态已被并发改变：继续走轮询逻辑取最新状态
-      }
-      try {
-        const st = await pollVideoTask(media.videoId);
-        if (st.status === "rate_limited") return json({ ok: true, status: "pending", progress: -1, rateLimited: true });
-        if (st.status === "failed") {
-          const failRes = await withTitleLock(slug(title), async () => {
-            const w = loadWorld(title);
-            const ch = w?.chapters.find((x) => x.index === idx);
-            const m = (ch?.media ?? []).find((x) => x.id === mediaId);
-            if (!m) return null;
-            const regen = videoRegen.get(vKey);
-            if (regen) {
-              // 重生成失败：回滚旧视频（旧 mp4 swap 时保留未删）→ 恢复 ready，不清 path
-              m.videoId = regen.oldVideoId;
-              m.status = "ready";
-              m.error = undefined;
-            } else if (m.path) {
-              // 非重生成但本地已有旧 mp4：保持可播放（不翻 failed）
-              m.status = "ready";
-              m.error = undefined;
-            } else {
-              m.status = "failed";
-              m.error = st.error ?? "视频生成失败";
-            }
-            if (w) {
-              applyStateChange(w, { actor: "user", commandId: "CMD-M04", field: "chapters[].media", reason: regen ? `第 ${idx} 章视频重生成失败，回滚旧视频（${mediaId}）` : `第 ${idx} 章视频生成失败（${mediaId}）：${st.error ?? ""}`, chapter: idx });
-              saveWorld(w);
-            }
-            return { status: m.status, path: m.path, error: m.error };
-          });
-          if (failRes) {
-            videoRegen.delete(vKey);
-            // M5：视频 ready/failed 翻转广播
-            publishSync({ type: "task-status", title, kind: "media", id: mediaId, status: failRes.status, error: failRes.status === "failed" ? failRes.error ?? undefined : undefined, at: Date.now(), user: currentUser() ?? undefined });
-            if (failRes.status === "ready") return json({ ok: true, status: "ready", progress: 100, path: failRes.path });
-            return json({ ok: true, status: "failed", error: failRes.error ?? "视频生成失败" });
-          }
-          return json({ ok: true, status: "failed", error: st.error ?? "视频生成失败" });
-        }
-        if (st.status === "completed" && st.url) {
-          // 锁外下载（网络 IO 不持锁）；落盘在锁内短事务
-          const buf = await downloadVideo(st.url);
-          const completeRes = await withTitleLock(slug(title), async () => {
-            const w = loadWorld(title);
-            if (!w) throw new AppError("故事不存在: " + title);
-            const ch = w.chapters.find((x) => x.index === idx);
-            const m = (ch?.media ?? []).find((x) => x.id === mediaId);
-            if (!m) throw new AppError("媒体不存在");
-            // M4 落盘前复查：并发轮询已落盘/已 ready → 跳过本次，丢弃刚下载的缓冲（下载在内存，无临时文件需删）
-            if (m.status === "ready" && m.path) {
-              return { path: m.path, oldPath: undefined as string | undefined };
-            }
-            // 时间戳文件名（cache-bust）：重生成后浏览器不会命中旧缓存
-            const rel = saveVideo(title, `${mediaId}-${Date.now().toString(36)}.mp4`, buf);
-            // 重生成交换期：取登记的旧 mp4 路径，落盘后锁外删盘
-            const regen = videoRegen.get(vKey);
-            const oldPath = regen?.oldPath && regen.oldPath !== rel ? regen.oldPath : undefined;
-            m.path = rel;
-            m.status = "ready";
-            m.error = undefined;
-            touchChapter(w, idx);
-            applyStateChange(w, { actor: "user", commandId: "CMD-M04", field: "chapters[].media", reason: `第 ${idx} 章视频生成完成（${mediaId}）`, chapter: idx });
-            saveWorld(w);
-            return { path: rel, oldPath };
-          });
-          // 锁外删旧 mp4（重生成替换；引用守卫在 deleteMediaFile 内）
-          if (completeRes.oldPath) deleteMediaFile(title, completeRes.oldPath);
-          videoRegen.delete(vKey);
-          // M5：视频就绪广播
-          publishSync({ type: "task-status", title, kind: "media", id: mediaId, status: "ready", at: Date.now(), user: currentUser() ?? undefined });
-          return json({ ok: true, status: "ready", progress: 100, path: completeRes.path });
-        }
-        return json({ ok: true, status: "pending", progress: st.progress });
-      } catch (e) {
-        console.error("[api/novel/media/status]", e);
-        return json({ error: e instanceof AppError ? e.message : "查询视频状态失败" }, 502);
-      }
+        : null);
+      const session = sessionObj && sessionObj.sessionId && sessionObj.cardId ? sessionObj : undefined;
+      const cancelled = await cancelMediaTargets({ title, reason, planId, items, session });
+      return json({ ok: true, cancelled });
     }
 
     case "/api/novel/visual/status": {
@@ -2743,6 +3112,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         // ④ 锁外删旧文件（best-effort，引用守卫在 deleteMediaFile 内）；
         // 视频旧 mp4 不在此删——延迟到 /media/status 新视频落盘成功后删除（失败则回滚继续用旧文件）
         if (snap.kind === "image" && snap.oldPath) deleteMediaFile(title, snap.oldPath);
+        if (snap.kind === "video") watchVideoTask(title, idx, mediaId);
         return json({ ok: true, mediaId, status: snap.kind === "image" ? "ready" : "pending", videoId: newMedia.videoId });
       } catch (e) {
         regenBusy.delete(mediaKey(mediaId));

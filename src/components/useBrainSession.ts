@@ -619,6 +619,11 @@ export function useBrainSession(title: string) {
     abortRef.current.get(activeIdRef.current)?.abort();
   }, []);
 
+  /** 只读访问某会话的展示消息缓存（跨会话 WS 事件匹配 / 后台会话任务清理用） */
+  const getSessionMessages = useCallback((sessionId: string): ChatMessage[] | undefined => {
+    return cacheRef.current.get(sessionId);
+  }, []);
+
   /** 挂载/切换书时恢复：清缓存 → 拉列表 → 打开最近会话（streaming 会话由 openSession 自动续流） */
   useEffect(() => {
     if (loadedTitleRef.current === title) return;
@@ -675,5 +680,6 @@ export function useBrainSession(title: string) {
     markCompleted,
     reloadActive,
     isStreaming: (id: string) => abortRef.current.has(id),
+    getSessionMessages,
   };
 }

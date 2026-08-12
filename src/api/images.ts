@@ -29,6 +29,8 @@ export function toAgnesSize(size: string): { size: string; ratio: string } {
 export type AgnesImageOpts = {
   /** 参考图数组（URL 或 Data URI）：传入即走图生图/多图合成（extra_body.image） */
   images?: string[];
+  /** 外部取消信号：abort 时终止生图请求（与 150s 超时合并，任一触发即中止） */
+  signal?: AbortSignal;
 };
 
 /** 调用 Agnes 云端生图。opts.images 非空 → 图生图（extra_body.image）；输出统一 b64_json 直出字节 */
@@ -36,6 +38,9 @@ export async function generateImageAgnes(prompt: string, size = "768x768", opts:
   const { size: gSize, ratio } = toAgnesSize(size);
   const extraBody: Record<string, unknown> = { response_format: "b64_json" };
   if (opts.images?.length) extraBody.image = opts.images; // 图生图/多图合成（文档：extra_body.image）
+  const signal = opts.signal
+    ? AbortSignal.any([opts.signal, AbortSignal.timeout(150_000)])
+    : AbortSignal.timeout(150_000);
   const res = await imageLimiter.run(() =>
     fetch(`${AGNES_IMAGE_BASE}/images/generations`, {
       method: "POST",
@@ -47,7 +52,7 @@ export async function generateImageAgnes(prompt: string, size = "768x768", opts:
         ratio,
         extra_body: extraBody,
       }),
-      signal: AbortSignal.timeout(150_000), // 生图上限 150s：Agnes 正常 30-90s，超过即快速失败，避免前端干等 6 分钟
+      signal, // 外部取消与 150s 上限合并：Agnes 正常 30-90s，超过即快速失败，避免前端干等 6 分钟
     }),
   );
   const data = (await res.json().catch(() => null)) as {

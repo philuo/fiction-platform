@@ -263,6 +263,9 @@ const Home: React.FC<HomeProps> = (props) => {
   // 流结束后若用户已切书，用此 ref 校验「仍是发起时的书」才写回 setWorld/setStoryUrl，避免旧书覆盖新书
   const worldTitleRef = useRef("");
   worldTitleRef.current = world?.title ?? "";
+  // world 镜像：供 WS 回调 / 一次性核对等异步闭包读取最新 world（避免闭包陈旧）
+  const worldRef = useRef<WorldState | null>(world);
+  worldRef.current = world;
   /** 推进任务阶段（任务中心展示）：轮询从 /api/brain/context 同步——聊天中启动的推进任务本页也能看到进度 */
   const [advancePhase, setAdvancePhase] = useState("");
   /** 系统事件注入信号：injectSystemNote 成功后递增，透传 BrainCabin 重拉会话（聊天舱内实时显示【系统】条） */
@@ -698,6 +701,12 @@ const Home: React.FC<HomeProps> = (props) => {
   /** WS 连接状态（阶段 5）：连接=true 时事件驱动不轮询；断开=false 时 sysPoll 降级。
    *  ref 镜像供异步回调（startAutoRun finally）读最新值 */
   const wsConnectedRef = useRef(false);
+  /** BrainCabin 注册的「某会话是否正在 SSE 生成」查询：brain-append 期间若该会话仍在流式生成，
+   *  跳过重拉（避免覆盖未完成正文；流式中的卡片更新由 card-update/task-status 就地处理）。 */
+  const brainStreamingRef = useRef<(sessionId: string) => boolean>(() => false);
+  const registerIsStreaming = useCallback((fn: (sessionId: string) => boolean) => {
+    brainStreamingRef.current = fn;
+  }, []);
 
   useSyncChannel({
     title: world?.title ?? null,
@@ -706,13 +715,19 @@ const Home: React.FC<HomeProps> = (props) => {
       // 推进任务完成广播（kind:"advance"）→ 清 advancePhase 释放运行锁（覆盖底部按钮/聊天/多 tab 发起路径；
       // 轮询降级后此广播是唯一不依赖本页 SSE 的释放通道）
       if (e.kind === "advance") setAdvancePhase("");
-      // media/visual 等任务完成广播 → 转发聊天舱（媒体生成轮询提前收尾，减少 /media/status 冗余轮询）
+      // 左侧章节媒体：消费 media task-status 的终态（ready/failed），全部收尾后刷新 world + 提示
+      if (e.kind === "media" && e.id) consumeHomeMediaStatus(e.id, e.status, e.error);
+      // media/visual 等任务完成广播 → 转发聊天舱（媒体生成 WS 事件驱动收尾，无轮询）
       taskStatusRef.current?.(e);
       void refreshWorld(e.kind === "advance" ? ["U03", "U06", "U08", "U10"] : undefined);
     },
     onAutoStatus: () => { void fetchAutoStatus(); },
     onBrainNote: () => setSysTick((t) => t + 1),
-    onBrainAppend: () => setSysTick((t) => t + 1),
+    onBrainAppend: (e) => {
+      // 该会话正在 SSE 流式生成时不重拉（卡片/正文由同条 SSE 事件就地更新，reload 会覆盖未完成正文）
+      if (e.sessionId && brainStreamingRef.current(e.sessionId)) return;
+      setSysTick((t) => t + 1);
+    },
     onCardUpdate: (e) => cardPatchRef.current?.(e),
     // 降级通道（阶段 5）：WS 连接时停 sysPoll（事件驱动）；WS 断开时启动 sysPoll（轮询兜底防漏事件）。
     // 与连载 SSE 直连（startAutoRun stopSysPoll）叠加：WS 断 + 连载 SSE 在 → 仍不轮询（SSE 自身实时）。
@@ -722,7 +737,13 @@ const Home: React.FC<HomeProps> = (props) => {
       if (connected) stopSysPoll();
       else if (!autoRunning) startSysPoll(); // 连载 SSE 直连时即使 WS 断也不轮询（SSE 实时）
     },
-    onReconnected: () => { void refreshAllStates(); },
+    onReconnected: () => {
+      // 全量补偿：刷新世界 + 重拉当前会话（断线期间完成的媒体任务由服务端权威落盘，reload 后卡片即终态）
+      setSysTick((t) => t + 1);
+      // 左侧媒体：清空「已核对」标记，refreshWorld 后的 world effect 会对残留 pending 再做一次批量核对
+      homeMediaCheckedRef.current.clear();
+      void refreshAllStates();
+    },
   });
 
   /** 单章推进任务恢复（刷新/重进页面后）：查询持久化任务状态——
@@ -1371,24 +1392,154 @@ const Home: React.FC<HomeProps> = (props) => {
   // 一致性治理：巡检/变更报告弹窗 与 删章两阶段预览
   const [integrityView, setIntegrityView] = useState<{ title: string; desc?: string; tip?: string; report: IntegrityReportView; repairable?: boolean } | null>(null);
   const [deletePreview, setDeletePreview] = useState<{ index: number; chapterTitle: string; report: IntegrityReportView } | null>(null);
-  const mediaTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
-  function stopMediaPolling() {
-    if (mediaTimer.current) { clearInterval(mediaTimer.current); mediaTimer.current = undefined; }
-  }
-  useEffect(() => () => { stopMediaPolling(); stopVisualPolling(); }, []);
+  useEffect(() => () => { stopVisualPolling(); }, []);
 
-  // 刷新/重新进入恢复轮询：world 中存在 pending 媒体（插画/视频异步任务）且当前无轮询时自动续接，保证刷新页面不影响生成结果
+  // —— 左侧章节媒体：WS 事件驱动收尾 + 一次性 /media/status-batch 核对（无 setInterval 轮询）——
+  // 提交后把 mediaId 登记进 homeMediaPendingRef；WS task-status 到达即消费收敛；刷新/重连后从 world
+  // 收集 pending 媒体做一次批量核对（错过 WS 终态的兜底）；核对过的 mediaId 记入 homeMediaCheckedRef，
+  // 重连时清空重新核对一次。状态更新与弹窗/tab 开关无关。
+  const homeMediaPendingRef = useRef<Map<string, { chapterIndex: number }>>(new Map());
+  const homeMediaFailedRef = useRef<string[]>([]);
+  const homeMediaTotalRef = useRef(0);
+  const homeMediaCheckedRef = useRef<Set<string>>(new Set());
+
+  /** 切书：清空左侧媒体跟踪（组件随切书不卸载，需手动清旧书状态） */
   useEffect(() => {
-    if (!world || mediaTimer.current) return;
-    for (const ch of world.chapters) {
-      const pend = (ch.media ?? []).filter((m) => m.status === "pending" && (m.kind === "image" || m.videoId));
-      if (pend.length) {
-        startMediaPolling(ch.index, pend.map((m) => m.id));
-        return;
+    homeMediaPendingRef.current.clear();
+    homeMediaFailedRef.current = [];
+    homeMediaTotalRef.current = 0;
+    homeMediaCheckedRef.current.clear();
+    setMediaGen(null);
+  }, [world?.title]);
+
+  /** 全部在跟媒体已收尾：刷新 world + 提示；由 WS 消费 / 一次性核对两条路径调用 */
+  function finalizeHomeMediaIfDone() {
+    if (homeMediaPendingRef.current.size > 0) return;
+    const total = homeMediaTotalRef.current;
+    const failed = homeMediaFailedRef.current;
+    homeMediaTotalRef.current = 0;
+    homeMediaFailedRef.current = [];
+    setMediaGen(null);
+    void refreshWorld();
+    if (total > 0) {
+      const okCount = total - failed.length;
+      if (failed.length) showToast(`${okCount}/${total} 个媒体已生成，${failed.length} 个失败：${failed[0]}`);
+      else showToast(total > 1 ? `${total} 个媒体已生成` : "媒体已生成");
+    }
+  }
+
+  /** 消费单个媒体状态（WS 事件 / 批量核对共用）：终态从 pending 集合移除并同步 UI；返回是否仍在跟 */
+  function consumeHomeMediaStatus(mediaId: string, status: string, error?: string) {
+    if (!homeMediaPendingRef.current.has(mediaId)) return false;
+    if (status === "ready") {
+      homeMediaPendingRef.current.delete(mediaId);
+    } else if (status === "failed") {
+      homeMediaPendingRef.current.delete(mediaId);
+      homeMediaFailedRef.current.push(error ?? "生成失败");
+    } else {
+      return true; // pending / 未知：保持
+    }
+    setMediaGen((prev) => {
+      if (!prev) return prev;
+      const ids = prev.mediaIds.filter((id) => id !== mediaId);
+      return ids.length ? { ...prev, mediaIds: ids, progress: 0 } : null;
+    });
+    finalizeHomeMediaIfDone();
+    return true;
+  }
+
+  /** 一次性批量核对：POST /media/status-batch，消费 ready/failed 结果（pending 继续等 WS）；网络异常静默等 WS/重连 */
+  async function checkHomeMediaOnce(title: string, items: { chapterIndex: number; mediaId: string }[]) {
+    if (!items.length) return;
+    try {
+      const res = await apiFetch("/api/novel/media/status-batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, items }),
+      });
+      const data = (await res.json()) as { ok?: boolean; results?: Record<string, { status?: string; error?: string }> };
+      if (!res.ok || !data.ok || !data.results) return;
+      for (const it of items) {
+        const r = data.results[it.mediaId];
+        if (r?.status) consumeHomeMediaStatus(it.mediaId, r.status, r.error);
+      }
+    } catch (e) {
+      console.warn("[media] 一次性核对失败，等待 WS 事件:", (e as Error).message);
+    }
+  }
+
+  /** 从 world 收集所有 pending 章节媒体，登记跟踪 + 恢复 UI，并对未核对过的做一次批量核对。
+   *  world 加载（含刷新）/ WS 重连后调用；不启动 interval。 */
+  function reconcilePendingHomeMedia() {
+    const w = worldRef.current;
+    if (!w) return;
+    const items: { chapterIndex: number; mediaId: string }[] = [];
+    for (const ch of w.chapters) {
+      for (const m of ch.media ?? []) {
+        if (m.status === "pending" && m.id && (m.kind === "image" || m.videoId)) {
+          items.push({ chapterIndex: ch.index, mediaId: m.id });
+        }
       }
     }
+    // 登记新出现的 pending（刷新恢复：此前未跟踪的 mediaId 补登，等 WS/核对收敛）
+    let added = 0;
+    for (const it of items) {
+      if (!homeMediaPendingRef.current.has(it.mediaId)) {
+        homeMediaPendingRef.current.set(it.mediaId, { chapterIndex: it.chapterIndex });
+        homeMediaTotalRef.current += 1;
+        added++;
+      }
+    }
+    if (!items.length) {
+      // world 已无 pending：若本地也清空则收尾（正常 refreshWorld 终态后）；有残留 pending（删章等）直接丢弃
+      if (homeMediaPendingRef.current.size === 0) {
+        homeMediaTotalRef.current = 0;
+        homeMediaFailedRef.current = [];
+        setMediaGen(null);
+      } else {
+        homeMediaPendingRef.current.clear();
+        finalizeHomeMediaIfDone();
+      }
+      return;
+    }
+    if (added > 0 || !mediaGen) {
+      // 按章节分组，优先展示当前查看章节的进度
+      const byCh = new Map<number, string[]>();
+      for (const it of items) {
+        if (!byCh.has(it.chapterIndex)) byCh.set(it.chapterIndex, []);
+        byCh.get(it.chapterIndex)!.push(it.mediaId);
+      }
+      const preferCh = shownChapter?.index ?? items[0].chapterIndex;
+      const chIdx = byCh.has(preferCh) ? preferCh : items[0].chapterIndex;
+      setMediaGen({ chapterIndex: chIdx, mediaIds: byCh.get(chIdx)!, progress: 0 });
+    }
+    // 仅对从未核对过的 mediaId 发一次批量查询
+    const toCheck = items.filter((i) => !homeMediaCheckedRef.current.has(i.mediaId));
+    for (const it of toCheck) homeMediaCheckedRef.current.add(it.mediaId);
+    if (toCheck.length) void checkHomeMediaOnce(w.title, toCheck);
+  }
+
+  // 刷新/重新进入：world 中存在 pending 媒体时恢复跟踪 + 一次性核对（保证刷新页面不影响生成结果）
+  useEffect(() => {
+    if (!world) return;
+    reconcilePendingHomeMedia();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [world]);
+
+  // 标签页重新可见：对残留 pending 媒体（尤其视频——provider 无回调，需查询驱动收敛）再做一次核对。
+  // 生命周期驱动而非 interval，与 BrainCabin 的 resumeMediaScan 对齐。
+  useEffect(() => {
+    if (!world) return;
+    const onVis = () => {
+      if (document.visibilityState === "visible") {
+        homeMediaCheckedRef.current.clear();
+        reconcilePendingHomeMedia();
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [world?.title]);
 
   /** 生成/重新生成角色全局立绘：生成立绘后刷新 world（插画/视频的样貌唯一基准）；description 为可选外貌描述 */
   async function generatePortrait(description?: string) {
@@ -1411,56 +1562,20 @@ const Home: React.FC<HomeProps> = (props) => {
     }
   }
   
-  /** 媒体任务轮询（插画/视频通用，支持多张并发）：每 5s 查各 mediaId 的 status，全部收尾（ready/failed）后结束；
-   * confirmMediaGen、regenerateMedia 与刷新恢复共用 */
+  /** 媒体任务登记（插画/视频通用，支持多张并发）：登记 mediaId 进 pending 集合 + 展示内联进度，
+   *  终态由 WS task-status 事件消费收敛（onTaskStatus），无轮询；confirmMediaGen、regenerateMedia 共用 */
   function startMediaPolling(chapterIndex: number, mediaIds: string[]) {
     if (!world || !mediaIds.length) return;
-    const storyTitle = world.title;
     const ids = [...mediaIds];
-    setMediaGen({ chapterIndex, mediaIds: ids, progress: 0 });
-    stopMediaPolling();
-    const finished = new Set<string>();
-    const failed: string[] = [];
-    mediaTimer.current = setInterval(async () => {
-      try {
-        const pending: string[] = [];
-        for (const id of ids) {
-          if (finished.has(id)) continue;
-          const r = await apiFetch("/api/novel/media/status", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ title: storyTitle, chapterIndex, mediaId: id }),
-          });
-          const st = (await r.json()) as { ok?: boolean; status?: string; progress?: number; error?: string };
-          if (!st.ok) throw new Error(st.error ?? "查询媒体状态失败");
-          if (st.status === "ready") {
-            finished.add(id);
-          } else if (st.status === "failed") {
-            finished.add(id);
-            failed.push(st.error ?? "生成失败");
-          } else {
-            pending.push(id);
-          }
-        }
-        if (finished.size === ids.length) {
-          // 全部收尾
-          stopMediaPolling();
-          setMediaGen(null);
-          await refreshWorld();
-          const okCount = ids.length - failed.length;
-          if (failed.length) {
-            showToast(`${okCount}/${ids.length} 个媒体已生成，${failed.length} 个失败：${failed[0]}`);
-          } else {
-            showToast(ids.length > 1 ? `${ids.length} 个媒体已生成` : "媒体已生成");
-          }
-        } else {
-          setMediaGen((prev) => (prev ? { ...prev, progress: pending.length ? Math.max(prev.progress, 0) : prev.progress } : prev));
-        }
-      } catch (e) {
-        // 网络抖动：保留轮询重试，不终止；连续失败由服务端超时兜底
-        console.warn("[media] 轮询失败，稍后重试:", (e as Error).message);
+    for (const id of ids) {
+      if (!homeMediaPendingRef.current.has(id)) {
+        homeMediaPendingRef.current.set(id, { chapterIndex });
+        homeMediaTotalRef.current += 1;
       }
-    }, 5000);
+      // 刚提交：状态必为 pending，无需立即核对（等 WS 终态；若断线则重连后 reconcile 兜底）
+      homeMediaCheckedRef.current.add(id);
+    }
+    setMediaGen({ chapterIndex, mediaIds: ids, progress: 0 });
   }
 
   /** 角色视觉后台自动生成轮询（立项 / 确认入册 / 手动新增角色后触发）：每 5s 查 /api/novel/visual/status，
@@ -2802,8 +2917,10 @@ const Home: React.FC<HomeProps> = (props) => {
         <MemoryAuditModal world={world} onClose={() => setShowMemoryAudit(false)} />
       )}
 
-      {/* 中枢对话舱：卡片式浏览 + 智能控制（报头中枢指示器点击打开） */}
-      {showBrainCabin && world && (
+      {/* 中枢对话舱：卡片式浏览 + 智能控制（报头中枢指示器点击打开）。
+          常驻挂载（仅 open 控制显隐）：关面板期间 SSE/WS 跟踪、媒体任务状态、倒计时仍存活，
+          状态更新与弹窗/tab 是否打开无关，回来即正确。 */}
+      {world && (
         <BrainCabin
           open={showBrainCabin}
           onClose={() => setShowBrainCabin(false)}
@@ -2825,6 +2942,7 @@ const Home: React.FC<HomeProps> = (props) => {
           registerCardPatch={registerCardPatch}
           registerTaskStatus={registerTaskStatus}
           registerWsStatus={registerWsStatus}
+          registerIsStreaming={registerIsStreaming}
           onGoToMedia={goToChapterMedia}
         />
       )}
