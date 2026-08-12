@@ -132,6 +132,13 @@ export function getJob(id: string): DurableJob | null {
   return row ? rowToJob(row) : null;
 }
 
+export function getActiveJob(user: string | null, dedupeKey: string): DurableJob | null {
+  const row = getDb().query(`SELECT * FROM jobs WHERE user_name=? AND dedupe_key=?
+    AND status IN ('queued','running','waiting_external','paused') LIMIT 1`)
+    .get(durableUser(user), dedupeKey) as Record<string, unknown> | null;
+  return row ? rowToJob(row) : null;
+}
+
 export function listJobs(user: string | null, title?: string, activeOnly = false): DurableJob[] {
   const args: (string | number | null)[] = [durableUser(user)];
   let sql = "SELECT * FROM jobs WHERE user_name=?";

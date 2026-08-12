@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { closeDb } from "../src/api/db";
 import {
-  acceptCommand, CommandConflictError, commitWorldCommit, contentHash, createJob, getJob,
+  acceptCommand, CommandConflictError, commitWorldCommit, contentHash, createJob, getActiveJob, getJob,
   latestOutboxCursor, listJobs, prepareWorldCommit, recordProjectionSnapshot, recoverPreparedWorldCommits, settleOrphanedJobs, syncRevision, updateJob, userOutboxAfter,
 } from "../src/api/control-plane";
 
@@ -46,6 +46,17 @@ describe("durable jobs", () => {
     expect(retry.job.id).not.toBe(first.job.id);
     expect(listJobs("alice", "书", true)).toHaveLength(1);
     expect(getJob(first.job.id)?.error).toBe("interrupted");
+  });
+
+  test("可按持久 dedupeKey 恢复视频重生成回滚上下文", () => {
+    const created = createJob({
+      user: "alice", title: "书", kind: "media-regenerate", dedupeKey: "media-regenerate:m1",
+      status: "waiting_external", recovery: { videoId: "new", rollback: { oldVideoId: "old", oldPath: "old.mp4" } },
+    }).job;
+    expect(getActiveJob("alice", "media-regenerate:m1")?.id).toBe(created.id);
+    expect(getActiveJob("alice", "media-regenerate:m1")?.recovery).toEqual({ videoId: "new", rollback: { oldVideoId: "old", oldPath: "old.mp4" } });
+    updateJob(created.id, { status: "succeeded" });
+    expect(getActiveJob("alice", "media-regenerate:m1")).toBeNull();
   });
 
   test("启动时仅保留有安全恢复点的活动任务", () => {

@@ -51,7 +51,7 @@ import type { CardType } from "./cards";
 import { renameSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { runtimeReadiness } from "./runtime-readiness";
-import { createJob, listJobs, updateJob } from "./control-plane";
+import { createJob, getActiveJob, listJobs, updateJob } from "./control-plane";
 
 function json(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(data), {
@@ -115,11 +115,13 @@ const activeAuto = new Set<string>();
 // 已删除图书注册表（key 同 autoKey：`<user>::<slug>`）：删除后仍在锁外跑的后台任务（角色视觉生成等）
 // 据此自查，避免向已删目录继续写媒体/烧配额；延迟清理防无限增长
 const deletedStories = new Set<string>();
-// 媒体重生成并发防护：同一 mediaId 同时只允许一个重生成（单进程部署，进程内集合即可）
-const regenBusy = new Set<string>();
 /** 进程内注册表 key：前缀当前用户，不同账号的同名书 / 相同 mediaId 互不串扰 */
 function mediaKey(id: string): string {
   return `${currentUser() ?? ""}::${id}`;
+}
+
+function activeMediaRegen(mediaId: string) {
+  return getActiveJob(currentUser(), `media-regenerate:${mediaId}`);
 }
 
 async function readBody(req: Request): Promise<Record<string, unknown>> {
@@ -321,7 +323,8 @@ async function getMediaStatus(title: string, idx: number, id: string): Promise<M
   if (!media) return { ok: false, error: "媒体不存在", httpStatus: 404 };
   if (media.status === "ready") return { ok: true, status: "ready", progress: 100, path: media.path };
   if (media.status === "failed") return { ok: true, status: "failed", error: media.error ?? "媒体生成失败" };
-  const vKey = `${currentUser() ?? ""}::${slug(title)}::${idx}::${id}`;
+  const regenJob = activeMediaRegen(id);
+  const regenRecovery = regenJob?.recovery as { rollback?: { oldVideoId?: string; oldPath?: string } } | undefined;
   if (!media.videoId) {
     // 插画（或异常媒体）：pending 查内存任务表区分生成中与中断
     if (media.status === "pending") {
@@ -353,7 +356,7 @@ async function getMediaStatus(title: string, idx: number, id: string): Promise<M
       const ch = w?.chapters.find((x) => x.index === idx);
       const m = (ch?.media ?? []).find((x) => x.id === id);
       if (!(w && m && m.status === "pending")) return null;
-      const regen = videoRegen.get(vKey);
+      const regen = regenRecovery?.rollback;
       if (regen) {
         m.videoId = regen.oldVideoId;
         m.status = "ready";
@@ -371,7 +374,7 @@ async function getMediaStatus(title: string, idx: number, id: string): Promise<M
       return { status: "failed" as const, error: m.error };
     });
     if (timeoutRes) {
-      videoRegen.delete(vKey);
+      if (regenJob) updateJob(regenJob.id, { status: "failed", phase: "provider-timeout", error: "视频重生成超时，已回滚旧视频" });
       publishSync({ type: "task-status", title, kind: "media", id, status: timeoutRes.status, error: timeoutRes.status === "failed" ? timeoutRes.error : undefined, at: Date.now(), user: currentUser() ?? undefined });
       if (timeoutRes.status === "ready") return { ok: true, status: "ready", progress: 100, path: timeoutRes.path };
       return { ok: true, status: "failed", error: timeoutRes.error };
@@ -386,7 +389,7 @@ async function getMediaStatus(title: string, idx: number, id: string): Promise<M
         const ch = w?.chapters.find((x) => x.index === idx);
         const m = (ch?.media ?? []).find((x) => x.id === id);
         if (!m) return null;
-        const regen = videoRegen.get(vKey);
+        const regen = regenRecovery?.rollback;
         if (regen) {
           m.videoId = regen.oldVideoId;
           m.status = "ready";
@@ -405,7 +408,7 @@ async function getMediaStatus(title: string, idx: number, id: string): Promise<M
         return { status: m.status, path: m.path, error: m.error };
       });
       if (failRes) {
-        videoRegen.delete(vKey);
+        if (regenJob) updateJob(regenJob.id, { status: "failed", phase: "provider-failed", error: st.error ?? "视频重生成失败，已回滚旧视频" });
         publishSync({ type: "task-status", title, kind: "media", id, status: failRes.status, error: failRes.status === "failed" ? failRes.error ?? undefined : undefined, at: Date.now(), user: currentUser() ?? undefined });
         if (failRes.status === "ready") return { ok: true, status: "ready", progress: 100, path: failRes.path };
         return { ok: true, status: "failed", error: failRes.error ?? "视频生成失败" };
@@ -422,7 +425,7 @@ async function getMediaStatus(title: string, idx: number, id: string): Promise<M
         if (!m) throw new AppError("媒体不存在");
         if (m.status === "ready" && m.path) return { path: m.path, oldPath: undefined as string | undefined };
         const rel = saveVideo(title, `${id}-${Date.now().toString(36)}.mp4`, buf);
-        const regen = videoRegen.get(vKey);
+        const regen = regenRecovery?.rollback;
         const oldPath = regen?.oldPath && regen.oldPath !== rel ? regen.oldPath : undefined;
         m.path = rel;
         m.status = "ready";
@@ -433,7 +436,7 @@ async function getMediaStatus(title: string, idx: number, id: string): Promise<M
         return { path: rel, oldPath };
       });
       if (completeRes.oldPath) deleteMediaFile(title, completeRes.oldPath);
-      videoRegen.delete(vKey);
+      if (regenJob) updateJob(regenJob.id, { status: "succeeded", phase: "ready", result: { path: completeRes.path } });
       publishSync({ type: "task-status", title, kind: "media", id, status: "ready", at: Date.now(), user: currentUser() ?? undefined });
       return { ok: true, status: "ready", progress: 100, path: completeRes.path };
     }
@@ -722,10 +725,6 @@ export function getSystemSyncSnapshot(title: string, heal = false): Omit<Extract
 const visualInFlight = new Set<string>();
 /** 小说封面生成中集合（进程级去重：同一本书同时只允许一个自动封面任务） */
 const coverInFlight = new Set<string>();
-/** 视频重生成交换期注册表：swap 后保留旧 mp4 继续播放（不立即删/不清 path），
- *  新视频落盘成功后删旧文件；失败/超时则回滚 videoId 为旧值并恢复 ready。
- *  key：当前用户::slug(title)::chapterIndex::mediaId（mediaId 重生成前后不变） */
-const videoRegen = new Map<string, { oldVideoId?: string; oldPath?: string }>();
 /** 视觉自动重试冷却：失败/尝试后 1 分钟内不再自动触发（防高频烧配额；手动生成不受影响）。入口触发与中枢巡检共用 */
 const VISUAL_RETRY_COOLDOWN = 60_000;
 
@@ -3024,7 +3023,6 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const newPrompt = String(body.prompt ?? "").trim().slice(0, 1200);
       if (!title || !mediaId) return json({ error: "缺少参数" }, 400);
       if (!Number.isInteger(idx) || idx < 1) return json({ error: "缺少有效的章节号" }, 400);
-      if (regenBusy.has(mediaKey(mediaId))) return json({ error: "该媒体正在重生成中，请稍候" }, 409);
       const regenJob = createJob({
         user: currentUser(), title, kind: "media-regenerate", dedupeKey: `media-regenerate:${mediaId}`,
         status: "running", phase: "generating", recovery: { mediaId, chapterIndex: idx },
@@ -3043,7 +3041,6 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           if (!finalPrompt.trim()) throw new AppError("提示词不能为空");
           return { kind: m.kind, anchor: m.anchor, oldPath: m.path, prompt: finalPrompt, style: styleAnchor(w), caption: m.caption, sceneType: m.sceneType, subject: m.subject };
         });
-        regenBusy.add(mediaKey(mediaId));
         let newMedia: ChapterMedia;
         try {
           // ② 锁外生成（耗时操作不持锁）
@@ -3077,12 +3074,10 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             }
           }
         } catch (e) {
-          regenBusy.delete(mediaKey(mediaId));
           throw e;
         }
         // ③ 锁内短事务：按 mediaId 重新定位（防期间被删/回滚）后交换
         // 视频重生成交换期 key（与 /media/status 一致；mediaId 重生成前后不变）
-        const vKey = `${currentUser() ?? ""}::${slug(title)}::${idx}::${mediaId}`;
         const swapped = await withTitleLock(slug(title), async () => {
           const w = loadWorld(title);
           const ch = w?.chapters.find((x) => x.index === idx);
@@ -3095,9 +3090,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             m.error = undefined;
           } else {
             // 视频重生成：保留旧 mp4（m.path 不清空）继续播放，等新视频在 /media/status 落盘后再替换；
-            // 旧 videoId/path 登记到 videoRegen，失败/超时据此回滚为 ready（旧文件 swap 期不删）
+            // 旧 videoId/path 持久写入 job recovery；失败/超时及服务重启后均可据此回滚。
             const rollback = { oldVideoId: m.videoId, oldPath: m.path };
-            videoRegen.set(vKey, rollback);
             updateJob(regenJob.job.id, {
               status: "waiting_external", phase: "provider-poll",
               recovery: { mediaId, chapterIndex: idx, videoId: newMedia.videoId, rollback },
@@ -3113,7 +3107,6 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           saveWorld(w);
           return true;
         });
-        regenBusy.delete(mediaKey(mediaId));
         if (!swapped) {
           // 媒体已被删除：丢弃新产物（图片/视频、无论 oldPath 是否存在，均删盘本次新文件，避免孤儿）
           if (newMedia.path) deleteMediaFile(title, newMedia.path);
@@ -3126,7 +3119,6 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         if (snap.kind === "image") updateJob(regenJob.job.id, { status: "succeeded", phase: "ready" });
         return json({ ok: true, mediaId, status: snap.kind === "image" ? "ready" : "pending", videoId: newMedia.videoId });
       } catch (e) {
-        regenBusy.delete(mediaKey(mediaId));
         updateJob(regenJob.job.id, { status: "failed", phase: "failed", error: errorDetail(e, "重生成失败") });
         console.error("[api/novel/media/regenerate]", e);
         const st = (e as { status?: number }).status;
@@ -3142,7 +3134,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const mediaId = String(body.mediaId ?? "").trim();
       if (!title || !mediaId) return json({ error: "缺少参数" }, 400);
       if (!Number.isInteger(idx) || idx < 1) return json({ error: "缺少有效的章节号" }, 400);
-      if (regenBusy.has(mediaKey(mediaId))) return json({ error: "该媒体正在重生成中，无法删除" }, 409);
+      if (activeMediaRegen(mediaId)) return json({ error: "该媒体正在重生成中，无法删除" }, 409);
       try {
         const oldPath = await withTitleLock(slug(title), async () => {
           const w = loadWorld(title);
@@ -3277,7 +3269,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       if (!w0) return json({ error: "故事不存在: " + title }, 404);
       const ch0 = w0.chapters.find((c) => c.index === index);
       if (!ch0) return json({ error: "章节不存在" }, 404);
-      if ((ch0.media ?? []).some((m) => regenBusy.has(mediaKey(m.id)))) return json({ error: "本章有媒体正在重生成中，无法删除" }, 409);
+      if ((ch0.media ?? []).some((m) => activeMediaRegen(m.id))) return json({ error: "本章有媒体正在重生成中，无法删除" }, 409);
       try {
         if (!strategy) {
           // 预览：确定性收集危险项；删中间章（非尾章）追加 1 次语义冲突评估（失败降级）
