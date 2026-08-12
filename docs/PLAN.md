@@ -29,8 +29,8 @@
 - [x] 增加断线、游标、冲突、状态接口 404、任务恢复、快照收敛、多 Tab 相关自动化测试。
 - [x] 完成 TypeScript、全量 Bun tests、生产构建和未登录页面浏览器冒烟。
 - [x] 实现 RFC 6902 `patch` 生成和应用；对象字段递归、数组原子替换，非法路径/缺口/hash 冲突回退 snapshot。
-- [ ] 将所有业务入口统一到单一 `CommandRequest/CommandReceipt` endpoint。当前入口与账本已建立并迁移 N01/M01/M02，其余旧入口仍逐步接入。
-- [ ] 将 new-story、advance、autorun 等遗留 JSON 事实及所有剩余业务型内存表完整迁入 job/recovery 数据。
+- [x] 将所有当前公开业务写入口统一到单一 `CommandRequest/CommandReceipt` endpoint。客户端契约与服务端白名单已覆盖现有公开写路由；旧 URL 仅作为兼容转发入口保留。
+- [x] 将 new-story、advance、autorun 等遗留 JSON 事实迁入 job/recovery 数据；删除墓碑及暂停/停止意图持久化。媒体 Map/Set 仅保留 AbortController、timer、provider watcher 等可丢弃执行句柄，用户可见终态由 job/world/sync 重建。
 - [x] 将 library/system/brain 非 world 投影正文、revision/hash 与 patch outbox 纳入同一事务。
 - [ ] 在具备测试账号的浏览器环境完成登录态网络验收。
 
@@ -86,4 +86,4 @@
 
 本轮已消除用户最初报告的 `/api/novel/state`、`/api/novel/visual/status` 以及其他状态接口轮询，并将连接生命周期提升到登录级。刷新、WS 断线、服务纪元变化、重复/冲突帧和完整快照后的幽灵 loading 均有收敛机制。
 
-系统可靠性仍是分阶段演进，而非一次性达到最终设计：RFC 6902、非 world 事务 outbox、统一命令入口骨架、视频回滚和服务端定时生成已完成；但在全部旧入口和遗留任务事实迁移前，不能宣称任意业务在任意崩溃点都严格 exactly-once。下一阶段应继续迁移 `activeAuto`、`planTasks`、`imageGenTasks`、`visualTasks`、删除墓碑及剩余取消意图，并扩大 `/api/commands` 白名单。
+系统可靠性仍是分阶段演进，而非一次性达到任意崩溃点严格 exactly-once：RFC 6902、非 world 事务 outbox、公开写入口命令契约、new-story/advance/autorun 任务事实、删除墓碑、视频回滚和服务端定时生成已经完成。下一阶段重点是租约接管、outbox 保留策略、故障注入与登录态网络验收。

@@ -65,6 +65,9 @@ export const COMMANDS: HarnessCommand[] = [
   C("CMD-N14", "跳过暂存草稿 auto/skip", "Narrative", "user", "/api/novel/auto/skip", "放弃暂存区草稿", "chapterPlans/nextChapter", "none", "L1", "—", ["control", "audit"], ["U04", "U10", "U16"]),
   C("CMD-N15", "关闭连载会话 clear-session", "Narrative", "user", "/api/novel/auto/clear-session", "清会话/暂存区", "会话文件", "none", "L0", "—", ["control"], ["U16"]),
   C("CMD-N16", "立即打断写作 requestInterrupt", "Narrative", "user", "/api/novel/intervene(interrupt) → steering.ts:11", "内存打断信号", "内存 Map（非 WorldState）", "none", "L0", "—", ["control"], ["U06"]),
+  C("CMD-N17", "确认暂存草稿 chapter/confirm", "Narrative", "user", "/api/novel/chapter/confirm", "确认待入册草稿并完成章节记账", "chapters/nextChapter/账本", "none", "L2", "无暂存草稿则拒绝", ["gate", "audit"], ["U03", "U06", "U08"]),
+  C("CMD-N18", "放弃暂存草稿 chapter/reject", "Narrative", "user", "/api/novel/chapter/reject", "删除待确认草稿，不改变已入册章节", "auto-pending job", "none", "L1", "无暂存草稿则拒绝", ["control", "audit"], ["U16"]),
+  C("CMD-N19", "暂停自动连载 pauseAuto", "Narrative", "user", "/api/novel/auto/pause", "持久化暂停意图，在章边界收敛 paused", "auto job recovery", "none", "L0", "—", ["control"], ["U16"]),
 
   // ===== 2.2 世界构建类（World）=====
   C("CMD-W01", "生成大纲要点 generateOutline", "World", "user", "/api/novel/outline → director.ts:538", "生成 3-6 条情节要点", "outline", "exec", "L1", "失败不写", ["gate", "audit"], ["U08", "U13"]),
@@ -114,6 +117,7 @@ export const COMMANDS: HarnessCommand[] = [
   C("CMD-M10", "上传封面 cover/upload", "Media", "user", "/api/novel/cover/upload", "上传本地封面", "cover", "none", "L0", "—", ["audit"], ["U01", "U13"]),
   C("CMD-M11", "后台补角色视觉 schedulePortraitFor", "Media", "system", "routes.ts:120", "媒体生成后 fire-and-forget 补头像+立绘（委托 ensureCharacterVisuals）", "characters[].portrait/image", "image", "L0", "—", ["none"], ["U13"]),
   C("CMD-M12", "异步批量生图 imageGenTasks", "Media", "system", "routes.ts:1270", "插画异步批量生成锁内回写", "chapters[].media", "image", "L0", "—", ["schedule"], ["U06", "U07"]),
+  C("CMD-M13", "取消媒体任务 media/cancel", "Media", "user", "/api/novel/media/cancel", "取消分镜/本地生成句柄并收敛持久 job", "jobs/chapters[].media", "none", "L0", "远端视频不可取消时保持 watcher", ["control", "audit"], ["U06", "U07"]),
 
   // ===== 2.5 干预治理类（Governance）=====
   C("CMD-G01", "干预影响报告 impactReport", "Governance", "user", "/api/novel/intervene(report) → steering.ts:82", "确定性受影响章+LLM 冲突评估", "只读（返回 ImpactReport）", "exec", "L0", "LLM 失败降级确定性部分", ["none"], ["U17"]),
@@ -137,6 +141,8 @@ export const COMMANDS: HarnessCommand[] = [
   C("CMD-S09", "整书评估 evaluateBook", "System", "user", "/api/novel/eval → eval.ts:49", "8 维 LLM 评估（缓存指纹）", "只读（写 eval.json）", "brain", "L0", "缓存兜底", ["none"], ["U15"]),
   C("CMD-S10", "限流排队 limiter", "System", "system", "limiter.ts", "text 5/40、image 5/40、video 1/2 并发限流", "影响所有 LLM/媒体行为", "none", "L0", "排队不 429", ["schedule"], []),
   C("CMD-S11", "中枢视觉巡检 sweepVisualGaps", "System", "system", "routes.ts:236（dev.ts/prod.ts 启动触发，每 60s）", "扫描所有故事角色，头像/立绘缺失自动补全（1 分钟冷却）", "characters[].portrait/image", "image", "L1", "冷却兜底防烧配额", ["schedule", "audit"], ["U13"]),
+  C("CMD-S12", "删除整本故事 deleteStory", "System", "user", "/api/novel/delete", "持久墓碑、取消活动任务并删除故事目录", "story scope/jobs/sessions/media", "none", "L3", "失败时仍存在故事则撤销墓碑", ["control", "audit"], ["U01"]),
+  C("CMD-S13", "关闭提案提示 proposal-closed", "System", "user", "/api/novel/proposal-closed", "持久化用户级提案提示偏好", "proposal_closed", "none", "L0", "失败不得本地假关闭", ["audit"], ["U09"]),
 
   // ===== 2.7 查询只读类（Query）=====
   C("CMD-Q01", "同步世界状态", "Query", "user", "sync system-snapshot", "订阅即推世界+运行态", "只读（条件写见 S08）", "none", "L0", "—", ["none"], ["U03", "U06", "U08"]),

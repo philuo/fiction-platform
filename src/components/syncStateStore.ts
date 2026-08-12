@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import type { WorldState } from "../api/world";
 import { applyJsonPatch, sha256Json, type JsonPatchOperation } from "../shared/json-patch";
+import { clearStoryRevisions, setStoryRevision } from "../shared/command-revisions";
 
 export type SystemSyncState = {
   title: string;
@@ -46,6 +47,7 @@ export function setSystemSyncState(state: SystemSyncState): ProjectionWrite {
     if (state.revision === previous.revision && previous.hash && state.hash && previous.hash !== state.hash) return "conflict";
   }
   states.set(state.title, state);
+  setStoryRevision(state.title, state.revision);
   for (const listener of [...listeners]) listener();
   return "accepted";
 }
@@ -80,6 +82,7 @@ export function acceptServerInstance(next: string): void {
     states.clear();
     brainStates.clear();
     libraryState = null;
+    clearStoryRevisions();
   }
   serverInstanceId = next;
   for (const listener of [...listeners]) listener();
@@ -137,6 +140,7 @@ export function resetSyncStores(): void {
   brainStates.clear();
   libraryState = null;
   serverInstanceId = null;
+  clearStoryRevisions();
   for (const listener of [...listeners]) listener();
 }
 

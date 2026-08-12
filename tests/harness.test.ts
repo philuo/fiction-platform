@@ -1,5 +1,5 @@
 // HARNESS 指令注册表完整性（docs/HARNESS.md 代码化验证）
-// 覆盖：87 条总数、ID 唯一性、ID 格式、7 类别分布、写指令/只读统计、L3 不可逆条数
+// 覆盖：注册表总数、ID 唯一性、ID 格式、7 类别分布、写指令/只读统计、L3 不可逆条数
 import { describe, expect, test } from "bun:test";
 import { COMMANDS, COMMAND_COUNTS, getCommand, commandsByGovernance, levelOf } from "../src/api/harness";
 
@@ -25,12 +25,12 @@ describe("HARNESS 指令注册表", () => {
     }
   });
 
-  test("写指令约 60 条、纯只读 27 条、L3 不可逆 2 条（N08/S03）", () => {
+  test("写指令/只读统计动态派生，L3 不可逆包含删章/删书", () => {
     expect(COMMAND_COUNTS.writers).toBe(COMMANDS.filter((c) => ["L1", "L2", "L3"].includes(c.level)).length);
     expect(COMMAND_COUNTS.readOnly).toBe(COMMANDS.filter((c) => c.level === "L0").length);
-    expect(COMMAND_COUNTS.l3).toBe(2);
+    expect(COMMAND_COUNTS.l3).toBe(3);
     const l3 = COMMANDS.filter((c) => c.level === "L3").map((c) => c.id).sort();
-    expect(l3).toEqual(["CMD-N08", "CMD-S03"]);
+    expect(l3).toEqual(["CMD-N08", "CMD-S03", "CMD-S12"]);
   });
 
   test("getCommand / commandsByGovernance / levelOf 工作", () => {

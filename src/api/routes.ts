@@ -7,7 +7,7 @@ import * as steering from "./steering";
 import { runAuto, stopAuto, pauseAuto } from "./autorun";
 import { evaluateBookCached } from "./eval";
 import { extractFingerprint } from "./style";
-import { loadWorld, listStories, deleteStory, exportMarkdown, exportEpub, slugify as slug, saveWorld, storyDir, storyExists, loadAutoSession, clearAutoSession, loadPendingChapter, clearPendingChapter, currentUser, migrateLegacyStoriesTo, runAsUser, userDir } from "./storage";
+import { loadWorld, listStories, deleteStory, exportMarkdown, exportEpub, slugify as slug, saveWorld, storyDir, storyExists, loadAutoSession, saveAutoSession, clearAutoSession, loadPendingChapter, clearPendingChapter, currentUser, migrateLegacyStoriesTo, runAsUser, userDir } from "./storage";
 import { createNewStoryTask, completeNewStoryTask, failNewStoryTask, markNewStoryTaskReady, updateNewStoryTaskStage, removeNewStoryTaskByTitle } from "./newtask";
 import { buildAutoLore, mergeLore, sanitizeLore } from "./lore";
 import { generateImage, saveImage, readImage, deleteMediaFile, compressToJpeg } from "./images";
@@ -20,6 +20,7 @@ import { notifyLibraryChanged, publishSync, publishSyncImmediate, publishCardRep
 import { withTitleLock } from "./titlelock";
 import { brainChatStream } from "./brain-chat";
 import { imageOccupiesQuota } from "../shared/media-const";
+import { publicCommandFor } from "../shared/commands";
 import {
   attachSessionTask,
   broadcastToSession,
@@ -51,10 +52,10 @@ import { migrateChapterMedia, touchChapter, genOf, type WorldState, type Charact
 import { AuthError, clearSessionCookieValue, firstUsername, getPropClosed, listUsernames, loginUser, logoutSession, registerUser, sessionCookieValue, setPropClosed, userFromRequest, validateCredentials, SESSION_COOKIE } from "./auth";
 import type { AuthUser } from "./auth";
 import type { CardType } from "./cards";
-import { renameSync, existsSync, readFileSync, readdirSync } from "node:fs";
+import { renameSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { runtimeReadiness } from "./runtime-readiness";
-import { acceptCommandOnce, CommandConflictError, createJob, getActiveJob, listJobs, listScheduledJobs, transitionJob, updateCommand, updateJob, type CommandRequest, type DurableJob } from "./control-plane";
+import { acceptCommandOnce, clearScopeDeleted, CommandConflictError, createJob, getActiveJob, isScopeDeleted, listJobs, listScheduledJobs, markScopeDeleted, syncRevision, transitionJob, updateCommand, updateJob, RevisionConflictError, type CommandRequest, type DurableJob } from "./control-plane";
 
 function json(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(data), {
@@ -115,9 +116,6 @@ function errorDetail(e: unknown, fallback: string): string {
 
 // 自动连载活跃运行注册表：同一用户名下同一书名同时只允许一个 runAuto 循环（防双跑重复写章/停止信号串扰）
 const activeAuto = new Set<string>();
-// 已删除图书注册表（key 同 autoKey：`<user>::<slug>`）：删除后仍在锁外跑的后台任务（角色视觉生成等）
-// 据此自查，避免向已删目录继续写媒体/烧配额；延迟清理防无限增长
-const deletedStories = new Set<string>();
 /** 进程内注册表 key：前缀当前用户，不同账号的同名书 / 相同 mediaId 互不串扰 */
 function mediaKey(id: string): string {
   return `${currentUser() ?? ""}::${id}`;
@@ -759,10 +757,6 @@ function schedulePortraitFor(title: string, w0: WorldState, anchor: string): voi
   ensureCharacterVisuals(title, w0, c);
 }
 
-/** 角色视觉自动生成任务表（内存态）：由 sync WS system-snapshot/task-status 推送。 */
-type VisualTaskResult = { status: "running" | "done" | "failed"; reason?: string };
-const visualTasks = new Map<string, Map<string, VisualTaskResult>>();
-
 /** sync WS 权威系统快照：订阅即推世界与全部运行态。 */
 export function getSystemSyncSnapshot(title: string, heal = false): Omit<Extract<SyncEvent, { type: "system-snapshot" }>, "type" | "at"> | null {
   const w = loadWorld(title);
@@ -818,16 +812,12 @@ function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter
   });
   if (!durable.created || visualInFlight.has(key)) return;
   visualInFlight.add(key);
-  const tKey = `${uk}::${slug(title)}`;
-  const tasks = visualTasks.get(tKey) ?? new Map<string, VisualTaskResult>();
-  tasks.set(c.id, { status: "running" });
-  visualTasks.set(tKey, tasks);
   publishSync({ type: "task-status", title, kind: "visual", id: c.id, status: "running", at: Date.now(), user: uk || undefined });
   void (async () => {
     const t0 = Date.now();
     const failures: string[] = [];
     // 删除自查：书已被删除时停止后续生成（书目录删除后仍在锁外跑的任务在每步生成前检查，防写孤儿媒体/继续烧配额）
-    const deleted = () => deletedStories.has(tKey);
+    const deleted = () => isScopeDeleted(uk, title);
     try {
       // ⓪ 立即落盘 visualTriedAt（读时自愈据此冷却重试，防烧配额；每次尝试都刷新时间戳，失败也置位，手动生成不受影响）；此步失败不阻塞生成
       try {
@@ -930,12 +920,7 @@ function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter
         phase: failures.length ? "failed" : "ready",
         error: failures.join("；") || null,
       });
-      const tasks = visualTasks.get(tKey);
-      if (tasks) {
-        tasks.delete(c.id);
-        if (tasks.size === 0) visualTasks.delete(tKey);
-        publishSync({ type: "task-status", title, kind: "visual", id: c.id, status: failures.length ? "failed" : "done", error: failures.join("；") || undefined, at: Date.now(), user: uk || undefined });
-      }
+      publishSync({ type: "task-status", title, kind: "visual", id: c.id, status: failures.length ? "failed" : "done", error: failures.join("；") || undefined, at: Date.now(), user: uk || undefined });
     }
   })();
 }
@@ -950,7 +935,7 @@ function ensureCover(title: string, w: WorldState): void {
   const durable = createJob({ user: uk, title, kind: "cover", dedupeKey: `cover:${slug(title)}`, status: "running", phase: "generating" });
   if (!durable.created || coverInFlight.has(tKey)) return;
   coverInFlight.add(tKey);
-  const deleted = () => deletedStories.has(tKey);
+  const deleted = () => isScopeDeleted(uk, title);
   void (async () => {
     const t0 = Date.now();
     try {
@@ -1107,15 +1092,33 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
     const type = String(command.type ?? "") as CommandRequest["type"];
     const title = String(command.scope?.title ?? "").trim();
     const routes: Partial<Record<CommandRequest["type"], string>> = {
-      "CMD-N01": "/api/novel/new",
-      "CMD-M01": "/api/novel/media/plan",
-      "CMD-M02": "/api/novel/media/generate",
+      "CMD-N01": "/api/novel/new", "CMD-N02": "/api/novel/step", "CMD-N03": "/api/novel/auto/start",
+      "CMD-N05": "/api/novel/chapter/regenerate", "CMD-N06": "/api/novel/chapter/edit", "CMD-N07": "/api/novel/chapter/rollback",
+      "CMD-N08": "/api/novel/chapter/delete", "CMD-N09": "/api/novel/chapter/review", "CMD-N13": "/api/novel/auto/stop",
+      "CMD-N14": "/api/novel/auto/skip", "CMD-N15": "/api/novel/auto/clear-session", "CMD-N16": "/api/novel/intervene",
+      "CMD-N17": "/api/novel/chapter/confirm", "CMD-N18": "/api/novel/chapter/reject", "CMD-N19": "/api/novel/auto/pause",
+      "CMD-W01": "/api/novel/outline", "CMD-W02": "/api/novel/blueprint", "CMD-W03": "/api/novel/blueprint",
+      "CMD-W04": "/api/novel/blueprint", "CMD-W05": "/api/novel/plans", "CMD-W07": "/api/novel/plans",
+      "CMD-W12": "/api/novel/world", "CMD-W14": "/api/novel/lore", "CMD-W16": "/api/novel/style",
+      "CMD-W17": "/api/novel/gacha", "CMD-W18": "/api/novel/gacha",
+      "CMD-L03": "/api/novel/chapter/resettle", "CMD-L04": "/api/novel/integrity", "CMD-L07": "/api/novel/foreshadow",
+      "CMD-L11": "/api/novel/proposal", "CMD-L13": "/api/novel/debt",
+      "CMD-M01": "/api/novel/media/plan", "CMD-M02": "/api/novel/media/generate", "CMD-M03": "/api/novel/media/generate",
+      "CMD-M05": "/api/novel/media/regenerate", "CMD-M06": "/api/novel/media/delete", "CMD-M07": "/api/novel/character/portrait",
+      "CMD-M13": "/api/novel/media/cancel",
+      "CMD-M08": "/api/novel/image", "CMD-M09": "/api/novel/image", "CMD-M10": "/api/novel/cover/upload",
+      "CMD-G02": "/api/novel/intervene", "CMD-G03": "/api/novel/lock", "CMD-G06": "/api/novel/rewrite", "CMD-G07": "/api/novel/rewrite",
+      "CMD-S02": "/api/novel/integrity", "CMD-S09": "/api/novel/eval", "CMD-S12": "/api/novel/delete", "CMD-S13": "/api/novel/proposal-closed",
     };
     const target = routes[type];
     if (!commandId || !type || !command.scope || !("payload" in command)) return json({ error: "commandId/type/scope/payload 不能为空" }, 400);
     if (!target) return json({ error: `命令尚未迁入统一入口: ${type}` }, 400);
     if (type !== "CMD-N01" && !title) return json({ error: "该命令缺少 scope.title" }, 400);
     try {
+      if (command.expectedRevision !== undefined && title) {
+        const current = syncRevision(user!.username, `story/${title}`, "world").revision;
+        if (current !== command.expectedRevision) throw new RevisionConflictError(`世界版本已变化：期望 ${command.expectedRevision}，当前 ${current}`);
+      }
       const accepted = acceptCommandOnce(user!.username, { ...command, commandId, type, scope: { ...command.scope, title: title || undefined } });
       if (accepted.created) {
         const username = user!.username;
@@ -1125,7 +1128,7 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
             const payload = typeof command.payload === "object" && command.payload ? command.payload as Record<string, unknown> : {};
             const forwarded = new Request(`http://internal${target}`, {
               method: "POST", headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ ...payload, ...(title ? { title } : {}) }),
+              body: JSON.stringify({ ...payload, ...(title ? { title } : {}), commandId }),
             });
             const response = await handleNovelApi(target, forwarded);
             const result = response ? await response.clone().json().catch(() => ({})) as Record<string, unknown> : {};
@@ -1139,7 +1142,50 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       return json(accepted.receipt, 202);
     } catch (error) {
       if (error instanceof CommandConflictError) return json({ error: error.message }, 409);
+      if (error instanceof RevisionConflictError) return json({ error: error.message }, 409);
       return json({ error: errorDetail(error, "命令提交失败") }, 400);
+    }
+  }
+
+  if (pathname.startsWith("/api/novel/") && req.method === "POST" && req.headers.get("x-command-contract") === "v1") {
+    const payload = await readBody(req.clone());
+    const route = publicCommandFor(pathname, payload);
+    if (route) {
+      const commandId = String(req.headers.get("x-command-id") ?? "").trim();
+      const claimedType = String(req.headers.get("x-command-type") ?? "").trim();
+      const title = String(payload.title ?? "").trim();
+      const expectedRaw = req.headers.get("x-expected-revision");
+      const expectedRevision = expectedRaw == null ? undefined : Number(expectedRaw);
+      if (!commandId || claimedType !== route.type) return json({ error: "命令契约与业务入口不匹配" }, 400);
+      if (route.requiresRevision && title && (!Number.isInteger(expectedRevision) || expectedRevision! < 0)) return json({ error: "覆盖性命令缺少 expectedRevision" }, 409);
+      if (expectedRevision !== undefined && title) {
+        const current = syncRevision(user!.username, `story/${title}`, "world").revision;
+        if (current !== expectedRevision) return json({ error: `世界版本已变化：期望 ${expectedRevision}，当前 ${current}` }, 409);
+      }
+      try {
+        const accepted = acceptCommandOnce(user!.username, { commandId, type: route.type, scope: { title: title || undefined }, expectedRevision, payload });
+        if (!accepted.created) return json(accepted.receipt, 202);
+        updateCommand(commandId, "running");
+        const headers = new Headers(req.headers);
+        headers.set("x-command-accepted", "1");
+        const forwarded = new Request(req.url, { method: req.method, headers, body: JSON.stringify({ ...payload, commandId }) });
+        const response = await handleNovelApi(pathname, forwarded);
+        if (!response) throw new AppError("命令执行器不存在");
+        const isStream = response.headers.get("content-type")?.includes("text/event-stream");
+        const asyncJob = pathname === "/api/novel/new" || pathname === "/api/novel/media/plan" || pathname === "/api/novel/media/generate" || pathname === "/api/novel/auto/start" || pathname === "/api/novel/step";
+        if (!response.ok) {
+          const result = await response.clone().json().catch(() => ({})) as Record<string, unknown>;
+          updateCommand(commandId, "failed", undefined, String(result.error ?? `命令执行器返回 ${response.status}`));
+        } else if (!isStream && !asyncJob) {
+          const result = await response.clone().json().catch(() => ({}));
+          updateCommand(commandId, "succeeded", result);
+        }
+        return response;
+      } catch (error) {
+        if (error instanceof CommandConflictError) return json({ error: error.message }, 409);
+        updateCommand(commandId, "failed", undefined, errorDetail(error, "命令提交失败"));
+        return json({ error: errorDetail(error, "命令提交失败") }, 400);
+      }
     }
   }
 
@@ -1631,7 +1677,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       try {
         // 异步立项：立即返回 taskId，后台跑完 5 个 LLM 调用（1-3 分钟）再落盘；
         // 用户级 sync 投影持续推送进度与终态，刷新或多 Tab 都不依赖 HTTP 状态查询。
-        const { id: taskId, created } = createNewStoryTask(idea, genre);
+        const { id: taskId, created } = createNewStoryTask(idea, genre, String(body.commandId ?? "") || undefined);
         notifyLibraryChanged(currentUser() ?? undefined);
         if (created) {
           // 只有真正新建任务才启动后台执行；复用已有 running 时（created=false）不再启动，
@@ -1643,6 +1689,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
               // 段 1（壳就绪）——立项主调用 + 落盘基础 world，随即 markReady；前端轮询到 ready
               // 立即进入三栏页面，角色视觉同步提前启动（角色已就绪，不等待蓝图）。
               const world = await runAsUser(username, () => director.newStoryCore(idea, genre));
+              clearScopeDeleted(username, world.title);
               markNewStoryTaskReady(taskId, world.title);
               notifyLibraryChanged(username ?? undefined);
               const fresh = world.characters.filter((c) => !(c.portrait?.path && c.image));
@@ -1690,6 +1737,10 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       try {
         // 先停该书运行态（自动连载/推进任务/暂存草稿），再锁内删除目录（与并发写章互斥，防删除后任务回写复活）
         const autoKey = `${currentUser() ?? ""}::${slug(title)}`;
+        markScopeDeleted(currentUser(), title, "story-delete-prepared");
+        for (const job of listJobs(currentUser(), title, true)) {
+          updateJob(job.id, { status: "cancelled", phase: "story-delete-prepared", error: "故事正在删除" });
+        }
         stopAuto(title);
         clearAutoSession(title);
         clearPendingChapter(title);
@@ -1703,15 +1754,12 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         // 删目录后清理该书所有用户上下文下的中枢会话缓存（防残留会话指向已删故事）
         invalidateStoryBySlug(slug(title));
         activeAuto.delete(autoKey);
-        // 该书正在后台生成的角色视觉任务：删除后无书可写，清理状态表（防 /visual/status 残留），
-        // 并登记已删除标记让仍在锁外跑的任务在下一步写盘前自查（防向已删目录写孤儿媒体/继续烧配额）
-        const delKey = `${currentUser() ?? ""}::${slug(title)}`;
-        visualTasks.delete(delKey);
-        deletedStories.add(delKey);
-        setTimeout(() => deletedStories.delete(delKey), 30 * 60_000).unref?.();
+        // 墓碑必须持久化：重启后仍阻止已经在 provider/模型侧执行的后台任务回写已删除 scope。
+        markScopeDeleted(currentUser(), title, "story-deleted");
         notifyLibraryChanged(currentUser() ?? undefined);
         return json({ ok });
       } catch (e) {
+        if (storyExists(title)) clearScopeDeleted(currentUser(), title);
         console.error("[api/novel/delete]", e);
         return json({ error: e instanceof AppError ? e.message : "删除失败，请稍后重试" }, 502);
       }
@@ -1725,7 +1773,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       // 任务持久化：刷新/关闭页面后可恢复状态；上一任务 running 且未陈旧时拒绝
       const stepWorld = loadWorld(title);
       if (!stepWorld) return json({ error: "故事不存在: " + title }, 404);
-      const startRes = startAdvanceTask(title, stepWorld.nextChapter);
+      const startRes = startAdvanceTask(title, stepWorld.nextChapter, String(body.commandId ?? "") || undefined);
       if (!startRes.ok) return json({ error: startRes.reason ?? "任务已在运行" }, 409);
       return sseStream(async (send) => {
         // loadWorld 必须与修改/保存同锁，防止并发下基于旧快照覆盖
@@ -2424,7 +2472,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const rawEvalEvery = Number(body.runEvalEvery);
       const runEvalEvery = Number.isInteger(rawEvalEvery) && rawEvalEvery >= 0 ? Math.min(rawEvalEvery, 50) : undefined;
       const durableAuto = createJob({
-        user: currentUser(), title, kind: "auto", dedupeKey: `auto:${slug(title)}`,
+        user: currentUser(), commandId: String(body.commandId ?? "") || undefined, title, kind: "auto", dedupeKey: `auto:${slug(title)}`,
         status: "running", phase: "starting", recovery: { target: maxChapters, written: initialWritten },
       });
       if (!durableAuto.created) return json({ error: "该书自动连载已在运行中，请先停止" }, 409);
@@ -2796,7 +2844,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const session = sessionBase ? { ...sessionBase, cardId } : undefined;
       const task: PlanTask = { user, title, chapterIndex: idx, kind: kind as "image" | "video", count, status: "pending", at: Date.now(), controller, session };
       createJob({
-        id, user, title, kind: "media-plan", dedupeKey: `media-plan:${idx}:${kind}`,
+        id, commandId: String(body.commandId ?? "") || undefined, user, title, kind: "media-plan", dedupeKey: `media-plan:${idx}:${kind}`,
         status: "running", phase: "planning",
         recovery: { chapterIndex: idx, mediaKind: kind, count, session },
         deadlineAt: new Date(Date.now() + PLAN_TASK_TIMEOUT).toISOString(),
@@ -3045,8 +3093,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           const okIds: string[] = [];
           let failed = 0;
           // 删除自查：书在生成期间被删时短路，避免继续烧 Agnes 配额/写孤儿媒体（对照 ensureCharacterVisuals/ensureCover）
-          const imgDelKey = `${currentUser() ?? ""}::${slug(title)}`;
-          const deleted = () => deletedStories.has(imgDelKey);
+          const deleted = () => isScopeDeleted(currentUser(), title);
           await Promise.allSettled(created.map(async (item, i) => {
             const s = toAdd[i];
             // 每张图独立 controller：删除会话/卡片消失时可单独 abort 底层 fetch
@@ -3646,16 +3693,25 @@ export function resumeAutoSessions(): void {
 }
 
 function resumeAutoForDir(username: string): void {
-  const dataDir = userDir(username);
-  if (!existsSync(dataDir)) return;
-  for (const d of readdirSync(dataDir)) {
-    if (d === ".DS_Store") continue;
-    const sp = join(dataDir, d, "autorun-session.json");
-    if (!existsSync(sp)) continue;
+  // 兼容升级：触发每本书旧 autorun-session.json 的一次性导入。
+  for (const directory of listStories()) {
+    const world = loadWorldBySlug(directory);
+    if (world) loadAutoSession(world.title);
+  }
+  for (const job of listJobs(currentUser()).filter((item) => item.kind === "auto" && (item.status === "queued" || item.status === "running"))) {
     try {
-      const s = JSON.parse(readFileSync(sp, "utf-8")) as { status?: string; target?: number; written?: number };
-      if (s.status !== "running") continue; // paused（等待人工决策）/ stopped / done 不自动恢复
-      const w = loadWorldBySlug(d);
+      const s = (job.progress ?? (job.recovery as { session?: unknown } | undefined)?.session) as { status?: string; target?: number; written?: number } | undefined;
+      if (!s || s.status !== "running") continue;
+      const controlIntent = (job.recovery as { controlIntent?: string } | undefined)?.controlIntent;
+      if (controlIntent === "pause") {
+        saveAutoSession(job.title ?? "", { ...s, status: "paused", phase: "已暂停（服务重启前收到暂停指令）", pauseReason: "用户手动暂停", updatedAt: new Date().toISOString() } as import("./storage").AutoSession);
+        continue;
+      }
+      if (controlIntent === "stop") {
+        updateJob(job.id, { status: "cancelled", phase: "stopped-before-recovery", error: null });
+        continue;
+      }
+      const w = job.title ? loadWorld(job.title) : null;
       if (!w) continue;
       const autoKey = `${currentUser() ?? ""}::${slug(w.title)}`;
       if (activeAuto.has(autoKey)) continue; // 防重复恢复（同进程内已有任务）
@@ -3665,7 +3721,7 @@ function resumeAutoForDir(username: string): void {
       void runAutoInBackground(w.title, target, written);
       console.log(`[auto] 服务重启恢复连载：${w.title}（目标 ${target} 章，已写 ${written} 章）`);
     } catch (e) {
-      console.warn("[auto] 会话恢复跳过:", d, (e as Error).message);
+      console.warn("[auto] 会话恢复跳过:", job.title ?? job.id, (e as Error).message);
     }
   }
 }

@@ -4,13 +4,10 @@ import { chatJson } from "./jsonutil";
 import { saveWorld, currentUser } from "./storage";
 import { getCommand } from "./harness";
 import type { ChangeLogEntry, SteeringItem, WorldState } from "./world";
+import { createJob, deleteJobs, findLatestJob, updateJob } from "./control-plane";
 
 // —— 立即打断（用户决策②）：内存态信号，writeOneChapter 每阶段边界轮询 ——
-// key 前缀当前用户：不同账号的同名书互不打断（多用户隔离）
-const interrupts = new Map<string, SteeringItem>();
-function intKey(title: string): string {
-  return `${currentUser() ?? ""}::${title}`;
-}
+function interruptJob(title: string) { return findLatestJob(currentUser(), "interrupt", title); }
 
 /** 请求打断指定故事的当前写作（写作中提交干预时调用） */
 export function requestInterrupt(title: string, item: Omit<SteeringItem, "id" | "at">): SteeringItem {
@@ -19,21 +16,26 @@ export function requestInterrupt(title: string, item: Omit<SteeringItem, "id" | 
     at: new Date().toISOString(),
     ...item,
   };
-  interrupts.set(intKey(title), full);
+  const existing = interruptJob(title);
+  if (existing) updateJob(existing.id, { status: "queued", phase: "requested", recovery: full, error: null });
+  else createJob({ user: currentUser(), title, kind: "interrupt", dedupeKey: `interrupt:${title}`, status: "queued", phase: "requested", recovery: full });
   return full;
 }
 
 /** 管线阶段边界检查：命中则取出（消费）并返回 */
 export function checkInterrupt(title: string): SteeringItem | null {
-  const key = intKey(title);
-  const item = interrupts.get(key);
-  if (item) interrupts.delete(key);
+  const job = interruptJob(title);
+  if (!job) return null;
+  const item = job.recovery as SteeringItem | undefined;
+  deleteJobs(currentUser(), { id: job.id });
   return item ?? null;
 }
 
 /** 打断后未消费的项可由调用方重新入队（如 commit 后阶段命中 → 章末消费） */
 export function requeueInterrupt(title: string, item: SteeringItem): void {
-  interrupts.set(intKey(title), item);
+  const existing = interruptJob(title);
+  if (existing) updateJob(existing.id, { status: "queued", phase: "requeued", recovery: item, error: null });
+  else createJob({ user: currentUser(), title, kind: "interrupt", dedupeKey: `interrupt:${title}`, status: "queued", phase: "requeued", recovery: item });
 }
 
 // —— 变更日志（审计：谁、第几章、改了什么、选了哪种传播策略） ——

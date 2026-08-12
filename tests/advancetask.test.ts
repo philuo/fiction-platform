@@ -1,16 +1,17 @@
 // 单章推进任务持久化（advancetask）单元测试：状态机 + 陈旧判定 + 重复拒绝
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { storyDir } from "../src/api/storage";
+import { closeDb } from "../src/api/db";
 import {
   startAdvanceTask, updateAdvanceTaskPhase, completeAdvanceTask,
   failAdvanceTask, getAdvanceTaskForClient, clearAdvanceTask, loadAdvanceTask,
+  cleanupStaleAdvanceTasks,
 } from "../src/api/advancetask";
 
 // 独立临时 data 目录，避免污染真实 data/
-const tmp = mkdirSync(join(tmpdir(), "advancetask-test-"), { recursive: true });
+const tmp = mkdtempSync(join(tmpdir(), "advancetask-test-"));
 const origCwd = process.cwd();
 
 beforeAll(() => {
@@ -21,6 +22,7 @@ beforeAll(() => {
   process.env.BRAIN_SESSIONS_DATA_DIR = join(tmp, "brain-sessions");
 });
 afterAll(() => {
+  closeDb();
   process.chdir(origCwd);
   delete process.env.BRAIN_SESSIONS_DATA_DIR;
   rmSync(tmp, { recursive: true, force: true });
@@ -91,14 +93,10 @@ describe("advancetask 任务状态机", () => {
     expect(loadAdvanceTask(TITLE)).toBeNull();
   });
 
-  test("getForClient：陈旧 running（超 15 分钟无更新）→ 自动标记 failed", () => {
+  test("启动恢复：running 立即收敛为 interrupted/failed", () => {
     clearAdvanceTask(TITLE);
     startAdvanceTask(TITLE, 9);
-    // 手动把 updatedAt 改成 20 分钟前（模拟服务重启中断）
-    const t = loadAdvanceTask(TITLE)!;
-    const stale = new Date(Date.now() - 20 * 60 * 1000).toISOString();
-    t.updatedAt = stale;
-    writeFileSync(join(storyDir(TITLE), "advance-task.json"), JSON.stringify(t), "utf-8");
+    cleanupStaleAdvanceTasks();
     const got = getAdvanceTaskForClient(TITLE);
     expect(got?.status).toBe("failed");
     expect(got?.error).toContain("中断");

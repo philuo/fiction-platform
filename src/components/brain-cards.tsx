@@ -4,6 +4,7 @@
 // 可选 image 字段：任意卡片可携带一张图（角色立绘/章节插画等），渲染在卡片内容上方
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { lensCn } from "../terms";
+import { formatChapterRange } from "../shared/chapterRange";
 import { RelationshipGraphCanvas, type RelationshipSubgraph } from "./RelationshipGraphCanvas";
 
 // ============ 卡片数据类型 ============
@@ -235,7 +236,9 @@ function isExecutionBusy(state?: CardExecutionState): boolean {
 }
 
 function isExecutionDone(state?: CardExecutionState): boolean {
-  return state === "succeeded" || state === "cancelled" || state === "interrupted";
+  // Interrupted/cancelled/failed are terminal outcomes, but remain retryable.
+  // Only a durable success should remove the action affordance.
+  return state === "succeeded";
 }
 
 // ============ PreviewCard 操作预览卡 ============
@@ -296,7 +299,7 @@ export const PreviewCardView: React.FC<{
       )}
       {failed && (
         <p className="bc-task-status bc-task-failed">
-          <span className="bc-progress-pill bc-progress-pill-failed">生成失败</span>
+          <span className="bc-progress-pill bc-progress-pill-failed">{card.executionState === "interrupted" ? "已中断" : card.executionState === "cancelled" ? "已取消" : "生成失败"}</span>
           {card.detail ? `：${card.detail}` : ""}
         </p>
       )}
@@ -314,7 +317,7 @@ export const PreviewCardView: React.FC<{
           ) : done ? (
             <span className="bc-done-tag">{completed ? "✓ 已执行" : "✓ 已完成"}</span>
           ) : (
-            <button className="btn-save btn-xs" disabled={busy || running} onClick={onExecute}>{running ? "处理中…" : (card.actionLabel ?? "执行")}</button>
+            <button className="btn-save btn-xs" disabled={busy || running} onClick={onExecute}>{running ? "处理中…" : failed ? "重试" : (card.actionLabel ?? "执行")}</button>
           )}
         </div>
       ) : null}
@@ -343,10 +346,10 @@ export const ConfirmCardView: React.FC<{
       </div>
       {card.impact && <p className="brain-card-impact">{card.impact}</p>}
       {card.verdict && <p className="brain-card-verdict">闸门裁决：{card.verdict === "allow" ? "放行" : card.verdict === "reject" ? "驳回" : String(card.verdict)}</p>}
-      {card.detail && <p className="brain-card-body">{card.detail}</p>}
+      {card.detail && <p className={`brain-card-body${card.executionState === "failed" ? " bc-task-failed" : ""}`}>{card.detail}</p>}
       <div className="brain-card-actions">
         {completed || stateDone ? (
-          <span className="bc-done-tag">{card.executionState === "cancelled" ? "已放弃" : "✓ 已处理"}</span>
+          <span className="bc-done-tag">✓ 已处理</span>
         ) : (
           card.options.map((opt) => (
             <button key={opt} className="btn-save btn-xs" disabled={busy || stateBusy} onClick={() => onChoose?.(opt)}>
@@ -583,7 +586,7 @@ export const BrowseCardView: React.FC<{
         )}
         <div className="bc-character-meta">
           <span className="bc-badge bc-badge-info">出场 {String(d.appearedCount ?? appeared.length)} 次</span>
-          {appeared.length > 0 && <span>第 {appeared.join("、")} 章</span>}
+          {appeared.length > 0 && <span>第 {formatChapterRange(appeared)} 章</span>}
         </div>
         {arrangement.length > 0 && (
           <div className="bc-character-arrangement">

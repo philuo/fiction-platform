@@ -256,6 +256,7 @@ const Home: React.FC<HomeProps> = (props) => {
   // P4 自动连载 + 流式预览 + 评估
   const [autoRunning, setAutoRunning] = useState(false);
   const [liveDraft, setLiveDraft] = useState("");
+  const [liveDraftState, setLiveDraftState] = useState<"running" | "interrupted" | "failed" | null>(null);
   const [showEval, setShowEval] = useState(false);
   // P4.5 自动连载 git 式：会话状态 / 暂存区 / 控制台 / 启动确认
   const [autoSession, setAutoSession] = useState<AutoSessionView | null>(null);
@@ -646,6 +647,7 @@ const Home: React.FC<HomeProps> = (props) => {
     setBusy(true);
     setBusyPhase("导演写作中…");
     setLiveDraft("");
+    setLiveDraftState("running");
     try {
       const res = await apiFetch("/api/novel/step", {
         method: "POST",
@@ -688,6 +690,7 @@ const Home: React.FC<HomeProps> = (props) => {
           if (ev.phase === "patching") setBusyPhase("定向修补段落中…");
           if (ev.phase === "settling") setBusyPhase("本章结算中（伏笔/状态/摘要）…");
           if (ev.phase === "interrupted") {
+            setLiveDraftState("interrupted");
             showToast("写作已被干预打断，草稿未存档（零污染）。请处理干预后继续。");
             await refreshWorld();
             return;
@@ -696,6 +699,7 @@ const Home: React.FC<HomeProps> = (props) => {
           if (ev.phase === "pending-commit") {
             // commitPolicy=confirm：审查通过已暂存，等人工确认入册
             setLiveDraft("");
+            setLiveDraftState(null);
             await refreshWorld();
             // C7：切书后不再为旧书弹任务中心/置待确认章
             if (stillSameBook()) {
@@ -709,6 +713,7 @@ const Home: React.FC<HomeProps> = (props) => {
       }
       setBusyPhase("存档中…");
       setLiveDraft("");
+      setLiveDraftState(null);
       await refreshWorld();
       // C7：流期间用户若切书，丢弃旧书的章节定位/路由/指令，不覆盖新书状态
       if (stillSameBook()) {
@@ -725,6 +730,7 @@ const Home: React.FC<HomeProps> = (props) => {
       );
       if (r?.verdict === "pass") launchConfetti(); // 章节完成彩蛋
     } catch (e) {
+      setLiveDraftState("failed");
       showToast("回合失败: " + (e as Error).message);
     } finally {
       setBusy(false);
@@ -2281,8 +2287,10 @@ const Home: React.FC<HomeProps> = (props) => {
                 {/* P4 实时写作预览（delta 流式打字机） */}
                 {liveDraft && (
                   <div style={{ marginBottom: "1rem", border: "1px dashed var(--line-strong)", padding: "0.9rem 1rem", background: "var(--paper-dark)" }}>
-                    <div style={{ fontSize: "0.72rem", fontFamily: "var(--sans)", color: "var(--seal)", marginBottom: "0.4rem" }}>✍ 实时写作中…</div>
-                    <div style={{ fontSize: "0.86rem", lineHeight: 1.9, whiteSpace: "pre-wrap" }}>{liveDraft}<span style={{ opacity: 0.5 }}>▌</span></div>
+                    <div style={{ fontSize: "0.72rem", fontFamily: "var(--sans)", color: liveDraftState === "running" ? "var(--seal)" : "var(--ink-soft)", marginBottom: "0.4rem" }}>
+                      {liveDraftState === "running" ? "✍ 未入册草稿 · 实时写作中…" : liveDraftState === "interrupted" ? "已中断 · 草稿未入册" : "生成失败 · 草稿未入册"}
+                    </div>
+                    <div style={{ fontSize: "0.86rem", lineHeight: 1.9, whiteSpace: "pre-wrap" }}>{liveDraft}{liveDraftState === "running" && <span style={{ opacity: 0.5 }}>▌</span>}</div>
                   </div>
                 )}
                 {editing && (

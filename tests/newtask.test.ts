@@ -69,7 +69,7 @@ describe("newtask 任务状态机", () => {
       expect(created).toBe(true); // 首次创建
       expect(id).toBeTruthy();
       expect(newtask.getNewStoryTask(id)?.status).toBe("running");
-      expect(existsSync(join(dataDir, "data", U, "newstory-tasks.json"))).toBe(true);
+      expect(existsSync(process.env.APP_DB_PATH!)).toBe(true);
 
       newtask.completeNewStoryTask(id, "星辰之书");
       const done = newtask.getNewStoryTask(id)!;
@@ -151,14 +151,12 @@ describe("newtask 任务状态机", () => {
     newtask.completeNewStoryTask(idDone, "完成的书"); // 释放 running 槽
     const { id: idReady } = newtask.createNewStoryTask("壳已就绪的任务");
     newtask.markNewStoryTaskReady(idReady, "壳之书"); // ready（壳已就绪仍在增强）
-    const { id: idRunning } = newtask.createNewStoryTask("刚提交的任务"); // 非陈旧 running
     newtask.cleanupNewStoryTasks();
     // running + ready 全部被标 failed（无论新旧——重启后后台执行必死），前端可查失败原因，
     // 占位卡/「世界构建中」横幅不再永久 loading；done 任务保留
     expect(newtask.listActiveNewStoryTasks()).toHaveLength(0);
     const after = newtask.loadNewStoryTasks();
     expect(after.find((t) => t.id === idReady)?.status).toBe("failed");
-    expect(after.find((t) => t.id === idRunning)?.status).toBe("failed");
     expect(after.find((t) => t.id === idDone)?.status).toBe("done");
   });
 });

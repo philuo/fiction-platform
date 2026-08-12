@@ -1,188 +1,120 @@
-// 单章推进任务持久化（advancetask）：/api/novel/step 任务状态落盘到 data/<username>/<slug>/advance-task.json。
-// 解决的问题：推进剧情（本章续写）是数分钟级异步任务，客户端刷新/关闭后前端状态丢失，
-// 但服务端仍会完整执行到存档——刷新后前端可查询任务状态恢复显示，不再"状态丢失"。
-// 与连载会话（autorun-session.json）同规范：原子写、服务重启可恢复/清理。
-import { mkdirSync, readFileSync, writeFileSync, existsSync, renameSync, readdirSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
-import { storyDir, runAsUser, userDir, currentUser } from "./storage";
+import { createJob, deleteJobs, listJobs, updateJob, type DurableJob } from "./control-plane";
+import { currentUser } from "./storage";
+import { runAsUser } from "./storage";
 import { listUsernames } from "./auth";
 import { loadSessions, updateMessageCard } from "./brain-sessions";
 import { publishCardUpdate } from "./sync";
 
 export type AdvanceTaskStatus = "running" | "done" | "failed";
-
 export type AdvanceTask = {
   status: AdvanceTaskStatus;
-  /** 目标章节号（任务启动时 world.nextChapter） */
   targetIndex: number;
-  /** 最近阶段（writing / reviewing / settling …，客户端恢复显示用） */
   phase: string;
   startedAt: string;
   updatedAt: string;
-  /** done：入册章节号 */
   chapterIndex?: number;
-  /** done：审查结论 pass/revise */
   verdict?: string;
-  /** done：通过用了几稿 */
   rounds?: number;
-  /** failed：错误信息 */
   error?: string;
-  /** commitPolicy=confirm：审查通过已暂存，等人工确认入册 */
   pendingCommit?: boolean;
 };
 
-/** 陈旧判定：updatedAt 超过 15 分钟仍 running（服务重启中断，无 SSE 消费者推进），视为失败 */
-const STALE_MS = 15 * 60 * 1000;
+type AdvanceRecovery = { targetIndex: number; startedAt: string };
+function fromJob(job: DurableJob): AdvanceTask {
+  const recovery = (job.recovery ?? {}) as AdvanceRecovery;
+  const progress = (job.progress ?? {}) as Partial<AdvanceTask>;
+  const status: AdvanceTaskStatus = job.status === "succeeded" ? "done" : job.status === "failed" || job.status === "interrupted" || job.status === "cancelled" ? "failed" : "running";
+  return {
+    status,
+    targetIndex: Number(progress.targetIndex ?? recovery.targetIndex),
+    phase: String(progress.phase ?? job.phase ?? ""),
+    startedAt: String(progress.startedAt ?? recovery.startedAt ?? job.updatedAt),
+    updatedAt: job.updatedAt,
+    chapterIndex: progress.chapterIndex,
+    verdict: progress.verdict,
+    rounds: progress.rounds,
+    error: progress.error ?? job.error,
+    pendingCommit: progress.pendingCommit,
+  };
+}
 
-function taskPath(title: string): string {
-  return join(storyDir(title), "advance-task.json");
+function latest(title: string): DurableJob | null {
+  return listJobs(currentUser(), title).find((job) => job.kind === "advance") ?? null;
 }
 
 export function loadAdvanceTask(title: string): AdvanceTask | null {
-  try {
-    const p = taskPath(title);
-    if (!existsSync(p)) return null;
-    return JSON.parse(readFileSync(p, "utf-8")) as AdvanceTask;
-  } catch {
-    return null;
-  }
+  const job = latest(title);
+  return job ? fromJob(job) : null;
 }
 
 export function saveAdvanceTask(title: string, task: AdvanceTask): void {
-  try {
-    const dir = storyDir(title);
-    mkdirSync(dir, { recursive: true });
-    const tmp = join(dir, `advance-task.json.tmp-${process.pid}`);
-    writeFileSync(tmp, JSON.stringify(task, null, 2), "utf-8");
-    renameSync(tmp, taskPath(title));
-  } catch (e) {
-    console.warn("[advancetask] 写入失败:", (e as Error).message);
-  }
+  const existing = latest(title);
+  const job = existing ?? createJob({ user: currentUser(), title, kind: "advance", dedupeKey: `advance:${title}`, status: task.status === "done" ? "succeeded" : task.status === "failed" ? "failed" : "running", phase: task.phase, recovery: { targetIndex: task.targetIndex, startedAt: task.startedAt } }).job;
+  updateJob(job.id, {
+    status: task.status === "done" ? "succeeded" : task.status === "failed" ? "failed" : "running",
+    phase: task.phase,
+    progress: task,
+    error: task.error ?? null,
+  });
 }
 
-/** 任务启动：写 running；上一任务 running 且未陈旧时拒绝（同书同时只允许一个单章推进） */
-export function startAdvanceTask(title: string, targetIndex: number): { ok: boolean; reason?: string } {
-  const prev = loadAdvanceTask(title);
-  if (prev && prev.status === "running" && Date.now() - Date.parse(prev.updatedAt) < STALE_MS) {
-    return { ok: false, reason: `单章推进任务运行中（第 ${prev.targetIndex} 章），请等待完成或稍后重试` };
+export function startAdvanceTask(title: string, targetIndex: number, commandId?: string): { ok: boolean; reason?: string } {
+  const prev = latest(title);
+  if (prev && ["queued", "running", "waiting_external", "paused"].includes(prev.status)) {
+    return { ok: false, reason: `单章推进任务运行中（第 ${fromJob(prev).targetIndex} 章），请等待完成或稍后重试` };
   }
-  saveAdvanceTask(title, {
-    status: "running",
-    targetIndex,
-    phase: "start",
-    startedAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  });
+  const startedAt = new Date().toISOString();
+  const created = createJob({ user: currentUser(), commandId, title, kind: "advance", dedupeKey: `advance:${title}`, status: "running", phase: "start", recovery: { targetIndex, startedAt } });
+  updateJob(created.job.id, { progress: { status: "running", targetIndex, phase: "start", startedAt } });
   return { ok: true };
 }
 
-/** 阶段更新（心跳）：running 中刷新 updatedAt，防陈旧误判 */
 export function updateAdvanceTaskPhase(title: string, phase: string): void {
-  const t = loadAdvanceTask(title);
-  if (!t || t.status !== "running") return;
-  saveAdvanceTask(title, { ...t, phase, updatedAt: new Date().toISOString() });
+  const job = latest(title);
+  if (!job || job.status !== "running") return;
+  const task = fromJob(job);
+  updateJob(job.id, { phase, progress: { ...task, phase, status: "running" } });
 }
 
-/** 任务完成（入册或 pending-commit 暂存待确认） */
 export function completeAdvanceTask(title: string, r: { chapterIndex: number; verdict?: string; rounds?: number; pendingCommit?: boolean }): void {
-  const t = loadAdvanceTask(title);
-  saveAdvanceTask(title, {
-    status: "done",
-    targetIndex: t?.targetIndex ?? r.chapterIndex,
-    phase: "done",
-    startedAt: t?.startedAt ?? new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    chapterIndex: r.chapterIndex,
-    verdict: r.verdict,
-    rounds: r.rounds,
-    pendingCommit: r.pendingCommit,
-  });
-  // HA3：刷新后 SSE 断开、任务由轮询感知完成 → 服务端主动翻转最近会话的 running progress 卡（多 tab 一致）
+  const job = latest(title) ?? createJob({ user: currentUser(), title, kind: "advance", dedupeKey: `advance:${title}`, status: "succeeded", phase: "done", recovery: { targetIndex: r.chapterIndex, startedAt: new Date().toISOString() } }).job;
+  const task = fromJob(job);
+  updateJob(job.id, { status: "succeeded", phase: "done", progress: { ...task, status: "done", phase: "done", chapterIndex: r.chapterIndex, verdict: r.verdict, rounds: r.rounds, pendingCommit: r.pendingCommit }, error: null, result: r });
   finalizeProgressForTask(title, { status: "done", phase: "result", detail: `第 ${r.chapterIndex} 章已完成${r.pendingCommit ? "（等待确认入册）" : ""}` });
 }
 
-/** 任务失败 */
 export function failAdvanceTask(title: string, error: string): void {
-  const t = loadAdvanceTask(title);
-  if (!t) return;
-  saveAdvanceTask(title, { ...t, status: "failed", phase: "failed", error, updatedAt: new Date().toISOString() });
-  // HA3：同上，翻转 running progress 卡为 failed
+  const job = latest(title);
+  if (!job) return;
+  const task = fromJob(job);
+  updateJob(job.id, { status: "failed", phase: "failed", progress: { ...task, status: "failed", phase: "failed", error }, error });
   finalizeProgressForTask(title, { status: "failed", phase: "failed", detail: error.slice(0, 200) });
 }
 
-/**
- * HA3：把「最近更新会话中最后一张 running 的 progress 卡」翻转为终态（服务端主动）。
- * 推进任务由前端 SSE 直连发起时，前端自己 finalize；刷新/断线后由本函数兜底（任务完成轮询感知）。
- * 无 running progress 卡（未从聊天发起 / 已翻转）→ 无操作。
- */
 function finalizeProgressForTask(title: string, patch: { status: string; phase: string; detail: string }): void {
   try {
     const user = currentUser() ?? undefined;
     const sessions = loadSessions(title);
-    for (const s of sessions) {
-      for (const m of s.messages) {
-        for (const c of m.cards ?? []) {
-          const card = c as { kind?: string; cardId?: string; status?: string };
-          if (card.kind === "progress" && card.cardId && card.status === "running") {
-            const updated = updateMessageCard(title, s.id, m.id, card.cardId, patch);
-            if (updated) {
-              publishCardUpdate(title, s.id, m.id, card.cardId, patch, user);
-              return; // 只翻转最近一张
-            }
-          }
-        }
+    for (const s of sessions) for (const m of s.messages) for (const c of m.cards ?? []) {
+      const card = c as { kind?: string; cardId?: string; status?: string };
+      if (card.kind === "progress" && card.cardId && card.status === "running") {
+        const updated = updateMessageCard(title, s.id, m.id, card.cardId, patch);
+        if (updated) { publishCardUpdate(title, s.id, m.id, card.cardId, patch, user); return; }
       }
     }
-  } catch {
-    /* 无 progress 卡 / 模块异常：静默（前端已处理大部分场景） */
-  }
+  } catch { /* 卡片不存在不影响任务终态 */ }
 }
 
-/** 查询：陈旧 running（服务重启中断，超 STALE_MS 无更新）→ 返回时直接标记 failed */
-export function getAdvanceTaskForClient(title: string): AdvanceTask | null {
-  const t = loadAdvanceTask(title);
-  if (t && t.status === "running" && Date.now() - Date.parse(t.updatedAt) > STALE_MS) {
-    failAdvanceTask(title, "任务在服务重启/长时间无响应后中断，请重新推进");
-    return loadAdvanceTask(title);
-  }
-  return t;
-}
+export function getAdvanceTaskForClient(title: string): AdvanceTask | null { return loadAdvanceTask(title); }
 
-/** 前端已确认读取 done/failed 结果后清除任务文件（避免每次刷新重复提示） */
-export function clearAdvanceTask(title: string): void {
-  try {
-    const p = taskPath(title);
-    if (existsSync(p)) unlinkSync(p);
-  } catch (e) {
-    console.warn("[advancetask] 清除失败:", (e as Error).message);
-  }
-}
+export function clearAdvanceTask(title: string): void { deleteJobs(currentUser(), { kind: "advance", title }); }
 
-/** 服务启动恢复：扫描各用户目录（+遗留根目录）的 advance-task.json，陈旧 running → 标记 failed。
- * 与连载不同，单章推进无自动续跑（执行上下文不持久化），只清理状态避免永久卡 running。 */
 export function cleanupStaleAdvanceTasks(): void {
-  cleanupStaleForDir("");
-  for (const username of listUsernames()) {
-    runAsUser(username, () => cleanupStaleForDir(username));
-  }
-}
-
-function cleanupStaleForDir(username: string): void {
-  try {
-    const dataDir = userDir(username);
-    if (!existsSync(dataDir)) return;
-    for (const slug of readdirSync(dataDir)) {
-      const p = join(dataDir, slug, "advance-task.json");
-      if (!existsSync(p)) continue;
-      try {
-        const t = JSON.parse(readFileSync(p, "utf-8")) as AdvanceTask;
-        if (t.status === "running" && Date.now() - Date.parse(t.updatedAt) > STALE_MS) {
-          saveAdvanceTask(slug, { ...t, status: "failed", phase: "failed", error: "服务重启中断了任务，请重新推进", updatedAt: new Date().toISOString() });
-          console.log(`[advancetask] 清理陈旧任务: ${slug}`);
-        }
-      } catch { /* 单文件损坏忽略 */ }
+  const cleanupCurrent = () => {
+    for (const job of listJobs(currentUser()).filter((item) => item.kind === "advance" && ["queued", "running", "waiting_external"].includes(item.status))) {
+      updateJob(job.id, { status: "interrupted", phase: "interrupted", error: "服务重启中断了任务，请重新推进" });
     }
-  } catch (e) {
-    console.warn("[advancetask] 启动清理失败:", (e as Error).message);
-  }
+  };
+  runAsUser(null, cleanupCurrent);
+  for (const username of listUsernames()) runAsUser(username, cleanupCurrent);
 }

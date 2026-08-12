@@ -340,8 +340,19 @@ async function recognizeIntent(w: WorldState, prompt: string, ctx?: BrainChatCon
       reply: (out.reply ?? "").trim(),
     };
   } catch {
-    // 降级：纯对话
-    return { intent: "chat", params: {}, reply: "（中枢意图识别暂不可用，请直接操作或稍后重试）" };
+    // Deterministic local fallback keeps common commands useful when the intent model
+    // is unavailable (network outage, missing key, or malformed model output).
+    const p = prompt.trim();
+    const chapter = chapterIndexFromPrompt(p);
+    if (/帮助|能做什么|支持哪些|功能/.test(p)) return { intent: "read_help", params: {}, reply: "我可以查询章节、角色、伏笔、关系、大纲、任务和媒体，也可以推进剧情、编辑设定、生成插画、管理连载。" };
+    if (/章节目录|写到哪|有哪些章节/.test(p)) return { intent: "read_chapters", params: {}, reply: "我会列出已入册章节、字数、审查状态和媒体数量。" };
+    if (/角色列表|有哪些角色|登场角色/.test(p)) return { intent: "read_characters", params: {}, reply: "我会列出角色定位、状态、出场次数和形象资料。" };
+    if (/伏笔/.test(p) && !/新增|修改|删除|登记/.test(p)) return { intent: "read_foreshadow", params: {}, reply: "我会列出伏笔账及其埋设、推进和回收状态。" };
+    if (/关系图|人物关系|关系网/.test(p)) return { intent: "read_relationships", params: {}, reply: "我会展示人物关系及一跳关系图。" };
+    if (chapter != null && /审查|评价|评分/.test(p)) return { intent: "read_review", params: { index: chapter }, reply: `我会查看第 ${chapter} 章的审查报告。` };
+    if (chapter != null && /看|查看|阅读|正文|内容/.test(p)) return { intent: "read_chapter", params: { index: chapter }, reply: `我会展示第 ${chapter} 章正文。` };
+    if (/推进剧情|写下一章|继续写/.test(p)) return { intent: "advance", params: {}, reply: "我会先展示推进剧情的确认卡，确认后开始写作。" };
+    return { intent: "chat", params: {}, reply: "我暂时无法连接意图识别服务，但仍可以处理章节、角色、伏笔、关系查询，以及推进剧情等常用指令。" };
   }
 }
 

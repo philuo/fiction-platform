@@ -146,6 +146,13 @@ CREATE TABLE IF NOT EXISTS world_commits (
 );
 CREATE INDEX IF NOT EXISTS idx_world_commits_status
   ON world_commits(status, created_at);
+CREATE TABLE IF NOT EXISTS scope_tombstones (
+  user_name TEXT NOT NULL,
+  scope_title TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(user_name, scope_title)
+);
 `);
   const syncColumns = db.query("PRAGMA table_info(sync_scopes)").all() as { name: string }[];
   if (!syncColumns.some((column) => column.name === "document_json")) {

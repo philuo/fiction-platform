@@ -64,12 +64,19 @@ const MODEL = process.env.TEXT_MODEL ?? process.env.AGNES_MODEL ?? "agnes-2.5-fl
 // Responses API 仅 Agnes 端点支持；其他 OpenAI 兼容端点直接走 chat/completions，避免无效降级重试
 const USE_RESPONSES_API = BASE_URL === AGNES_BASE;
 
+/** Fail fast when the text provider is not configured. Background jobs must settle
+ * to a durable failed state instead of waiting for a network timeout. */
+function ensureTextProviderConfigured(): void {
+  const key = process.env.TEXT_API_KEY ?? process.env.AGNES_API_KEY ?? "";
+  if (!key.trim()) throw new LLMError("未配置文本模型 API key，请在 .env 设置 TEXT_API_KEY 或 AGNES_API_KEY");
+}
+
 async function postJson(url: string, body: unknown, timeoutMs = 120_000, signal?: AbortSignal): Promise<Response> {
   // 全局文本限流（并发 + RPM）：排队不触发 429；超时在拿到槽位后才起算
   return textLimiter.run(() =>
     fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${API_KEY}` },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.TEXT_API_KEY ?? process.env.AGNES_API_KEY ?? API_KEY}` },
       body: JSON.stringify(body),
       // 外部取消信号与超时合并：任一触发即中止（AbortSignal.any 需同时兼容两者）
       signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
@@ -257,6 +264,7 @@ async function parseResponses(res: Response, ctx?: { model?: string; msgChars?: 
 /** 完整 message 返回（含 tool_calls），供叙事引擎的工具循环使用；模型由 TEXT_MODEL/AGNES_MODEL 配置，失败重试后直接抛错。
  * 无工具调用的任务优先走官方 Responses API，失败自动降级 chat/completions 兜底（功能不中断） */
 export async function complete(messages: ChatMessage[], opts: AgnesOptions = {}): Promise<{ content: string; tool_calls?: ToolCall[] }> {
+  ensureTextProviderConfigured();
   const retries = opts.retries ?? 4;
   const t0 = Date.now();
   const msgChars = messages.reduce((n, m) => n + (m.content?.length ?? 0), 0);
@@ -352,6 +360,7 @@ export async function chatStream(
   onChunk: (delta: string) => void,
   opts: AgnesOptions = {},
 ): Promise<string> {
+  ensureTextProviderConfigured();
   const retries = opts.retries ?? 4;
   const t0 = Date.now();
   const model = opts.model ?? MODEL;

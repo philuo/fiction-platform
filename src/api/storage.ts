@@ -11,7 +11,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { Arc, ChangeLogEntry, ChapterVersion, PendingChapter, WorldState } from "./world";
 import type { EvalReport } from "./eval";
 import { notifyWorldSaved } from "./sync";
-import { abortWorldCommit, commitWorldCommit, prepareWorldCommit } from "./control-plane";
+import { abortWorldCommit, commitWorldCommit, createJob, deleteJobs, findLatestJob, prepareWorldCommit, updateJob } from "./control-plane";
 
 export function slugify(title: string): string {
   const s = title.trim().replace(/[\\/:*?"<>|\s]+/g, "-").slice(0, 40);
@@ -381,33 +381,32 @@ function pendingPath(title: string): string {
 }
 
 export function savePendingChapter(title: string, p: PendingChapter): void {
-  try {
-    const dir = storyDir(title);
-    mkdirSync(dir, { recursive: true });
-    atomicWriteJson(pendingPath(title), p);
-  } catch (e) {
-    console.warn("[storage] 暂存区草稿写入失败:", (e as Error).message);
-  }
+  const existing = findLatestJob(currentUser(), "auto-pending", title);
+  const job = existing ?? createJob({ user: currentUser(), title, kind: "auto-pending", dedupeKey: `auto-pending:${title}`, status: "succeeded", phase: "stored", recovery: p }).job;
+  updateJob(job.id, { status: "succeeded", phase: "stored", recovery: p, result: p, error: null });
 }
 
 export function loadPendingChapter(title: string): PendingChapter | null {
-  try {
-    const p = pendingPath(title);
-    if (!existsSync(p)) return null;
-    const d = JSON.parse(readFileSync(p, "utf-8")) as PendingChapter;
-    return d.chapterIndex && d.text ? d : null;
-  } catch {
-    return null;
+  let job = findLatestJob(currentUser(), "auto-pending", title);
+  const legacy = pendingPath(title);
+  if (!job && existsSync(legacy)) {
+    try {
+      const value = JSON.parse(readFileSync(legacy, "utf-8")) as PendingChapter;
+      if (value.chapterIndex && value.text) {
+        savePendingChapter(title, value);
+        job = findLatestJob(currentUser(), "auto-pending", title);
+      }
+      rmSync(legacy, { force: true });
+    } catch { return null; }
   }
+  const value = (job?.result ?? job?.recovery) as PendingChapter | undefined;
+  return value?.chapterIndex && value.text ? value : null;
 }
 
 export function clearPendingChapter(title: string): void {
-  try {
-    const p = pendingPath(title);
-    if (existsSync(p)) rmSync(p, { force: true });
-  } catch {
-    /* 清理失败不影响主流程 */
-  }
+  deleteJobs(currentUser(), { kind: "auto-pending", title });
+  const path = pendingPath(title);
+  if (existsSync(path)) rmSync(path, { force: true });
 }
 
 // —— 连载会话状态（刷新/服务重启恢复用） ——
@@ -430,32 +429,31 @@ function sessionPath(title: string): string {
 }
 
 export function saveAutoSession(title: string, s: AutoSession): void {
-  try {
-    const dir = storyDir(title);
-    mkdirSync(dir, { recursive: true });
-    atomicWriteJson(sessionPath(title), s);
-  } catch (e) {
-    console.warn("[storage] 会话状态写入失败:", (e as Error).message);
-  }
+  const status = s.status === "done" ? "succeeded" : s.status === "stopped" ? "cancelled" : s.status === "paused" ? "paused" : "running";
+  const existing = findLatestJob(currentUser(), "auto", title);
+  const recovery = { ...((existing?.recovery ?? {}) as Record<string, unknown>), session: s };
+  const job = existing ?? createJob({ user: currentUser(), title, kind: "auto", dedupeKey: `auto:${title}`, status, phase: s.phase, recovery }).job;
+  updateJob(job.id, { status, phase: s.phase, progress: s, recovery, result: s.status === "done" ? s : undefined, error: null });
 }
 
 export function loadAutoSession(title: string): AutoSession | null {
-  try {
-    const p = sessionPath(title);
-    if (!existsSync(p)) return null;
-    return JSON.parse(readFileSync(p, "utf-8")) as AutoSession;
-  } catch {
-    return null;
+  let job = findLatestJob(currentUser(), "auto", title);
+  const legacy = sessionPath(title);
+  if (!job && existsSync(legacy)) {
+    try {
+      const value = JSON.parse(readFileSync(legacy, "utf-8")) as AutoSession;
+      saveAutoSession(title, value);
+      job = findLatestJob(currentUser(), "auto", title);
+      rmSync(legacy, { force: true });
+    } catch { return null; }
   }
+  return (job?.progress ?? (job?.recovery as { session?: AutoSession } | undefined)?.session ?? null) as AutoSession | null;
 }
 
 export function clearAutoSession(title: string): void {
-  try {
-    const p = sessionPath(title);
-    if (existsSync(p)) rmSync(p, { force: true });
-  } catch {
-    /* 清理失败不影响主流程 */
-  }
+  deleteJobs(currentUser(), { kind: "auto", title });
+  const path = sessionPath(title);
+  if (existsSync(path)) rmSync(path, { force: true });
 }
 
 export function listStories(username?: string): string[] {

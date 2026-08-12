@@ -165,6 +165,39 @@ export function listJobs(user: string | null, title?: string, activeOnly = false
   return (getDb().query(sql).all(...args) as Record<string, unknown>[]).map(rowToJob);
 }
 
+export function findLatestJob(user: string | null, kind: string, title?: string): DurableJob | null {
+  const args: string[] = [durableUser(user), kind];
+  let sql = "SELECT * FROM jobs WHERE user_name=? AND kind=?";
+  if (title !== undefined) { sql += " AND scope_title=?"; args.push(title); }
+  sql += " ORDER BY updated_at DESC LIMIT 1";
+  const row = getDb().query(sql).get(...args) as Record<string, unknown> | null;
+  return row ? rowToJob(row) : null;
+}
+
+export function deleteJobs(user: string | null, filter: { kind?: string; title?: string; id?: string }): number {
+  const args: string[] = [durableUser(user)];
+  let sql = "DELETE FROM jobs WHERE user_name=?";
+  if (filter.kind !== undefined) { sql += " AND kind=?"; args.push(filter.kind); }
+  if (filter.title !== undefined) { sql += " AND scope_title=?"; args.push(filter.title); }
+  if (filter.id !== undefined) { sql += " AND id=?"; args.push(filter.id); }
+  return Number(getDb().query(sql).run(...args).changes);
+}
+
+export function markScopeDeleted(user: string | null, title: string, reason = "deleted"): void {
+  getDb().query(`INSERT INTO scope_tombstones(user_name,scope_title,reason,created_at) VALUES (?,?,?,?)
+    ON CONFLICT(user_name,scope_title) DO UPDATE SET reason=excluded.reason,created_at=excluded.created_at`)
+    .run(durableUser(user), title, reason, now());
+}
+
+export function clearScopeDeleted(user: string | null, title: string): void {
+  getDb().query("DELETE FROM scope_tombstones WHERE user_name=? AND scope_title=?").run(durableUser(user), title);
+}
+
+export function isScopeDeleted(user: string | null, title: string): boolean {
+  return Boolean(getDb().query("SELECT 1 FROM scope_tombstones WHERE user_name=? AND scope_title=?")
+    .get(durableUser(user), title));
+}
+
 export function updateJob(id: string, patch: {
   status?: JobStatus; phase?: string; progress?: unknown; recovery?: unknown; result?: unknown; error?: string | null;
   leaseOwner?: string | null; leaseExpiresAt?: string | null;
@@ -215,7 +248,8 @@ export function settleOrphanedJobs(): number {
     const resumableVideo = (row.kind === "video" || row.kind === "media-regenerate") && typeof recovery?.videoId === "string" && Boolean(recovery.videoId);
     const resumableAuto = row.kind === "auto";
     const scheduledMedia = row.kind === "media-auto-generate" && row.status === "queued";
-    if (resumableVideo || resumableAuto || scheduledMedia) {
+    const durableControl = row.kind === "interrupt";
+    if (resumableVideo || resumableAuto || scheduledMedia || durableControl) {
       updateJob(row.id, {
         status: resumableVideo ? "waiting_external" : "queued",
         leaseOwner: null,

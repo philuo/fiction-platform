@@ -32,10 +32,14 @@ function command(body: Record<string, unknown>, auth = true) {
 }
 
 describe("POST /api/commands", () => {
-  test("未登录拒绝，未迁移指令拒绝", async () => {
+  test("未登录拒绝，公开写指令均已迁入", async () => {
     expect((await command({ commandId: "unauth", type: "CMD-M01", scope: { title: "书" }, payload: {} }, false))?.status).toBe(401);
-    const unsupported = await command({ commandId: "unsupported", type: "CMD-W12", scope: { title: "书" }, payload: {} });
-    expect(unsupported?.status).toBe(400);
+    const migrated = await command({ commandId: "world-edit", type: "CMD-W12", scope: { title: "书" }, payload: {} });
+    expect(migrated?.status).toBe(202);
+    await Bun.sleep(20);
+    const row = getDb().query("SELECT status,error FROM command_receipts WHERE command_id=?").get("world-edit") as { status: string; error: string };
+    expect(row.status).toBe("failed");
+    expect(row.error).toContain("故事不存在");
   });
 
   test("相同 commandId 同 payload 返回原回执，不同 payload 409", async () => {

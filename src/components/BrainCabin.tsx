@@ -76,7 +76,11 @@ async function fetchAction(endpoint: string, method: string, body: Record<string
   const res = await apiFetch(endpoint, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   if (!res.ok) {
     const errData = await res.json().catch(() => ({})) as Record<string, unknown>;
-    return { success: false, detail: String(errData.error ?? `HTTP ${res.status}`) };
+    if (res.status === 409) {
+      return { success: false, detail: `世界已变化，当前指令未执行。请刷新状态后重试。${errData.error ? `（${String(errData.error)}）` : ""}` };
+    }
+    if (res.status === 401) return { success: false, detail: "登录状态已失效，请重新登录后重试。" };
+    return { success: false, detail: String(errData.error ?? `操作失败（HTTP ${res.status}），请重试`) };
   }
   const ct = res.headers.get("content-type") ?? "";
   if (ct.includes("text/event-stream")) {

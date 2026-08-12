@@ -89,13 +89,13 @@ idle -> submitting -> running -> succeeded|failed|interrupted|cancelled
 | sync socket/listener/throttle timer、`videoWatchers` timer | 连接、合并通知、provider 查询句柄 | 可留内存；重启由持久 provider id/job 重建或收敛 |
 | brain task emitter/AbortController、前端 abort/cache/展开集合 | 流式执行和 UI 缓存 | 可留内存；会话检查点/job 才能决定用户可见终态 |
 | `panelConsumingRef`、Canvas 布局/缩放/拖拽状态 | 一次请求防抖和纯 UI 状态 | 可留内存；权威消费时间及关系数据均已持久化 |
-| `activeAuto`、autorun stop/pause flags | 连载执行镜像及控制意图 | 仍有遗留风险；会话 JSON/部分 job 已持久，但应彻底迁入 job 与持久取消意图 |
-| `planTasks`、`imageGenTasks` | 分镜/生图执行句柄和部分结果 | 已有 job/世界 pending 投影，但 Map 仍混合业务结果；需缩减为 jobId→句柄 |
-| `visualTasks`、`visualInFlight`、`coverInFlight` | 视觉终态缓存与并发控制 | 部分接入 job，仍应移除终态缓存并用数据库唯一约束 |
+| `activeAuto` | 连载循环执行镜像 | 可留内存；会话、checkpoint、暂停/停止意图和终态均由 auto job 持久化 |
+| `planTasks`、`imageGenTasks` | 分镜/生图执行句柄和流内即时结果 | 可留内存；job/world 保存恢复依据与用户可见终态，重启恢复不依赖 Map |
+| `visualInFlight`、`coverInFlight` | 单进程并发优化 | 可留内存；SQLite 活动 job 唯一约束负责权威仲裁，视觉终态缓存已移除 |
 | 视频重生成 recovery job | 视频回滚上下文、重生成互斥 | 已迁入 SQLite；watcher 重启后按 dedupeKey 读取旧 id/path，成功/失败/超时收敛 job |
-| `deletedStories`、读自愈 Set | 删除墓碑/短期去重 | 删除墓碑应持久化；纯自愈执行锁可留内存 |
+| `scope_tombstones`、读自愈 Set | 持久删除墓碑/短期去重 | 墓碑已迁入 SQLite；纯自愈执行锁可留内存 |
 | `media-auto-generate` job / 前端倒计时展示 | 自动生成 deadline 与展示 | deadline/scenes/session 已持久并由服务端恢复；前端 interval 只更新剩余秒数，不触发业务命令 |
-| new-story/advance/autorun JSON | 旧业务事实 | 当前仍参与恢复；后续迁入统一 job/command 账本并提供兼容迁移 |
+| new-story/advance/autorun 旧 JSON | 兼容导入源 | 首次读取一次性导入 job 后删除旧文件；不再作为运行时权威事实 |
 
 由此可见，“内存中存在 Set/Map”本身不是问题；风险取决于它是否是用户可见业务事实的唯一副本。连接、锁和执行句柄可以留内存，任务状态、幂等键、取消意图、倒计时、provider id、删除墓碑和回滚数据必须持久化。
 
@@ -110,7 +110,7 @@ idle -> submitting -> running -> succeeded|failed|interrupted|cancelled
 
 ## 6. 后续演进顺序
 
-1. 迁移删除墓碑和剩余取消意图，避免后台任务在进程重启后误写已删 scope。
-2. 迁移 `activeAuto/planTasks/imageGenTasks/visualTasks`，确保 Map 只保存执行句柄。
-3. 将剩余写入口纳入 `/api/commands` 并强制 expectedRevision。
-4. 增加租约续期、outbox 压缩/保留策略、故障注入和登录态浏览器网络验收，为多进程部署做准备。
+1. 将进程内执行表继续收窄为 jobId 到 AbortController/timer/provider watcher 的句柄映射。
+2. 增加租约续期与过期执行器接管，支持多进程安全恢复。
+3. 增加 outbox 压缩/保留策略和故障注入。
+4. 在具备测试账号后完成登录态浏览器网络验收。

@@ -4361,7 +4361,7 @@ html { scroll-behavior: smooth; }
 }
 .bc-character-facts { display: flex; flex-wrap: wrap; gap: 0.28rem 0.65rem; margin: 0.2rem 0 0.45rem; }
 .bc-character-fact { display: inline-flex; gap: 0.28rem; align-items: baseline; font-size: 0.72rem; color: var(--ink); }
-.bc-character-fact b { font-size: 0.63rem; color: var(--ink-soft); font-weight: 600; }
+.bc-character-fact b { font-size: 0.63rem; color: var(--ink-soft); font-weight: 600; white-space: nowrap; }
 .bc-character-copy { margin: 0.25rem 0; font-size: 0.74rem; line-height: 1.55; color: var(--ink-soft); }
 .bc-character-copy b { margin-right: 0.45rem; color: var(--ink); font-size: 0.68rem; }
 .bc-character-exit { color: #8f3a34; }
