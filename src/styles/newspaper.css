@@ -3393,6 +3393,38 @@ html { scroll-behavior: smooth; }
   overflow: hidden;
   background: #faf8f4;
 }
+.relationship-graph-canvas {
+  display: block;
+  width: 100%;
+  height: clamp(220px, 42vh, 340px);
+  min-height: 220px;
+  cursor: grab;
+  touch-action: none;
+}
+.relationship-graph-canvas:active { cursor: grabbing; }
+.relationship-graph-modal { height: clamp(240px, 55vh, 400px); }
+.bc-relationship-graph {
+  margin-top: 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+  background: #faf8f4;
+}
+.bc-relationship-graph .relationship-graph-canvas {
+  height: clamp(210px, 35vh, 290px);
+}
+.bc-empty-state {
+  padding: 1.15rem 0.75rem;
+  text-align: center;
+  color: var(--ink-soft);
+  font-size: 0.78rem;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+}
+@media (max-width: 600px) {
+  .relationship-graph-canvas,
+  .bc-relationship-graph .relationship-graph-canvas { height: 230px; min-height: 230px; }
+}
 
 /* ============ 浮动下拉菜单（body 层级） ============ */
 .float-dropdown {

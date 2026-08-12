@@ -741,3 +741,31 @@ test("卡片 executionState 原地呈现：提交中禁用、成功隐藏操作�
   root.unmount();
   mount.remove();
 });
+
+test("relationships 卡：有边渲染只读 Canvas，无关系显示空状态且不渲染空画布", async () => {
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root = createRoot(mount);
+  const graph = {
+    focus: "c1",
+    nodes: [{ id: "c1", name: "林墨", role: "主角" }, { id: "c2", name: "沈夜", role: "反派" }],
+    edges: [{ from: "c1", to: "c2", label: "宿敌" }],
+  };
+  root.render(React.createElement(BrainCardView, { card: {
+    kind: "browse", title: "林墨 · 关系网", browseType: "relationships",
+    data: { list: [{ a: "林墨", relation: "宿敌", b: "沈夜" }], subgraph: graph },
+  } }));
+  await tick();
+  expect(mount.querySelector('canvas[aria-label="林墨 · 关系网只读关系子图"]')).not.toBeNull();
+  expect(mount.textContent).not.toContain("新增连线");
+
+  root.render(React.createElement(BrainCardView, { card: {
+    kind: "browse", title: "路人 · 关系网", browseType: "relationships",
+    data: { list: [], subgraph: { focus: "c4", nodes: [{ id: "c4", name: "路人", role: "配角" }], edges: [] } },
+  } }));
+  await tick();
+  expect(mount.textContent).toContain("暂未记录人物关系");
+  expect(mount.querySelector("canvas")).toBeNull();
+  root.unmount();
+  mount.remove();
+});

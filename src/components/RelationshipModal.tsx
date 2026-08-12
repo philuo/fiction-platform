@@ -5,6 +5,8 @@ import { useEffect, useRef, useState } from "react";
 import { Plus, Trash2, X } from "../components/icons";
 import type { Character, WorldState } from "../api/world";
 import { formatChapterRange } from "../shared/appearance";
+import { RelationshipGraphCanvas } from "./RelationshipGraphCanvas";
+import { extractRelationshipSubgraph } from "../shared/relationships";
 
 type GNode = { id: string; name: string; role: string; x: number; y: number };
 type GEdge = { from: string; to: string; label: string };
@@ -767,10 +769,18 @@ export const RelationshipModal: React.FC<{
           </div>
         )}
         <div className="rel-canvas-wrap">
-          <canvas
-            ref={canvasRef}
-            style={{ width: "100%", height: "clamp(240px, 55vh, 400px)", cursor: "default", touchAction: "none" }}
-          />
+          {p.readOnly ? (
+            <RelationshipGraphCanvas
+              graph={extractRelationshipSubgraph(p.world.characters) ?? { nodes: [], edges: [] }}
+              className="relationship-graph-modal"
+              ariaLabel="人物关系只读图"
+            />
+          ) : (
+            <canvas
+              ref={canvasRef}
+              style={{ width: "100%", height: "clamp(240px, 55vh, 400px)", cursor: "default", touchAction: "none" }}
+            />
+          )}
         </div>
           </>
         )}

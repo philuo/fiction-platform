@@ -26,6 +26,7 @@ import { gachaGenerate as directorGachaGenerate } from "./director";
 import { uuid } from '../shared/uuid';
 import type { CardType } from "./cards";
 import type { Card as WorldCard, WorldState } from "./world";
+import { extractRelationshipSubgraph } from "../shared/relationships";
 import {
   appendMessage,
   createSession,
@@ -520,25 +521,18 @@ export function executeQuery(w: WorldState, intent: string, params: Record<strin
     };
   }
   if (intent === "read_relationships") {
-    // 全部关系（去重：a-(rel)-b 与 b-(rel)-a 同值只留一条，方向按名字排序）；params.name 限定某角色局部
     const filterName = String(params.name ?? "").trim();
-    const seen = new Set<string>();
-    const list: Record<string, unknown>[] = [];
-    for (const c of w.characters) {
-      for (const [b, relation] of Object.entries(c.relations ?? {})) {
-        const key = [c.name, b].sort().join("|") + "|" + relation;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        if (filterName && c.name !== filterName && b !== filterName) continue;
-        list.push({ a: c.name, relation, b });
-      }
-    }
-    if (filterName) {
-      const c = w.characters.find((x) => x.name.includes(filterName) || filterName.includes(x.name));
-      if (!c) return { kind: "result", title: "未找到角色", success: false, detail: `没有叫「${filterName}」的角色` };
-      return { kind: "browse", title: `${c.name} · 关系网（${list.length} 条）`, browseType: "relationships", data: { name: c.name, list } };
-    }
-    return { kind: "browse", title: `人物关系图（${list.length} 条）`, browseType: "relationships", data: { list } };
+    const subgraph = extractRelationshipSubgraph(w.characters, filterName || undefined);
+    if (!subgraph) return { kind: "result", title: "未找到角色", success: false, detail: `没有叫「${filterName}」的角色` };
+    const byId = new Map(subgraph.nodes.map((node) => [node.id, node.name]));
+    const list = subgraph.edges.map((edge) => ({ a: byId.get(edge.from) ?? edge.from, relation: edge.label, b: byId.get(edge.to) ?? edge.to }));
+    const focus = subgraph.focus ? byId.get(subgraph.focus) : undefined;
+    return {
+      kind: "browse",
+      title: focus ? `${focus} · 关系网（${list.length} 条）` : `人物关系图（${list.length} 条）`,
+      browseType: "relationships",
+      data: { name: focus, list, subgraph },
+    };
   }
   if (intent === "read_outline") {
     // 大纲/蓝图：主题 + 指南针 + 卷 + 弧线

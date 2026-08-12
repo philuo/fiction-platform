@@ -4,6 +4,7 @@
 // 可选 image 字段：任意卡片可携带一张图（角色立绘/章节插画等），渲染在卡片内容上方
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { lensCn } from "../terms";
+import { RelationshipGraphCanvas, type RelationshipSubgraph } from "./RelationshipGraphCanvas";
 
 // ============ 卡片数据类型 ============
 
@@ -610,10 +611,12 @@ export const BrowseCardView: React.FC<{
       </>
     );
   } else if (card.browseType === "relationships" && d) {
-    // 人物关系：a-(关系)-b 列表（局部关系网：d.name）
+    // 人物关系：轻量摘要 + 只读一跳子图；无边时不渲染空画布。
     const list = (Array.isArray(d.list) ? d.list : []) as Record<string, unknown>[];
+    const subgraph = d.subgraph as RelationshipSubgraph | undefined;
     body = (
       <>
+        {list.length === 0 && <div className="bc-empty-state">暂未记录人物关系</div>}
         <div className="bc-browse-list">
           {list.map((r, i) => (
             <div key={i} className="bc-browse-item bc-rel-item">
@@ -623,6 +626,11 @@ export const BrowseCardView: React.FC<{
             </div>
           ))}
         </div>
+        {subgraph && subgraph.nodes.length > 0 && subgraph.edges.length > 0 && (
+          <div className="bc-relationship-graph">
+            <RelationshipGraphCanvas graph={subgraph} ariaLabel={`${card.title}只读关系子图`} />
+          </div>
+        )}
       </>
     );
   } else if (card.browseType === "outline" && d) {
