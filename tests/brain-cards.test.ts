@@ -714,3 +714,30 @@ test("媒体 form 卡：WS/world 更新额度后扩展选项，并把超额旧�
   expect((mount.querySelectorAll("select")[1] as HTMLSelectElement).options.length).toBe(2);
   root.unmount();
 });
+
+test("卡片 executionState 原地呈现：提交中禁用、成功隐藏操作、失败保留重试", async () => {
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root = createRoot(mount);
+  const base = {
+    kind: "preview" as const, cardId: "state-card", title: "执行指令", summary: "不会追加结果卡",
+    action: { endpoint: "/api/novel/test", body: {} },
+  };
+  root.render(React.createElement(BrainCardView, { card: { ...base, executionState: "submitting" as const, detail: "正在提交" }, onExecute: () => {} }));
+  await tick();
+  expect(mount.textContent).toContain("提交中");
+  expect((mount.querySelector("button") as HTMLButtonElement).disabled).toBe(true);
+
+  root.render(React.createElement(BrainCardView, { card: { ...base, executionState: "succeeded" as const, detail: "已保存" }, onExecute: () => {} }));
+  await tick();
+  expect(mount.textContent).toContain("已完成");
+  expect(mount.textContent).toContain("已保存");
+  expect(mount.querySelector("button")).toBeNull();
+
+  root.render(React.createElement(BrainCardView, { card: { ...base, executionState: "failed" as const, detail: "冲突" }, onExecute: () => {} }));
+  await tick();
+  expect(mount.textContent).toContain("冲突");
+  expect((mount.querySelector("button") as HTMLButtonElement).disabled).toBe(false);
+  root.unmount();
+  mount.remove();
+});

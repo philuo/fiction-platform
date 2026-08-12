@@ -43,6 +43,7 @@ import {
   abortSessionTask,
   listSyncSessionSnapshots,
   settleCardsAfterMutation,
+  isCardExecutionTransition,
   type BrainMutationImpact,
 } from "./brain-sessions";
 import { startAdvanceTask, updateAdvanceTaskPhase, completeAdvanceTask, failAdvanceTask, getAdvanceTaskForClient, clearAdvanceTask } from "./advancetask";
@@ -1435,6 +1436,12 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       const ucPatch = (ucBody.patch ?? null) as Record<string, unknown> | null;
       if (!ucTitle || !ucSessionId || !ucMessageId || !ucCardId || !ucPatch || typeof ucPatch !== "object") {
         return json({ error: "缺少 title/sessionId/messageId/cardId/patch" }, 400);
+      }
+      const ucSession = getBrainSession(ucTitle, ucSessionId);
+      const ucMessage = ucSession?.messages.find((item) => item.id === ucMessageId);
+      const ucCard = ucMessage?.cards?.find((item) => item.cardId === ucCardId);
+      if (ucCard && !isCardExecutionTransition(ucCard.executionState, ucPatch.executionState)) {
+        return json({ error: "非法卡片状态迁移", current: ucCard.executionState }, 409);
       }
       const updated = updateBrainMessageCard(ucTitle, ucSessionId, ucMessageId, ucCardId, ucPatch);
       if (updated) {

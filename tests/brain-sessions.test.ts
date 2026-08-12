@@ -29,10 +29,22 @@ import {
   replaceMessageCard,
   updateMessageText,
   createProgressMessage,
+  isCardExecutionTransition,
 } from "../src/api/brain-sessions";
 
 const TITLE = "brain-sessions-test";
 let dataDir = "";
+
+test("卡片执行状态机：允许正常推进，终态幂等且拒绝乱序回滚", () => {
+  expect(isCardExecutionTransition("idle", "submitting")).toBe(true);
+  expect(isCardExecutionTransition("submitting", "running")).toBe(true);
+  expect(isCardExecutionTransition("running", "succeeded")).toBe(true);
+  expect(isCardExecutionTransition("waiting_confirmation", "submitting")).toBe(true);
+  expect(isCardExecutionTransition("succeeded", "succeeded")).toBe(true);
+  expect(isCardExecutionTransition("succeeded", "running")).toBe(false);
+  expect(isCardExecutionTransition("failed", "submitting")).toBe(false);
+  expect(isCardExecutionTransition("idle", "bogus")).toBe(false);
+});
 let sessionIds: string[] = [];
 
 beforeAll(() => {

@@ -22,6 +22,8 @@ import type { WorldState } from "../api/world";
 
 /** 从消息卡片中找 PreviewCard 的 action（供 ConfirmCard 确认时执行） */
 function findPreviewAction(cards?: BrainCard[]): PreviewCard["action"] | undefined {
+  const confirm = cards?.find((c) => c.kind === "confirm" && c.action);
+  if (confirm?.kind === "confirm") return confirm.action;
   const p = cards?.find((c): c is PreviewCard => c.kind === "preview");
   return p?.action;
 }
@@ -1048,7 +1050,7 @@ export const BrainCabin: React.FC<{
                     completedItems={card.kind === "browse" ? completedItemIdsOf(completed, msg.id, i) : undefined}
                     onExecute={(card2, action) => executeCard(card2, action, msg.id, i)}
                     onConfirmChoose={(opt) => confirmChoose(opt, msg, i)}
-                    onOption={handleOption}
+                    onOption={(option) => handleOption(option, { messageId: msg.id, cardIndex: i, card })}
                     onFormSubmit={(card2, values) => submitForm(card2, values, msg.id, i)}
                     onFormValuesChange={(vals, source) => {
                       // 仅媒体 form 卡写入（非媒体卡如 settings/edit_world 不污染 state、不触发无谓重渲染）
@@ -1272,48 +1274,75 @@ export const BrainCabin: React.FC<{
     inputRef.current?.focus();
   }
 
-  /** 操作被前置校验拦截时的反馈：追加失败结果卡；若最后一条消息已是同标题+原因的失败卡则不重复（防刷屏） */
-  function notifyBlocked(title: string, reason: string) {
-    const last = messages[messages.length - 1];
-    const lastCard = last?.cards?.[last.cards.length - 1];
-    if (lastCard?.kind === "result" && lastCard.title === title && lastCard.detail === reason) return;
+  type CardLocation = { messageId?: string; cardIndex?: number; card?: BrainCard };
+
+  /** Persist a card state transition before treating it as authoritative. The local patch is
+   * immediate for feedback; a failed write is made visible on the same card. */
+  async function settleCard(location: CardLocation, patch: Record<string, unknown>): Promise<boolean> {
+    const { messageId, card } = location;
+    const cardId = card?.cardId;
+    if (!activeId || !messageId || !cardId) return false;
+    patchCard(activeId, messageId, cardId, patch);
+    try {
+      const res = await apiFetch("/api/brain/sessions/update-card", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: world.title, sessionId: activeId, messageId, cardId, patch }),
+      });
+      if (res.ok) return true;
+      const data = await res.json().catch(() => ({})) as { error?: string };
+      patchCard(activeId, messageId, cardId, { executionState: "failed", detail: data.error ?? `状态保存失败（HTTP ${res.status}）` });
+      return false;
+    } catch (error) {
+      patchCard(activeId, messageId, cardId, { executionState: "failed", detail: `状态保存失败：${(error as Error).message}` });
+      return false;
+    }
+  }
+
+  /** 操作被前置校验拦截时在原卡反馈，不再追加结果卡。 */
+  function notifyBlocked(title: string, reason: string, location?: CardLocation) {
+    if (location?.card?.cardId) {
+      void settleCard(location, { executionState: "failed", detail: reason, settledAt: Date.now() });
+      return;
+    }
     appendBrainMsg([{ kind: "result", title, success: false, detail: reason }]);
   }
 
   /** 统一操作守卫：不可执行时反馈原因并返回 true（调用方直接 return，不发请求、不标记完成） */
-  function guardBlocked(act: { endpoint: string; body?: Record<string, unknown> }, title: string): boolean {
+  function guardBlocked(act: { endpoint: string; body?: Record<string, unknown> }, title: string, location?: CardLocation): boolean {
     const reason = guardAction(act, {
       executing, streaming,
       writingRunning: writing?.status === "running",
       world,
     });
     if (reason) {
-      notifyBlocked(title, reason);
+      notifyBlocked(title, reason, location);
       return true;
     }
     return false;
   }
 
   /** 计划/意见选项卡点击：有动作则执行并回执；纯说明则记录选择 */
-  async function handleOption(option: ChoiceOption) {
+  async function handleOption(option: ChoiceOption, location: CardLocation = {}) {
     if (!option.action) {
-      appendBrainMsg([{ kind: "result", title: option.label, success: true, detail: option.description ?? "已选择，中枢将据此继续" }]);
+      await settleCard(location, { executionState: "succeeded", detail: option.description ?? `已选择：${option.label}`, selectedOption: option.label, settledAt: Date.now() });
       return;
     }
-    if (guardBlocked(option.action, option.label)) return;
+    if (guardBlocked(option.action, option.label, location)) return;
+    if (!await settleCard(location, { executionState: "submitting", detail: `正在执行：${option.label}`, selectedOption: option.label })) return;
     setExecuting(true);
     try {
       const r = await fetchAction(option.action.endpoint, option.action.method ?? "POST", option.action.body);
-      appendBrainMsg([{ kind: "result", title: option.label, success: r.success, detail: r.detail }]);
+      await settleCard(location, { executionState: r.success ? "succeeded" : "failed", detail: r.detail, settledAt: Date.now() });
       if (r.success) onWorldUpdate?.();
     } catch (e) {
-      appendBrainMsg([{ kind: "result", title: option.label, success: false, detail: (e as Error).message }]);
+      await settleCard(location, { executionState: "failed", detail: (e as Error).message, settledAt: Date.now() });
     } finally {
       setExecuting(false);
     }
   }
 
-  /** 标记消息内某张卡片已执行完成（preview/form/confirm：按钮替换为完成标记；browse 卡按 itemId 标记列表项）。
+  /** 旧协议兼容：没有 executionState 的历史卡仍使用 completed key。
    *  经 useBrainSession.markCompleted 持久化到服务端——刷新页面后完成态不丢失。 */
   function markCardDone(msgId?: string, cardIndex?: number, itemId?: string) {
     if (!msgId || cardIndex == null) return;
@@ -1332,44 +1361,20 @@ export const BrainCabin: React.FC<{
    * 追加 result 卡到会话并刷新世界。
    */
   /** 返回是否成功：中断/失败为 false（调用方不标记卡片完成态，用户可重试） */
-  async function streamWritingTask(title: string, act: { endpoint: string; method?: string; body: Record<string, unknown> }, cardTitle: string): Promise<boolean> {
+  async function streamWritingTask(title: string, act: { endpoint: string; method?: string; body: Record<string, unknown> }, cardTitle: string, location: CardLocation): Promise<boolean> {
     const ctrl = new AbortController();
     writingAbortRef.current = ctrl;
     // 清掉上一次任务的收起定时器，避免任务 A 结束后 2.5s 内启动任务 B 时把 B 的进度卡提前收起
     if (writingTimerRef.current) window.clearTimeout(writingTimerRef.current);
     setWriting({ title: cardTitle, phase: "start", text: "", status: "running" });
 
-    // 阶段 3b：创建服务端持久 progress 卡（带 cardId）——SSE 期间就地更新，完成后翻转 + 广播（多 tab 一致、刷新可见）。
-    // 失败建卡（无 activeId / 网络）则退化为纯瞬态（writing 仍展示），不阻塞任务。
-    let progressRef: { sessionId: string; messageId: string; cardId: string } | null = null;
-    const sid = activeId;
-    if (sid) {
-      try {
-        const pr = await apiFetch("/api/brain/sessions/progress", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title, sessionId: sid, cardTitle }),
-        });
-        if (pr.ok) {
-          const pd = (await pr.json()) as { messageId?: string; cardId?: string };
-          if (pd.messageId && pd.cardId) progressRef = { sessionId: sid, messageId: pd.messageId, cardId: pd.cardId };
-        }
-      } catch { /* 建卡失败：退化为瞬态 */ }
-    }
-    /** 本地就地更新 progress 卡（命中 active 会话即时可见）；静默 */
+    const progressRef = activeId && location.messageId && location.card?.cardId
+      ? { sessionId: activeId, messageId: location.messageId, cardId: location.card.cardId }
+      : null;
     const patchProgressCard = (patch: Record<string, unknown>) => {
       if (progressRef) patchCard(progressRef.sessionId, progressRef.messageId, progressRef.cardId, patch);
     };
-    /** 完成后服务端翻转 + 广播（多 tab 一致）；失败静默（卡保持 running，重开会话仍可见过程） */
-    const finalizeProgressCard = (patch: Record<string, unknown>) => {
-      if (!progressRef) return;
-      patchProgressCard(patch);
-      void apiFetch("/api/brain/sessions/update-card", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, sessionId: progressRef.sessionId, messageId: progressRef.messageId, cardId: progressRef.cardId, patch }),
-      }).catch(() => {});
-    };
+    const finalizeProgressCard = (patch: Record<string, unknown>) => settleCard(location, patch);
 
     let finalText = "";
     let ended: "done" | "failed" | "running" = "running"; // 流式终态跟踪
@@ -1388,8 +1393,7 @@ export const BrainCabin: React.FC<{
         const msg = String(err.error ?? `HTTP ${res.status}`);
         ended = "failed";
         patch({ status: "failed", detail: msg });
-        finalizeProgressCard({ status: "failed", phase: "failed", detail: msg });
-        appendBrainMsg([{ kind: "result", title: cardTitle, success: false, detail: msg }]);
+        await finalizeProgressCard({ status: "failed", executionState: "failed", phase: "failed", detail: msg, settledAt: Date.now() });
         return false;
       }
       const reader = res.body.getReader();
@@ -1437,15 +1441,15 @@ export const BrainCabin: React.FC<{
       // 流正常关闭但未收到终态：任务已完成（SSE 在 result 后关闭）；兜底收尾
       if (ended === "running") ended = "done";
       patch((w) => (w!.status === "running" ? { status: "done", detail: "任务已结束" } : {}));
-      finalizeProgressCard({ status: "done", detail: "任务已结束" });
-      appendBrainMsg([{ kind: "result", title: cardTitle, success: ended === "done", detail: ended === "done" ? "写作已完成，正文已更新" : "写作未完成" }]);
+      await finalizeProgressCard({ status: "done", executionState: "succeeded", detail: ended === "done" ? "写作已完成，正文已更新" : "写作未完成", settledAt: Date.now() });
       return ended === "done";
     } catch (e) {
       const aborted = (e as Error).name === "AbortError";
       ended = "failed";
       patch(aborted ? { status: "failed", detail: "写作已中断" } : { status: "failed", detail: (e as Error).message });
-      finalizeProgressCard(aborted ? { status: "failed", phase: "failed", detail: "写作已中断" } : { status: "failed", phase: "failed", detail: (e as Error).message });
-      if (!aborted) appendBrainMsg([{ kind: "result", title: cardTitle, success: false, detail: (e as Error).message }]);
+      await finalizeProgressCard(aborted
+        ? { status: "failed", executionState: "interrupted", phase: "failed", detail: "写作已中断", settledAt: Date.now() }
+        : { status: "failed", executionState: "failed", phase: "failed", detail: (e as Error).message, settledAt: Date.now() });
       return false;
     } finally {
       writingAbortRef.current = null;
@@ -1458,15 +1462,18 @@ export const BrainCabin: React.FC<{
   async function executeCard(card: BrainCard, action?: { endpoint: string; method?: string; body: Record<string, unknown> }, msgId?: string, cardIndex?: number) {
     const act = action ?? (card.kind === "preview" ? card.action : undefined);
     if (!act) return;
+    const location = { messageId: msgId, cardIndex, card };
     const cardTitle = card.kind === "ask" ? "" : card.title; // AskCard 无 title（且无 action 走不到这里，收窄用）
-    if (guardBlocked(act, cardTitle)) return; // 前置校验：不可执行时反馈原因，不发请求（服务端仍兜底权威）
+    if (guardBlocked(act, cardTitle, location)) return; // 前置校验：不可执行时反馈原因，不发请求（服务端仍兜底权威）
+    if (!await settleCard(location, { executionState: "submitting", detail: "正在提交指令…" })) return;
     setExecuting(true);
     try {
       // 推进剧情 / 自动连载：聊天内流式显示写作过程（progress 卡实时阶段+正文），结束后 result 卡回执；
       // 仅成功才标记卡片完成（中断/失败保留按钮，用户可重试）
       if (act.endpoint === "/api/novel/step" || act.endpoint === "/api/novel/auto/start") {
-        const ok = await streamWritingTask(world.title, act, cardTitle);
-        if (ok) markCardDone(msgId, cardIndex);
+        await settleCard(location, { executionState: "running", status: "running", detail: "写作任务运行中…" });
+        const ok = await streamWritingTask(world.title, act, cardTitle, location);
+        if (ok && !card.cardId) markCardDone(msgId, cardIndex);
         onWorldUpdate?.();
         return;
       }
@@ -1489,8 +1496,7 @@ export const BrainCabin: React.FC<{
         const data = (await res.json().catch(() => ({}))) as { ok?: boolean; mediaIds?: string[]; mediaId?: string; error?: string };
         if (!res.ok || data.error) {
           const msg = String(data.error ?? `HTTP ${res.status}`);
-          // 提交失败：服务端未落盘 running 卡，卡保持倒计时/预览态可重试；仅追加错误回执
-          appendBrainMsg([{ kind: "result", title: cardTitle, success: false, detail: msg }]);
+          await settleCard(location, { executionState: "failed", status: "failed", detail: msg, settledAt: Date.now() });
           return;
         }
         const ids = data.mediaIds ?? (data.mediaId ? [data.mediaId] : []);
@@ -1503,19 +1509,18 @@ export const BrainCabin: React.FC<{
         return;
       }
       const r = await fetchAction(act.endpoint, act.method ?? "POST", act.body);
-      appendBrainMsg([{ kind: "result", title: cardTitle, success: r.success, detail: r.detail }]);
+      await settleCard(location, { executionState: r.success ? "succeeded" : "failed", detail: r.detail, settledAt: Date.now() });
       if (r.success) {
         // gacha 全部应用（auto:true）：pendingCards 一次性消耗，标记本卡全部列表项完成（刷新后保持「已处理」）
         if (act.endpoint === "/api/novel/gacha" && act.body.action === "apply" && act.body.auto === true && card.kind === "browse") {
           const list = (card.data as { list?: { id?: unknown }[] } | null)?.list ?? [];
           for (const c of list) if (c?.id) markCardDone(msgId, cardIndex, String(c.id));
         }
-        markCardDone(msgId, cardIndex, card.kind === "browse" ? actionItemId(act.body) : undefined);
+        if (!card.cardId || card.kind === "browse") markCardDone(msgId, cardIndex, card.kind === "browse" ? actionItemId(act.body) : undefined);
         onWorldUpdate?.();
       }
     } catch (e) {
-      // media/generate 网络异常：服务端未落盘 running 卡，卡保持倒计时/预览态可重试；仅追加错误回执（不回写 HTTP）
-      appendBrainMsg([{ kind: "result", title: cardTitle, success: false, detail: (e as Error).message }]);
+      await settleCard(location, { executionState: "failed", status: "failed", detail: (e as Error).message, settledAt: Date.now() });
     } finally {
       setExecuting(false);
     }
@@ -1618,38 +1623,41 @@ export const BrainCabin: React.FC<{
 
   /** ConfirmCard 确认（L2/L3 三选一；msg/cardIndex 供成功后标记 confirm 与 preview 卡完成态） */
   async function confirmChoose(opt: "merge" | "rewrite" | "abort", msg?: ChatMessage, cardIndex?: number) {
+    const cards = msg?.cards ?? [];
+    const confirmIdx = cardIndex ?? cards.findIndex((c) => c.kind === "confirm");
+    const confirmCard = confirmIdx >= 0 ? cards[confirmIdx] : undefined;
+    const location = { messageId: msg?.id, cardIndex: confirmIdx, card: confirmCard };
     if (opt === "abort") {
-      appendBrainMsg([{ kind: "result", title: "已放弃", success: true, detail: "用户选择放弃本次操作" }]);
-      // 放弃同样标记 confirm/preview 卡完成，防 ctx-bar 与消息内按钮重复触发
-      const cards = msg?.cards ?? [];
-      const confirmIdx = cardIndex ?? cards.findIndex((c) => c.kind === "confirm");
-      if (msg && confirmIdx >= 0) markCardDone(msg.id, confirmIdx);
+      await settleCard(location, { executionState: "cancelled", detail: "用户选择放弃本次操作", settledAt: Date.now() });
+      if (msg && confirmIdx >= 0 && !confirmCard?.cardId) markCardDone(msg.id, confirmIdx);
       const pIdx = cards.findIndex((c) => c.kind === "preview");
-      if (pIdx >= 0) markCardDone(msg?.id, pIdx);
+      const preview = pIdx >= 0 ? cards[pIdx] : undefined;
+      if (preview?.cardId) await settleCard({ messageId: msg?.id, cardIndex: pIdx, card: preview }, { executionState: "cancelled", detail: "用户选择放弃本次操作", settledAt: Date.now() });
+      else if (pIdx >= 0) markCardDone(msg?.id, pIdx);
       return;
     }
-    const cards = msg?.cards;
     const action = findPreviewAction(cards);
     if (!action) {
-      appendBrainMsg([{ kind: "result", title: "无法执行", success: false, detail: "未找到操作端点" }]);
+      await settleCard(location, { executionState: "failed", detail: "未找到操作端点", settledAt: Date.now() });
       return;
     }
-    if (guardBlocked(action, `已执行（${opt}）`)) return; // 前置校验：系统忙/写作运行中/资源已消耗时拦截
+    if (guardBlocked(action, `执行（${opt}）`, location)) return;
+    if (!await settleCard(location, { executionState: "submitting", detail: `正在执行：${opt}` })) return;
     setExecuting(true);
     try {
       const body = { ...action.body, strategy: opt };
       const r = await fetchAction(action.endpoint, action.method ?? "POST", body);
-      appendBrainMsg([{ kind: "result", title: `已执行（${opt}）`, success: r.success, detail: r.detail }]);
+      await settleCard(location, { executionState: r.success ? "succeeded" : "failed", detail: r.detail, settledAt: Date.now() });
       if (r.success) {
-        // 自动定位 confirm 卡下标（ctx-bar 调用未传 cardIndex 时也能标记完成态，防重复提交）
-        const confirmIdx = cardIndex ?? (cards ?? []).findIndex((c) => c.kind === "confirm");
-        if (confirmIdx >= 0) markCardDone(msg?.id, confirmIdx); // confirm 卡完成
-        const pIdx = (cards ?? []).findIndex((c) => c.kind === "preview");
-        if (pIdx >= 0) markCardDone(msg?.id, pIdx); // 连带 preview 卡完成（防重复执行）
+        if (!confirmCard?.cardId && confirmIdx >= 0) markCardDone(msg?.id, confirmIdx);
+        const pIdx = cards.findIndex((c) => c.kind === "preview");
+        const preview = pIdx >= 0 ? cards[pIdx] : undefined;
+        if (preview?.cardId) await settleCard({ messageId: msg?.id, cardIndex: pIdx, card: preview }, { executionState: "succeeded", detail: r.detail, settledAt: Date.now() });
+        else if (pIdx >= 0) markCardDone(msg?.id, pIdx);
         onWorldUpdate?.();
       }
     } catch (e) {
-      appendBrainMsg([{ kind: "result", title: `执行失败（${opt}）`, success: false, detail: (e as Error).message }]);
+      await settleCard(location, { executionState: "failed", detail: (e as Error).message, settledAt: Date.now() });
     } finally {
       setExecuting(false);
     }
@@ -1661,7 +1669,8 @@ export const BrainCabin: React.FC<{
    * 否则结果回执 + 刷新世界。confirmRequired 卡（如删除伏笔）由按钮文案承担确认语义。
    */
   async function submitForm(card: FormCard, values: Record<string, unknown>, msgId?: string, cardIndex?: number) {
-    if (guardBlocked(card.action, card.title)) return; // 前置校验：系统忙/写作运行中拦截
+    const location = { messageId: msgId, cardIndex, card };
+    if (guardBlocked(card.action, card.title, location)) return; // 前置校验：系统忙/写作运行中拦截
     const flat = flattenFormValues(card.fields ?? [], values);
     const body: Record<string, unknown> = { ...(card.action.body ?? {}), ...flat, title: world.title };
     const isMediaPlan = card.action.endpoint === "/api/novel/media/plan";
@@ -1672,10 +1681,11 @@ export const BrainCabin: React.FC<{
       const quota = mediaQuotaOf(chapterIndex);
       const count = Number(body.count);
       if (quota <= 0 || !Number.isInteger(count) || count < 1 || count > quota) {
-        appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: quota <= 0 ? "本章插画已满（上限 3 张），请先删除部分插画再生成" : "所选张数超出本章剩余可生成数量，请调整后重试" }]);
+        await settleCard(location, { executionState: "failed", detail: quota <= 0 ? "本章插画已满（上限 3 张），请先删除部分插画再生成" : "所选张数超出本章剩余可生成数量，请调整后重试", settledAt: Date.now() });
         return;
       }
     }
+    if (!await settleCard(location, { executionState: "submitting", detail: "正在提交…" })) return;
     // 媒体分镜：中间态「分镜中」running 卡由【服务端】在 /media/plan 同步落盘并经 card-replaced WS 推下，
     // 前端不再乐观落盘（避免无 planId 的悬死卡被恢复扫描误判为「分镜已中断」）。提交按钮 busy 态已覆盖在途 UX。
     setExecuting(true);
@@ -1695,8 +1705,7 @@ export const BrainCabin: React.FC<{
       const data = await res.json().catch(() => ({})) as Record<string, unknown>;
       if (!res.ok || data.error) {
         const msg = String(data.error ?? `HTTP ${res.status}`);
-        // 分镜提交失败：form 卡本就未被前端改动，保持原样可重试（服务端未落盘 running 卡）
-        appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: msg }]);
+        await settleCard(location, { executionState: "failed", detail: msg, settledAt: Date.now() });
         return;
       }
       // 媒体生成表单（/api/novel/media/plan）：planId 由服务端写入 running 卡并随 card-replaced 到达；
@@ -1705,31 +1714,25 @@ export const BrainCabin: React.FC<{
         return;
       }
       if (data.needIntervention && data.report) {
-        // L2 干预：预览影响面 + 三选一确认（复用 confirmChoose 的 preview 查找逻辑）
+        // L2 干预：原表单就地转换为确认卡，保留 cardId/commandId，避免消息列表增长。
         const rp = data.report as { summary?: string; affectedChapters?: unknown[] };
-        const preview: PreviewCard = {
-          kind: "preview",
+        const confirm: BrainCard = {
+          kind: "confirm",
+          cardId: card.cardId,
           title: card.title,
           commandId: card.commandId,
           level: card.level ?? "L2",
-          summary: rp.summary ?? "此修改为 L2 回溯变更，将影响已写内容",
-          confirmRequired: true,
+          executionState: "waiting_confirmation",
+          detail: rp.summary ?? "此修改为 L2 回溯变更，将影响已写内容",
+          impact: `影响 ${(rp.affectedChapters ?? []).length} 个已写章节，请选择处理策略。${rp.summary ?? ""}`,
+          options: ["merge", "rewrite", "abort"],
           action: { endpoint: card.action.endpoint, method: card.action.method ?? "POST", body },
         };
-        const confirm: BrainCard = {
-          kind: "confirm",
-          title: `${card.title} · 确认`,
-          commandId: card.commandId,
-          level: card.level ?? "L2",
-          impact: `影响 ${(rp.affectedChapters ?? []).length} 个已写章节，请选择处理策略`,
-          options: ["merge", "rewrite", "abort"],
-        };
-        markCardDone(msgId, cardIndex); // 表单已完成，进入确认阶段
-        appendBrainMsg([preview, confirm]);
+        if (activeId && msgId != null && cardIndex != null) await replaceCard(activeId, msgId, cardIndex, confirm, true);
         return;
       }
-      markCardDone(msgId, cardIndex);
-      appendBrainMsg([{ kind: "result", title: card.title, success: true, detail: "已保存" }]);
+      await settleCard(location, { executionState: "succeeded", detail: "已保存", settledAt: Date.now() });
+      if (!card.cardId) markCardDone(msgId, cardIndex);
       onWorldUpdate?.();
     } catch (e) {
       const aborted = (e as Error).name === "AbortError";
@@ -1738,7 +1741,7 @@ export const BrainCabin: React.FC<{
         // 分镜提交网络异常/超时：回退 form 卡（服务端任务可能已创建但无 planId 无法轮询，重试即可）
         void replaceCard(activeId, msgId, cardIndex, card, true);
       }
-      appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: msg }]);
+      await settleCard(location, { executionState: aborted ? "interrupted" : "failed", detail: msg, settledAt: Date.now() });
     } finally {
       window.clearTimeout(formTimer);
       setExecuting(false);

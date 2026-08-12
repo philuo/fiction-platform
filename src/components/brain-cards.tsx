@@ -11,12 +11,13 @@ import { lensCn } from "../terms";
 export type CardImage = { src: string; alt?: string };
 
 export type BrainCardLevel = "L0" | "L1" | "L2" | "L3";
+export type CardExecutionState = "idle" | "submitting" | "running" | "waiting_confirmation" | "succeeded" | "failed" | "interrupted" | "cancelled";
 
 /** 卡片公共字段（新增字段向后兼容——旧卡片无 cardId 时跳过就地更新） */
 export type BrainCardBase = {
   /** 卡片稳定标识（阶段 3a）：系统事件可就地更新该卡（如任务完成翻转状态）；未产出则跳过更新 */
   cardId?: string;
-  executionState?: "idle" | "submitting" | "running" | "waiting_confirmation" | "succeeded" | "failed" | "interrupted" | "cancelled";
+  executionState?: CardExecutionState;
   detail?: string;
   settledAt?: number;
 };
@@ -72,6 +73,7 @@ export type ConfirmCard = BrainCardBase & {
   impact?: string;
   verdict?: string; // 闸门裁决 allow/reject
   options: ("merge" | "rewrite" | "abort")[];
+  action?: { endpoint: string; method?: string; body: Record<string, unknown> };
 };
 
 export type ResultCard = BrainCardBase & {
@@ -127,6 +129,7 @@ export type ChoiceCard = BrainCardBase & {
   title: string;
   summary?: string;
   options: ChoiceOption[];
+  selectedOption?: string;
   image?: CardImage;
 };
 
@@ -216,6 +219,24 @@ function CommandBadge({ commandId }: { commandId?: string }) {
   return <span className="bc-cmd" title={`指令 ${commandId}`}>{commandId}</span>;
 }
 
+const EXECUTION_LABEL: Record<CardExecutionState, string> = {
+  idle: "待执行", submitting: "提交中", running: "运行中", waiting_confirmation: "等待确认",
+  succeeded: "已完成", failed: "失败", interrupted: "已中断", cancelled: "已取消",
+};
+
+function ExecutionBadge({ state }: { state?: CardExecutionState }) {
+  if (!state || state === "idle") return null;
+  return <span className={`bc-execution-badge bc-execution-${state}`}>{EXECUTION_LABEL[state]}</span>;
+}
+
+function isExecutionBusy(state?: CardExecutionState): boolean {
+  return state === "submitting" || state === "running";
+}
+
+function isExecutionDone(state?: CardExecutionState): boolean {
+  return state === "succeeded" || state === "cancelled" || state === "interrupted";
+}
+
 // ============ PreviewCard 操作预览卡 ============
 
 export const PreviewCardView: React.FC<{
@@ -226,10 +247,10 @@ export const PreviewCardView: React.FC<{
   /** 生成完成跳转（done 态「查看插画」按钮） */
   onGoToMedia?: (chapterIndex: number, mediaId: string) => void;
 }> = ({ card, onExecute, busy, completed, onGoToMedia }) => {
-  const running = card.status === "running";
-  const failed = card.status === "failed";
+  const running = card.status === "running" || isExecutionBusy(card.executionState);
+  const failed = card.status === "failed" || card.executionState === "failed" || card.executionState === "interrupted";
   // failed 覆盖 completed 展示（任务失败时优先显示失败态，按钮保留可重试）
-  const done = card.status === "done" || (completed && !failed);
+  const done = card.status === "done" || isExecutionDone(card.executionState) || (completed && !failed);
   // 分镜完成待自动生成（scenes + countdownAt，无 status）：展示场景 + 倒计时 + 立即生成按钮
   const awaitingAuto = !!card.scenes?.length && !!card.countdownAt && !running && !failed && !done;
   // 倒计时剩余秒：本地每秒刷新（countdownAt 为截止时间戳，跨刷新恢复后自动对齐）
@@ -249,6 +270,7 @@ export const PreviewCardView: React.FC<{
         <span className="brain-card-title">{done ? "✓ " : ""}{card.title}</span>
         <CommandBadge commandId={card.commandId} />
         <LevelBadge level={card.level} />
+        <ExecutionBadge state={card.executionState} />
         {card.confirmRequired && !done && <span className="bc-confirm-tag">需确认</span>}
       </div>
       <p className="brain-card-body">{card.summary}</p>
@@ -277,6 +299,7 @@ export const PreviewCardView: React.FC<{
           {card.detail ? `：${card.detail}` : ""}
         </p>
       )}
+      {!running && !failed && card.detail && <p className="bc-task-status">{card.detail}</p>}
       {awaitingAuto && (
         <p className="bc-task-status bc-task-countdown">
           <span className="bc-progress-pill bc-progress-pill-running">倒计时 {left}s</span>
@@ -307,21 +330,25 @@ export const ConfirmCardView: React.FC<{
   completed?: boolean;
 }> = ({ card, onChoose, busy, completed }) => {
   const optLabel: Record<string, string> = { merge: "① 正向弥合", rewrite: "② 回溯重写", abort: "③ 放弃" };
+  const stateDone = isExecutionDone(card.executionState);
+  const stateBusy = isExecutionBusy(card.executionState);
   return (
-    <div className={`brain-card brain-card-confirm${completed ? " bc-card-done" : ""}`}>
+    <div className={`brain-card brain-card-confirm${completed || stateDone ? " bc-card-done" : ""}`}>
       <div className="brain-card-head">
         <span className="brain-card-title">{completed ? "✓ " : ""}{card.title}</span>
         <CommandBadge commandId={card.commandId} />
         <LevelBadge level={card.level} />
+        <ExecutionBadge state={card.executionState} />
       </div>
       {card.impact && <p className="brain-card-impact">{card.impact}</p>}
       {card.verdict && <p className="brain-card-verdict">闸门裁决：{card.verdict === "allow" ? "放行" : card.verdict === "reject" ? "驳回" : String(card.verdict)}</p>}
+      {card.detail && <p className="brain-card-body">{card.detail}</p>}
       <div className="brain-card-actions">
-        {completed ? (
-          <span className="bc-done-tag">✓ 已处理</span>
+        {completed || stateDone ? (
+          <span className="bc-done-tag">{card.executionState === "cancelled" ? "已放弃" : "✓ 已处理"}</span>
         ) : (
           card.options.map((opt) => (
-            <button key={opt} className="btn-save btn-xs" disabled={busy} onClick={() => onChoose?.(opt)}>
+            <button key={opt} className="btn-save btn-xs" disabled={busy || stateBusy} onClick={() => onChoose?.(opt)}>
               {optLabel[opt]}
             </button>
           ))
@@ -1023,10 +1050,11 @@ export const ChoiceCardView: React.FC<{
   onOption?: (option: ChoiceOption) => void;
   busy?: boolean;
 }> = ({ card, onOption, busy }) => (
-  <div className={`brain-card brain-card-choice brain-card-${card.kind}`}>
+  <div className={`brain-card brain-card-choice brain-card-${card.kind}${isExecutionDone(card.executionState) ? " bc-card-done" : ""}`}>
     <div className="brain-card-head">
       <span className="brain-card-title">{card.kind === "plan" ? "🗺 " : "💬 "}{card.title}</span>
       {card.kind === "opinion" && <span className="bc-confirm-tag">请选择</span>}
+      <ExecutionBadge state={card.executionState} />
     </div>
     {card.summary && <p className="brain-card-body">{card.summary}</p>}
     <div className="bc-choice-options">
@@ -1034,7 +1062,7 @@ export const ChoiceCardView: React.FC<{
         <button
           key={i}
           className="bc-choice-option"
-          disabled={busy}
+          disabled={busy || isExecutionBusy(card.executionState) || isExecutionDone(card.executionState)}
           onClick={() => onOption?.(o)}
           title={o.description ?? o.label}
         >
@@ -1044,6 +1072,7 @@ export const ChoiceCardView: React.FC<{
         </button>
       ))}
     </div>
+    {card.detail && <p className="bc-task-status">{card.detail}</p>}
   </div>
 );
 
@@ -1120,6 +1149,8 @@ export const FormCardView: React.FC<{
   /** 媒体插画 form 卡：张数下拉的剩余额度回调（按所选章节动态计算，切换章节后 options 跟随） */
   mediaQuota?: (chapterIndex: number) => number;
 }> = ({ card, onSubmit, busy, completed, onValuesChange, mediaQuota }) => {
+  const stateDone = isExecutionDone(card.executionState);
+  const stateBusy = isExecutionBusy(card.executionState);
   const [values, setValues] = useState<Record<string, unknown>>(() => {
     const init: Record<string, unknown> = {};
     for (const f of card.fields ?? []) init[f.key] = f.value ?? (f.type === "number" ? "" : f.type === "multiselect" ? [] : "");
@@ -1180,14 +1211,16 @@ export const FormCardView: React.FC<{
   };
 
   return (
-    <div className={`brain-card brain-card-form${card.confirmRequired ? " bc-form-confirm" : ""}${completed ? " bc-card-done" : ""}`}>
+    <div className={`brain-card brain-card-form${card.confirmRequired ? " bc-form-confirm" : ""}${completed || stateDone ? " bc-card-done" : ""}`}>
       <div className="brain-card-head">
         <span className="brain-card-title">{card.title}</span>
         <CommandBadge commandId={card.commandId} />
         <LevelBadge level={card.level} />
+        <ExecutionBadge state={card.executionState} />
         {card.confirmRequired && <span className="bc-confirm-tag">需确认</span>}
       </div>
       {liveSummary && <p className="brain-card-body">{liveSummary}</p>}
+      {card.detail && card.executionState !== "idle" && <p className="bc-task-status">{card.detail}</p>}
       {(card.fields ?? []).length === 0 ? (
         <p className="bc-browse-meta">无需填写字段，直接提交执行。</p>
       ) : (
@@ -1250,11 +1283,11 @@ export const FormCardView: React.FC<{
       )}
       <div className="brain-card-actions">
         {onSubmit && (
-          completed ? (
-            <span className="bc-done-tag">✓ 已执行</span>
+          completed || stateDone ? (
+            <span className="bc-done-tag">{card.executionState === "cancelled" ? "已取消" : card.executionState === "interrupted" ? "已中断" : "✓ 已执行"}</span>
           ) : (
-            <button className="btn-save btn-xs" disabled={busy || mediaCountQuota === 0} onClick={submit}>
-              {card.submitLabel ?? "提交"}
+            <button className="btn-save btn-xs" disabled={busy || stateBusy || mediaCountQuota === 0} onClick={submit}>
+              {stateBusy ? "提交中…" : (card.submitLabel ?? "提交")}
             </button>
           )
         )}

@@ -14,11 +14,21 @@ import { slugify, currentUser } from "./storage";
 import { uuid } from "../shared/uuid";
 
 const EXECUTABLE_CARD_KINDS = new Set(["preview", "confirm", "form", "plan", "opinion", "browse", "progress"]);
+const CARD_EXECUTION_STATES = new Set([
+  "idle", "submitting", "running", "waiting_confirmation", "succeeded", "failed", "interrupted", "cancelled",
+]);
+const TERMINAL_CARD_STATES = new Set(["succeeded", "failed", "interrupted", "cancelled"]);
 
 function normalizeCard(card: BrainChatCard): BrainChatCard {
-  const next = { ...card };
+  // Mutate the outgoing object as well as returning a copy. brain-chat persists a card
+  // immediately before emitting the same object over SSE; this keeps both channels on
+  // the same stable cardId instead of letting the current tab briefly create a ghost card.
+  const next = card;
   const kind = String(next.kind ?? "");
   if (EXECUTABLE_CARD_KINDS.has(kind) && !next.cardId) next.cardId = `card-${uuid()}`;
+  if (EXECUTABLE_CARD_KINDS.has(kind) && !next.executionState) {
+    next.executionState = kind === "progress" || next.status === "running" ? "running" : "idle";
+  }
   const legacyOpen = next.open as { target?: unknown; opts?: Record<string, unknown> } | undefined;
   if (legacyOpen?.target && !next.panelIntent) {
     next.panelIntent = {
@@ -27,7 +37,24 @@ function normalizeCard(card: BrainChatCard): BrainChatCard {
       opts: legacyOpen.opts,
     };
   }
-  return next;
+  return { ...next };
+}
+
+export type CardExecutionState = "idle" | "submitting" | "running" | "waiting_confirmation" | "succeeded" | "failed" | "interrupted" | "cancelled";
+
+/** Public protocol guard used by the card update endpoint. Terminal cards are immutable,
+ * except for an idempotent replay of the same terminal state. */
+export function isCardExecutionTransition(current: unknown, next: unknown): boolean {
+  if (next == null) return true;
+  if (typeof next !== "string" || !CARD_EXECUTION_STATES.has(next)) return false;
+  if (current == null || current === next) return true;
+  if (typeof current !== "string" || !CARD_EXECUTION_STATES.has(current)) return false;
+  if (TERMINAL_CARD_STATES.has(current)) return false;
+  if (current === "idle") return next === "submitting" || next === "waiting_confirmation" || TERMINAL_CARD_STATES.has(next);
+  if (current === "submitting") return next === "running" || next === "waiting_confirmation" || TERMINAL_CARD_STATES.has(next);
+  if (current === "running") return TERMINAL_CARD_STATES.has(next);
+  if (current === "waiting_confirmation") return next === "submitting" || TERMINAL_CARD_STATES.has(next);
+  return false;
 }
 
 function normalizeMessage(msg: BrainChatMsg): BrainChatMsg {
