@@ -7,8 +7,8 @@ import * as steering from "./steering";
 import { runAuto, stopAuto, pauseAuto } from "./autorun";
 import { evaluateBookCached } from "./eval";
 import { extractFingerprint } from "./style";
-import { loadWorld, listStories, listStoriesMeta, deleteStory, exportMarkdown, exportEpub, slugify as slug, saveWorld, storyDir, storyExists, loadAutoSession, clearAutoSession, loadPendingChapter, clearPendingChapter, currentUser, migrateLegacyStoriesTo, runAsUser, userDir } from "./storage";
-import { createNewStoryTask, completeNewStoryTask, failNewStoryTask, markNewStoryTaskReady, updateNewStoryTaskStage, getNewStoryTask, listActiveNewStoryTasks, removeNewStoryTaskByTitle } from "./newtask";
+import { loadWorld, listStories, deleteStory, exportMarkdown, exportEpub, slugify as slug, saveWorld, storyDir, storyExists, loadAutoSession, clearAutoSession, loadPendingChapter, clearPendingChapter, currentUser, migrateLegacyStoriesTo, runAsUser, userDir } from "./storage";
+import { createNewStoryTask, completeNewStoryTask, failNewStoryTask, markNewStoryTaskReady, updateNewStoryTaskStage, removeNewStoryTaskByTitle } from "./newtask";
 import { buildAutoLore, mergeLore, sanitizeLore } from "./lore";
 import { generateImage, saveImage, readImage, deleteMediaFile, compressToJpeg } from "./images";
 import { pollVideoTask, downloadVideo, saveVideo } from "./videos";
@@ -976,6 +976,12 @@ export async function handleApi(pathname: string, req: Request): Promise<Respons
 }
 
 async function handleApiInner(pathname: string, req: Request, user: AuthUser | null): Promise<Response | null> {
+  const removedStateRoutes = new Set([
+    "/api/brain/context", "/api/novel/list", "/api/novel/new/status", "/api/novel/step/status",
+    "/api/novel/step/clear", "/api/novel/auto/status", "/api/novel/media/plan-status",
+    "/api/novel/media/status", "/api/novel/media/status-batch", "/api/novel/state", "/api/novel/visual/status",
+  ]);
+  if (removedStateRoutes.has(pathname)) return json({ error: "状态查询接口已移除，请使用 /api/sync" }, 404);
   // 强制登录：全部业务数据/能力接口按账号隔离，未登录一律 401（前端未登录本就只显示登录页）。
   // 覆盖小说、中枢、对话（/api/chat、/api/chat/stream）与搜索——全局功能均与账号绑定。
   const requiresAuth =
@@ -1368,50 +1374,6 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       return json({ ok });
     }
 
-    case "/api/brain/context": {
-      // 中枢系统状态快照（索引式全知）：服务端权威聚合——自动连载/写作任务/媒体生成/视觉任务/待办清单。
-      // 供中枢按需拉取（而非每轮全量注入 LLM，控制 token）；前端 BrainCabin 一并注入 chatCtx。
-      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
-      const bcCtxBody = await readBody(req);
-      const bcCtxTitle = String(bcCtxBody.title ?? "").trim();
-      if (!bcCtxTitle) return json({ error: "缺少 title" }, 400);
-      const bcCtxW = loadWorld(bcCtxTitle);
-      if (!bcCtxW) return json({ error: "故事不存在: " + bcCtxTitle }, 404);
-      // 自动连载 / 待入册草稿
-      const bcCtxAuto = loadAutoSession(bcCtxTitle);
-      const bcCtxPending = loadPendingChapter(bcCtxTitle);
-      // 写作任务（advance-task）
-      const bcCtxTask = getAdvanceTaskForClient(bcCtxTitle);
-      // 媒体生成中（内存表，按当前用户+书名 key）
-      const mk = mediaKey(bcCtxTitle);
-      const mediaGenerating = imageGenTasks.has(mk);
-      // 视觉任务运行中
-      const vk = `${currentUser() ?? ""}::${bcCtxTitle}`;
-      const vTasks = visualTasks.get(vk);
-      const visualRunning = vTasks ? [...vTasks.values()].some((v) => v.status === "running") : false;
-      // 待办清单（world 派生）
-      const pendingProposals = (bcCtxW.characterProposals ?? []).filter((pp) => pp.status === "pending").length;
-      const pendingCards = (bcCtxW.pendingCards ?? []).length;
-      const openDebt = (bcCtxW.qualityDebt ?? []).filter((d) => d.status === "open").length;
-      const reviseChapters = bcCtxW.chapters.filter((c) => c.review?.verdict === "revise").map((c) => c.index);
-      return json({
-        context: {
-          autoRunning: bcCtxAuto?.status === "running",
-          autoPhase: bcCtxAuto?.status === "running" ? bcCtxAuto?.phase : undefined,
-          pendingCommit: bcCtxPending ? { index: bcCtxPending.chapterIndex ?? null, title: bcCtxPending.title ?? "" } : null,
-          advanceTaskRunning: bcCtxTask?.status === "running",
-          advancePhase: bcCtxTask?.status === "running" ? bcCtxTask?.phase : undefined,
-          /** 推进任务启动时间（稳定标识）：前端「推进任务完成」事件注入聊天用其做 eventId（防并发重复/漏报） */
-          advanceStartedAt: bcCtxTask?.status === "running" ? bcCtxTask?.startedAt : undefined,
-          mediaGenerating,
-          visualRunning,
-          pendingProposals,
-          pendingCards,
-          openDebt,
-          reviseChapters,
-        },
-      });
-    }
     case "/api/brain/chat": {
       // 中枢对话编排（SSE，事件协议 v2）：意图识别 + 流式回复 + 卡片（查询直接执行 / 写操作预览 / L2·L3 确认卡）
       // 会话化：body 带 sessionId（历史会话）或新建；resume=true 续流未完成消息
@@ -1484,9 +1446,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       if (!idea) return json({ error: "缺少 idea" }, 400);
       const genre = body.genre ? String(body.genre) : undefined;
       try {
-        // 异步立项：立即返回 taskId，后台跑完 5 个 LLM 调用（1-3 分钟）再落盘。
-        // 前端据 taskId 轮询 /api/novel/new/status，列表接口合并 creating 占位——用户"点了就有反馈"，
-        // 刷新列表也能看到生成中的书；不再同步阻塞 HTTP 请求（原实现最坏挂十几分钟）。
+        // 异步立项：立即返回 taskId，后台跑完 5 个 LLM 调用（1-3 分钟）再落盘；
+        // 用户级 sync 投影持续推送进度与终态，刷新或多 Tab 都不依赖 HTTP 状态查询。
         const { id: taskId, created } = createNewStoryTask(idea, genre);
         notifyLibraryChanged(currentUser() ?? undefined);
         if (created) {
@@ -1538,23 +1499,6 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       }
     }
 
-    case "/api/novel/new/status": {
-      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
-      const id = String(body.taskId ?? "").trim();
-      if (!id) return json({ error: "缺少 taskId" }, 400);
-      const t = getNewStoryTask(id);
-      if (!t) return json({ error: "任务不存在" }, 404);
-      return json({ status: t.status, title: t.title, error: t.error, idea: t.idea, stage: t.stage });
-    }
-
-    case "/api/novel/list": {
-      // creating：进行中的异步立项任务（running 壳未就绪 + ready 壳已就绪仍在增强）。
-      // 失败任务不进列表——失败即时 toast 提示即可，不残留卡片；status 端点仍可查终态
-      return json({
-        stories: listStoriesMeta(),
-        creating: listActiveNewStoryTasks().map((t) => ({ id: t.id, idea: t.idea, genre: t.genre ?? "", status: t.status, title: t.title, createdAt: t.startedAt })),
-      });
-    }
 
     case "/api/novel/delete": {
       if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
@@ -1632,22 +1576,6 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       });
     }
 
-    case "/api/novel/step/status": {
-      // 查询单章推进任务状态（前端刷新后恢复显示用）：陈旧 running 自动标记 failed
-      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
-      const title = String(body.title ?? "").trim();
-      if (!title) return json({ error: "缺少 title" }, 400);
-      return json({ task: getAdvanceTaskForClient(title) });
-    }
-
-    case "/api/novel/step/clear": {
-      // 前端已读取 done/failed 结果后清除任务文件（避免刷新重复提示）
-      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
-      const title = String(body.title ?? "").trim();
-      if (!title) return json({ error: "缺少 title" }, 400);
-      clearAdvanceTask(title);
-      return json({ ok: true });
-    }
 
     case "/api/novel/chapter/confirm": {
       // 确认入册（commitPolicy=confirm 通道）：消费暂存区待确认草稿 → 完整 commit 记账
@@ -2371,13 +2299,6 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       return json({ ok: true });
     }
 
-    case "/api/novel/auto/status": {
-      // 会话与暂存区查询（前端刷新恢复 / 进度轮询）
-      const url = new URL(req.url, "http://localhost");
-      const title = String(url.searchParams.get("title") ?? body.title ?? "").trim();
-      if (!title) return json({ error: "缺少 title" }, 400);
-      return json({ ok: true, session: loadAutoSession(title), pending: loadPendingChapter(title) });
-    }
 
     case "/api/novel/auto/skip": {
       // 跳过暂存区章节（git：放弃该章工作区）：清草稿 + 删未核销本章计划 + nextChapter 前移（章节号空洞由 integrity 支持）
@@ -2738,22 +2659,6 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       return json({ ok: true, planId: id });
     }
 
-    case "/api/novel/media/plan-status": {
-      // 分镜任务状态查询（前端一次性核对）：pending → 继续等；ready → 返回场景；failed → 错误信息；
-      // notfound（服务重启任务表丢失）→ 前端提示重试。超时已由 setTimeout 真超时处理，此处不再懒判。
-      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
-      const pt = String(body.title ?? "").trim();
-      const planIdStr = String(body.planId ?? "").trim();
-      if (!pt || !planIdStr) return json({ error: "缺少 title/planId" }, 400);
-      const t = planTasks.get(planIdStr);
-      if (!t) return json({ ok: true, status: "notfound" });
-      return json({
-        ok: true,
-        status: t.status,
-        scenes: t.status === "ready" ? t.scenes : undefined,
-        error: t.status === "failed" ? t.error : undefined,
-      });
-    }
 
     case "/api/novel/media/generate": {
       // 按确认的场景生成媒体：image/video 均锁外生成、锁内短事务追加（对齐，避免长时间持锁阻塞写作）
@@ -3021,36 +2926,6 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       }
     }
 
-    case "/api/novel/media/status": {
-      // 单个媒体状态查询（插画 pending/ready/failed；视频 completed 时下载落盘并置 ready，429 容忍）。
-      // 逻辑抽到 getMediaStatus，供 /media/status-batch 复用
-      const title = String(body.title ?? "").trim();
-      const idx = Number(body.chapterIndex);
-      const mediaId = String(body.mediaId ?? "").trim();
-      if (!title || !mediaId) return json({ error: "缺少参数" }, 400);
-      if (!Number.isInteger(idx) || idx < 1) return json({ error: "缺少有效的章节号" }, 400);
-      const res = await getMediaStatus(title, idx, mediaId);
-      if (!res.ok) return json({ error: res.error }, res.httpStatus);
-      return json(res);
-    }
-
-    case "/api/novel/media/status-batch": {
-      // 一次性批量核对媒体状态（前端卡片生命周期/左侧章节视图刷新后调用，不做轮询）。
-      // 顺序执行：图片最多 3 张即时返回；视频避免 provider 429，逐个查询。
-      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
-      const title = String(body.title ?? "").trim();
-      const items = Array.isArray(body.items) ? body.items as { chapterIndex?: unknown; mediaId?: unknown }[] : [];
-      if (!title) return json({ error: "缺少 title" }, 400);
-      const results: Record<string, { status: string; progress?: number; path?: string; error?: string; rateLimited?: boolean }> = {};
-      for (const it of items) {
-        const idx = Number(it.chapterIndex);
-        const id = String(it.mediaId ?? "").trim();
-        if (!id || !Number.isInteger(idx) || idx < 1) continue;
-        const res = await getMediaStatus(title, idx, id);
-        if (res.ok) results[id] = { status: res.status, ...(res.status === "ready" ? { progress: 100, path: res.path } : {}), ...(res.status === "failed" ? { error: res.error } : {}), ...(res.status === "pending" ? { progress: res.progress, ...(res.rateLimited ? { rateLimited: true } : {}) } : {}) };
-      }
-      return json({ ok: true, results });
-    }
 
     case "/api/novel/media/cancel": {
       // 取消进行中的分镜/插画任务（前端卡片消失兜底；幂等）。已就绪媒体保留；已拿 videoId 的视频不可取消。
