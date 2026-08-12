@@ -3,7 +3,7 @@ import { recoverPreparedWorldCommits, settleOrphanedJobs } from "./control-plane
 import { cleanupStaleAdvanceTasks } from "./advancetask";
 import { cleanupNewStoryTasks } from "./newtask";
 import { cleanupStaleMediaTasksOnBoot } from "./media-recovery";
-import { migrateLegacyOnBoot, resumeAutoSessions, startVisualSweep } from "./routes";
+import { migrateLegacyOnBoot, resumeAutoSessions, resumeScheduledMediaJobs, startVisualSweep } from "./routes";
 import { markRuntimeReady, markRuntimeRecovering, markRuntimeRecoveryFailed, runtimeReadiness } from "./runtime-readiness";
 
 const BOOT_PROMISE_KEY = "__moshift_boot_recovery_promise__";
@@ -24,6 +24,7 @@ export async function runBootRecovery(): Promise<void> {
     cleanupNewStoryTasks();
     await cleanupStaleMediaTasksOnBoot();
     resumeAutoSessions();
+    resumeScheduledMediaJobs();
     startVisualSweep();
     markRuntimeReady({ recoveredWorldCommits, interruptedJobs });
   } catch (error) {

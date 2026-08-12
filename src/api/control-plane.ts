@@ -190,18 +190,32 @@ export function updateJob(id: string, patch: {
   return getJob(id);
 }
 
+export function transitionJob(id: string, from: JobStatus[], to: JobStatus, phase: string): boolean {
+  if (from.length === 0) return false;
+  const placeholders = from.map(() => "?").join(",");
+  const result = getDb().query(`UPDATE jobs SET status=?,phase=?,updated_at=? WHERE id=? AND status IN (${placeholders})`)
+    .run(to, phase, now(), id, ...from);
+  return Number(result.changes) === 1;
+}
+
+export function listScheduledJobs(kind: string): DurableJob[] {
+  return (getDb().query(`SELECT * FROM jobs WHERE kind=? AND status='queued' ORDER BY deadline_at,created_at`).all(kind) as Record<string, unknown>[])
+    .map(rowToJob);
+}
+
 /** 收敛重启后已失去进程执行句柄的任务；仅保留有安全恢复点的任务。 */
 export function settleOrphanedJobs(): number {
-  const rows = getDb().query(`SELECT id,kind,recovery_json FROM jobs
+  const rows = getDb().query(`SELECT id,kind,status,recovery_json FROM jobs
     WHERE status IN ('queued','running','waiting_external')`).all() as {
-      id: string; kind: string; recovery_json: string | null;
+      id: string; kind: string; status: JobStatus; recovery_json: string | null;
     }[];
   let interrupted = 0;
   for (const row of rows) {
     const recovery = parseJson<Record<string, unknown>>(row.recovery_json);
     const resumableVideo = (row.kind === "video" || row.kind === "media-regenerate") && typeof recovery?.videoId === "string" && Boolean(recovery.videoId);
     const resumableAuto = row.kind === "auto";
-    if (resumableVideo || resumableAuto) {
+    const scheduledMedia = row.kind === "media-auto-generate" && row.status === "queued";
+    if (resumableVideo || resumableAuto || scheduledMedia) {
       updateJob(row.id, {
         status: resumableVideo ? "waiting_external" : "queued",
         leaseOwner: null,

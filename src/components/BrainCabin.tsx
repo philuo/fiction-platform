@@ -444,8 +444,6 @@ export const BrainCabin: React.FC<{
   const planTrackRef = useRef<Map<string, {
     sid: string; msgId: string; cardIndex: number; cardId: string; kind: "image" | "video"; chapterIndex: number; commandId?: string;
   }>>(new Map());
-  /** 自动生成倒计时 timer（cardId → timer）：分镜完成 3s 无操作自动生成；跨刷新恢复对齐 */
-  const countdownRef = useRef<Map<string, number>>(new Map());
   /** WS 连接状态：默认 true（页面加载后 WS 基本已连；连接时零 HTTP 轮询，靠订阅快照 + task-status 事件驱动） */
   /** 已处理「悬死」分镜中卡（running 但无 planId/mediaIds：提交后刷新丢失任务 id，无法恢复轮询）的 cardId 集合 */
   const stuckMediaRef = useRef<Set<string>>(new Set());
@@ -670,8 +668,6 @@ export const BrainCabin: React.FC<{
       cabinMountedRef.current = false;
       mediaPollJobsRef.current = [];
       planTrackRef.current.clear();
-      for (const t of countdownRef.current.values()) window.clearTimeout(t);
-      countdownRef.current.clear();
       if (writingTimerRef.current) { window.clearTimeout(writingTimerRef.current); writingTimerRef.current = null; }
       if (delTimerRef.current) { window.clearTimeout(delTimerRef.current); delTimerRef.current = null; }
       inputResizeCleanupRef.current?.();
@@ -686,8 +682,6 @@ export const BrainCabin: React.FC<{
     stuckMediaRef.current.clear();
     trackedCardsRef.current.clear();
     goneSuspectRef.current.clear();
-    for (const t of countdownRef.current.values()) window.clearTimeout(t);
-    countdownRef.current.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [world.title]);
 
@@ -719,7 +713,6 @@ export const BrainCabin: React.FC<{
   useEffect(() => {
     const liveJobs = new Set<string>();       // 仍在跑（running 带 mediaIds）的 cardId
     const livePlans = new Set<string>();      // 仍在分镜中（running 带 planId）的 planId
-    const liveCountdowns = new Set<string>(); // 仍待自动生成（scenes+countdownAt 且无终态）的 cardId
     // 当前所有已加载会话里仍存在的卡片（cardId → 取消所需锚点）；用于与上一轮快照 diff 出「消失的运行中卡」
     const liveCards = new Map<string, { sid: string; msgId: string; cardIndex: number; planId?: string; mediaIds?: string[]; chapterIndex?: number; running: boolean }>();
     for (const s of sessions) {
@@ -737,16 +730,12 @@ export const BrainCabin: React.FC<{
           });
           if (pc.status === "running" && pc.mediaIds?.length) liveJobs.add(cardId);
           if (pc.status === "running" && pc.planId) livePlans.add(pc.planId);
-          if (pc.scenes?.length && pc.countdownAt && !pc.status) liveCountdowns.add(cardId);
         });
       }
     }
     mediaPollJobsRef.current = mediaPollJobsRef.current.filter((j) => !!j.cardId && liveJobs.has(j.cardId));
     for (const [pid] of planTrackRef.current) {
       if (!livePlans.has(pid)) planTrackRef.current.delete(pid);
-    }
-    for (const [cardId, t] of countdownRef.current) {
-      if (!liveCountdowns.has(cardId)) { window.clearTimeout(t); countdownRef.current.delete(cardId); }
     }
 
     // 卡片消失 → 取消后台任务（两次确认：切书时快照已被 world.title effect 清空，不会误取消；
@@ -1478,7 +1467,7 @@ export const BrainCabin: React.FC<{
       // 逐张 task-status 进度（pollMediaGen 为纯 WS 登记，无 HTTP）。提交按钮 busy 态覆盖在途 UX。
       if (act.endpoint === "/api/novel/media/generate") {
         const mediaCardId = (card as { cardId?: string }).cardId;
-        stopCountdown(mediaCardId); // 手动点击「立即生成」：取消该卡自动倒计时
+        // 自动调度由服务端持久 job 仲裁；手动点击会原子取消尚未到期的 queued job。
         const genSid = activeId;
         // 携带会话定位：服务端落盘「生成中」卡与终态卡并推 card-replaced（cardId 沿用当前卡）
         const genBody = (msgId != null && cardIndex != null && mediaCardId && genSid)
@@ -1756,52 +1745,6 @@ export const BrainCabin: React.FC<{
     planTrackRef.current.set(planId, { sid: sid || activeId, msgId, cardIndex, cardId, kind, chapterIndex, commandId });
   }
 
-  /** 自动生成倒计时：分镜完成卡 3s 无手动操作自动生成（手动点「立即生成」由 executeCard 的 stopCountdown 取消）。
-   *  跨刷新恢复：countdownAt 为截止时间戳，重开后剩余时间自动对齐；已过期（面板关闭期间错过触发点）→
-   *  恢复扫描时【同步直接触发】，不依赖 setTimeout 异步时序——避免真实环境下 timer 在卸载/后台标签被丢弃而卡「0s 即将自动生成」。 */
-  function startCountdown(msgId: string, cardIndex: number, card: PreviewCard, cardId: string) {
-    if (countdownRef.current.has(cardId)) return; // 幂等（含占位）
-    const remain = (card.countdownAt ?? 0) - Date.now();
-    if (remain <= 0) {
-      // 已过期：同步自检后直接触发；先占位防重入（executeCard 会把卡 patch 成 running 离开待生成态，随后不再命中）
-      countdownRef.current.set(cardId, 0 as unknown as number);
-      const cur = findCard(msgId, cardIndex);
-      if (cur?.kind === "preview") {
-        const pc = cur as PreviewCard;
-        if (pc.scenes?.length && pc.countdownAt && !pc.status) {
-          void executeCard(pc, pc.action, msgId, cardIndex);
-          return; // 已触发：占位由 executeCard 的 stopCountdown 清理
-        }
-      }
-      countdownRef.current.delete(cardId);
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      countdownRef.current.delete(cardId);
-      if (!cabinMountedRef.current) return;
-      // 到点自检：卡片仍是「待自动生成」态（scenes + countdownAt 且非 running/failed/done）才触发，防重复
-      const cur = findCard(msgId, cardIndex);
-      if (!cur || cur.kind !== "preview") return;
-      const pc = cur as PreviewCard;
-      if (!pc.scenes?.length || !pc.countdownAt || pc.status) return;
-      void executeCard(pc, pc.action, msgId, cardIndex);
-    }, remain);
-    countdownRef.current.set(cardId, timer);
-  }
-
-  /** 取消某卡的自动生成倒计时（手动点击「立即生成」时） */
-  function stopCountdown(cardId?: string) {
-    if (!cardId) return;
-    const t = countdownRef.current.get(cardId);
-    if (t != null) { window.clearTimeout(t); countdownRef.current.delete(cardId); }
-  }
-
-  /** 从当前（active）消息流取指定消息内下标的卡片（倒计时到点自检用；倒计时只对展示会话运行） */
-  function findCard(msgId: string, cardIndex: number): BrainCard | undefined {
-    const m = messagesRef.current.find((x) => x.id === msgId);
-    return m?.cards?.[cardIndex];
-  }
-
   /** 媒体插画剩余可生成张数（每章上限 MAX_IMAGES_PER_CHAPTER 与后端同源；扣已有含生成中 pending）：
    *  供张数下拉动态 options + 提交前校验 */
   function mediaQuotaOf(chapterIndex: number): number {
@@ -1811,13 +1754,12 @@ export const BrainCabin: React.FC<{
   }
 
   // 媒体状态恢复扫描：会话加载/消息变化/重连/页面重新可见时，对所有已加载会话的 preview 卡续接跟踪——
-  // 分镜中（planId）→ 登记 WS 跟踪；分镜完成待生成（countdownAt，仅展示会话）→ 恢复倒计时；
+  // 分镜中（planId）→ 登记 WS 跟踪；分镜完成后的 deadline 由服务端持久调度；
   // 生成中（mediaIds）→ 登记 WS 跟踪（等 task-status 事件收尾）。纯事件驱动，无 interval 轮询。
   function resumeMediaScan() {
     for (const s of sessions) {
       const msgs = getSessionMessages(s.id);
       if (!msgs?.length) continue;
-      const isActive = s.id === activeId;
       for (const m of msgs) {
         (m.cards ?? []).forEach((c, i) => {
           if (c.kind !== "preview") return;
@@ -1826,9 +1768,6 @@ export const BrainCabin: React.FC<{
           if (!cardId) return;
           if (pc.status === "running" && pc.planId && !planTrackRef.current.has(pc.planId)) {
             trackPlanTask(pc.planId, m.id, i, cardId, pc.mediaKind ?? "image", pc.chapterIndex ?? 1, pc.commandId, s.id);
-          } else if (pc.scenes?.length && pc.countdownAt && !pc.status && isActive && !countdownRef.current.has(cardId)) {
-            // 倒计时只对当前展示会话启动；后台会话切回时再次扫描，countdownAt 已过则 startCountdown 同步触发
-            startCountdown(m.id, i, pc, cardId);
           } else if (pc.status === "running" && pc.mediaIds?.length) {
             // 登记 WS 跟踪（幂等）；错过的终态由 brain-status 权威快照覆盖。
             const chIdx = pc.chapterIndex ?? 1;

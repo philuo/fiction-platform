@@ -51,7 +51,7 @@ import type { CardType } from "./cards";
 import { renameSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { runtimeReadiness } from "./runtime-readiness";
-import { acceptCommandOnce, CommandConflictError, createJob, getActiveJob, listJobs, updateCommand, updateJob, type CommandRequest } from "./control-plane";
+import { acceptCommandOnce, CommandConflictError, createJob, getActiveJob, listJobs, listScheduledJobs, transitionJob, updateCommand, updateJob, type CommandRequest, type DurableJob } from "./control-plane";
 
 function json(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(data), {
@@ -145,6 +145,50 @@ type GenTask = {
   session?: { sessionId: string; messageId: string; cardIndex: number; cardId: string };
 };
 const imageGenTasks = new Map<string, GenTask>();
+const scheduledMediaTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleMediaAutoJob(job: DurableJob): void {
+  if (scheduledMediaTimers.has(job.id)) return;
+  const delay = Math.max(0, Date.parse(job.deadlineAt ?? "") - Date.now()) || 0;
+  const timer = setTimeout(() => {
+    scheduledMediaTimers.delete(job.id);
+    const recovery = job.recovery as { chapterIndex?: number; mediaKind?: string; scenes?: unknown[]; session?: unknown } | undefined;
+    void runAsUser(job.user === "__legacy__" ? null : job.user, async () => {
+      try {
+        const session = recovery?.session as { sessionId?: string; messageId?: string; cardIndex?: number; cardId?: string } | undefined;
+        if (session?.sessionId && session.messageId && Number.isInteger(session.cardIndex)) {
+          const persisted = getBrainSession(job.title ?? "", session.sessionId);
+          const message = persisted?.messages.find((item) => item.id === session.messageId);
+          const card = message?.cards?.[Number(session.cardIndex)] as { cardId?: string; status?: string; scenes?: unknown[] } | undefined;
+          if (!card || card.cardId !== session.cardId || card.status || !card.scenes?.length) {
+            updateJob(job.id, { status: "cancelled", phase: "card-no-longer-awaiting" });
+            return;
+          }
+        }
+        if (!transitionJob(job.id, ["queued"], "running", "dispatching")) return;
+        const request = new Request("http://internal/api/novel/media/generate", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: job.title, chapterIndex: recovery?.chapterIndex, kind: recovery?.mediaKind,
+            scenes: recovery?.scenes, session: recovery?.session, scheduledJobId: job.id,
+          }),
+        });
+        const response = await handleNovelApi("/api/novel/media/generate", request);
+        const result = response ? await response.clone().json().catch(() => ({})) as Record<string, unknown> : {};
+        if (!response?.ok) throw new Error(String(result.error ?? "自动生成提交失败"));
+        updateJob(job.id, { status: "succeeded", phase: "dispatched", result });
+      } catch (error) {
+        updateJob(job.id, { status: "failed", phase: "dispatch-failed", error: errorDetail(error, "自动生成提交失败") });
+      }
+    });
+  }, delay);
+  timer.unref?.();
+  scheduledMediaTimers.set(job.id, timer);
+}
+
+export function resumeScheduledMediaJobs(): void {
+  for (const job of listScheduledJobs("media-auto-generate")) scheduleMediaAutoJob(job);
+}
 
 /** 分镜执行句柄表（内存态）：planId → controller/timer；权威状态在 SQLite jobs 并经 sync 投影。
  *  恢复「分镜中」状态——关闭弹窗/刷新页面后重开，从会话卡读到 planId 继续轮询拿最新结果。
@@ -607,6 +651,13 @@ async function cancelMediaTargets(target: CancelTarget): Promise<CancelResult> {
   // 3) 按会话上下文扫描（删除/截断会话时）：匹配 sessionId + cardId 的 plan/image 任务
   if (target.session) {
     const { sessionId, cardId } = target.session;
+    const scheduled = getActiveJob(currentUser(), `media-auto:${cardId}`);
+    if (scheduled?.status === "queued") {
+      transitionJob(scheduled.id, ["queued"], "cancelled", "card-cancelled");
+      const timer = scheduledMediaTimers.get(scheduled.id);
+      if (timer) clearTimeout(timer);
+      scheduledMediaTimers.delete(scheduled.id);
+    }
     for (const [pid, t] of planTasks) {
       if (t.title === target.title && t.status === "pending"
         && t.session?.sessionId === sessionId && t.session?.cardId === cardId) {
@@ -2738,6 +2789,12 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             if (ok) {
               // 落盘成功 → 广播 card-replaced：所有 tab（含发起端）就地整卡替换，不重拉会话
               publishCardReplaced(title, sess.sessionId, sess.messageId, sess.cardIndex, card, user || undefined);
+              const scheduled = createJob({
+                user, title, kind: "media-auto-generate", dedupeKey: `media-auto:${sess.cardId}`,
+                status: "queued", phase: "waiting-deadline", deadlineAt: new Date(Number(card.countdownAt)).toISOString(),
+                recovery: { chapterIndex: idx, mediaKind: kind, scenes: valid, session: sess },
+              });
+              if (scheduled.created) scheduleMediaAutoJob(scheduled.job);
             }
           }
           // ② WS 广播（面板打开时实时就地翻卡，免轮询）
@@ -2788,6 +2845,17 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         : null);
       const genSession = genSessionCtx && genSessionCtx.sessionId && genSessionCtx.messageId && Number.isInteger(genSessionCtx.cardIndex) && genSessionCtx.cardId
         ? genSessionCtx : undefined;
+      const scheduledJobId = String(body.scheduledJobId ?? "").trim();
+      if (genSession) {
+        const scheduled = getActiveJob(currentUser(), `media-auto:${genSession.cardId}`);
+        if (scheduled && scheduled.id !== scheduledJobId) {
+          if (scheduled.status === "running") return json({ error: "自动生成任务已开始" }, 409);
+          transitionJob(scheduled.id, ["queued"], "cancelled", "manual-trigger");
+          const timer = scheduledMediaTimers.get(scheduled.id);
+          if (timer) clearTimeout(timer);
+          scheduledMediaTimers.delete(scheduled.id);
+        }
+      }
       try {
         if (kind === "video") {
           // SQLite 活动任务唯一约束是并发仲裁者：跨 Tab、跨进程都只能创建一个 provider 任务。

@@ -6,6 +6,7 @@ import { mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { emptyWorld, type WorldState } from "../src/api/world";
+import { updateJob } from "../src/api/control-plane";
 
 // —— mock LLM 层（必须在 import 任何 src/api 模块之前） ——
 let nextScenesJson = "";
@@ -287,7 +288,7 @@ describe("分镜完成服务端落盘翻卡（带会话上下文，刷新/重开
     expect(p.status).toBe(200);
     expect(String(p.data.planId ?? "")).not.toBe("");
     // 等后台完成并落盘（mock LLM 立即完成，轮询 detail 直到卡被翻）
-    let flipped: { kind?: string; status?: string; scenes?: unknown[]; countdownAt?: number; action?: { endpoint?: string } } | null = null;
+    let flipped: { kind?: string; cardId?: string; status?: string; scenes?: unknown[]; countdownAt?: number; action?: { endpoint?: string } } | null = null;
     for (let i = 0; i < 40; i++) {
       const dt = await handleApi(
         "/api/brain/sessions/detail",
@@ -299,7 +300,7 @@ describe("分镜完成服务端落盘翻卡（带会话上下文，刷新/重开
       );
       const dj = (await dt!.json()) as { session?: { messages?: { cards?: unknown[] }[] } };
       const cards = dj.session?.messages?.find((m) => (m as { id?: string }).id === msgId)?.cards ?? [];
-      const c = cards[0] as { kind?: string; status?: string; scenes?: unknown[]; countdownAt?: number; action?: { endpoint?: string } } | undefined;
+      const c = cards[0] as { kind?: string; cardId?: string; status?: string; scenes?: unknown[]; countdownAt?: number; action?: { endpoint?: string } } | undefined;
       if (c && c.status !== "running") { flipped = c; break; }
       await Bun.sleep(50);
     }
@@ -309,6 +310,12 @@ describe("分镜完成服务端落盘翻卡（带会话上下文，刷新/重开
     expect((flipped!.scenes ?? []).length).toBe(2);
     expect(typeof flipped!.countdownAt).toBe("number");
     expect(flipped!.action?.endpoint).toBe("/api/novel/media/generate");
+    const { getActiveJob } = await import("../src/api/control-plane");
+    const scheduled = getActiveJob(USER, `media-auto:${flipped!.cardId}`);
+    expect(scheduled?.kind).toBe("media-auto-generate");
+    expect(scheduled?.deadlineAt).toBeTruthy();
+    expect((scheduled?.recovery as { scenes?: unknown[] } | undefined)?.scenes?.length).toBe(2);
+    if (scheduled) updateJob(scheduled.id, { status: "cancelled", phase: "test-cleanup" });
   });
 });
 
