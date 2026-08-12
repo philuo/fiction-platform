@@ -12,9 +12,11 @@
 //     { type:"ping" }                                # 心跳保活（前端定时发送）
 import type { Server, ServerWebSocket } from "bun";
 import { userFromRequest, type AuthUser } from "./auth";
-import { currentUser, runAsUser, slugify, storyExists } from "./storage";
-import { subscribeSync, worldVersion, type SyncEvent } from "./sync";
-import { listPendingMediaTasks } from "./routes";
+import { currentUser, loadWorld, runAsUser, slugify, storyExists } from "./storage";
+import { publishSyncImmediate, subscribeSync, worldVersion, type SyncEvent } from "./sync";
+import { listMediaTaskStates, listPendingMediaTasks } from "./routes";
+import { listSyncSessionSnapshots, sessionHasAsyncState, updateMediaFormCardValues } from "./brain-sessions";
+import { MAX_IMAGES_PER_CHAPTER, imageOccupiesQuota } from "../shared/media-const";
 
 /** WS 端点路径（dev/prod 共用） */
 export const SYNC_WS_PATH = "/api/sync";
@@ -30,6 +32,7 @@ type SyncWsData = {
   channels: Set<string>;
   /** 最近一次收到消息（含 ping）的时间戳；open 时置位 */
   lastSeen: number;
+  brainTimer?: ReturnType<typeof setInterval>;
 };
 
 /** 心跳超时（ms）：超过此间隔未收到任何消息视为僵尸连接，主动断开 */
@@ -62,8 +65,33 @@ function ensureHeartbeatSweep(server: Server<SyncWsData>): void {
 /** 所有活动连接集合（供心跳扫描） */
 const allSockets = new Set<ServerWebSocket<SyncWsData>>();
 
+function brainStatusPayload(ws: ServerWebSocket<SyncWsData>, title: string) {
+  const sessions = runAsUser(ws.data.user.username, () => listSyncSessionSnapshots(title));
+  const tasks = runAsUser(ws.data.user.username, () => listMediaTaskStates(ws.data.user.username, title));
+  return {
+    type: "brain-status", title,
+    sessions: sessions.map((s) => ({ id: s.id, sessionTitle: s.title, createdAt: s.createdAt, streaming: s.streaming, updatedAt: s.updatedAt, messages: s.messages as unknown as Record<string, unknown>[], completed: s.completed })),
+    tasks,
+    at: Date.now(),
+    active: sessions.some(sessionHasAsyncState) || tasks.some((t) => t.status === "pending" || t.status === "running"),
+  };
+}
+
+function sendBrainStatus(ws: ServerWebSocket<SyncWsData>, title: string): boolean {
+  const payload = brainStatusPayload(ws, title);
+  ws.send(JSON.stringify(payload));
+  return payload.active;
+}
+
 /** 订阅消息体校验 */
-type SubscribeMsg = { type?: string; title?: unknown };
+type SubscribeMsg = {
+  type?: string;
+  title?: unknown;
+  sessionId?: unknown;
+  messageId?: unknown;
+  cardIndex?: unknown;
+  values?: { chapterIndex?: unknown; count?: unknown };
+};
 
 /** websocket 配置（dev/prod 的 Bun.serve 共用） */
 export const syncWebsocket = {
@@ -84,6 +112,40 @@ export const syncWebsocket = {
       ws.send(JSON.stringify({ type: "pong" }));
       return;
     }
+    if (msg.type === "media-form-values") {
+      const title = String(msg.title ?? "").trim();
+      const sessionId = String(msg.sessionId ?? "").trim();
+      const messageId = String(msg.messageId ?? "").trim();
+      const cardIndex = Number(msg.cardIndex);
+      const chapterIndex = Number(msg.values?.chapterIndex);
+      const count = Number(msg.values?.count);
+      const key = syncChannelKey(ws.data.user.username, title);
+      if (!title || !sessionId || !messageId || !Number.isInteger(cardIndex) || cardIndex < 0 || !ws.data.channels.has(key)) {
+        ws.send(JSON.stringify({ type: "error", error: "媒体参数同步请求无效或尚未订阅该书" }));
+        return;
+      }
+      const result = runAsUser(ws.data.user.username, () => {
+        const world = loadWorld(title);
+        const chapter = world?.chapters.find((c) => c.index === chapterIndex);
+        if (!world || !chapter) return null;
+        const quota = Math.max(0, MAX_IMAGES_PER_CHAPTER - (chapter.media ?? []).filter(imageOccupiesQuota).length);
+        const normalizedCount = Number.isInteger(count) ? Math.max(0, Math.min(quota, count)) : undefined;
+        return updateMediaFormCardValues(title, sessionId, messageId, cardIndex, {
+          chapterIndex,
+          count: normalizedCount,
+        });
+      });
+      if (!result) {
+        ws.send(JSON.stringify({ type: "error", error: "媒体参数卡不存在或已进入下一阶段" }));
+        return;
+      }
+      const event: SyncEvent = {
+        type: "card-replaced", title, sessionId, messageId, cardIndex,
+        card: result, at: Date.now(), user: ws.data.user.username,
+      };
+      publishSyncImmediate(event);
+      return;
+    }
     if (msg.type !== "subscribe") return; // 未知消息忽略
     const title = String(msg.title ?? "").trim();
     if (!title) {
@@ -100,15 +162,35 @@ export const syncWebsocket = {
     ws.subscribe(key);
     ws.data.channels.add(key);
     ws.send(JSON.stringify({ type: "subscribed", title, version: worldVersion(title) }));
+    let hadActive = sendBrainStatus(ws, title);
+    let hadPendingTasks = false;
+    if (ws.data.brainTimer) clearInterval(ws.data.brainTimer);
+    ws.data.brainTimer = setInterval(() => {
+      try {
+        const payload = brainStatusPayload(ws, title);
+        const pending = runAsUser(ws.data.user.username, () => listPendingMediaTasks(ws.data.user.username, title));
+        const hasPendingTasks = pending.length > 0;
+        // 进行中定时推；刚进入终态时再推最后一帧，确保 UI 清 loading。
+        if (payload.active || hadActive || hasPendingTasks || hadPendingTasks) {
+          ws.send(JSON.stringify(payload));
+          // 任务快照也经同一条 WS 周期复推，避免页面休眠/事件丢失后 UI 无法确认仍在运行。
+          for (const e of pending) ws.send(JSON.stringify(e));
+        }
+        hadActive = payload.active;
+        hadPendingTasks = hasPendingTasks;
+      } catch { /* closed socket */ }
+    }, 3000);
     // 订阅快照：推送该书当前「进行中」媒体任务（分镜 pending / 插画生成中 / state.json pending），
     // 刷新/重开后前端据此把对应卡标 loading——纯事件驱动，无需 HTTP 轮询。
     // runAsUser 包裹：快照新增的 state.json 扫描依赖 currentUser() 做账号目录隔离。
     const pending = runAsUser(ws.data.user.username, () => listPendingMediaTasks(ws.data.user.username, title));
+    hadPendingTasks = pending.length > 0;
     for (const e of pending) {
       ws.send(JSON.stringify(e));
     }
   },
   close(ws: ServerWebSocket<SyncWsData>) {
+    if (ws.data.brainTimer) clearInterval(ws.data.brainTimer);
     allSockets.delete(ws);
     // 手动退订（Bun close 时 socket 销毁，频道订阅可能残留；显式清理防内存泄漏）
     for (const ch of ws.data.channels) {

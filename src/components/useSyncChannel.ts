@@ -4,7 +4,7 @@
 // - 断线自动重连（指数退避 1s→2s→4s，上限 8s），重连成功后自动重新订阅并触发 onReconnected（前端全量补偿一次）
 // - world-changed 版本去重：服务端事件已按 1s 窗口节流合并，version 单调递增；客户端只处理 version 更新的事件
 // - 与 sysPoll 双跑（阶段 1 策略）：事件驱动即时刷新 + 轮询兜底校验；断线时 onStatusChange(false) 通知可启用降级
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /** 事件类型（与 src/api/sync.ts SyncEvent 一致；服务端透传原样 JSON） */
 export type SyncChannelEvent =
@@ -13,7 +13,9 @@ export type SyncChannelEvent =
   | { type: "task-status"; title: string; kind: "build" | "advance" | "media" | "visual"; id?: string; sub?: "plan"; scenes?: { anchor: string; scene: string; caption?: string }[]; status: string; error?: string; at: number }
   | { type: "brain-note"; title: string; eventId: string; text: string; at: number }
   | { type: "card-update"; title: string; sessionId: string; messageId: string; cardId: string; patch: Record<string, unknown>; at: number }
+  | { type: "card-replaced"; title: string; sessionId: string; messageId: string; cardIndex: number; card: Record<string, unknown>; at: number }
   | { type: "brain-append"; title: string; sessionId: string; messageId: string; at: number }
+  | { type: "brain-status"; title: string; sessions: { id: string; sessionTitle: string; createdAt: number; streaming: boolean; updatedAt: number; messages: Record<string, unknown>[]; completed?: string[] }[]; tasks: { id: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[] }[]; at: number }
   | { type: "subscribed"; title: string; version: number }
   | { type: "pong" }
   | { type: "error"; error: string };
@@ -28,8 +30,11 @@ export type UseSyncChannelOpts = {
   onBrainNote?: (e: Extract<SyncChannelEvent, { type: "brain-note" }>) => void;
   /** 卡片就地更新（card-update）：按 messageId+cardId 就地替换卡片对象，不重拉会话 */
   onCardUpdate?: (e: Extract<SyncChannelEvent, { type: "card-update" }>) => void;
+  /** 卡片整体替换（card-replaced）：服务端权威翻卡（form→分镜中→完成→生成中→done/failed），按 messageId+cardIndex 整卡替换，不重拉会话 */
+  onCardReplaced?: (e: Extract<SyncChannelEvent, { type: "card-replaced" }>) => void;
   /** 卡片消息追加（brain-append）：其他 tab 在会话中追加了卡片消息（preview/result 卡），重拉会话显示 */
   onBrainAppend?: (e: Extract<SyncChannelEvent, { type: "brain-append" }>) => void;
+  onBrainStatus?: (e: Extract<SyncChannelEvent, { type: "brain-status" }>) => void;
   /** 连接状态变化：true=已连接，false=断线（前端可据此决定降级轮询策略） */
   onStatusChange?: (connected: boolean) => void;
   /** 重连成功后触发（前端应做一次全量补偿 refreshAllStates） */
@@ -39,7 +44,10 @@ export type UseSyncChannelOpts = {
 /** 重连退避上限（ms） */
 const MAX_RETRY_MS = 8000;
 
-export function useSyncChannel(opts: UseSyncChannelOpts): { connected: boolean } {
+export function useSyncChannel(opts: UseSyncChannelOpts): {
+  connected: boolean;
+  syncMediaFormValues: (payload: { sessionId: string; messageId: string; cardIndex: number; values: Record<string, unknown> }) => boolean;
+} {
   const { title } = opts;
   const [connected, setConnected] = useState(false);
 
@@ -141,8 +149,16 @@ export function useSyncChannel(opts: UseSyncChannelOpts): { connected: boolean }
           optsRef.current.onCardUpdate?.(obj);
           return;
         }
+        if (obj.type === "card-replaced") {
+          optsRef.current.onCardReplaced?.(obj);
+          return;
+        }
         if (obj.type === "brain-append") {
           optsRef.current.onBrainAppend?.(obj);
+          return;
+        }
+        if (obj.type === "brain-status") {
+          optsRef.current.onBrainStatus?.(obj);
           return;
         }
         // pong / error：心跳无需处理 / 订阅失败等静默（onopen 重订阅会处理）
@@ -205,5 +221,16 @@ export function useSyncChannel(opts: UseSyncChannelOpts): { connected: boolean }
     }
   }, [connected]);
 
-  return { connected };
+  const syncMediaFormValues = useCallback((payload: { sessionId: string; messageId: string; cardIndex: number; values: Record<string, unknown> }): boolean => {
+    const ws = wsRef.current;
+    if (!title || !ws || ws.readyState !== 1) return false; // 1 = WebSocket.OPEN（浏览器/Bun 标准值）
+    try {
+      ws.send(JSON.stringify({ type: "media-form-values", title, ...payload }));
+      return true;
+    } catch {
+      return false;
+    }
+  }, [title]);
+
+  return { connected, syncMediaFormValues };
 }

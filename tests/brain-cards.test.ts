@@ -669,3 +669,47 @@ test("媒体 form 卡：mediaQuota 动态张数下拉（切换章节后 options 
   expect(mount.textContent ?? "").toContain("还可生成 3 张");
   root.unmount();
 });
+
+test("媒体 form 卡：WS/world 更新额度后扩展选项，并把超额旧值收敛到新额度", async () => {
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root: Root = createRoot(mount);
+  let remaining = 3;
+  const reported: Record<string, unknown>[] = [];
+  const mediaForm = {
+    kind: "form" as const,
+    title: "生成章节插画",
+    fields: [
+      { key: "chapterIndex", label: "章节", type: "select" as const, value: 1, options: [{ label: "第 1 章", value: "1" }] },
+      { key: "count", label: "张数", type: "select" as const, value: 3, options: [
+        { label: "1 张", value: "1" }, { label: "2 张", value: "2" }, { label: "3 张", value: "3" },
+      ] },
+    ],
+    action: { endpoint: "/api/novel/media/plan", method: "POST", body: { title: "书", kind: "image" } },
+  };
+  const render = () => root.render(React.createElement(BrainCardView, {
+    card: mediaForm,
+    onFormSubmit: () => {},
+    onFormValuesChange: (v) => reported.push({ ...v }),
+    mediaQuota: () => remaining,
+  }));
+  render();
+  await tick();
+  let count = mount.querySelectorAll("select")[1] as HTMLSelectElement;
+  expect(count.options.length).toBe(3);
+  expect(count.value).toBe("3");
+
+  remaining = 1;
+  render();
+  await tick();
+  count = mount.querySelectorAll("select")[1] as HTMLSelectElement;
+  expect(count.options.length).toBe(1);
+  expect(count.value).toBe("1");
+  expect(reported.at(-1)?.count).toBe(1);
+
+  remaining = 2;
+  render();
+  await tick();
+  expect((mount.querySelectorAll("select")[1] as HTMLSelectElement).options.length).toBe(2);
+  root.unmount();
+});

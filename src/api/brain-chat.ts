@@ -21,6 +21,7 @@ import { withTitleLock } from "./titlelock";
 import { readEvalReport } from "./eval";
 import { isPendingForeshadow, targetChapterCount } from "./world";
 import { mediaDataUri, MAX_IMAGES_PER_CHAPTER } from "./media";
+import { imageOccupiesQuota } from "../shared/media-const";
 import { gachaGenerate as directorGachaGenerate } from "./director";
 import { uuid } from '../shared/uuid';
 import type { CardType } from "./cards";
@@ -258,6 +259,28 @@ ${INTENT_ENUM.map((k) => `- ${k}：${INTENT_HINT[k] ?? k}`).join("\n")}
 
 type IntentResult = { intent: string; params: Record<string, unknown>; reply: string };
 
+/** 显式媒体指令走本地确定性识别，避免云端意图分类器超时把参数卡一起卡住。
+ *  这里只接管明确的执行语气；疑问、失败排查、取消等仍交给 LLM 正常对话。 */
+export function explicitMediaIntent(prompt: string): IntentResult | null {
+  const text = prompt.replace(/\s+/g, "").trim();
+  if (!text || /(?:不要|不用|别|取消|停止|失败|报错|为什么|怎么|如何|是否|能否|可以吗|是什么|说明|介绍)/.test(text)) return null;
+  const video = /(?:生成|制作|创建|做|拍)(?:.{0,12})(?:视频|短片)/.test(text);
+  const image = /(?:生成|制作|创建|画|绘制|配)(?:.{0,12})(?:插画|插图|配图|图片)/.test(text);
+  if (!video && !image) return null;
+  const params: Record<string, unknown> = {};
+  const chapterIndex = chapterIndexFromPrompt(text);
+  if (chapterIndex != null) params.chapterIndex = chapterIndex;
+  if (!video) {
+    const countMatch = text.match(/([1-3])张/) ?? text.match(/([一二三])张/);
+    if (countMatch) params.count = /^[1-3]$/.test(countMatch[1]) ? Number(countMatch[1]) : CN_NUM[countMatch[1]];
+  }
+  return {
+    intent: video ? "media_video" : "media_image",
+    params,
+    reply: video ? "请选择生成视频的参数。" : "请选择生成插画的参数。",
+  };
+}
+
 /** 意图识别（LLM）；失败降级为 chat。
  *  ctx：前端上下文（选中章）——用户未指定章节时作为参数兜底（需求 1/2）；
  *  history：最近会话文本（支持「上一章/刚说的那个」类指代）。 */
@@ -297,6 +320,8 @@ async function recognizeIntent(w: WorldState, prompt: string, ctx?: BrainChatCon
       {
         ...taskOpts("brainGate"),
         maxTokens: 2000,
+        // 意图识别是简单 JSON 分类（非长推理）：关闭思考，首字节大幅提速，避免思考吃光预算（对齐 planScenesOnce）
+        thinking: "disabled",
         schema: {
           type: "object",
           required: ["intent", "reply"],
@@ -878,6 +903,8 @@ async function buildChoiceOptions(w: WorldState, prompt: string, kind: "plan" | 
       {
         ...taskOpts("brainGate"),
         maxTokens: 2000,
+        // 选项生成是小 JSON 输出：关闭思考提速（对齐 recognizeIntent / planScenesOnce）
+        thinking: "disabled",
         schema: {
           type: "object",
           required: ["options"],
@@ -1215,7 +1242,7 @@ export function buildMediaCard(
   // 剩余可生成张数（下拉选择依据）：每章上限 MAX_IMAGES_PER_CHAPTER，扣掉已有插画（含生成中的 pending）
   // —— 前端切换章节时也会用 world 实时重算（brain-cards 动态 options），此处按默认章节兜底
   const quotaCh = validIdx != null ? chapters.find((c) => c.index === validIdx) : undefined;
-  const existingImgs = (quotaCh?.media ?? []).filter((m) => m.kind === "image").length;
+  const existingImgs = (quotaCh?.media ?? []).filter(imageOccupiesQuota).length;
   const remaining = Math.max(0, MAX_IMAGES_PER_CHAPTER - existingImgs);
   const fields: FormFieldDef[] = [
     {
@@ -1413,7 +1440,8 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
 
     // —— 意图识别（注入前端选中章 + 最近会话上下文，供 LLM 自动提取工具参数，需求 2） ——
     const hist = (session?.messages ?? []).slice(-6).map((m) => `${m.role === "user" ? "用户" : "中枢"}：${(m.text ?? "").slice(0, 200)}`);
-    const { intent, params, reply } = await recognizeIntent(w, activePrompt, ctx.ctx, hist);
+    const { intent, params, reply } = explicitMediaIntent(activePrompt)
+      ?? await recognizeIntent(w, activePrompt, ctx.ctx, hist);
 
     // 纯对话 / 未知意图：真流式回复（可中断、可恢复）
     const meta = INTENTS[intent];

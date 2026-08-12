@@ -1014,7 +1014,7 @@ export async function planScenes(
   const deadline = AbortSignal.any([opts.signal, AbortSignal.timeout(PLAN_SCENE_TIMEOUT_MS)].filter(Boolean) as AbortSignal[]);
   let lastErr: Error | null = null;
   let emptyCount = 0; // 空内容/渠道繁忙类失败计数（诊断与文案用）
-  const MAX_RETRY = 2; // 外层 2 次尝试（收紧：避免重试乘积超过总 deadline）
+  const MAX_RETRY = 3; // 外层 3 次完整尝试；单次云端调用也有内部瞬时错误重试
   for (let retry = 0; retry < MAX_RETRY; retry++) {
     if (deadline.aborted) throw new DOMException("aborted", "AbortError");
     try {

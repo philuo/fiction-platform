@@ -36,6 +36,16 @@ export type SessionMeta = {
   messageCount: number;
 };
 
+export type BrainSyncSession = {
+  id: string;
+  sessionTitle: string;
+  createdAt: number;
+  updatedAt: number;
+  streaming: boolean;
+  messages: BrainSessionDetail["messages"];
+  completed?: string[];
+};
+
 /** 服务端会话（含消息） */
 export type BrainSessionDetail = {
   id: string;
@@ -624,6 +634,50 @@ export function useBrainSession(title: string) {
     return cacheRef.current.get(sessionId);
   }, []);
 
+  /** 应用 sync WS 的服务端权威会话快照。正在由本 Tab 接收 SSE 的会话保留本地流，避免跨通道乱序回退文本。 */
+  const applySyncSnapshot = useCallback((snapshot: BrainSyncSession[]) => {
+    const authoritativeIds = new Set(snapshot.map((s) => s.id));
+    const metas: SessionMeta[] = snapshot.map((s) => ({
+      id: s.id,
+      title: s.sessionTitle,
+      createdAt: s.createdAt,
+      updatedAt: s.updatedAt,
+      streaming: s.streaming,
+      messageCount: s.messages.length,
+    }));
+    setSessions(metas);
+    // 快照中不存在的会话已被其它 Tab 删除：清掉消息/completed/SSE，不能只更新历史列表
+    // 而让当前活动区继续展示已删除的旧会话。
+    for (const id of [...cacheRef.current.keys()]) {
+      if (authoritativeIds.has(id)) continue;
+      abortRef.current.get(id)?.abort();
+      abortRef.current.delete(id);
+      cacheRef.current.delete(id);
+      completedRef.current.delete(id);
+    }
+    const activeRemoved = !!activeIdRef.current && !authoritativeIds.has(activeIdRef.current);
+    if (activeRemoved) {
+      setActive("");
+      setMessages([]);
+      setStreaming(false);
+      setThinking(false);
+      setCompleted(new Set());
+    }
+    for (const s of snapshot) {
+      // 本 Tab 正在接 SSE 且服务端也仍运行时，保留更细粒度的本地 delta；服务端已终态则必须覆盖，确保清 loading。
+      if (abortRef.current.has(s.id) && s.streaming) continue;
+      const next = s.messages.map(toDisplayMsg);
+      cacheRef.current.set(s.id, next);
+      completedRef.current.set(s.id, new Set(s.completed ?? []));
+      void cachePutSession(title, s.id, next, s.completed ?? []);
+      if (s.id === activeIdRef.current) {
+        setMessages(next);
+        setStreaming(s.streaming);
+        setCompleted(completedRef.current.get(s.id) ?? new Set());
+      }
+    }
+  }, [title]);
+
   /** 挂载/切换书时恢复：清缓存 → 拉列表 → 打开最近会话（streaming 会话由 openSession 自动续流） */
   useEffect(() => {
     if (loadedTitleRef.current === title) return;
@@ -681,5 +735,6 @@ export function useBrainSession(title: string) {
     reloadActive,
     isStreaming: (id: string) => abortRef.current.has(id),
     getSessionMessages,
+    applySyncSnapshot,
   };
 }

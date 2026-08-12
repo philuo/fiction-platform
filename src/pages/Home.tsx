@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSyncChannel } from "../components/useSyncChannel";
 import { AlertTriangle, BookMarked, BookOpen, ChevronDown, Dices, History, List, LogOut, MoreHorizontal, PenLine, Play, RefreshCw, Search, Sparkles, Trash2, Users, Video, Wand2, X } from "../components/icons";
 import type { Card, Chapter, ChapterMedia, Character, LoreEntry, ReviewResult, WorldPatch, WorldState } from "../api/world";
+import { imageOccupiesQuota } from "../shared/media-const";
 import { Masthead } from "../components/Masthead";
 import { StatusPanel } from "../components/StatusPanel";
 import { ChapterView } from "../components/ChapterView";
@@ -20,6 +21,7 @@ import { AutoRunPanel, type AutoSessionView, type PendingChapterView } from "../
 import { MemoryAuditModal } from "../components/MemoryAuditModal";
 import { BrainCore } from "../components/BrainCore";
 import { BrainCabin } from "../components/BrainCabin";
+import type { BrainSyncSession } from "../components/useBrainSession";
 import { TaskCenterModal } from "../components/TaskCenterModal";
 import { ForeshadowModal } from "../components/ForeshadowModal";
 import AuthPage from "./AuthPage";
@@ -263,7 +265,7 @@ const Home: React.FC<HomeProps> = (props) => {
   // 流结束后若用户已切书，用此 ref 校验「仍是发起时的书」才写回 setWorld/setStoryUrl，避免旧书覆盖新书
   const worldTitleRef = useRef("");
   worldTitleRef.current = world?.title ?? "";
-  // world 镜像：供 WS 回调 / 一次性核对等异步闭包读取最新 world（避免闭包陈旧）
+  // world 镜像：供 WS 回调等异步闭包读取最新 world（避免闭包陈旧）
   const worldRef = useRef<WorldState | null>(world);
   worldRef.current = world;
   /** 推进任务阶段（任务中心展示）：轮询从 /api/brain/context 同步——聊天中启动的推进任务本页也能看到进度 */
@@ -685,6 +687,19 @@ const Home: React.FC<HomeProps> = (props) => {
   const registerCardPatch = useCallback((fn: (e: { sessionId: string; messageId: string; cardId: string; patch: Record<string, unknown> }) => void) => {
     cardPatchRef.current = fn;
   }, []);
+  /** 卡片整体替换注册（card-replaced）：BrainCabin 挂载时注册整卡替换处理器；
+   *  服务端权威翻卡（分镜中/生成中/完成/失败）经此就地替换，不重拉会话、不回写 HTTP。 */
+  const cardReplaceRef = useRef<((e: { sessionId: string; messageId: string; cardIndex: number; card: Record<string, unknown> }) => void) | null>(null);
+  const registerCardReplace = useCallback((fn: (e: { sessionId: string; messageId: string; cardIndex: number; card: Record<string, unknown> }) => void) => {
+    cardReplaceRef.current = fn;
+  }, []);
+  const brainStatusRef = useRef<((sessions: BrainSyncSession[]) => void) | null>(null);
+  const lastBrainStatusRef = useRef<{ title: string; sessions: BrainSyncSession[] } | null>(null);
+  const registerBrainStatus = useCallback((fn: (sessions: BrainSyncSession[]) => void) => {
+    brainStatusRef.current = fn;
+    const last = lastBrainStatusRef.current;
+    if (last && last.title === world?.title) fn(last.sessions);
+  }, [world?.title]);
   /** 任务状态事件注册（阶段 3b+）：BrainCabin 挂载时注册 media task-status 处理器，
    *  媒体生成轮询据此在 WS 广播任务完成时提前收尾（减少 /media/status 冗余轮询）。 */
   const taskStatusRef = useRef<((e: { kind: string; id?: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[] }) => void) | null>(null);
@@ -708,7 +723,7 @@ const Home: React.FC<HomeProps> = (props) => {
     brainStreamingRef.current = fn;
   }, []);
 
-  useSyncChannel({
+  const { syncMediaFormValues } = useSyncChannel({
     title: world?.title ?? null,
     onWorldChanged: (e) => { void refreshWorld(e.regions); },
     onTaskStatus: (e) => {
@@ -729,6 +744,21 @@ const Home: React.FC<HomeProps> = (props) => {
       setSysTick((t) => t + 1);
     },
     onCardUpdate: (e) => cardPatchRef.current?.(e),
+    onCardReplaced: (e) => cardReplaceRef.current?.(e),
+    onBrainStatus: (e) => {
+      const snapshot = e.sessions as BrainSyncSession[];
+      lastBrainStatusRef.current = { title: e.title, sessions: snapshot };
+      brainStatusRef.current?.(snapshot);
+      let hasTerminalMedia = false;
+      for (const task of e.tasks) {
+        if (task.sub !== "plan") {
+          const tracked = consumeHomeMediaStatus(task.id, task.status, task.error);
+          if (tracked && (task.status === "ready" || task.status === "failed")) hasTerminalMedia = true;
+        }
+        taskStatusRef.current?.({ kind: "media", ...task });
+      }
+      if (hasTerminalMedia) void refreshWorld(["U06", "U07"]);
+    },
     // 降级通道（阶段 5）：WS 连接时停 sysPoll（事件驱动）；WS 断开时启动 sysPoll（轮询兜底防漏事件）。
     // 与连载 SSE 直连（startAutoRun stopSysPoll）叠加：WS 断 + 连载 SSE 在 → 仍不轮询（SSE 自身实时）。
     onStatusChange: (connected) => {
@@ -740,8 +770,6 @@ const Home: React.FC<HomeProps> = (props) => {
     onReconnected: () => {
       // 全量补偿：刷新世界 + 重拉当前会话（断线期间完成的媒体任务由服务端权威落盘，reload 后卡片即终态）
       setSysTick((t) => t + 1);
-      // 左侧媒体：清空「已核对」标记，refreshWorld 后的 world effect 会对残留 pending 再做一次批量核对
-      homeMediaCheckedRef.current.clear();
       void refreshAllStates();
     },
   });
@@ -1394,25 +1422,21 @@ const Home: React.FC<HomeProps> = (props) => {
   const [deletePreview, setDeletePreview] = useState<{ index: number; chapterTitle: string; report: IntegrityReportView } | null>(null);
   useEffect(() => () => { stopVisualPolling(); }, []);
 
-  // —— 左侧章节媒体：WS 事件驱动收尾 + 一次性 /media/status-batch 核对（无 setInterval 轮询）——
-  // 提交后把 mediaId 登记进 homeMediaPendingRef；WS task-status 到达即消费收敛；刷新/重连后从 world
-  // 收集 pending 媒体做一次批量核对（错过 WS 终态的兜底）；核对过的 mediaId 记入 homeMediaCheckedRef，
-  // 重连时清空重新核对一次。状态更新与弹窗/tab 开关无关。
+  // —— 左侧章节媒体：纯 sync WS 事件驱动收尾 ——
+  // 提交后登记 mediaId；刷新后从 world 恢复 pending UI；服务端订阅快照与周期 task-status 推送负责收敛终态。
   const homeMediaPendingRef = useRef<Map<string, { chapterIndex: number }>>(new Map());
   const homeMediaFailedRef = useRef<string[]>([]);
   const homeMediaTotalRef = useRef(0);
-  const homeMediaCheckedRef = useRef<Set<string>>(new Set());
 
   /** 切书：清空左侧媒体跟踪（组件随切书不卸载，需手动清旧书状态） */
   useEffect(() => {
     homeMediaPendingRef.current.clear();
     homeMediaFailedRef.current = [];
     homeMediaTotalRef.current = 0;
-    homeMediaCheckedRef.current.clear();
     setMediaGen(null);
   }, [world?.title]);
 
-  /** 全部在跟媒体已收尾：刷新 world + 提示；由 WS 消费 / 一次性核对两条路径调用 */
+  /** 全部在跟媒体已收尾：刷新 world + 提示；仅由 sync WS 终态事件调用 */
   function finalizeHomeMediaIfDone() {
     if (homeMediaPendingRef.current.size > 0) return;
     const total = homeMediaTotalRef.current;
@@ -1428,7 +1452,7 @@ const Home: React.FC<HomeProps> = (props) => {
     }
   }
 
-  /** 消费单个媒体状态（WS 事件 / 批量核对共用）：终态从 pending 集合移除并同步 UI；返回是否仍在跟 */
+  /** 消费单个 sync WS 媒体状态：终态从 pending 集合移除并同步 UI；返回是否仍在跟 */
   function consumeHomeMediaStatus(mediaId: string, status: string, error?: string) {
     if (!homeMediaPendingRef.current.has(mediaId)) return false;
     if (status === "ready") {
@@ -1448,28 +1472,7 @@ const Home: React.FC<HomeProps> = (props) => {
     return true;
   }
 
-  /** 一次性批量核对：POST /media/status-batch，消费 ready/failed 结果（pending 继续等 WS）；网络异常静默等 WS/重连 */
-  async function checkHomeMediaOnce(title: string, items: { chapterIndex: number; mediaId: string }[]) {
-    if (!items.length) return;
-    try {
-      const res = await apiFetch("/api/novel/media/status-batch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, items }),
-      });
-      const data = (await res.json()) as { ok?: boolean; results?: Record<string, { status?: string; error?: string }> };
-      if (!res.ok || !data.ok || !data.results) return;
-      for (const it of items) {
-        const r = data.results[it.mediaId];
-        if (r?.status) consumeHomeMediaStatus(it.mediaId, r.status, r.error);
-      }
-    } catch (e) {
-      console.warn("[media] 一次性核对失败，等待 WS 事件:", (e as Error).message);
-    }
-  }
-
-  /** 从 world 收集所有 pending 章节媒体，登记跟踪 + 恢复 UI，并对未核对过的做一次批量核对。
-   *  world 加载（含刷新）/ WS 重连后调用；不启动 interval。 */
+  /** 从 world 收集所有 pending 章节媒体，登记跟踪 + 恢复 UI；后续状态只等 sync WS。 */
   function reconcilePendingHomeMedia() {
     const w = worldRef.current;
     if (!w) return;
@@ -1481,7 +1484,7 @@ const Home: React.FC<HomeProps> = (props) => {
         }
       }
     }
-    // 登记新出现的 pending（刷新恢复：此前未跟踪的 mediaId 补登，等 WS/核对收敛）
+    // 登记新出现的 pending（刷新恢复：此前未跟踪的 mediaId 补登，等 WS 收敛）
     let added = 0;
     for (const it of items) {
       if (!homeMediaPendingRef.current.has(it.mediaId)) {
@@ -1513,33 +1516,14 @@ const Home: React.FC<HomeProps> = (props) => {
       const chIdx = byCh.has(preferCh) ? preferCh : items[0].chapterIndex;
       setMediaGen({ chapterIndex: chIdx, mediaIds: byCh.get(chIdx)!, progress: 0 });
     }
-    // 仅对从未核对过的 mediaId 发一次批量查询
-    const toCheck = items.filter((i) => !homeMediaCheckedRef.current.has(i.mediaId));
-    for (const it of toCheck) homeMediaCheckedRef.current.add(it.mediaId);
-    if (toCheck.length) void checkHomeMediaOnce(w.title, toCheck);
   }
 
-  // 刷新/重新进入：world 中存在 pending 媒体时恢复跟踪 + 一次性核对（保证刷新页面不影响生成结果）
+  // 刷新/重新进入：world 中存在 pending 媒体时恢复跟踪；WS 建连后立即推权威状态。
   useEffect(() => {
     if (!world) return;
     reconcilePendingHomeMedia();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [world]);
-
-  // 标签页重新可见：对残留 pending 媒体（尤其视频——provider 无回调，需查询驱动收敛）再做一次核对。
-  // 生命周期驱动而非 interval，与 BrainCabin 的 resumeMediaScan 对齐。
-  useEffect(() => {
-    if (!world) return;
-    const onVis = () => {
-      if (document.visibilityState === "visible") {
-        homeMediaCheckedRef.current.clear();
-        reconcilePendingHomeMedia();
-      }
-    };
-    document.addEventListener("visibilitychange", onVis);
-    return () => document.removeEventListener("visibilitychange", onVis);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [world?.title]);
 
   /** 生成/重新生成角色全局立绘：生成立绘后刷新 world（插画/视频的样貌唯一基准）；description 为可选外貌描述 */
   async function generatePortrait(description?: string) {
@@ -1572,8 +1556,7 @@ const Home: React.FC<HomeProps> = (props) => {
         homeMediaPendingRef.current.set(id, { chapterIndex });
         homeMediaTotalRef.current += 1;
       }
-      // 刚提交：状态必为 pending，无需立即核对（等 WS 终态；若断线则重连后 reconcile 兜底）
-      homeMediaCheckedRef.current.add(id);
+      // 刚提交：状态必为 pending，等待 WS 终态；断线重连后服务端重发快照。
     }
     setMediaGen({ chapterIndex, mediaIds: ids, progress: 0 });
   }
@@ -2940,9 +2923,12 @@ const Home: React.FC<HomeProps> = (props) => {
           buildingStage={buildingStage}
           sysTick={sysTick}
           registerCardPatch={registerCardPatch}
+          registerCardReplace={registerCardReplace}
+          registerBrainStatus={registerBrainStatus}
           registerTaskStatus={registerTaskStatus}
           registerWsStatus={registerWsStatus}
           registerIsStreaming={registerIsStreaming}
+          syncMediaFormValues={syncMediaFormValues}
           onGoToMedia={goToChapterMedia}
         />
       )}
@@ -3348,12 +3334,12 @@ const Home: React.FC<HomeProps> = (props) => {
           {/* 生成插画（1~3 张）：LLM 挑选关键场景 → 确认选中段落 → 段落锚定生成；每章上限 3 张，超限禁用 */}
           <div className="menu-imgen">
             <span className="menu-imgen-label"><Wand2 size={14} /> 生成插画{(() => {
-              const imgCount = (shownChapter?.media ?? []).filter((x) => x.kind === "image").length;
+              const imgCount = (shownChapter?.media ?? []).filter(imageOccupiesQuota).length;
               return <span className="menu-imgen-count">（{imgCount}/3）</span>;
             })()}</span>
             <span className="menu-imgen-counts">
               {[1, 2, 3].map((n) => {
-                const imgCount = (shownChapter?.media ?? []).filter((x) => x.kind === "image").length;
+                const imgCount = (shownChapter?.media ?? []).filter(imageOccupiesQuota).length;
                 const overLimit = imgCount + n > 3;
                 return (
                   <button key={n} className="menu-imgen-num" disabled={taskActive || !!mediaGen || overLimit} title={overLimit ? `本章已有 ${imgCount} 张插画（上限 3 张），请先删除部分插画` : taskActive ? "任务运行中已禁用" : undefined} onClick={() => { setChapterMenu(null); void planMedia("image", n); }}>{n}张</button>

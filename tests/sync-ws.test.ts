@@ -170,6 +170,84 @@ describe("订阅与广播（协议）", () => {
 });
 
 describe("saveWorld → 事件总线 → WS 广播（真实链路集成）", () => {
+  test("brain-status：建连立即推 pending，多 Tab 未轮询也会定时收到终态", async () => {
+    const { createSession, appendMessage, markStreaming, markMessageDone } = await import("../src/api/brain-sessions");
+    const { runAsUser } = await import("../src/api/storage");
+    const sid = "sync-brain-pending";
+    runAsUser("sync_ws_user", () => {
+      createSession("sync-ws-world", "生成插画", sid);
+      appendMessage("sync-ws-world", sid, { id: "bm1", role: "assistant", text: "", at: Date.now(), pending: true });
+      markStreaming("sync-ws-world", sid);
+    });
+
+    const { ws, waitFor } = await connectWs("sync_ws_user");
+    ws.send(JSON.stringify({ type: "subscribe", title: "sync-ws-world" }));
+    const pending = await waitFor((m) => m.type === "brain-status" && JSON.stringify(m).includes('"pending":true'));
+    expect((pending.sessions as { id: string; streaming: boolean }[]).find((s) => s.id === sid)?.streaming).toBe(true);
+
+    // 不发 HTTP、不主动查询：仅改变服务端持久态，等待 3s 周期 WS 快照推送最终状态。
+    runAsUser("sync_ws_user", () => markMessageDone("sync-ws-world", sid, "bm1"));
+    const done = await waitFor((m) => {
+      if (m.type !== "brain-status") return false;
+      const sessions = m.sessions as { id: string; streaming: boolean; messages: { id: string; pending?: boolean }[] }[];
+      const session = sessions.find((s) => s.id === sid);
+      return session?.streaming === false && session.messages.find((x) => x.id === "bm1")?.pending === false;
+    }, 5000);
+    expect((done.sessions as { id: string; streaming: boolean }[]).find((s) => s.id === sid)?.streaming).toBe(false);
+    ws.close();
+  });
+
+  test("媒体参数选择经 sync WS 持久化并广播到所有 Tab", async () => {
+    const { createSession, appendMessage, getSession } = await import("../src/api/brain-sessions");
+    const { loadWorld, runAsUser, saveWorld } = await import("../src/api/storage");
+    const sid = "sync-media-form-session";
+    const mid = "sync-media-form-message";
+    runAsUser("sync_ws_user", () => {
+      const w = loadWorld("sync-ws-world")!;
+      w.chapters = [
+        { index: 1, title: "第一章", text: "正文一", review: null },
+        { index: 2, title: "第二章", text: "正文二", review: null },
+      ];
+      w.nextChapter = 3;
+      saveWorld(w);
+      createSession("sync-ws-world", "生成插画", sid);
+      appendMessage("sync-ws-world", sid, {
+        id: mid, role: "assistant", text: "请选择参数", at: Date.now(), cards: [{
+          kind: "form", title: "生成章节插画",
+          fields: [
+            { key: "chapterIndex", label: "章节", type: "select", value: 1, options: [{ label: "第 1 章", value: "1" }, { label: "第 2 章", value: "2" }] },
+            { key: "count", label: "张数", type: "select", value: 1, options: [{ label: "1 张", value: "1" }, { label: "2 张", value: "2" }, { label: "3 张", value: "3" }] },
+          ],
+          action: { endpoint: "/api/novel/media/plan", body: { kind: "image" } },
+        }],
+      });
+    });
+    const tabA = await connectWs("sync_ws_user");
+    const tabB = await connectWs("sync_ws_user");
+    tabA.ws.send(JSON.stringify({ type: "subscribe", title: "sync-ws-world" }));
+    tabB.ws.send(JSON.stringify({ type: "subscribe", title: "sync-ws-world" }));
+    await Promise.all([tabA.waitFor((m) => m.type === "subscribed"), tabB.waitFor((m) => m.type === "subscribed")]);
+    tabA.ws.send(JSON.stringify({
+      type: "media-form-values", title: "sync-ws-world", sessionId: sid, messageId: mid, cardIndex: 0,
+      values: { chapterIndex: 2, count: 3 },
+    }));
+    const [eventA, eventB] = await Promise.all([
+      tabA.waitFor((m) => m.type === "card-replaced" && m.messageId === mid),
+      tabB.waitFor((m) => m.type === "card-replaced" && m.messageId === mid),
+    ]);
+    for (const event of [eventA, eventB]) {
+      const fields = ((event.card as { fields?: { key: string; value?: unknown }[] }).fields ?? []);
+      expect(fields.find((f) => f.key === "chapterIndex")?.value).toBe(2);
+      expect(fields.find((f) => f.key === "count")?.value).toBe(3);
+    }
+    const persisted = runAsUser("sync_ws_user", () => getSession("sync-ws-world", sid));
+    const fields = persisted?.messages[0]?.cards?.[0]?.fields as { key: string; value?: unknown }[];
+    expect(fields.find((f) => f.key === "chapterIndex")?.value).toBe(2);
+    expect(fields.find((f) => f.key === "count")?.value).toBe(3);
+    tabA.ws.close();
+    tabB.ws.close();
+  });
+
   test("真 saveWorld 触发 world-changed 广播（runAsUser 上下文带 user）", async () => {
     const { saveWorld, runAsUser, loadWorld } = await import("../src/api/storage");
     const { ws, waitFor } = await connectWs("sync_ws_user");

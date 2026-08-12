@@ -9,10 +9,10 @@ import { BrainCore } from "./BrainCore";
 import { History, Plus, Send, Square, X } from "./icons";
 import { BrainCardView, mediaPlanDerived, type BrainCard, type PreviewCard, type ChoiceOption, type FormCard, type FormField, type AskCard } from "./brain-cards";
 import { MarkdownView } from "./MarkdownView";
-import { useBrainSession, type ChatMessage } from "./useBrainSession";
+import { useBrainSession, type BrainSyncSession, type ChatMessage } from "./useBrainSession";
 import { apiFetch } from "../api/client";
 import { uuid } from "../shared/uuid";
-import { MAX_IMAGES_PER_CHAPTER } from "../shared/media-const";
+import { MAX_IMAGES_PER_CHAPTER, imageOccupiesQuota } from "../shared/media-const";
 import {
   PRESENCE_LABEL, ACTIVITY_LABEL, GOVERNANCE_LABEL,
   type BrainState, type Presence, type Activity,
@@ -348,9 +348,13 @@ export const BrainCabin: React.FC<{
   /** 卡片就地更新注册（阶段 3a）：挂载时注册 patch 处理器，Home 的 useSyncChannel 收到 card-update 后调用。
    *  @param fn 处理器（接收 card-update 事件）；卸载时传入空函数解绑。 */
   registerCardPatch?: (fn: (e: { sessionId: string; messageId: string; cardId: string; patch: Record<string, unknown> }) => void) => void;
+  /** 卡片整体替换注册：Home 的 useSyncChannel 收到 card-replaced（服务端权威翻卡）后调用，
+   *  按 messageId+cardIndex 就地整卡替换（persist=false，不回写 HTTP、不重拉会话）。 */
+  registerCardReplace?: (fn: (e: { sessionId: string; messageId: string; cardIndex: number; card: Record<string, unknown> }) => void) => void;
+  /** sync WS 权威会话快照：覆盖所有 Tab 的消息/pending/running 卡状态。 */
+  registerBrainStatus?: (fn: (sessions: BrainSyncSession[]) => void) => void;
   /** 任务状态事件注册（阶段 3b+）：挂载时注册处理器，Home 的 useSyncChannel 收到 task-status 后调用。
-   *  聊天舱内媒体生成轮询据此在 WS 广播任务完成时提前收尾，减少 /media/status 冗余轮询；
-   *  sub:"plan" 分镜完成事件据此就地翻「分镜完成」确认卡（免轮询）。
+   *  聊天舱内媒体生成据此收尾；sub:"plan" 分镜完成由服务端权威翻卡。
    *  @param fn 处理器（接收 task-status 事件）；卸载时传入空函数解绑。 */
   registerTaskStatus?: (fn: (e: { kind: string; id?: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[] }) => void) => void;
   /** 生成完成跳转（preview 卡 done 态「查看插画」→ 左侧对应章节滚动到插画位置） */
@@ -360,11 +364,13 @@ export const BrainCabin: React.FC<{
   registerWsStatus?: (fn: (connected: boolean) => void) => void;
   /** 注册「某会话是否正在 SSE 生成」查询：Home 的 brain-append 处理据此在流式期间跳过重拉（避免覆盖未完成正文）。 */
   registerIsStreaming?: (fn: (sessionId: string) => boolean) => void;
-}> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk, onOpenPanel, currentChapter, autoRunning, buildingStage, sysTick = 0, registerCardPatch, registerTaskStatus, onGoToMedia, registerWsStatus, registerIsStreaming }) => {
+  /** 媒体参数选择经 sync WS 上行并由服务端持久化/广播到其它 Tab。 */
+  syncMediaFormValues?: (payload: { sessionId: string; messageId: string; cardIndex: number; values: Record<string, unknown> }) => boolean;
+}> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk, onOpenPanel, currentChapter, autoRunning, buildingStage, sysTick = 0, registerCardPatch, registerCardReplace, registerBrainStatus, registerTaskStatus, onGoToMedia, registerWsStatus, registerIsStreaming, syncMediaFormValues }) => {
   const {
     sessions, activeId, messages, streaming, thinking, reconnecting,
     openSession, newSession, removeSession, truncate, appendCard, patchCard, replaceCard, send, stop, isStreaming,
-    completed, markCompleted, reloadActive, getSessionMessages,
+    completed, markCompleted, reloadActive, getSessionMessages, applySyncSnapshot,
   } = useBrainSession(world.title);
 
   const [input, setInput] = useState("");
@@ -447,13 +453,10 @@ export const BrainCabin: React.FC<{
   /** 自动生成倒计时 timer（cardId → timer）：分镜完成 3s 无操作自动生成；跨刷新恢复对齐 */
   const countdownRef = useRef<Map<string, number>>(new Map());
   /** WS 连接状态：默认 true（页面加载后 WS 基本已连；连接时零 HTTP 轮询，靠订阅快照 + task-status 事件驱动） */
-  const wsConnectedRef = useRef(true);
   /** 已处理「悬死」分镜中卡（running 但无 planId/mediaIds：提交后刷新丢失任务 id，无法恢复轮询）的 cardId 集合 */
   const stuckMediaRef = useRef<Set<string>>(new Set());
   /** 已做过一次性恢复核对的分镜 planId（每挂载周期核对一次，非轮询） */
-  const planCheckedRef = useRef<Set<string>>(new Set());
   /** 已做过一次性媒体状态核对的卡片 key（`cardId::sortedMediaIds`；重试换 mediaIds 后可再次核对），非轮询 */
-  const mediaCheckedRef = useRef<Set<string>>(new Set());
   /** 上一轮可跟踪 running 卡快照（cardId → 锚点）：卡片消失经「两次确认」后向服务端 POST /media/cancel */
   const trackedCardsRef = useRef<Map<string, { sid: string; msgId: string; cardIndex: number; planId?: string; mediaIds?: string[]; chapterIndex?: number }>>(new Map());
   /** 首次检测到消失的 cardId → 消失时的轮次（两次确认，避免切书/会话缓存瞬时空窗误取消） */
@@ -624,8 +627,25 @@ export const BrainCabin: React.FC<{
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [registerCardPatch]);
 
+  // 服务端权威翻卡（card-replaced）：按 messageId+cardIndex 就地整卡替换，persist=false 不回写 HTTP、不重拉会话。
+  // 媒体卡 form→分镜中→分镜完成→生成中→done/failed 全部经此通道（含发起端与其他 tab）。
+  const replaceCardRef = useRef<((e: { sessionId: string; messageId: string; cardIndex: number; card: Record<string, unknown> }) => void) | null>(null);
+  replaceCardRef.current = (e) => { void replaceCard(e.sessionId, e.messageId, e.cardIndex, e.card as BrainCard, false); };
+  useEffect(() => {
+    if (registerCardReplace) registerCardReplace((e) => replaceCardRef.current?.(e));
+    return () => { if (registerCardReplace) registerCardReplace(() => {}); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [registerCardReplace]);
+
+  const applySyncSnapshotRef = useRef(applySyncSnapshot);
+  applySyncSnapshotRef.current = applySyncSnapshot;
+  useEffect(() => {
+    if (registerBrainStatus) registerBrainStatus((snapshot) => applySyncSnapshotRef.current(snapshot));
+    return () => { if (registerBrainStatus) registerBrainStatus(() => {}); };
+  }, [registerBrainStatus]);
+
   // 任务状态事件注册（阶段 3b+）：Home 的 useSyncChannel 收到 task-status(kind:media) 后转发，
-  // 媒体轮询据此提前收尾（WS 已广播完成，不必等下一轮 /media/status 轮询）
+  // 媒体任务据此收尾（WS 广播 + 周期快照保证多 Tab 收敛）
   const taskStatusRef = useRef<((e: { kind: string; id?: string; status: string; sub?: string }) => void) | null>(null);
   taskStatusRef.current = (e) => { if (e.kind === "media") handleMediaTaskStatus(e); };
   useEffect(() => {
@@ -636,14 +656,7 @@ export const BrainCabin: React.FC<{
 
   // WS 连接状态镜像（纯事件驱动，无降级轮询；重连边沿主动跑一次恢复扫描，不依赖会话异步刷新时序）
   useEffect(() => {
-    if (registerWsStatus) registerWsStatus((connected) => {
-      const wasConnected = wsConnectedRef.current;
-      wsConnectedRef.current = connected;
-      // 断开→连接边沿：重订快照会推 pending，但终态需一次性核对（断线窗口可能错过 ready/failed）
-      if (connected && !wasConnected && cabinMountedRef.current) {
-        try { resumeMediaScan(); } catch { /* 状态尚未就绪，忽略，由会话加载 effect 补跑 */ }
-      }
-    });
+    if (registerWsStatus) registerWsStatus(() => {});
     return () => { if (registerWsStatus) registerWsStatus(() => {}); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [registerWsStatus]);
@@ -678,14 +691,11 @@ export const BrainCabin: React.FC<{
   useEffect(() => {
     mediaPollJobsRef.current = [];
     planTrackRef.current.clear();
-    planCheckedRef.current.clear();
-    mediaCheckedRef.current.clear();
     stuckMediaRef.current.clear();
     trackedCardsRef.current.clear();
     goneSuspectRef.current.clear();
     for (const t of countdownRef.current.values()) window.clearTimeout(t);
     countdownRef.current.clear();
-    wsConnectedRef.current = true;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [world.title]);
 
@@ -696,14 +706,14 @@ export const BrainCabin: React.FC<{
     void appendCard(activeId, { id: uuid(), role: "brain", cards, at: new Date().toISOString() });
   }
 
-  // 媒体任务恢复扫描：会话加载/消息变化后，对所有已加载会话的 preview 卡续接 WS 跟踪（分镜登记+一次性核对、
+  // 媒体任务恢复扫描：会话加载/消息变化后，对所有已加载会话的 preview 卡续接 WS 跟踪（分镜登记、
   // 生成登记、展示会话倒计时）。常驻挂载，面板关闭也运行（关面板期间完成的任务回来即正确）。
   useEffect(() => {
     resumeMediaScan();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, activeId, messages, sessions]);
 
-  // 页面从后台切回可见时：恢复扫描（兜底后台标签被节流丢弃的倒计时/错过的终态；一次性核对非轮询）
+  // 页面从后台切回可见时恢复本地倒计时/跟踪；权威状态由 sync WS 快照持续推送。
   useEffect(() => {
     const onVis = () => { if (document.visibilityState === "visible") resumeMediaScan(); };
     document.addEventListener("visibilitychange", onVis);
@@ -1051,9 +1061,12 @@ export const BrainCabin: React.FC<{
                     onConfirmChoose={(opt) => confirmChoose(opt, msg, i)}
                     onOption={handleOption}
                     onFormSubmit={(card2, values) => submitForm(card2, values, msg.id, i)}
-                    onFormValuesChange={(vals) => {
+                    onFormValuesChange={(vals, source) => {
                       // 仅媒体 form 卡写入（非媒体卡如 settings/edit_world 不污染 state、不触发无谓重渲染）
-                      if (mediaCardOf(msg)) setMediaFormValues((prev) => ({ ...prev, [msg.id]: vals }));
+                      if (mediaCardOf(msg)) {
+                        setMediaFormValues((prev) => ({ ...prev, [msg.id]: vals }));
+                        if (source === "user") syncMediaFormValues?.({ sessionId: activeId, messageId: msg.id, cardIndex: i, values: vals });
+                      }
                     }}
                     onGoToMedia={onGoToMedia}
                     mediaQuota={mediaQuotaOf}
@@ -1468,16 +1481,14 @@ export const BrainCabin: React.FC<{
         onWorldUpdate?.();
         return;
       }
-      // 媒体生成（插画/视频）：image 为异步任务，提交后轮询 /media/status，完成后刷新世界；
-      // 单面板：任务状态就地更新到被操作的 preview 卡（running→done/failed，update-card 持久化 + 广播）。
-      // running 中间态【落盘】并携带 mediaIds/chapterIndex——刷新/重开后恢复扫描据此续接轮询，
-      // 生成状态始终正确更新（不再「刷新后回可执行态」丢失进度感知）。
+      // 媒体生成（插画/视频）：「生成中」running 卡与终态卡均由【服务端】权威落盘并经 card-replaced WS 推下，
+      // 前端不再乐观落盘/回写 HTTP（避免无锚点卡被误判中断）。此处仅：提交动作（HTTP）+ 登记内存跟踪以即时消费
+      // 逐张 task-status 进度（pollMediaGen 为纯 WS 登记，无 HTTP）。提交按钮 busy 态覆盖在途 UX。
       if (act.endpoint === "/api/novel/media/generate") {
         const mediaCardId = (card as { cardId?: string }).cardId;
         stopCountdown(mediaCardId); // 手动点击「立即生成」：取消该卡自动倒计时
         const genSid = activeId;
-        patchMediaTaskStatus(msgId, mediaCardId, { status: "running", detail: "生成任务已提交，正在生成…" }, true);
-        // 携带会话上下文：服务端生成完成后权威落盘翻卡（关面板/切 tab/断线期间也能在会话记录里保持终态）
+        // 携带会话定位：服务端落盘「生成中」卡与终态卡并推 card-replaced（cardId 沿用当前卡）
         const genBody = (msgId != null && cardIndex != null && mediaCardId && genSid)
           ? { ...act.body, session: { sessionId: genSid, messageId: msgId, cardIndex, cardId: mediaCardId } }
           : act.body;
@@ -1489,21 +1500,15 @@ export const BrainCabin: React.FC<{
         const data = (await res.json().catch(() => ({}))) as { ok?: boolean; mediaIds?: string[]; mediaId?: string; error?: string };
         if (!res.ok || data.error) {
           const msg = String(data.error ?? `HTTP ${res.status}`);
-          patchMediaTaskStatus(msgId, mediaCardId, { status: "failed", detail: msg }, true);
+          // 提交失败：服务端未落盘 running 卡，卡保持倒计时/预览态可重试；仅追加错误回执
           appendBrainMsg([{ kind: "result", title: cardTitle, success: false, detail: msg }]);
           return;
         }
         const ids = data.mediaIds ?? (data.mediaId ? [data.mediaId] : []);
         const chapterIndex = Number(act.body.chapterIndex);
         if (ids.length) {
-          // 补记 mediaIds + chapterIndex（持久化）：刷新/重开由恢复扫描登记，WS 事件据此收尾
-          patchMediaTaskStatus(msgId, mediaCardId, { mediaIds: ids, chapterIndex }, true);
+          // 登记内存跟踪：逐张消费 task-status(media) WS 进度（无 HTTP 轮询）；终态由服务端 card-replaced 收敛
           pollMediaGen(world.title, chapterIndex, ids, cardTitle, msgId, mediaCardId, genSid);
-        } else if (data.mediaId) {
-          // video 同步完成：直接 done + 跳转信息
-          patchMediaTaskStatus(msgId, mediaCardId, { status: "done", detail: "视频已生成", mediaId: String(data.mediaId), chapterIndex }, true);
-        } else {
-          patchMediaTaskStatus(msgId, mediaCardId, { status: "done", detail: "已提交生成任务" }, true);
         }
         onWorldUpdate?.();
         return;
@@ -1520,10 +1525,7 @@ export const BrainCabin: React.FC<{
         onWorldUpdate?.();
       }
     } catch (e) {
-      // media/generate 网络异常：预览卡翻转 failed（持久化，按钮保留可重试）
-      if (act.endpoint === "/api/novel/media/generate") {
-        patchMediaTaskStatus(msgId, (card as { cardId?: string }).cardId, { status: "failed", detail: (e as Error).message.slice(0, 200) });
-      }
+      // media/generate 网络异常：服务端未落盘 running 卡，卡保持倒计时/预览态可重试；仅追加错误回执（不回写 HTTP）
       appendBrainMsg([{ kind: "result", title: cardTitle, success: false, detail: (e as Error).message }]);
     } finally {
       setExecuting(false);
@@ -1551,7 +1553,8 @@ export const BrainCabin: React.FC<{
   }
 
   /** 媒体生成任务收尾：从跟踪表移除 + 就地翻转预览卡终态 + 刷新世界（单面板，不追加结果卡）。
-   *  纯 WS 驱动：无定时器；按 job.sid 写对应会话（后台 tab 完成也能正确落卡）。 */
+   *  纯 WS 驱动：无定时器；按 job.sid 写对应会话（后台 tab 完成也能正确落卡）。
+   *  终态卡由【服务端】card-replaced 权威落盘；此处 persist=false 仅做本地即时收敛，不回写 HTTP。 */
   function finalizeMediaJob(job: { sid: string; mediaIds: string[]; remaining: Set<string>; failedCount: number; msgId?: string; cardId?: string }) {
     const i = mediaPollJobsRef.current.indexOf(job);
     if (i >= 0) mediaPollJobsRef.current.splice(i, 1);
@@ -1559,72 +1562,22 @@ export const BrainCabin: React.FC<{
     if (job.msgId && job.cardId) {
       patchMediaTaskStatus(job.msgId, job.cardId, job.failedCount === 0
         ? { status: "done", detail: `已完成 ${done} 项`, mediaId: job.mediaIds[0] }
-        : { status: "failed", detail: `${done} 项成功，${job.failedCount} 项失败` }, true, job.sid);
+        : { status: "failed", detail: `${done} 项成功，${job.failedCount} 项失败` }, false, job.sid);
     }
     onWorldUpdate?.();
   }
 
   /** WS task-status(kind:media) 事件（纯事件驱动，无 HTTP 轮询）：
-   *  sub:"plan" → 分镜完成广播：按 planTrackRef 定位会话卡，就地翻「分镜完成」确认卡（场景+倒计时）；
+   *  sub:"plan" → 分镜完成广播：卡的「分镜完成/失败」翻转由【服务端】card-replaced 权威落盘并推下，
+   *               此处仅清理本端 planTrack 跟踪；倒计时由 resumeMediaScan 见到 card-replaced 应用的
+   *               countdownAt 后启动（不依赖此处翻卡）。
    *  缺省 → 媒体生成完成广播：从对应跟踪任务消费该 mediaId，全部 ready/failed 即收尾。
    *  跨会话：跟踪记录携带 sid，后台 tab/面板关闭期间完成也能写对会话（patchCard 写入缓存，切回即见）。 */
   function handleMediaTaskStatus(e: { id?: string; status: string; sub?: string; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[] }) {
     if (!e.id) return;
-    // 分镜任务事件：按 planId 在跟踪表中定位（本端提交或恢复扫描登记的任务）→ 就地翻卡
+    // 分镜任务事件：卡翻转由服务端 card-replaced 负责，这里只清理本端跟踪
     if (e.sub === "plan") {
-      const track = planTrackRef.current.get(e.id);
-      if (!track) return; // 非本端跟踪的任务（其他 tab 提交/会话未加载）：服务端已权威落盘，打开会话时拉取
-      const { sid, msgId, cardIndex, cardId, kind, chapterIndex, commandId } = track;
-      // 防双路径重复翻卡：卡已非「分镜中」running 态（服务端落盘/WS 已翻过）则跳过
-      const cur = findCardInSession(sid, msgId, cardIndex);
-      if (cur?.kind === "preview" && (cur as PreviewCard).status !== "running") return;
-      if (e.status === "ready") {
-        const raw = (e.scenes ?? []).filter((x) => x?.anchor?.trim() && x?.scene?.trim());
-        if (!raw.length) {
-          void replaceCard(sid, msgId, cardIndex, {
-            kind: "preview", cardId,
-            title: "分镜失败",
-            summary: "场景规划失败", status: "failed",
-            detail: "分镜未产出有效场景，请重新提交",
-          }, true);
-          planTrackRef.current.delete(e.id);
-          return;
-        }
-        const scenes = raw.map((x) => ({ anchor: x.anchor, scene: x.scene, caption: x.caption }));
-        const card: PreviewCard = {
-          kind: "preview",
-          cardId,
-          title: kind === "video" ? `生成第 ${chapterIndex} 章视频` : `生成第 ${chapterIndex} 章插画（${scenes.length} 张）`,
-          commandId,
-          level: "L0",
-          summary: kind === "video"
-            ? `已从第 ${chapterIndex} 章正文挑选 1 个关键场景，3 秒后自动生成视频。`
-            : `已从第 ${chapterIndex} 章正文挑选 ${scenes.length} 个关键场景，3 秒后自动生成，也可点击立即生成。`,
-          scenes,
-          countdownAt: Date.now() + 3000,
-          chapterIndex,
-          mediaKind: kind,
-          action: {
-            endpoint: "/api/novel/media/generate",
-            method: "POST",
-            body: { title: world.title, chapterIndex, kind, scenes },
-          },
-          actionLabel: "立即生成",
-        };
-        void replaceCard(sid, msgId, cardIndex, card, true);
-        planTrackRef.current.delete(e.id);
-        // 倒计时仅对当前展示会话启动（findCard 读 active 消息）；后台会话的倒计时在切回该会话时
-        // 由 resumeMediaScan → startCountdown 发现 countdownAt 已过而同步触发，不依赖此处。
-        if (sid === activeId) startCountdown(msgId, cardIndex, card, cardId);
-      } else if (e.status === "failed") {
-        void replaceCard(sid, msgId, cardIndex, {
-          kind: "preview", cardId,
-          title: "分镜失败",
-          summary: "场景规划失败", status: "failed",
-          detail: e.error ?? "分镜任务失败，请重新提交",
-        }, true);
-        planTrackRef.current.delete(e.id);
-      }
+      if (e.status === "ready" || e.status === "failed") planTrackRef.current.delete(e.id);
       return;
     }
     // 订阅快照的 pending 仅「确认任务在跑」（卡保持 running），不消费 remaining——仅 ready/failed 终态才收尾。
@@ -1637,7 +1590,7 @@ export const BrainCabin: React.FC<{
     }
   }
 
-  /** 消费单个媒体终态（WS 到达 与 checkMediaOnce 一次性核对共用，避免状态机分叉）：
+  /** 消费单个媒体终态（由 WS task-status 驱动）：
    *  从 remaining 移除该 mediaId，失败计数 +1；全部终态则收尾翻卡，否则更新中间进度（仅本地，不落盘）。 */
   function consumeMediaTaskStatus(job: { sid: string; mediaIds: string[]; remaining: Set<string>; failedCount: number; msgId?: string; cardId?: string; chapterIndex?: number }, mediaId: string, status: string, error?: string) {
     if (!job.remaining.has(mediaId)) return;
@@ -1672,42 +1625,6 @@ export const BrainCabin: React.FC<{
       chapterIndex,
     };
     mediaPollJobsRef.current.push(job);
-  }
-
-  /** 插画/视频生成一次性状态核对（非轮询）：会话加载/重连/可见性恢复时对「生成中」卡做单次 status-batch 查询——
-   *  正常 pending 保持 running 等 WS；ready/failed（服务端已完成但事件错过，或重启中断）复用 WS 同款消费逻辑翻卡。
-   *  key = cardId::sortedMediaIds（重试换 mediaIds 后可再次核对）；网络异常从 ref 删除，允许下个生命周期再核对。 */
-  function checkMediaOnce(sid: string, msgId: string, cardIndex: number, cardId: string, chapterIndex: number, mediaIds: string[]) {
-    if (!sid || !mediaIds.length) return;
-    const key = `${cardId}::${[...mediaIds].sort().join(",")}`;
-    if (mediaCheckedRef.current.has(key)) return;
-    mediaCheckedRef.current.add(key);
-    void (async () => {
-      try {
-        const r = await apiFetch("/api/novel/media/status-batch", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title: world.title, items: mediaIds.map((id) => ({ chapterIndex, mediaId: id })) }),
-        });
-        if (!r.ok) { mediaCheckedRef.current.delete(key); return; }
-        const d = (await r.json()) as { results?: Record<string, { status?: string; error?: string }> };
-        const results = d.results ?? {};
-        // 找到对应 job（pollMediaGen 已在 resumeMediaScan 中先于本函数登记）；无 job 则建一个临时消费载体
-        let job = cardId ? mediaPollJobsRef.current.find((j) => j.cardId === cardId) : undefined;
-        if (!job) {
-          pollMediaGen(world.title, chapterIndex, mediaIds, cardId, msgId, cardId, sid);
-          job = mediaPollJobsRef.current.find((j) => j.cardId === cardId);
-          if (!job) return;
-        }
-        for (const id of mediaIds) {
-          const st = results[id]?.status;
-          if (st === "ready" || st === "failed") consumeMediaTaskStatus(job, id, st, results[id]?.error);
-        }
-      } catch {
-        // 网络异常：允许下次生命周期（会话加载/重连/可见性恢复）再核对；不使用 interval
-        mediaCheckedRef.current.delete(key);
-      }
-    })();
   }
 
   /** ConfirmCard 确认（L2/L3 三选一；msg/cardIndex 供成功后标记 confirm 与 preview 卡完成态） */
@@ -1770,31 +1687,15 @@ export const BrainCabin: React.FC<{
         return;
       }
     }
-    // 媒体分镜（异步任务化单面板流转）：form 卡就地替换为「分镜中」running 卡并【落盘】——
-    // 服务端分镜立即返回 planId、后台 LLM 跑（轮询 /media/plan-status 拿结果）；关闭弹窗/刷新页面后
-    // 重开由恢复扫描从 planId 续接轮询，始终看到最新分镜状态（不落盘则刷新后丢失恢复依据）。
-    let mediaCardId: string | undefined;
-    if (isMediaPlan && msgId != null && cardIndex != null) {
-      mediaCardId = `media-${uuid()}`;
-      void replaceCard(activeId, msgId, cardIndex, {
-        kind: "preview",
-        cardId: mediaCardId,
-        title: kind === "image" ? `生成第 ${chapterIndex} 章插画（分镜中）` : `生成第 ${chapterIndex} 章视频（分镜中）`,
-        summary: "AI 正在从正文挑选关键场景…",
-        status: "running",
-        statusLabel: "分镜中",
-        detail: "AI 分镜中（挑选关键场景）…",
-        chapterIndex,
-        mediaKind: kind as "image" | "video",
-      }, true);
-    }
+    // 媒体分镜：中间态「分镜中」running 卡由【服务端】在 /media/plan 同步落盘并经 card-replaced WS 推下，
+    // 前端不再乐观落盘（避免无 planId 的悬死卡被恢复扫描误判为「分镜已中断」）。提交按钮 busy 态已覆盖在途 UX。
     setExecuting(true);
     const formCtrl = new AbortController();
     const formTimer = window.setTimeout(() => formCtrl.abort(), 15_000); // 任务化后提交即返回，仅网络层兜底超时
     try {
-      // 分镜提交携带会话上下文：服务端完成后直接落盘翻卡（刷新/重开读落盘卡即最新，不依赖前端事件消费）
-      const planBody = isMediaPlan && msgId != null && cardIndex != null && mediaCardId
-        ? { ...body, session: { sessionId: activeId, messageId: msgId, cardIndex, cardId: mediaCardId } }
+      // 分镜提交携带会话定位（不带 cardId：由服务端生成）；服务端据此落盘翻卡并推 card-replaced
+      const planBody = isMediaPlan && msgId != null && cardIndex != null
+        ? { ...body, session: { sessionId: activeId, messageId: msgId, cardIndex } }
         : body;
       const res = await apiFetch(card.action.endpoint, {
         method: card.action.method ?? "POST",
@@ -1805,26 +1706,13 @@ export const BrainCabin: React.FC<{
       const data = await res.json().catch(() => ({})) as Record<string, unknown>;
       if (!res.ok || data.error) {
         const msg = String(data.error ?? `HTTP ${res.status}`);
-        if (isMediaPlan && msgId != null && cardIndex != null) {
-          // 分镜提交失败：回退为原 form 卡（保留选择可重试），不落盘 failed 悬死
-          void replaceCard(activeId, msgId, cardIndex, card, true);
-        }
+        // 分镜提交失败：form 卡本就未被前端改动，保持原样可重试（服务端未落盘 running 卡）
         appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: msg }]);
         return;
       }
-      // 媒体生成表单（/api/novel/media/plan）：任务化 → 落盘 planId → 轮询 /media/plan-status 拿分镜结果
+      // 媒体生成表单（/api/novel/media/plan）：planId 由服务端写入 running 卡并随 card-replaced 到达；
+      // resumeMediaScan 见到 running+planId 会自行 trackPlanTask，前端无需补记/回写。
       if (isMediaPlan) {
-        const planId = String(data.planId ?? "").trim();
-        if (!planId) {
-          if (msgId != null && cardIndex != null) void replaceCard(activeId, msgId, cardIndex, card, true);
-          appendBrainMsg([{ kind: "result", title: card.title, success: false, detail: "分镜任务创建失败，请重试" }]);
-          return;
-        }
-        if (mediaCardId && msgId != null && cardIndex != null) {
-          // 补记 planId 到分镜中卡（持久化）：恢复扫描据此登记 WS 跟踪
-          patchMediaTaskStatus(msgId, mediaCardId, { planId }, true);
-          trackPlanTask(planId, msgId, cardIndex, mediaCardId, kind as "image" | "video", chapterIndex, card.commandId, activeId);
-        }
         return;
       }
       if (data.needIntervention && data.report) {
@@ -1876,53 +1764,6 @@ export const BrainCabin: React.FC<{
     planTrackRef.current.set(planId, { sid: sid || activeId, msgId, cardIndex, cardId, kind, chapterIndex, commandId });
   }
 
-  /** 分镜任务一次性恢复核对（非轮询）：会话打开/重连/页面重新可见时，对「分镜中」卡做单次 plan-status 查询——
-   *  正常进行中（pending）直接返回等 WS 事件；ready/failed/notfound（服务端已完成但事件错过，或服务重启任务表丢失）
-   *  就地翻卡，避免卡片永久「分镜中」。每个 planId 每挂载周期最多核对一次（planCheckedRef 去重）。 */
-  function checkPlanOnce(planId: string, msgId: string, cardIndex: number, cardId: string, kind: "image" | "video", chapterIndex: number, commandId?: string, sid?: string) {
-    const targetSid = sid || activeId;
-    if (!targetSid || planCheckedRef.current.has(planId)) return;
-    planCheckedRef.current.add(planId);
-    void (async () => {
-      try {
-        const r = await apiFetch("/api/novel/media/plan-status", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title: world.title, planId }),
-        });
-        if (!r.ok) return;
-        const d = (await r.json()) as { status?: string; scenes?: { anchor?: string; scene?: string; caption?: string }[]; error?: string };
-        if (d.status === "pending" || d.status === "running") return; // 仍在进行：等 WS 事件
-        const cur = findCardInSession(targetSid, msgId, cardIndex);
-        if (cur?.kind === "preview" && (cur as PreviewCard).status !== "running") return; // 已被 WS 翻过
-        if (d.status === "ready" && Array.isArray(d.scenes) && d.scenes.length) {
-          const scenes = d.scenes
-            .filter((x) => x?.anchor?.trim() && x?.scene?.trim())
-            .map((x) => ({ anchor: x.anchor as string, scene: x.scene as string, caption: x.caption }));
-          if (!scenes.length) {
-            void replaceCard(targetSid, msgId, cardIndex, { kind: "preview", cardId, title: "分镜失败", summary: "场景规划失败", status: "failed", detail: "分镜未产出有效场景，请重新提交" }, true);
-            return;
-          }
-          const preview: PreviewCard = {
-            kind: "preview", cardId,
-            title: kind === "image" ? `生成第 ${chapterIndex} 章插画（${scenes.length} 张）` : `生成第 ${chapterIndex} 章视频`,
-            commandId, level: "L0",
-            summary: kind === "image"
-              ? `已从第 ${chapterIndex} 章正文挑选 ${scenes.length} 个关键场景，3 秒后自动生成，也可点击立即生成。`
-              : `已从第 ${chapterIndex} 章正文挑选 1 个关键场景，3 秒后自动生成视频。`,
-            scenes, countdownAt: Date.now() + 3000, chapterIndex, mediaKind: kind,
-            action: { endpoint: "/api/novel/media/generate", method: "POST", body: { title: world.title, chapterIndex, kind, scenes } },
-            actionLabel: "立即生成",
-          };
-          void replaceCard(targetSid, msgId, cardIndex, preview, true);
-          if (targetSid === activeId) startCountdown(msgId, cardIndex, preview, cardId);
-        } else {
-          void replaceCard(targetSid, msgId, cardIndex, { kind: "preview", cardId, title: "分镜失败", summary: "场景规划失败", status: "failed", detail: d.error ?? "分镜任务失败，请重新提交" }, true);
-        }
-      } catch { /* 网络异常：保持 running，等 WS/下次恢复核对 */ }
-    })();
-  }
-
   /** 自动生成倒计时：分镜完成卡 3s 无手动操作自动生成（手动点「立即生成」由 executeCard 的 stopCountdown 取消）。
    *  跨刷新恢复：countdownAt 为截止时间戳，重开后剩余时间自动对齐；已过期（面板关闭期间错过触发点）→
    *  恢复扫描时【同步直接触发】，不依赖 setTimeout 异步时序——避免真实环境下 timer 在卸载/后台标签被丢弃而卡「0s 即将自动生成」。 */
@@ -1969,22 +1810,16 @@ export const BrainCabin: React.FC<{
     return m?.cards?.[cardIndex];
   }
 
-  /** 从指定会话的消息缓存取卡片（跨会话 WS 事件定位 / 后台会话任务核对用） */
-  function findCardInSession(sid: string, msgId: string, cardIndex: number): BrainCard | undefined {
-    const m = getSessionMessages(sid)?.find((x) => x.id === msgId);
-    return m?.cards?.[cardIndex];
-  }
-
   /** 媒体插画剩余可生成张数（每章上限 MAX_IMAGES_PER_CHAPTER 与后端同源；扣已有含生成中 pending）：
    *  供张数下拉动态 options + 提交前校验 */
   function mediaQuotaOf(chapterIndex: number): number {
     const ch = world.chapters.find((c) => c.index === chapterIndex);
-    const existing = (ch?.media ?? []).filter((m) => m.kind === "image").length;
+    const existing = (ch?.media ?? []).filter(imageOccupiesQuota).length;
     return Math.max(0, MAX_IMAGES_PER_CHAPTER - existing);
   }
 
   // 媒体状态恢复扫描：会话加载/消息变化/重连/页面重新可见时，对所有已加载会话的 preview 卡续接跟踪——
-  // 分镜中（planId）→ 登记 WS 跟踪 + 一次性核对 plan-status；分镜完成待生成（countdownAt，仅展示会话）→ 恢复倒计时；
+  // 分镜中（planId）→ 登记 WS 跟踪；分镜完成待生成（countdownAt，仅展示会话）→ 恢复倒计时；
   // 生成中（mediaIds）→ 登记 WS 跟踪（等 task-status 事件收尾）。纯事件驱动，无 interval 轮询。
   function resumeMediaScan() {
     for (const s of sessions) {
@@ -1999,17 +1834,15 @@ export const BrainCabin: React.FC<{
           if (!cardId) return;
           if (pc.status === "running" && pc.planId && !planTrackRef.current.has(pc.planId)) {
             trackPlanTask(pc.planId, m.id, i, cardId, pc.mediaKind ?? "image", pc.chapterIndex ?? 1, pc.commandId, s.id);
-            checkPlanOnce(pc.planId, m.id, i, cardId, pc.mediaKind ?? "image", pc.chapterIndex ?? 1, pc.commandId, s.id);
           } else if (pc.scenes?.length && pc.countdownAt && !pc.status && isActive && !countdownRef.current.has(cardId)) {
             // 倒计时只对当前展示会话启动；后台会话切回时再次扫描，countdownAt 已过则 startCountdown 同步触发
             startCountdown(m.id, i, pc, cardId);
           } else if (pc.status === "running" && pc.mediaIds?.length) {
-            // 登记 WS 跟踪（幂等）后做【一次性】真实状态核对（非轮询）：错过 ready/failed 事件（刷新/断线）也能收敛
+            // 登记 WS 跟踪（幂等）；错过的终态由 brain-status 权威快照覆盖。
             const chIdx = pc.chapterIndex ?? 1;
             if (!mediaPollJobsRef.current.some((j) => j.cardId === cardId)) {
               pollMediaGen(world.title, chIdx, pc.mediaIds, pc.title, m.id, cardId, s.id);
             }
-            checkMediaOnce(s.id, m.id, i, cardId, chIdx, pc.mediaIds);
           } else if (pc.status === "running" && !pc.planId && !pc.mediaIds?.length && !pc.scenes?.length && !stuckMediaRef.current.has(cardId)) {
             // 分镜中卡但无 planId（提交后在补记前刷新，任务 id 丢失）且无 scenes（非生成提交中）：无法跟踪 → 标记失败提示重新提交。
             // 注意：生成提交中的卡（有 scenes、POST 未返回 mediaIds）不在此列——executeCard 会在 POST 返回后补记 mediaIds 续接跟踪。

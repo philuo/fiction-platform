@@ -11,6 +11,8 @@ import { emptyWorld, type WorldState } from "../src/api/world";
 let nextScenesJson = "";
 /** 分镜失败开关：true 时 LLM 恒返回空场景（planScenes 3 次重试后失败）；后台任务异步执行，测试期间须保持 true 直至收到 failed 广播 */
 let planFailScenes = false;
+let transientFailures = 0;
+let llmCalls = 0;
 mock.module("../src/api/agnes", () => ({
   ChatMessage: Object,
   ToolCall: Object,
@@ -22,7 +24,14 @@ mock.module("../src/api/agnes", () => ({
   complete: async () => ({ content: planFailScenes ? JSON.stringify({ scenes: [] }) : nextScenesJson }),
   chat: async () => (planFailScenes ? JSON.stringify({ scenes: [] }) : nextScenesJson),
   readStream: async () => (planFailScenes ? JSON.stringify({ scenes: [] }) : nextScenesJson),
-  chatStream: async () => (planFailScenes ? JSON.stringify({ scenes: [] }) : nextScenesJson),
+  chatStream: async () => {
+    llmCalls++;
+    if (transientFailures > 0) {
+      transientFailures--;
+      throw new Error("HTTP 503: temporary cloud failure");
+    }
+    return planFailScenes ? JSON.stringify({ scenes: [] }) : nextScenesJson;
+  },
 }));
 
 const TITLE = "plan-task-test";
@@ -214,6 +223,21 @@ describe("分镜失败事件广播", () => {
       planFailScenes = false;
       unsub();
       resetSyncState();
+    }
+  });
+});
+
+describe("分镜云端错误重试", () => {
+  test("连续两次失败后第三次成功，不会提前把任务翻 failed", async () => {
+    const { planScenes } = await import("../src/api/media");
+    transientFailures = 2;
+    llmCalls = 0;
+    try {
+      const scenes = await planScenes(mockWorld, 1, "image", 1);
+      expect(scenes.length).toBe(1);
+      expect(llmCalls).toBe(3);
+    } finally {
+      transientFailures = 0;
     }
   });
 });

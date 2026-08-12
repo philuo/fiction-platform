@@ -163,4 +163,35 @@ describe("/api/brain/sessions POST 协议", () => {
     // 清理
     await post("/api/brain/sessions/delete", { title: TITLE, id: sid });
   });
+
+  test("删除/编辑截断会话后立即发布 brain-status 权威快照", async () => {
+    const { appendMessage } = await import("../src/api/brain-sessions");
+    const { runAsUser } = await import("../src/api/storage");
+    const { subscribeSync } = await import("../src/api/sync");
+    const events: Record<string, unknown>[] = [];
+    const unsubscribe = subscribeSync((e) => {
+      if (e.type === "brain-status" && e.title === TITLE && e.user === USER) events.push(e as unknown as Record<string, unknown>);
+    });
+    try {
+      const sid = "proto-sync-change";
+      await post("/api/brain/sessions", { title: TITLE, id: sid, prompt: "第一条" });
+      runAsUser(USER, () => {
+        appendMessage(TITLE, sid, { id: "sync-u1", role: "user", text: "第一条", at: 1 });
+        appendMessage(TITLE, sid, { id: "sync-b1", role: "assistant", text: "回复", at: 2 });
+      });
+
+      const trunc = await post("/api/brain/sessions/truncate", { title: TITLE, id: sid, messageId: "sync-b1" });
+      expect(((await trunc!.json()) as { ok?: boolean }).ok).toBe(true);
+      const truncated = events.at(-1) as { sessions?: { id: string; messages: { id: string }[] }[] } | undefined;
+      expect(truncated?.sessions?.find((s) => s.id === sid)?.messages.map((m) => m.id)).toEqual(["sync-u1"]);
+
+      const del = await post("/api/brain/sessions/delete", { title: TITLE, id: sid });
+      expect(((await del!.json()) as { ok?: boolean }).ok).toBe(true);
+      const deleted = events.at(-1) as { sessions?: { id: string }[] } | undefined;
+      expect(deleted?.sessions?.some((s) => s.id === sid)).toBe(false);
+      expect(events).toHaveLength(2);
+    } finally {
+      unsubscribe();
+    }
+  });
 });

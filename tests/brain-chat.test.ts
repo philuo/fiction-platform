@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { emptyWorld, type WorldState } from "../src/api/world";
 import type { Card as WorldCard } from "../src/api/world";
-import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, extractNameFromHistory, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard } from "../src/api/brain-chat";
+import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, extractNameFromHistory, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard } from "../src/api/brain-chat";
 import { getSession as sessGet, lastPendingMessage as sessLastPending } from "../src/api/brain-sessions";
 import type { ChatMessage } from "../src/api/agnes";
 
@@ -903,6 +903,30 @@ describe("chapterIndexFromPrompt（从用户输入提取章号）", () => {
   });
 });
 
+describe("显式媒体指令本地快路径", () => {
+  test("提取插画/视频参数，疑问与故障描述不误触发", () => {
+    expect(explicitMediaIntent("给第二章生成三张插画")).toMatchObject({ intent: "media_image", params: { chapterIndex: 2, count: 3 } });
+    expect(explicitMediaIntent("为第 1 章生成视频")).toMatchObject({ intent: "media_video", params: { chapterIndex: 1 } });
+    expect(explicitMediaIntent("为什么生成插画失败了")).toBeNull();
+    expect(explicitMediaIntent("不要生成插画")).toBeNull();
+  });
+
+  test("显式生成插画不等待云端意图识别，直接返回参数卡", async () => {
+    mockWorld = mkWorld();
+    let cloudCalls = 0;
+    const original = brainChatDeps.chatJson;
+    brainChatDeps.chatJson = (async () => { cloudCalls += 1; throw new Error("cloud unavailable"); }) as typeof brainChatDeps.chatJson;
+    try {
+      const events = await runTurn("给第一章生成一张插画", { sessionId: "local-media-fast-path" });
+      expect(cloudCalls).toBe(0);
+      expect(events.some((e) => e.type === "card" && (e.card as { kind?: string })?.kind === "form")).toBe(true);
+      expect(events.some((e) => e.type === "done")).toBe(true);
+    } finally {
+      brainChatDeps.chatJson = original;
+    }
+  });
+});
+
 describe("buildMediaCard（生成插画/视频表单卡，需求 1）", () => {
   test("未指定章节 → 默认前端选中章（ctx.chapterIndex），张数默认 1", () => {
     const w = mkWorld();
@@ -984,6 +1008,18 @@ describe("buildMediaCard 张数下拉（按章节剩余额度生成 options）",
     expect(countField.options?.length).toBe(1);
     expect(countField.options?.[0]?.value).toBe("1");
     expect(countField.value).toBe(1);
+  });
+
+  test("失败/取消的插画占位不占额度：1 ready + 1 failed → 还可生成 2 张", () => {
+    const w = mkWorld();
+    (w.chapters[0] as { media?: unknown[] }).media = [
+      { id: "m-ready", kind: "image", anchor: "a", prompt: "p", status: "ready", path: "x" },
+      { id: "m-failed", kind: "image", anchor: "b", prompt: "p", status: "failed", error: "生成任务已取消" },
+    ];
+    const card = buildMediaCard(w, "media_image", {}, "给第一章配张插画", { chapterIndex: 1 });
+    const countField = card.fields.find((f) => f.key === "count")!;
+    expect(countField.options?.map((o) => o.value)).toEqual(["1", "2"]);
+    expect(countField.label).toContain("还可生成 2 张");
   });
 
   test("已有 3 张（已满）→ options 仅「已满」占位，value 0", () => {

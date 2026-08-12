@@ -70,10 +70,40 @@ export type SyncEvent = {
       at: number;
     }
   | {
+      type: "card-replaced";
+      title: string;
+      sessionId: string;
+      messageId: string;
+      cardIndex: number;
+      card: Record<string, unknown>;
+      at: number;
+    }
+  | {
       type: "brain-append";
       title: string;
       sessionId: string;
       messageId: string;
+      at: number;
+    }
+  | {
+      type: "brain-status";
+      title: string;
+      sessions: {
+        id: string;
+        sessionTitle: string;
+        createdAt: number;
+        streaming: boolean;
+        updatedAt: number;
+        messages: Record<string, unknown>[];
+        completed?: string[];
+      }[];
+      tasks: {
+        id: string;
+        status: string;
+        sub?: "plan";
+        error?: string;
+        scenes?: { anchor: string; scene: string; caption?: string }[];
+      }[];
       at: number;
     }
 );
@@ -97,21 +127,25 @@ export const SYNC_THROTTLE_MS = 1000;
 type Pending = { event: SyncEvent; timer: ReturnType<typeof setTimeout> | null };
 const pendingByKey = new Map<string, Pending>();
 
-/** 节流 key：用户 + 事件类型 + 书名 + 任务维度（同用户同书高频写合并；不同用户同名书不互相吞） */
+/** 节流 key：用户 + 事件类型 + 书名 + 任务/卡片维度（同用户同书高频写合并；不同用户同名书不互相吞）。
+ *  card-update/card-replaced 按「消息内卡片」分桶：同卡连续更新合并为最新，不同卡互不吞。 */
 function throttleKey(e: SyncEvent): string {
   const taskDim = "kind" in e && e.kind ? `::${e.kind}${e.id ? `::${e.id}` : ""}` : "";
-  return `${e.user ?? ""}::${e.type}::${slugify(e.title)}${taskDim}`;
+  let cardDim = "";
+  if (e.type === "card-update") cardDim = `::${e.sessionId}::${e.messageId}::${e.cardId}`;
+  else if (e.type === "card-replaced") cardDim = `::${e.sessionId}::${e.messageId}::${e.cardIndex}`;
+  return `${e.user ?? ""}::${e.type}::${slugify(e.title)}${taskDim}${cardDim}`;
 }
 
 function flushPending(key: string, p: Pending): void {
   pendingByKey.delete(key);
   if (p.timer) clearTimeout(p.timer);
+  dispatchSync(p.event);
+}
+
+function dispatchSync(e: SyncEvent): void {
   for (const fn of [...listeners]) {
-    try {
-      fn(p.event);
-    } catch {
-      /* 订阅者异常不阻塞其他订阅者/写路径 */
-    }
+    try { fn(e); } catch { /* 订阅者异常不阻塞其他订阅者/写路径 */ }
   }
 }
 
@@ -128,6 +162,18 @@ export function publishSync(e: SyncEvent): void {
   const p: Pending = { event: e, timer: null };
   p.timer = setTimeout(() => flushPending(key, p), SYNC_THROTTLE_MS);
   pendingByKey.set(key, p);
+}
+
+/** 立即发布不可丢的权威快照（会话删除/截断等瞬时变更不等待节流窗口）。 */
+export function publishSyncImmediate(e: SyncEvent): void {
+  if (listeners.size === 0) return;
+  const key = throttleKey(e);
+  const pending = pendingByKey.get(key);
+  if (pending) {
+    if (pending.timer) clearTimeout(pending.timer);
+    pendingByKey.delete(key);
+  }
+  dispatchSync(e);
 }
 
 /** 立即冲刷所有挂起事件（测试收尾 / 断线前尽量派发） */
@@ -185,4 +231,18 @@ export function publishCardUpdate(
 ): void {
   if (listeners.size === 0) return;
   publishSync({ type: "card-update", title, sessionId, messageId, cardId, patch, at: Date.now(), user });
+}
+
+/** 卡片整体替换事件发布：服务端权威落盘整卡（form→分镜中→分镜完成→生成中→done/failed）后调用。
+ *  前端按 messageId+cardIndex 就地整卡替换（不重拉会话、不回写 HTTP）；按卡节流（同卡连续替换取最新）。 */
+export function publishCardReplaced(
+  title: string,
+  sessionId: string,
+  messageId: string,
+  cardIndex: number,
+  card: Record<string, unknown>,
+  user?: string,
+): void {
+  if (listeners.size === 0) return;
+  publishSync({ type: "card-replaced", title, sessionId, messageId, cardIndex, card, at: Date.now(), user });
 }

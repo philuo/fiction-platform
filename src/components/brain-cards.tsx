@@ -29,7 +29,7 @@ export type PreviewCard = BrainCardBase & {
   action?: { endpoint: string; method?: string; body: Record<string, unknown> };
   /** 附图（如写操作影响章节的主插画预览） */
   image?: CardImage;
-  /** 异步任务状态（插画/视频生成：提交后轮询期间就地更新，呈现在被操作的预览卡上） */
+  /** 异步任务状态（插画/视频生成：由 sync WS 就地更新，呈现在被操作的预览卡上） */
   status?: "running" | "done" | "failed";
   /** 任务状态详情（进度/错误信息） */
   detail?: string;
@@ -37,13 +37,13 @@ export type PreviewCard = BrainCardBase & {
   statusLabel?: string;
   /** 操作按钮文案（缺省「执行」；媒体确认生成用「确认并生成」） */
   actionLabel?: string;
-  /** 分镜任务 id（分镜中 running 卡：轮询 /media/plan-status 恢复，刷新后重开继续轮询） */
+  /** 分镜任务 id（分镜中 running 卡：sync WS 快照用于刷新/多 Tab 恢复） */
   planId?: string;
   /** 分镜场景列表（分镜完成后呈现给用户；倒计时期间展示，确认后生成） */
   scenes?: { anchor: string; scene: string; caption?: string }[];
   /** 自动生成倒计时截止时间戳（ms）：3s 无手动操作自动生成；落盘跨刷新恢复对齐 */
   countdownAt?: number;
-  /** 生成任务 mediaIds（生成中 running 卡：轮询 /media/status 恢复，刷新后重开继续轮询） */
+  /** 生成任务 mediaIds（生成中 running 卡：sync WS 快照用于刷新/多 Tab 恢复） */
   mediaIds?: string[];
   /** 目标章节（生成完成跳转左侧章节用） */
   chapterIndex?: number;
@@ -1104,7 +1104,7 @@ export const FormCardView: React.FC<{
   busy?: boolean;
   completed?: boolean;
   /** 值变化上报（供父组件动态正文跟随卡片选项；初始挂载也上报默认值） */
-  onValuesChange?: (values: Record<string, unknown>) => void;
+  onValuesChange?: (values: Record<string, unknown>, source?: "user" | "sync") => void;
   /** 媒体插画 form 卡：张数下拉的剩余额度回调（按所选章节动态计算，切换章节后 options 跟随） */
   mediaQuota?: (chapterIndex: number) => number;
 }> = ({ card, onSubmit, busy, completed, onValuesChange, mediaQuota }) => {
@@ -1120,11 +1120,33 @@ export const FormCardView: React.FC<{
   const set = (key: string, v: unknown) => {
     const next = { ...values, [key]: v };
     setValues(next);
-    onValuesChangeRef.current?.(next);
+    onValuesChangeRef.current?.(next, "user");
   };
 
   // 生成插画/视频表单（action 指向 /api/novel/media/plan）：切换「章节/张数」选项后提示文案实时更新
   const isMediaForm = card.action?.endpoint === "/api/novel/media/plan";
+  const isImageMediaForm = isMediaForm && (card.action?.body?.kind ?? "image") === "image";
+  const mediaCountQuota = isImageMediaForm && mediaQuota
+    ? Math.max(0, mediaQuota(Number(values.chapterIndex) || 0))
+    : null;
+  // world-changed / brain-status 会令额度实时变化。旧表单实例不会重新 mount，需主动
+  // 把已失效的 count 收敛到新额度，并上报父层更新聊天正文与后续提交值。
+  useEffect(() => {
+    if (mediaCountQuota == null) return;
+    const current = Number(values.count);
+    const next = mediaCountQuota === 0 ? 0 : Math.max(1, Math.min(mediaCountQuota, current || 1));
+    if (current === next) return;
+    const nextValues = { ...values, count: next };
+    setValues(nextValues);
+    onValuesChangeRef.current?.(nextValues, "sync");
+  }, [mediaCountQuota, values]);
+  useEffect(() => {
+    const next: Record<string, unknown> = {};
+    for (const f of card.fields ?? []) next[f.key] = f.value ?? (f.type === "number" ? "" : f.type === "multiselect" ? [] : "");
+    if (JSON.stringify(next) === JSON.stringify(values)) return;
+    setValues(next);
+    onValuesChangeRef.current?.(next, "sync");
+  }, [card.fields]);
   const liveSummary = isMediaForm ? (() => {
     const { kind, chapterLabel, count } = mediaPlanDerived(card, values);
     const target = chapterLabel ?? "所选章节";
@@ -1161,8 +1183,8 @@ export const FormCardView: React.FC<{
           {(card.fields ?? []).map((f) => {
             const id = `fld-${card.title}-${f.key}`;
             // 媒体插画 form 卡：张数下拉按所选章节剩余额度动态生成（章节切换后 options 跟随；已满时禁用）
-            const isCountQuota = isMediaForm && f.key === "count" && !!mediaQuota && (card.action?.body?.kind ?? "image") === "image";
-            const quota = isCountQuota ? Math.max(0, mediaQuota!(Number(values.chapterIndex) || 0)) : null;
+            const isCountQuota = isImageMediaForm && f.key === "count" && !!mediaQuota;
+            const quota = isCountQuota ? mediaCountQuota : null;
             const fieldLabel = quota != null ? `张数（还可生成 ${quota} 张）` : f.label;
             const selectOptions = quota != null
               ? (quota > 0
@@ -1219,7 +1241,7 @@ export const FormCardView: React.FC<{
           completed ? (
             <span className="bc-done-tag">✓ 已执行</span>
           ) : (
-            <button className="btn-save btn-xs" disabled={busy} onClick={submit}>
+            <button className="btn-save btn-xs" disabled={busy || mediaCountQuota === 0} onClick={submit}>
               {card.submitLabel ?? "提交"}
             </button>
           )
@@ -1236,7 +1258,7 @@ export const BrainCardView: React.FC<{
   onOption?: (option: ChoiceOption) => void;
   onFormSubmit?: (card: FormCard, values: Record<string, unknown>) => void;
   /** form 卡值变化上报（供父组件动态正文跟随选项） */
-  onFormValuesChange?: (values: Record<string, unknown>) => void;
+  onFormValuesChange?: (values: Record<string, unknown>, source?: "user" | "sync") => void;
   busy?: boolean;
   /** 已执行完成（preview/form 卡：按钮替换为完成标记，防重复提交） */
   completed?: boolean;

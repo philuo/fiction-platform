@@ -140,7 +140,7 @@ const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 
 /** 复刻 BrainCabin.doSend 的发送入口（无 activeId → newSession → send） */
 function Harness() {
-  const { messages, activeId, newSession, openSession, send, completed, markCompleted, appendCard, replaceCard } = useBrainSession("brain-session-hook-test");
+  const { messages, activeId, newSession, openSession, send, completed, markCompleted, appendCard, replaceCard, applySyncSnapshot } = useBrainSession("brain-session-hook-test");
   const msgRef = React.useRef(messages);
   msgRef.current = messages;
   const completedRef = React.useRef(completed);
@@ -171,6 +171,7 @@ function Harness() {
       markCompleted: (key: string) => markCompleted(key),
       appendCard: (msg: { id: string; role: "brain"; cards: unknown[]; at: string }) => appendCard(activeId, msg),
       replaceCard: (messageId: string, cardIndex: number, card: unknown, persist?: boolean) => replaceCard(activeId, messageId, cardIndex, card as never, persist ?? true),
+      applySyncSnapshot,
     };
   });
   return <div>{messages.map((m) => `${m.role}:${m.text}`).join("|")}</div>;
@@ -194,9 +195,43 @@ async function mountHarness() {
   return { mount, root };
 }
 
-  const harness = () => (win as unknown as { __harness: { doSend: (p: string, ctx?: { chapterIndex?: number | null }) => Promise<void>; startNew: () => Promise<string>; getMessages: () => { role: string; text?: string; pending?: boolean }[]; getActiveId: () => string; openSession: (id: string, force?: boolean) => Promise<void>; replaceCard: (messageId: string, cardIndex: number, card: unknown, persist?: boolean) => Promise<void> } }).__harness;
+  const harness = () => (win as unknown as { __harness: { doSend: (p: string, ctx?: { chapterIndex?: number | null }) => Promise<void>; startNew: () => Promise<string>; getMessages: () => { id?: string; role: string; text?: string; pending?: boolean; cards?: unknown[] }[]; getActiveId: () => string; openSession: (id: string, force?: boolean) => Promise<void>; replaceCard: (messageId: string, cardIndex: number, card: unknown, persist?: boolean) => Promise<void>; appendCard: (msg: { id: string; role: "brain"; cards: unknown[]; at: string }) => Promise<void>; applySyncSnapshot: (sessions: unknown[]) => void } }).__harness;
 
 describe("useBrainSession 首次对话发送", () => {
+  test("brain-status 快照覆盖非本 Tab 流式会话，清除 pending/loading 并更新 running 卡", async () => {
+    const { root } = await mountHarness();
+    await tick();
+    const sid = "sync-session";
+    await act(() => harness().applySyncSnapshot([{
+      id: sid, sessionTitle: "插画任务", createdAt: 1, updatedAt: 2, streaming: false, completed: [],
+      messages: [{ id: "brain-sync-1", role: "assistant", text: "分镜失败", at: 2, pending: false, interrupted: true, cards: [{ kind: "preview", cardId: "media-sync", status: "failed", title: "分镜失败" }] }],
+    }]));
+    await act(() => harness().openSession(sid));
+    await tick();
+    const msg = harness().getMessages().find((m) => m.id === "brain-sync-1");
+    expect(msg?.pending).toBe(false);
+    expect((msg?.cards?.[0] as { status?: string }).status).toBe("failed");
+    await act(() => root.unmount());
+  });
+
+  test("brain-status 权威快照移除当前会话时清空旧消息与 activeId", async () => {
+    const { root } = await mountHarness();
+    await tick();
+    const sid = "deleted-in-other-tab";
+    await act(() => harness().applySyncSnapshot([{
+      id: sid, sessionTitle: "待删除", createdAt: 1, updatedAt: 2, streaming: false, completed: [],
+      messages: [{ id: "u-del", role: "user", text: "旧消息", at: 2 }],
+    }]));
+    await act(() => harness().openSession(sid));
+    expect(harness().getActiveId()).toBe(sid);
+    expect(harness().getMessages()).toHaveLength(1);
+
+    await act(() => harness().applySyncSnapshot([]));
+    expect(harness().getActiveId()).toBe("");
+    expect(harness().getMessages()).toEqual([]);
+    await act(() => root.unmount());
+  });
+
   test("无 activeId 时发送：SSE 完成前用户消息已出现在对话列表（立即展示，不依赖流式完成）", async () => {
     const { root } = await mountHarness();
     await tick();

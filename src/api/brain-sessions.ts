@@ -52,6 +52,17 @@ export type BrainSession = {
   systemNotes?: string[];
 };
 
+/** WS 同步快照使用的权威会话状态。消息/卡片完整返回，便于刷新或多 Tab 直接覆盖本地缓存。 */
+export function listSyncSessionSnapshots(title: string): BrainSession[] {
+  return listSessions(title);
+}
+
+export function sessionHasAsyncState(s: BrainSession): boolean {
+  return s.streaming || s.messages.some((m) =>
+    m.pending || (m.cards ?? []).some((c) => c?.status === "running" || c?.status === "pending"),
+  );
+}
+
 /** 单会话消息条数上限（防文件膨胀；超出丢最旧） */
 const MAX_MESSAGES = 100;
 
@@ -334,6 +345,34 @@ export function replaceMessageCard(
   return hit;
 }
 
+/** 更新媒体参数 form 卡的已选值（sync WS 上行使用）。
+ *  仅接受 /media/plan 表单且只写既有 chapterIndex/count 字段，避免 WS 成为任意卡片改写通道。 */
+export function updateMediaFormCardValues(
+  title: string,
+  sessionId: string,
+  messageId: string,
+  cardIndex: number,
+  values: { chapterIndex: number; count?: number },
+): BrainChatCard | null {
+  let updated: BrainChatCard | null = null;
+  mutateSession(title, sessionId, (s) => {
+    const m = s.messages.find((x) => x.id === messageId);
+    if (!m || !Array.isArray(m.cards) || cardIndex < 0 || cardIndex >= m.cards.length) return;
+    const card = m.cards[cardIndex] as BrainChatCard;
+    const action = card.action as { endpoint?: unknown; body?: { kind?: unknown } } | undefined;
+    if (card.kind !== "form" || action?.endpoint !== "/api/novel/media/plan" || !Array.isArray(card.fields)) return;
+    const kind = String(action.body?.kind ?? "image");
+    const fields = (card.fields as Record<string, unknown>[]).map((field) => {
+      if (field.key === "chapterIndex") return { ...field, value: values.chapterIndex };
+      if (field.key === "count" && kind === "image" && values.count != null) return { ...field, value: values.count };
+      return field;
+    });
+    updated = { ...card, fields };
+    m.cards[cardIndex] = updated;
+  });
+  return updated;
+}
+
 /** 创建「任务进度消息」（阶段 3b：推进/连载的持久进度卡）。
  *  追加一条 assistant 消息，cards 内放一张带 cardId 的 progress 卡（status:running）；
  *  前端 SSE 流式期间就地更新，完成后经 update-card 翻转 + 广播（多 tab 一致，刷新可见）。
@@ -535,4 +574,33 @@ export function recoverRunningMediaCards(
 
   if (mutated) saveSessions(title, sessions);
   return result;
+}
+
+/** 在 brain 会话中查找「含指定 pending 媒体、仍处于 running」的 preview 卡，返回其会话定位。
+ *  供重启恢复视频 watcher 时关联会话，使重启期间完成的视频也能由服务端权威翻 brain 卡。
+ *  找不到返回 null（无卡可翻：仅章节媒体维度收敛）。 */
+export function findRunningMediaCard(
+  title: string,
+  mediaId: string,
+): { sessionId: string; messageId: string; cardIndex: number; cardId: string; chapterIndex?: number } | null {
+  const sessions = loadSessions(title);
+  for (const s of sessions) {
+    for (const m of s.messages) {
+      const cards = m.cards;
+      if (!Array.isArray(cards)) continue;
+      for (let i = 0; i < cards.length; i++) {
+        const c = cards[i] as BrainChatCard & {
+          cardId?: string; kind?: string; status?: string; mediaIds?: unknown; chapterIndex?: number;
+        };
+        if (c.kind !== "preview" || c.status !== "running" || !c.cardId) continue;
+        const ids = Array.isArray(c.mediaIds) ? (c.mediaIds as unknown[]).filter((x): x is string => typeof x === "string" && x.length > 0) : [];
+        if (!ids.includes(mediaId)) continue;
+        return {
+          sessionId: s.id, messageId: m.id, cardIndex: i, cardId: c.cardId,
+          ...(typeof c.chapterIndex === "number" ? { chapterIndex: c.chapterIndex } : {}),
+        };
+      }
+    }
+  }
+  return null;
 }

@@ -65,17 +65,21 @@ afterAll(() => {
 const tick = (ms = 0) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** 测试壳：把 hook 暴露出来断言 */
-function Harness(props: { title: string | null; log: (e: string) => void; onReconnected?: () => void; onBrainNote?: (e: SyncChannelEvent & { type: "brain-note" }) => void; onCardUpdate?: (e: SyncChannelEvent & { type: "card-update" }) => void }) {
-  const { connected } = useSyncChannel({
+function Harness(props: { title: string | null; log: (e: string) => void; onReconnected?: () => void; onBrainNote?: (e: SyncChannelEvent & { type: "brain-note" }) => void; onCardUpdate?: (e: SyncChannelEvent & { type: "card-update" }) => void; onBrainStatus?: (e: SyncChannelEvent & { type: "brain-status" }) => void }) {
+  const { connected, syncMediaFormValues } = useSyncChannel({
     title: props.title,
     onWorldChanged: (e) => props.log("world-changed" + (e.regions ? ":" + e.regions.join(",") : "")),
     onAutoStatus: () => props.log("auto-status"),
     onTaskStatus: () => props.log("task-status"),
     onBrainNote: (e) => props.onBrainNote?.(e),
     onCardUpdate: (e) => props.onCardUpdate?.(e),
+    onBrainStatus: (e) => props.onBrainStatus?.(e),
     onReconnected: () => { props.onReconnected?.(); props.log("reconnected"); },
   });
-  return React.createElement("div", { "data-connected": String(connected) });
+  return React.createElement("button", {
+    "data-connected": String(connected),
+    onClick: () => syncMediaFormValues({ sessionId: "s1", messageId: "m1", cardIndex: 0, values: { chapterIndex: 2, count: 1 } }),
+  });
 }
 
 function mountHarness(title: string | null, log: (e: string) => void, onReconnected?: () => void, onBrainNote?: (e: SyncChannelEvent & { type: "brain-note" }) => void, onCardUpdate?: (e: SyncChannelEvent & { type: "card-update" }) => void): { root: Root; el: HTMLElement } {
@@ -105,6 +109,23 @@ test("挂载后连接 /api/sync 并发送 subscribe(title)", async () => {
   await tick(50);
   expect(FakeWebSocket.instances[0].sent).toEqual([JSON.stringify({ type: "subscribe", title: "书A" })]);
   expect(el.querySelector("[data-connected]")?.getAttribute("data-connected")).toBe("true");
+  root.unmount();
+});
+
+test("媒体参数选择通过已连接的 sync WS 上行", async () => {
+  const { root, el } = mountHarness("书参数", () => {});
+  await afterMount();
+  const ws = FakeWebSocket.instances[0];
+  // 未连接时点击不会发送
+  (el.querySelector("button") as HTMLButtonElement).click();
+  expect(ws.sent).toEqual([]);
+  ws.open();
+  await tick(20);
+  (el.querySelector("button") as HTMLButtonElement).click();
+  expect(ws.sent.at(-1)).toBe(JSON.stringify({
+    type: "media-form-values", title: "书参数", sessionId: "s1", messageId: "m1", cardIndex: 0,
+    values: { chapterIndex: 2, count: 1 },
+  }));
   root.unmount();
 });
 
@@ -146,6 +167,25 @@ test("auto-status / task-status / brain-note / card-update 分发到对应回调
   ws.emit({ type: "card-update", title: "书C", sessionId: "s1", messageId: "m1", cardId: "card-media-1", patch: { status: "ready" }, at: Date.now() });
   await tick(20);
   expect(log).toEqual(["auto-status", "task-status", "note:auto-ch1", "card:card-media-1"]);
+  root.unmount();
+});
+
+test("brain-status 权威快照分发到回调", async () => {
+  const log: string[] = [];
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root = createRoot(mount);
+  root.render(React.createElement(Harness, {
+    title: "书C2", log: (e: string) => log.push(e),
+    onBrainStatus: (e: SyncChannelEvent & { type: "brain-status" }) => log.push(`brain:${e.sessions.length}:${e.sessions[0]?.streaming}`),
+  }));
+  await afterMount();
+  const ws = FakeWebSocket.instances[0];
+  ws.open();
+  await tick(20);
+  ws.emit({ type: "brain-status", title: "书C2", sessions: [{ id: "s1", sessionTitle: "插画", createdAt: 1, updatedAt: 2, streaming: true, messages: [], completed: [] }], tasks: [], at: Date.now() });
+  await tick(20);
+  expect(log).toEqual(["brain:1:true"]);
   root.unmount();
 });
 
