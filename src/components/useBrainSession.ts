@@ -42,7 +42,10 @@ export type BrainSyncSession = {
   createdAt: number;
   updatedAt: number;
   streaming: boolean;
-  messages: BrainSessionDetail["messages"];
+  /** 完整订阅帧携带；紧凑状态帧只更新列表交互状态。 */
+  messages?: BrainSessionDetail["messages"];
+  messageStates?: Pick<BrainSessionDetail["messages"][number], "id" | "pending" | "interrupted" | "cards">[];
+  messageCount?: number;
   completed?: string[];
 };
 
@@ -356,37 +359,14 @@ export function useBrainSession(title: string) {
       patchStreaming(sessionId, false);
       setThinkingFor(sessionId, false);
       if (sessionId === activeIdRef.current) setReconnecting(false);
-      // 兜底：流已结束但本地缓存仍 pending（done 事件在连接收尾期丢失/未送达）
-      // → 查服务端最终状态并同步，避免"AI 已回复但一直 loading，需刷新才可见"（需求 3）
-      const last = lastMsgOf(sessionId);
-      if (last && last.pending) {
-        void (async () => {
-          try {
-            const r = await apiFetch("/api/brain/sessions/detail", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ title, id: sessionId }),
-            });
-            if (!r.ok) return;
-            const d = (await r.json()) as { session?: BrainSessionDetail };
-            const serverLast = d.session?.messages[d.session.messages.length - 1];
-            if (serverLast && serverLast.id === last.id && !serverLast.pending) {
-              patchMsg(sessionId, last.id, serverLast.interrupted
-                ? { pending: false, interrupted: true }
-                : { pending: false, interrupted: false });
-            }
-          } catch { /* 网络异常：保持现状，下次打开会话会从服务端拉取最新状态 */ }
-        })();
-      }
       // Phase 4：回合结束把最终消息快照写回 indexeddb 缓存（服务端持久化 + 客户端缓存双写）
       const arr = cacheRef.current.get(sessionId);
       if (arr?.length) {
         const comp = completedRef.current.get(sessionId);
         void cachePutSession(title, sessionId, arr, comp ? [...comp] : []);
       }
-      void refreshList(); // 更新会话列表（标题/时间/streaming 标记）
     }
-  }, [title, patchMsg, patchStreaming, setThinkingFor, refreshList, alignMsgId]);
+  }, [title, patchMsg, patchStreaming, setThinkingFor, alignMsgId]);
 
   /** 展示某会话（缓存命中即时；未命中从服务端拉详情；streaming 会话自动 resume 续流）。
    *  ctx：resume 续流时透传前端上下文（选中章），供服务端意图识别参数提取兜底（需求 1/2）。
@@ -480,11 +460,10 @@ export function useBrainSession(title: string) {
         body: JSON.stringify({ title, id, prompt: firstPrompt }),
       });
       if (!res.ok) return id;
-      await refreshList();
     } catch { /* 静默 */ }
     await openSession(id);
     return id;
-  }, [title, refreshList, openSession]);
+  }, [title, openSession]);
 
   /** 删除会话（含运行中的：先 abort 其 SSE） */
   const removeSession = useCallback(async (id: string) => {
@@ -499,14 +478,13 @@ export function useBrainSession(title: string) {
         body: JSON.stringify({ title, id }),
       });
     } catch { /* 静默 */ }
-    await refreshList();
     if (activeIdRef.current === id) {
       setActive("");
       setMessages([]);
       setStreaming(false);
       setCompleted(new Set());
     }
-  }, [title, refreshList]);
+  }, [title]);
 
   /** 截断会话到指定消息（编辑重发前置）：服务端 + 本地缓存同步删该消息及其后 */
   const truncate = useCallback(async (id: string, messageId: string) => {
@@ -528,8 +506,7 @@ export function useBrainSession(title: string) {
         if (id === activeIdRef.current) setMessages(next);
       }
     }
-    void refreshList();
-  }, [title, refreshList]);
+  }, [title]);
 
   /** 纯追加一条展示消息（卡片执行结果等，不触发 SSE） */
   const appendMsg = useCallback((id: string, msg: ChatMessage) => {
@@ -643,7 +620,7 @@ export function useBrainSession(title: string) {
       createdAt: s.createdAt,
       updatedAt: s.updatedAt,
       streaming: s.streaming,
-      messageCount: s.messages.length,
+      messageCount: s.messages?.length ?? s.messageCount ?? cacheRef.current.get(s.id)?.length ?? 0,
     }));
     setSessions(metas);
     // 快照中不存在的会话已被其它 Tab 删除：清掉消息/completed/SSE，不能只更新历史列表
@@ -664,6 +641,21 @@ export function useBrainSession(title: string) {
       setCompleted(new Set());
     }
     for (const s of snapshot) {
+      // 周期紧凑帧只负责交互状态，不得用“缺少 messages”覆盖已有正文。
+      if (!s.messages) {
+        const current = cacheRef.current.get(s.id);
+        if (current && s.messageStates) {
+          const states = new Map(s.messageStates.map((m) => [m.id, m]));
+          const next = current.map((m) => {
+            const state = states.get(m.id);
+            return state ? { ...m, pending: state.pending, interrupted: state.interrupted, cards: state.cards ?? m.cards } : m;
+          });
+          cacheRef.current.set(s.id, next);
+          if (s.id === activeIdRef.current) setMessages(next);
+        }
+        if (s.id === activeIdRef.current) setStreaming(s.streaming);
+        continue;
+      }
       // 本 Tab 正在接 SSE 且服务端也仍运行时，保留更细粒度的本地 delta；服务端已终态则必须覆盖，确保清 loading。
       if (abortRef.current.has(s.id) && s.streaming) continue;
       const next = s.messages.map(toDisplayMsg);
@@ -674,6 +666,16 @@ export function useBrainSession(title: string) {
         setMessages(next);
         setStreaming(s.streaming);
         setCompleted(completedRef.current.get(s.id) ?? new Set());
+      }
+    }
+    // 刷新、重新打开弹窗时，Home 会重放最近一次完整订阅快照；直接恢复最近会话。
+    if (!activeIdRef.current) {
+      const latest = snapshot.find((s) => s.messages);
+      if (latest?.messages) {
+        setActive(latest.id);
+        setMessages(cacheRef.current.get(latest.id) ?? latest.messages.map(toDisplayMsg));
+        setStreaming(latest.streaming);
+        setCompleted(completedRef.current.get(latest.id) ?? new Set());
       }
     }
   }, [title]);
@@ -695,11 +697,7 @@ export function useBrainSession(title: string) {
     setCompleted(new Set());
     // Phase 4：切书时清上一本书的 indexeddb 缓存（防跨书串扰；当前书缓存由 openSession 拉 detail 时写回）
     if (oldTitle) void cacheClearBook(oldTitle);
-    void (async () => {
-      const list = await refreshList();
-      const latest = list[0];
-      if (latest) await openSession(latest.id);
-    })();
+    // 会话恢复完全等待 sync WS 的订阅快照；不再由 HTTP 列表抢写交互状态。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [title]);
 

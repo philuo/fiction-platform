@@ -94,7 +94,11 @@ export type SyncEvent = {
         createdAt: number;
         streaming: boolean;
         updatedAt: number;
-        messages: Record<string, unknown>[];
+        /** 仅订阅/变更快照携带；周期状态帧省略正文，避免反复传输整段聊天。 */
+        messages?: Record<string, unknown>[];
+        /** 周期帧的轻量消息状态：不含 text/thinking，只用于清 pending 与翻卡。 */
+        messageStates?: Record<string, unknown>[];
+        messageCount?: number;
         completed?: string[];
       }[];
       tasks: {

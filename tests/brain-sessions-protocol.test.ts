@@ -194,4 +194,22 @@ describe("/api/brain/sessions POST 协议", () => {
       unsubscribe();
     }
   });
+
+  test("服务重启后的孤儿 streaming/pending 在 sync 快照前收敛为 interrupted", async () => {
+    const { createSession, appendMessage, markStreaming, listSyncSessionSnapshots } = await import("../src/api/brain-sessions");
+    const { runAsUser } = await import("../src/api/storage");
+    const sid = "orphan-stream-after-restart";
+    const snapshot = runAsUser(USER, () => {
+      createSession(TITLE, "未完成回复", sid);
+      appendMessage(TITLE, sid, { id: "orphan-msg", role: "assistant", text: "半段回复", at: 1, pending: true });
+      markStreaming(TITLE, sid);
+      return listSyncSessionSnapshots(TITLE);
+    });
+    const session = snapshot.find((s) => s.id === sid)!;
+    const message = session.messages.find((m) => m.id === "orphan-msg")!;
+    expect(session.streaming).toBe(false);
+    expect(message.pending).toBe(false);
+    expect(message.interrupted).toBe(true);
+    await post("/api/brain/sessions/delete", { title: TITLE, id: sid });
+  });
 });

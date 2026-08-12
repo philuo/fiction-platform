@@ -54,6 +54,22 @@ export type BrainSession = {
 
 /** WS 同步快照使用的权威会话状态。消息/卡片完整返回，便于刷新或多 Tab 直接覆盖本地缓存。 */
 export function listSyncSessionSnapshots(title: string): BrainSession[] {
+  // streaming/pending 是进程内流任务的镜像。服务重启后任务注册表必为空，落盘的 true
+  // 不能继续作为权威状态，否则所有新连接都会把会话卡永久恢复成 loading。
+  const sessions = loadSessions(title);
+  let dirty = false;
+  for (const s of sessions) {
+    if ((!s.streaming && !s.messages.some((m) => m.pending)) || isSessionRunning(title, s.id)) continue;
+    s.streaming = false;
+    for (const m of s.messages) {
+      if (!m.pending) continue;
+      m.pending = false;
+      m.interrupted = true;
+    }
+    s.updatedAt = Date.now();
+    dirty = true;
+  }
+  if (dirty) saveSessions(title, sessions);
   return listSessions(title);
 }
 

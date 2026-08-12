@@ -1328,26 +1328,6 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       return json({ ok });
     }
 
-    case "/api/brain/state": {
-      // 中枢四维状态派生（零 LLM）：world + autoSession runtime + 落盘 eval + 确定性完整性扫描
-      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
-      const bsBody = await readBody(req);
-      const bsTitle = String(bsBody.title ?? "").trim();
-      if (!bsTitle) return json({ error: "缺少 title" }, 400);
-      const bw = loadWorld(bsTitle);
-      if (!bw) return json({ error: "故事不存在: " + bsTitle }, 404);
-      const bsSession = loadAutoSession(bsTitle);
-      const bsAutoRunning = bsSession?.status === "running";
-      const brainState = deriveBrainState(bw, {
-        busy: bsAutoRunning,
-        phase: bsAutoRunning ? bsSession?.phase : undefined,
-        autoRunning: bsAutoRunning,
-        evalReport: readEvalReport(bsTitle),
-        integrityReport: auditWorld(bw),
-      });
-      return json({ brainState });
-    }
-
     case "/api/brain/context": {
       // 中枢系统状态快照（索引式全知）：服务端权威聚合——自动连载/写作任务/媒体生成/视觉任务/待办清单。
       // 供中枢按需拉取（而非每轮全量注入 LLM，控制 token）；前端 BrainCabin 一并注入 chatCtx。

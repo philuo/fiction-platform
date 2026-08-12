@@ -65,12 +65,18 @@ function ensureHeartbeatSweep(server: Server<SyncWsData>): void {
 /** 所有活动连接集合（供心跳扫描） */
 const allSockets = new Set<ServerWebSocket<SyncWsData>>();
 
-function brainStatusPayload(ws: ServerWebSocket<SyncWsData>, title: string) {
+function brainStatusPayload(ws: ServerWebSocket<SyncWsData>, title: string, full: boolean) {
   const sessions = runAsUser(ws.data.user.username, () => listSyncSessionSnapshots(title));
   const tasks = runAsUser(ws.data.user.username, () => listMediaTaskStates(ws.data.user.username, title));
   return {
-    type: "brain-status", title,
-    sessions: sessions.map((s) => ({ id: s.id, sessionTitle: s.title, createdAt: s.createdAt, streaming: s.streaming, updatedAt: s.updatedAt, messages: s.messages as unknown as Record<string, unknown>[], completed: s.completed })),
+    type: "brain-status", title, full,
+    sessions: sessions.map((s) => ({
+      id: s.id, sessionTitle: s.title, createdAt: s.createdAt, streaming: s.streaming,
+      updatedAt: s.updatedAt, messageCount: s.messages.length,
+      ...(full
+        ? { messages: s.messages as unknown as Record<string, unknown>[], completed: s.completed }
+        : { messageStates: s.messages.map((m) => ({ id: m.id, pending: m.pending, interrupted: m.interrupted, cards: m.cards })) }),
+    })),
     tasks,
     at: Date.now(),
     active: sessions.some(sessionHasAsyncState) || tasks.some((t) => t.status === "pending" || t.status === "running"),
@@ -78,7 +84,7 @@ function brainStatusPayload(ws: ServerWebSocket<SyncWsData>, title: string) {
 }
 
 function sendBrainStatus(ws: ServerWebSocket<SyncWsData>, title: string): boolean {
-  const payload = brainStatusPayload(ws, title);
+  const payload = brainStatusPayload(ws, title, true);
   ws.send(JSON.stringify(payload));
   return payload.active;
 }
@@ -167,11 +173,13 @@ export const syncWebsocket = {
     if (ws.data.brainTimer) clearInterval(ws.data.brainTimer);
     ws.data.brainTimer = setInterval(() => {
       try {
-        const payload = brainStatusPayload(ws, title);
+        let payload = brainStatusPayload(ws, title, false);
         const pending = runAsUser(ws.data.user.username, () => listPendingMediaTasks(ws.data.user.username, title));
         const hasPendingTasks = pending.length > 0;
         // 进行中定时推；刚进入终态时再推最后一帧，确保 UI 清 loading。
         if (payload.active || hadActive || hasPendingTasks || hadPendingTasks) {
+          // 活跃期只发轻量状态；从 active 转入终态时补一帧完整消息，其他 Tab 同时拿到最终正文。
+          if (hadActive && !payload.active) payload = brainStatusPayload(ws, title, true);
           ws.send(JSON.stringify(payload));
           // 任务快照也经同一条 WS 周期复推，避免页面休眠/事件丢失后 UI 无法确认仍在运行。
           for (const e of pending) ws.send(JSON.stringify(e));

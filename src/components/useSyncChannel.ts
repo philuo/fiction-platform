@@ -15,7 +15,7 @@ export type SyncChannelEvent =
   | { type: "card-update"; title: string; sessionId: string; messageId: string; cardId: string; patch: Record<string, unknown>; at: number }
   | { type: "card-replaced"; title: string; sessionId: string; messageId: string; cardIndex: number; card: Record<string, unknown>; at: number }
   | { type: "brain-append"; title: string; sessionId: string; messageId: string; at: number }
-  | { type: "brain-status"; title: string; sessions: { id: string; sessionTitle: string; createdAt: number; streaming: boolean; updatedAt: number; messages: Record<string, unknown>[]; completed?: string[] }[]; tasks: { id: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[] }[]; at: number }
+  | { type: "brain-status"; title: string; full?: boolean; sessions: { id: string; sessionTitle: string; createdAt: number; streaming: boolean; updatedAt: number; messages?: Record<string, unknown>[]; messageStates?: Record<string, unknown>[]; messageCount?: number; completed?: string[] }[]; tasks: { id: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[] }[]; at: number }
   | { type: "subscribed"; title: string; version: number }
   | { type: "pong" }
   | { type: "error"; error: string };

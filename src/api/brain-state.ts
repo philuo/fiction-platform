@@ -361,7 +361,7 @@ function derivePresence(
 
 /**
  * 派生中枢四维状态（纯函数，零 LLM）。
- * SSR 与客户端共用：前端拉取 /api/brain/state 或 world 附带 brainState 后调用此函数。
+ * SSR 与客户端共用：由 world 及 sync WS 提供的运行时信号在前端确定性派生。
  */
 export function deriveBrainState(w: WorldState | null, runtime: BrainRuntimeInput = {}): BrainState | null {
   if (!w) return null;

@@ -232,6 +232,25 @@ describe("useBrainSession 首次对话发送", () => {
     await act(() => root.unmount());
   });
 
+  test("brain-status 紧凑帧保留正文并收敛 pending/loading", async () => {
+    const { root } = await mountHarness();
+    const sid = "compact-status";
+    await act(() => harness().applySyncSnapshot([{
+      id: sid, sessionTitle: "紧凑状态", createdAt: 1, updatedAt: 2, streaming: true,
+      messages: [{ id: "b-compact", role: "assistant", text: "已经生成的长正文", at: 2, pending: true }],
+    }]));
+    await act(() => harness().openSession(sid));
+    await act(() => harness().applySyncSnapshot([{
+      id: sid, sessionTitle: "紧凑状态", createdAt: 1, updatedAt: 3, streaming: false, messageCount: 1,
+      messageStates: [{ id: "b-compact", pending: false, interrupted: true }],
+    }]));
+    const msg = harness().getMessages().find((m) => m.id === "b-compact");
+    expect(msg?.text).toBe("已经生成的长正文");
+    expect(msg?.pending).toBe(false);
+    expect(msg?.interrupted).toBe(true);
+    await act(() => root.unmount());
+  });
+
   test("无 activeId 时发送：SSE 完成前用户消息已出现在对话列表（立即展示，不依赖流式完成）", async () => {
     const { root } = await mountHarness();
     await tick();
