@@ -5,10 +5,12 @@
 // - world-changed 版本去重：服务端事件已按 1s 窗口节流合并，version 单调递增；客户端只处理 version 更新的事件
 // - 与 sysPoll 双跑（阶段 1 策略）：事件驱动即时刷新 + 轮询兜底校验；断线时 onStatusChange(false) 通知可启用降级
 import { useCallback, useEffect, useRef, useState } from "react";
-import { setBrainSyncState, setSystemSyncState, type SystemSyncState } from "./syncStateStore";
+import { acceptServerInstance, setBrainSyncState, setLibrarySyncState, setSystemSyncState, type SystemSyncState } from "./syncStateStore";
 
 /** 事件类型（与 src/api/sync.ts SyncEvent 一致；服务端透传原样 JSON） */
 export type SyncChannelEvent =
+  | { type: "hello"; serverInstanceId: string; ready: boolean }
+  | { type: "library-snapshot"; scope: "user"; document: "library"; revision: number; hash: string; data: { stories: { slug: string; title: string; genre: string; chapters: number; updatedAt: string; cover?: string }[]; tasks: { id: string; idea: string; genre: string; status: string; title?: string; stage?: string; error?: string; createdAt: string; updatedAt: string }[] } }
   | { type: "system-snapshot"; title: string; world: Record<string, unknown>; visual: { running: boolean; pending: { id: string; name: string }[]; failed: { id: string; name: string; reason?: string }[] }; autoSession: Record<string, unknown> | null; autoPending: Record<string, unknown> | null; advanceTask: Record<string, unknown> | null; at: number }
   | { type: "world-changed"; title: string; version: number; reason?: string; regions?: string[]; at: number }
   | { type: "auto-status"; title: string; status: string; phase?: string; written?: number; updatedAt?: string; at: number }
@@ -25,6 +27,7 @@ export type SyncChannelEvent =
 export type UseSyncChannelOpts = {
   /** 当前书 title；null/空 时不连接 */
   title: string | null;
+  enabled?: boolean;
   onWorldChanged?: (e: Extract<SyncChannelEvent, { type: "world-changed" }>) => void;
   onSystemSnapshot?: (e: Extract<SyncChannelEvent, { type: "system-snapshot" }>) => void;
   onAutoStatus?: (e: Extract<SyncChannelEvent, { type: "auto-status" }>) => void;
@@ -75,13 +78,12 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
   }, []);
 
   useEffect(() => {
-    // SSR / 无 window / 无 title：不连接
-    if (typeof window === "undefined" || !title) {
+    // 登录后立即建立用户级连接；title 只控制故事订阅，不控制 socket 生命周期。
+    if (typeof window === "undefined" || optsRef.current.enabled === false) {
       setConnected(false);
       return;
     }
 
-    const t = title;
     let closedByEffect = false;
     retryMsRef.current = 1000;
 
@@ -106,8 +108,8 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
         if (!mountedRef.current || closedByEffect) return;
         setConnected(true);
         optsRef.current.onStatusChange?.(true);
-        // 订阅当前书
-        ws.send(JSON.stringify({ type: "subscribe", title: t }));
+        const selectedTitle = optsRef.current.title;
+        if (selectedTitle) ws.send(JSON.stringify({ type: "subscribe", title: selectedTitle }));
         // 心跳：周期 ping 保活（服务端 60s 无消息断开，30s ping 间隔留有裕量）
         pingTimerRef.current = setInterval(() => {
           const cur = wsRef.current;
@@ -128,6 +130,14 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
         if (obj.type === "subscribed") {
           // 订阅确认：记录服务端当前版本（跳过已消费的旧版本）
           lastVersionRef.current = obj.version;
+          return;
+        }
+        if (obj.type === "hello") {
+          acceptServerInstance(obj.serverInstanceId);
+          return;
+        }
+        if (obj.type === "library-snapshot") {
+          setLibrarySyncState({ ...obj.data, revision: obj.revision, hash: obj.hash });
           return;
         }
         if (obj.type === "system-snapshot") {
@@ -216,7 +226,15 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
       }
       // 重连成功补偿：由 onReconnected 回调触发（若重连发生在下一次 effect 里）
     };
-  }, [title]); // 仅 title 变化重连；回调走 ref
+  }, [opts.enabled]);
+
+  // 切书只切换同一 socket 上的故事订阅，不重建登录级连接。
+  useEffect(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    lastVersionRef.current = 0;
+    ws.send(JSON.stringify(title ? { type: "subscribe", title } : { type: "unsubscribe-story" }));
+  }, [title]);
 
   // 监听 onReconnected 的稳定调用：重连成功由 ws.onopen 判断「是否初次连接」——
   // 初次连接(connected 由 false→true)不补偿；断线重连(connected 由 false→true 且此前连接过)才补偿。
@@ -244,8 +262,8 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
 
   const requestSnapshot = useCallback((): boolean => {
     const ws = wsRef.current;
-    if (!title || !ws || ws.readyState !== WebSocket.OPEN) return false;
-    ws.send(JSON.stringify({ type: "snapshot", title }));
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify({ type: "snapshot", title: title ?? "" }));
     return true;
   }, [title]);
 

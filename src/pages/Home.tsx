@@ -2,7 +2,7 @@
 // 交互：立项一句话 / 指令输入 / 抽卡筛选 / 世界观·设定·角色·大纲编辑 / 章节段落编辑 / 推进
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSyncChannel } from "../components/useSyncChannel";
-import { getBrainSyncState, getSystemSyncState, useSystemSyncState } from "../components/syncStateStore";
+import { getBrainSyncState, getSystemSyncState, useLibrarySyncState, useSystemSyncState } from "../components/syncStateStore";
 import { AlertTriangle, BookMarked, BookOpen, ChevronDown, Dices, History, List, LogOut, MoreHorizontal, PenLine, Play, RefreshCw, Search, Sparkles, Trash2, Users, Video, Wand2, X } from "../components/icons";
 import type { Card, Chapter, ChapterMedia, Character, LoreEntry, ReviewResult, WorldPatch, WorldState } from "../api/world";
 import { imageOccupiesQuota } from "../shared/media-const";
@@ -135,6 +135,7 @@ const Home: React.FC<HomeProps> = (props) => {
   const [world, setWorld] = useState<WorldState | null>(props.initialData?.world ?? null);
   const [syncTitle, setSyncTitle] = useState<string | null>(props.initialData?.world?.title ?? null);
   const syncedSystem = useSystemSyncState(syncTitle);
+  const syncedLibrary = useLibrarySyncState();
   const [busy, setBusy] = useState(false);
   const [busyPhase, setBusyPhase] = useState("");
   // 初始选中章节：SSR 预载时按 URL chapter（服务端）恢复 → localStorage 上次选中 → 第一章。
@@ -271,7 +272,7 @@ const Home: React.FC<HomeProps> = (props) => {
   // world 镜像：供 WS 回调等异步闭包读取最新 world（避免闭包陈旧）
   const worldRef = useRef<WorldState | null>(world);
   worldRef.current = world;
-  /** 推进任务阶段（任务中心展示）：轮询从 /api/brain/context 同步——聊天中启动的推进任务本页也能看到进度 */
+  /** 推进任务阶段（任务中心展示）：由 sync 系统快照同步，聊天中启动的推进任务本页也能看到进度。 */
   const [advancePhase, setAdvancePhase] = useState("");
   /** 系统事件注入信号：injectSystemNote 成功后递增，透传 BrainCabin 重拉会话（聊天舱内实时显示【系统】条） */
   const [sysTick, setSysTick] = useState(0);
@@ -288,13 +289,7 @@ const Home: React.FC<HomeProps> = (props) => {
   /** 恢复代次：协调 effect 每次执行自增。旧 effect 实例的 release/兜底回调据此自检——
    *  切书/重进 playing 时新 effect 置锁后，旧实例的异步完成不会误释放新锁（代次不匹配直接忽略）。 */
   const restoreGenRef = useRef(0);
-  /** 协调三路任务状态恢复并持锁：进入 playing（SSR 首帧 / openStory / 重进页面）时置恢复锁，
-   *  推进任务（step/status）、连载会话（auto/status）、世界构建（novel/list → creating）三路查询
-   *  全部首次决策完成后释放。查询为幂等 GET；推进恢复唯一触发点在此（openStory/SSR 不再单独调用，
-   *  restoreAdvanceTask 自带 in-flight 防重）；连载展示由下方 autoCheckedRef 防重的 effect 负责（此处只取决策信号）。
-   *  任一查询抛错也走 finally 释放，锁不会永久卡住；world 离开 playing 立即释放。
-   *  兜底超时 15s：apiFetch 无超时，若 fetch 挂起（服务端无响应）三路查询永不 resolve 会死锁——超时强制解锁
-   *  （恢复窗口 15s 远超正常 GET 耗时，任务运行中 status 查询会正常返回，不会误释放运行锁）。 */
+  /** 进入故事时保持恢复锁，直到 sync 权威快照落地。 */
   useEffect(() => {
     const gen = ++restoreGenRef.current;
     if (phase !== "playing" || !world) {
@@ -302,29 +297,8 @@ const Home: React.FC<HomeProps> = (props) => {
       return;
     }
     setRestoringTasks(true);
-    let pending = 3;
-    const release = () => {
-      if (restoreGenRef.current !== gen) return; // 旧代回调：新锁已置位，忽略
-      if (--pending <= 0) setRestoringTasks(false);
-    };
     const timer = setTimeout(() => { if (restoreGenRef.current === gen) setRestoringTasks(false); }, 15_000);
-    void restoreAdvanceTask(world.title).finally(release); // 首查决策后即 resolve（running 的轮询挂后台）
-    void fetchAutoStatus().catch(() => {}).finally(release); // 内部已 setAutoSession（锁释放时状态已就位）
-    void (async () => {
-      try {
-        const res = await apiFetch("/api/novel/list");
-        const data = (await res.json()) as { stories?: StoryMeta[]; creating?: { id: string; idea: string; genre: string; status: string; title?: string; createdAt: string }[] };
-        if (data.stories) setStories(data.stories);
-        setCreating(data.creating ?? []);
-        // 世界构建匹配（与下方 creating 驱动 effect 同逻辑）：creating 到位即同步决策——
-        // 锁释放时 buildingStage 已设，消除「fetchStories 先释放锁、554 行 effect 后设 buildingStage」的窗口
-        const t = (data.creating ?? []).find((c) => (c.status === "running" || c.status === "ready") && c.title === world?.title);
-        if (t) {
-          setCurrentTaskId(t.id);
-          setBuildingStage(t.status === "ready" ? "世界已就绪，正在生成故事蓝图…" : "世界构建中…");
-        }
-      } catch { /* 查询失败：不匹配（视为无构建任务），锁正常释放 */ } finally { release(); }
-    })();
+    requestSyncSnapshotRef.current?.();
     return () => { restoreGenRef.current++; clearTimeout(timer); }; // cleanup：作废旧代回调，新 effect 的锁不受干扰
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase, world?.title]);
@@ -337,13 +311,35 @@ const Home: React.FC<HomeProps> = (props) => {
   // 加载小说列表（stories + 进行中的异步立项任务 creating）
   const [creating, setCreating] = useState<{ id: string; idea: string; genre: string; status: string; title?: string; createdAt: string }[]>([]);
   async function fetchStories() {
-    try {
-      const res = await apiFetch("/api/novel/list");
-      const data = (await res.json()) as { stories?: StoryMeta[]; creating?: { id: string; idea: string; genre: string; status: string; title?: string; createdAt: string }[] };
-      if (data.stories) setStories(data.stories);
-      setCreating(data.creating ?? []);
-    } catch { /* ignore */ }
+    requestSyncSnapshotRef.current?.();
   }
+
+  useEffect(() => {
+    if (!syncedLibrary) return;
+    setStories(syncedLibrary.stories);
+    const active = syncedLibrary.tasks.filter((t) => t.status === "running" || t.status === "ready");
+    setCreating(active);
+    const mine = lastTaskIdRef.current;
+    if (!mine) return;
+    const task = syncedLibrary.tasks.find((t) => t.id === mine);
+    if (!task) return;
+    if (task.status === "ready" && task.title && phase !== "playing") {
+      lastTaskIdRef.current = null;
+      setCurrentTaskId(task.id);
+      setBuildingStage(task.stage ?? "世界已就绪，正在生成故事蓝图…");
+      void openStory(task.title);
+    } else if (task.status === "done") {
+      lastTaskIdRef.current = null;
+      setCurrentTaskId(null);
+      setBuildingStage(null);
+      if (task.title && phase !== "playing") void openStory(task.title);
+    } else if (task.status === "failed") {
+      lastTaskIdRef.current = null;
+      setCurrentTaskId(null);
+      setBuildingStage(null);
+      showToast("立项失败: " + (task.error ?? "未知错误"));
+    }
+  }, [syncedLibrary, phase]);
 
   /** 删除图书二次确认（与中枢历史会话删除同款交互）：首次点击进入确认态（3s 未确认自动恢复），再点才真正删除 */
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
@@ -500,149 +496,12 @@ const Home: React.FC<HomeProps> = (props) => {
       setIdea(""); // 提交后清空输入（列表占位卡展示生成中）
       showToast("立项已提交，正在初始化…");
       fetchStories();
-      // 任务可能瞬时失败（如 LLM 上游网络故障，0s 内 ConnectionRefused）：立即主动查一次，
-      // 否则 creating 为空时轮询不会启动，用户将永远看不到失败反馈
-      void checkTaskOnce(data.taskId);
     } catch (e) {
       showToast("立项提交失败: " + (e as Error).message);
     }
   }
 
-  /** 单次查询任务终态：failed 立即 toast 失败原因；done 自动打开；running/ready 交由轮询 */
-  async function checkTaskOnce(taskId: string) {
-    try {
-      const sr = await apiFetch("/api/novel/new/status", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ taskId }),
-      });
-      const st = (await sr.json()) as { status?: string; title?: string; error?: string };
-      if (st.status === "failed") {
-        lastTaskIdRef.current = null;
-        showToast("立项失败: " + (st.error ?? "未知错误"));
-      } else if (st.status === "done" && st.title) {
-        lastTaskIdRef.current = null;
-        showToast(`《${st.title}》立项完成，导演与审查者已就位。`);
-        void openStory(st.title);
-      } else if (st.status === "ready" && st.title && phase !== "playing") {
-        lastTaskIdRef.current = null;
-        setCurrentTaskId(taskId);
-        setBuildingStage("世界已就绪，正在生成故事蓝图…");
-        void openStory(st.title);
-      } else if (sr.status === 404) {
-        lastTaskIdRef.current = null;
-        showToast("立项任务已不存在（可能书籍已被删除）");
-      }
-    } catch { /* 查询失败：交给轮询处理 */ }
-  }
-
-  /** 立项任务轮询：有 creating 时每 3s 刷新列表；检测自己提交的任务 → ready 立即进三栏页面 / 终态提示 */
-  const newTaskPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const lastSeenCreatingRef = useRef<Set<string>>(new Set());
-  async function pollNewTasks() {
-    const res = await apiFetch("/api/novel/list");
-    const data = (await res.json()) as { stories?: StoryMeta[]; creating?: { id: string; idea: string; genre: string; status: string; title?: string; createdAt: string }[] };
-    if (data.stories) setStories(data.stories);
-    const next = data.creating ?? [];
-    setCreating(next);
-    const ids = new Set(next.map((c) => c.id));
-    const mine = lastTaskIdRef.current;
-    if (mine) {
-      const myTask = next.find((c) => c.id === mine);
-      if (myTask?.status === "ready" && phase !== "playing") {
-        // 壳就绪：立即进入三栏页面（title 已分配、基础世界已落盘），后台继续增强，页面内构建徽章显示进度
-        lastTaskIdRef.current = null;
-        setCurrentTaskId(mine);
-        setBuildingStage("世界已就绪，正在生成故事蓝图…");
-        void openStory(myTask.title ?? "");
-      } else if (!myTask) {
-        // 我的任务不在当前 creating → 已终态（可能是两轮之间失败的，无需"上一轮见过"——
-        // 快速失败的任务从未进入 creating 列表，但 checkTaskOnce 已兜底；这里覆盖轮询期间的失败）
-        lastTaskIdRef.current = null;
-        try {
-          const sr = await apiFetch("/api/novel/new/status", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ taskId: mine }),
-          });
-          const st = (await sr.json()) as { status?: string; title?: string; error?: string };
-          if (st.status === "failed") showToast("立项失败: " + (st.error ?? "未知错误"));
-          else if (st.status === "done" && st.title) void openStory(st.title);
-          else if (sr.status === 404) showToast("立项任务已不存在（可能书籍已被删除）");
-        } catch { /* 查询失败下次轮询再试 */ }
-      }
-    }
-    lastSeenCreatingRef.current = ids;
-    if (!next.length) stopNewTaskPolling();
-  }
-  function startNewTaskPolling() {
-    if (newTaskPollRef.current) return;
-    lastSeenCreatingRef.current = new Set(creating.map((c) => c.id));
-    newTaskPollRef.current = setInterval(() => void pollNewTasks(), 3000);
-  }
-  function stopNewTaskPolling() {
-    if (newTaskPollRef.current) { clearInterval(newTaskPollRef.current); newTaskPollRef.current = null; }
-  }
-  // creating 变化：非空则开始轮询（含刷新后看到历史生成中任务）
-  useEffect(() => {
-    if (creating.length > 0) startNewTaskPolling();
-    else stopNewTaskPolling();
-  }, [creating]);
-  useEffect(() => () => { stopNewTaskPolling(); }, []);
-
-  /** 页面内构建状态：currentTaskId 非空表示当前打开的书还在后台增强（壳已就绪），轮询 status 更新阶段文案 */
-  const buildPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  async function pollBuildingStatus() {
-    if (!currentTaskId) return;
-    try {
-      const res = await apiFetch("/api/novel/new/status", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ taskId: currentTaskId }),
-      });
-      // 404 = 任务不存在：书被删除（removeNewStoryTaskByTitle 清任务）或任务被服务端清理。
-      // 必须清构建态停轮询，否则 buildingStage 残留永久禁用一切操作（双 tab 删书场景）
-      if (res.status === 404) {
-        setCurrentTaskId(null);
-        setBuildingStage(null);
-        stopBuildingPoll();
-        showToast("构建任务已不存在（可能书籍已被删除），已恢复可编辑状态");
-        return;
-      }
-      const st = (await res.json()) as { status?: string; stage?: string; error?: string; title?: string };
-      if (st.status === "ready" && st.stage) {
-        setBuildingStage(st.stage);
-      } else if (st.status === "done") {
-        setCurrentTaskId(null);
-        setBuildingStage(null);
-        stopBuildingPoll();
-        // 刷新世界拿到增强后的完整内容（蓝图/章节就绪），构建完成及时感知
-        void refreshWorld();
-        showToast(st.title ? `《${st.title}》世界构建完成，导演与审查者已就位。` : "世界构建完成。");
-      } else if (st.status === "failed") {
-        setCurrentTaskId(null);
-        setBuildingStage(null);
-        stopBuildingPoll();
-        // 壳仍在（书名已落盘）：刷新世界恢复可写作状态，仅提示增强未完成
-        void refreshWorld();
-        showToast("世界已生成，但部分增强未完成：" + (st.error ?? "未知原因"));
-      }
-    } catch { /* 网络抖动，下次轮询再试 */ }
-  }
-  function startBuildingPoll() {
-    if (buildPollRef.current) return;
-    buildPollRef.current = setInterval(() => void pollBuildingStatus(), 3000);
-  }
-  function stopBuildingPoll() {
-    if (buildPollRef.current) { clearInterval(buildPollRef.current); buildPollRef.current = null; }
-  }
-  // 进页面（currentTaskId 设置）后开始构建轮询；离开页面/卸载清理
-  useEffect(() => {
-    if (currentTaskId) startBuildingPoll();
-    else stopBuildingPoll();
-  }, [currentTaskId]);
-  useEffect(() => () => { stopBuildingPoll(); }, []);
-  // 刷新/重进页面后恢复世界构建状态：creating 列表含 ready/running 任务且 title 匹配当前打开的书
+  // 刷新/重进页面后从用户级 sync 投影恢复世界构建状态。
   // （currentTaskId/buildingStage 是内存态，刷新即丢；此处从服务端 creating 恢复，任务仍在后台跑）
   useEffect(() => {
     if (phase === "playing" && world?.title && !currentTaskId) {
@@ -668,7 +527,7 @@ const Home: React.FC<HomeProps> = (props) => {
 
   // 阶段 1b/2：状态同步 WebSocket 频道——服务端事件推送即时刷新（与 sysPoll 双跑，轮询兜底校验）。
   // world-changed → 刷新世界（新章/任务完成即时感知）；
-  // task-status → 刷新世界（任务完成已落盘，无需再查系统状态——局部更新省一次 /api/brain/context）；
+  // task-status → 刷新世界（任务完成已落盘，无需额外状态查询）；
   // auto-status → 连载会话；brain-note → 系统事件已注入聊天，sysTick 递增让 BrainCabin 重拉（多 tab 一致）；
   // 重连成功 → 全量补偿一次（事件可能错过）。
   // 卡片就地更新注册（阶段 3a）：BrainCabin 挂载时注册 patch 处理器；card-update 事件经此转发（聊天舱关闭时事件丢弃，重开拉服务端最新）
@@ -716,6 +575,7 @@ const Home: React.FC<HomeProps> = (props) => {
   const requestSyncSnapshotRef = useRef<(() => boolean) | null>(null);
   const { syncMediaFormValues, requestSnapshot } = useSyncChannel({
     title: syncTitle,
+    enabled: Boolean(user),
     onSystemSnapshot: () => {},
     onWorldChanged: () => {},
     onTaskStatus: (e) => {
@@ -776,110 +636,9 @@ const Home: React.FC<HomeProps> = (props) => {
     setAutoPending(syncedSystem.autoPending as unknown as PendingChapterView | null);
     const advance = syncedSystem.advanceTask as { status?: string; phase?: string } | null;
     setAdvancePhase(advance?.status === "running" ? (advance.phase ?? "推进中") : "");
+    setRestoringTasks(false);
     if (activeIdx === -1 && nextWorld.chapters.length) setActiveIdx(resolveInitialChapter(nextWorld, loadReadingPref(nextWorld.title)));
   }, [syncedSystem, syncTitle, activeIdx]);
-
-  /** 单章推进任务恢复（刷新/重进页面后）：查询持久化任务状态——
-   * running → 恢复忙碌态 + 轮询直到完成（后台仍在执行，不重复发起）；
-   * done → 刷新世界 + 提示（pendingCommit 则打开任务中心确认）；failed → 报错提示。
-   * 读取后调 /api/novel/step/clear 清除任务文件，避免下次刷新重复提示。 */
-  const advanceRestoreTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
-  function stopAdvanceRestorePolling() {
-    if (advanceRestoreTimer.current) { clearInterval(advanceRestoreTimer.current); advanceRestoreTimer.current = undefined; }
-  }
-  useEffect(() => () => { stopAdvanceRestorePolling(); }, []);
-
-  async function clearAdvanceTaskFile(storyTitle: string) {
-    try {
-      await apiFetch("/api/novel/step/clear", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: storyTitle }),
-      });
-    } catch { /* 清除失败不阻塞 */ }
-  }
-
-  async function finishRestoreAdvance(storyTitle: string, task: { status: string; chapterIndex?: number; verdict?: string; rounds?: number; pendingCommit?: boolean; error?: string }) {
-    stopAdvanceRestorePolling();
-    setBusy(false);
-    setBusyPhase("");
-    setAdvancePhase(""); // 修复：恢复任务结束同样清 advancePhase（轮询降级后无兜底）
-    setLiveDraft("");
-    await clearAdvanceTaskFile(storyTitle);
-    if (task.status === "failed") {
-      showToast(`推进任务失败：${task.error ?? "未知错误"}`);
-      await refreshWorld();
-      return;
-    }
-    // done
-    await refreshWorld();
-    setActiveIdx(-1); // 跟随最新章节
-    if (task.pendingCommit && task.chapterIndex != null) {
-      setPendingCommitIdx(task.chapterIndex);
-      setShowTaskCenter(true);
-      showToast(`检测到第 ${task.chapterIndex} 章审查通过待确认入册（任务在页面刷新前已暂存）`);
-    } else {
-      showToast(
-        task.verdict === "pass"
-          ? `检测到后台推进完成：第 ${task.chapterIndex} 章已入册（${task.rounds ?? 1} 稿通过）`
-          : `检测到后台推进完成：第 ${task.chapterIndex} 章已入册（最终仍需修改，可查看审查报告）`,
-      );
-    }
-  }
-
-  /** in-flight 防重：恢复查询进行中禁止再次进入（openStory/SSR/协调 effect 收敛后由协调 effect
-   *  唯一触发；此防重防御未来误用/极端时序，防止双路并发重复 finishRestoreAdvance） */
-  const advanceRestoreInFlight = useRef(false);
-  async function restoreAdvanceTask(storyTitle: string) {
-    if (advanceRestoreInFlight.current || advanceRestoreTimer.current) return; // 已在恢复中
-    advanceRestoreInFlight.current = true;
-    try {
-      const res = await apiFetch("/api/novel/step/status", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: storyTitle }),
-      });
-      const data = (await res.json()) as { task?: { status: string; phase: string; chapterIndex?: number; verdict?: string; rounds?: number; pendingCommit?: boolean; error?: string } | null };
-      const task = data.task;
-      if (!task) return;
-      if (task.status === "done" || task.status === "failed") {
-        // 已结束但前端未消费（刷新发生在完成之后）：提示并清除
-        await finishRestoreAdvance(storyTitle, task);
-        return;
-      }
-      // running：恢复忙碌态展示，轮询直到完成（服务端仍在执行）
-      const phaseText: Record<string, string> = { start: "准备中…", writing: "导演写作中…", reviewing: "审查中…", patching: "修补中…", settling: "结算中…", selfcheck: "自检中…", saving: "存档中…" };
-      setBusy(true);
-      setBusyPhase(phaseText[task.phase] ?? "后台推进中…");
-      showToast("检测到后台推进任务仍在运行，已恢复进度显示（刷新不影响写作）");
-      advanceRestoreTimer.current = setInterval(async () => {
-        try {
-          const r = await apiFetch("/api/novel/step/status", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ title: storyTitle }),
-          });
-          const d = (await r.json()) as { task?: { status: string; phase: string; chapterIndex?: number; verdict?: string; rounds?: number; pendingCommit?: boolean; error?: string } | null };
-          const t = d.task;
-          if (!t) { // 任务文件被清除：异常，停止恢复
-            stopAdvanceRestorePolling();
-            setBusy(false);
-            setBusyPhase("");
-            return;
-          }
-          if (t.status === "running") {
-            setBusyPhase(phaseText[t.phase] ?? "后台推进中…");
-          } else {
-            await finishRestoreAdvance(storyTitle, t);
-          }
-        } catch (e) {
-          console.warn("[advance-restore] 轮询失败，稍后重试:", (e as Error).message);
-        }
-      }, 5000);
-    } catch { /* 查询失败静默（不阻塞打开故事） */ } finally {
-      advanceRestoreInFlight.current = false;
-    }
-  }
 
   async function advance() {
     if (!world || busy || buildingStage) return; // 世界构建中禁止手动推进（后台正在增强蓝图/章节）
@@ -1837,131 +1596,6 @@ const Home: React.FC<HomeProps> = (props) => {
 
   // —— P4.5 自动连载（git 式）：会话状态查询 / 轮询 / 控制台操作 ——
 
-  /** 查询连载会话与暂存区（刷新恢复 / 轮询 / SSE 结束后同步） */
-  async function fetchAutoStatus() {
-    if (!world) return null;
-    // C7 守卫：切书后旧闭包的回调不再写旧书的连载会话状态
-    if (worldTitleRef.current !== world.title) return null;
-    try {
-      const res = await apiFetch(`/api/novel/auto/status?title=${encodeURIComponent(world.title)}`);
-      const d = (await res.json()) as { session?: AutoSessionView | null; pending?: PendingChapterView | null; error?: string };
-      if (d.error) return null;
-      setAutoSession(d.session ?? null);
-      setAutoPending(d.pending ?? null);
-      return d.session ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  /** 把系统状态变化注入中枢聊天会话（幂等：服务端按 eventId 去重，同事件不重复注入）。
-   *  聊天中可见系统动态（灰色【系统】条），且消息进入会话历史 → 中枢 AI 感知（意图识别 hist 携带） */
-  async function injectSystemNote(eventId: string, text: string) {
-    if (!world) return;
-    try {
-      const res = await apiFetch("/api/brain/sessions/system-note", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: world.title, eventId, text }),
-      });
-      if (res.ok) {
-        const d = (await res.json().catch(() => ({}))) as { injected?: boolean };
-        if (d.injected) setSysTick((t) => t + 1); // 实际注入成功 → 通知聊天舱重拉（显示最新系统条）
-      }
-    } catch { /* 注入失败静默：不影响系统功能 */ }
-  }
-
-  // 统一状态轮询基线：上次快照（首次为 null，仅建立基线不判定变化）
-  const prevSysRef = useRef<{
-    written: number;
-    autoRunning: boolean;
-    autoPhase: string;
-    advanceRunning: boolean;
-    advanceStartedAt: string | null;
-  } | null>(null);
-
-  /** 单次系统状态快照拉取 + 变化检测（统一轮询与卡片执行后即时刷新共用）。
-   *  连载会话（auto/status）+ 运行时上下文（brain/context：推进任务/媒体/视觉）并行拉取；
-   *  检测到状态转移（新章提交 / 连载开始·结束·暂停 / 推进任务完成）→ 刷新 world（新章出现）+
-   *  注入聊天会话 + 打开连载控制台。解决：长期停留页面不同步、聊天触发任务后系统 UI 不更新
-   *  可靠性：任一来源拉取失败 → 本轮只更新展示状态、跳过变化检测（prev 不推进），
-   *  避免网络抖动误报「连载结束/任务完成」污染聊天上下文 */
-  type SysCtx = { autoRunning?: boolean; advanceTaskRunning?: boolean; advancePhase?: string; advanceStartedAt?: string; mediaGenerating?: boolean; visualRunning?: boolean };
-  async function pollSysStateOnce() {
-    if (!world) return;
-    // C7 守卫：切书后旧闭包/旧轮询不再拉取或写入旧书系统状态
-    if (worldTitleRef.current !== world.title) return;
-    const auto = await fetchAutoStatus().catch(() => null);
-    let ctx: SysCtx | null = null;
-    try {
-      const res = await apiFetch("/api/brain/context", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: world.title }),
-      });
-      if (res.ok) ctx = ((await res.json()) as { context?: SysCtx }).context ?? null;
-    } catch { /* 网络抖动 */ }
-
-    // C7：await 期间用户可能已切书，再次校验后才写 state / 推进基线
-    if (worldTitleRef.current !== world.title) return;
-
-    // 推进任务阶段同步（聊天中启动的任务在任务中心可见）；ctx 失败时保留旧值（防误释放运行锁）
-    if (ctx) setAdvancePhase(ctx.advanceTaskRunning ? (ctx.advancePhase ?? "推进中") : "");
-
-    // 快照不可靠（auto/ctx 任一失败）→ 只更新展示，不判定变化（prev 不推进，防误报状态转移）
-    if (!auto || !ctx) return;
-    const prev = prevSysRef.current;
-    const now = {
-      written: auto.written ?? 0,
-      autoRunning: ctx.autoRunning ?? false,
-      autoPhase: auto.phase ?? "",
-      advanceRunning: ctx.advanceTaskRunning ?? false,
-      advanceStartedAt: ctx.advanceStartedAt ?? null,
-    };
-
-    if (prev) {
-      const notes: { id: string; text: string }[] = [];
-      let worldDirty = false;
-      // 连载：已写章数前进 → 刷新 world（新章出现）+ 通知聊天
-      if (now.autoRunning && now.written > prev.written) {
-        worldDirty = true;
-        notes.push({ id: `auto-ch${now.written}`, text: `自动连载已提交第 ${now.written} 章${now.autoPhase ? `（${now.autoPhase}）` : ""}` });
-      }
-      // 连载：running → 终态（paused/stopped/done）——eventId 用 updatedAt（并发重判定时服务端幂等去重）
-      if (prev.autoRunning && !now.autoRunning) {
-        worldDirty = true;
-        const status = auto.status;
-        const phaseText = auto.phase ?? "";
-        if (status === "paused") {
-          setShowAutoPanel(true);
-          notes.push({ id: `auto-paused-${auto.updatedAt ?? prev.written}`, text: `自动连载已暂停：${phaseText || "审查未通过"}` });
-        } else {
-          notes.push({ id: `auto-ended-${auto.updatedAt ?? prev.written}`, text: `自动连载已结束：${phaseText || (status === "stopped" ? "已手动停止" : "已完成")}` });
-        }
-      }
-      // 连载：空闲 → running（聊天中/其他入口启动，本页发现）→ 打开连载控制台 + 通知
-      if (!prev.autoRunning && now.autoRunning) {
-        setShowAutoPanel(true);
-        notes.push({ id: `auto-started-${auto.startedAt ?? prev.written}`, text: `自动连载已开始${now.autoPhase ? `：${now.autoPhase}` : ""}` });
-      }
-      // 推进任务：running → 结束 → 刷新 world + 通知（eventId 用任务启动时间，每个任务唯一：并发重判定同 id 服务端去重、不同任务不互吞）
-      if (prev.advanceRunning && !now.advanceRunning) {
-        worldDirty = true;
-        notes.push({ id: `advance-ended-${prev.advanceStartedAt ?? prev.written}`, text: "推进任务已完成，正文已更新" });
-      }
-      if (worldDirty) void refreshWorld();
-      for (const n of notes) void injectSystemNote(n.id, n.text);
-    }
-    prevSysRef.current = now;
-  }
-
-  /** 统一系统状态轮询：打开小说常驻 3s（长期停留页面也同步连载/任务/系统状态），离开页面停止 */
-  function startSysPoll() {
-    stopSysPoll();
-    sysPollRef.current = setInterval(() => void pollSysStateOnce(), 3000);
-  }
-  // 仅保留旧变化检测实现供后续迁移审计；运行时不再启用，sync WS 是唯一状态通道。
-  void startSysPoll;
   function stopSysPoll() {
     if (sysPollRef.current) {
       clearInterval(sysPollRef.current);
@@ -1983,7 +1617,6 @@ const Home: React.FC<HomeProps> = (props) => {
     }
     if (autoCheckedRef.current === world.title) return;
     autoCheckedRef.current = world.title;
-    prevSysRef.current = null; // 重置变化检测基线（切书防串书误报：书 A 连载结束判定不能注入书 B）
     stopSysPoll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [world]);

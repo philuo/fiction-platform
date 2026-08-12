@@ -16,7 +16,7 @@ import { planScenes, generateSceneImage, createSceneVideo, styleAnchor, findChar
 import { auditWorld, autoRepair, alignWorld, collectOrphanMediaFiles } from "./integrity";
 import { resetChapterLedger, settleChapter } from "./chronicler";
 import { applyStateChange, finalizeStateChange } from "./statechange";
-import { publishSync, publishSyncImmediate, publishCardReplaced, type SyncEvent } from "./sync";
+import { notifyLibraryChanged, publishSync, publishSyncImmediate, publishCardReplaced, type SyncEvent } from "./sync";
 import { withTitleLock } from "./titlelock";
 import { brainChatStream } from "./brain-chat";
 import { imageOccupiesQuota } from "../shared/media-const";
@@ -1488,6 +1488,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         // 前端据 taskId 轮询 /api/novel/new/status，列表接口合并 creating 占位——用户"点了就有反馈"，
         // 刷新列表也能看到生成中的书；不再同步阻塞 HTTP 请求（原实现最坏挂十几分钟）。
         const { id: taskId, created } = createNewStoryTask(idea, genre);
+        notifyLibraryChanged(currentUser() ?? undefined);
         if (created) {
           // 只有真正新建任务才启动后台执行；复用已有 running 时（created=false）不再启动，
           // 否则两个并发 newStory 写同一 taskId 互相覆盖终态（防重入状态管理硬约束）
@@ -1499,6 +1500,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
               // 立即进入三栏页面，角色视觉同步提前启动（角色已就绪，不等待蓝图）。
               const world = await runAsUser(username, () => director.newStoryCore(idea, genre));
               markNewStoryTaskReady(taskId, world.title);
+              notifyLibraryChanged(username ?? undefined);
               const fresh = world.characters.filter((c) => !(c.portrait?.path && c.image));
               for (const c of fresh) ensureCharacterVisuals(world.title, world, c);
               // 封面自动生成（fire-and-forget，与角色视觉并行）：新书封面随立绘/头像一起后台生成
@@ -1507,21 +1509,25 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
               try {
                 await runAsUser(username, async () => {
                   updateNewStoryTaskStage(taskId, "正在补全角色设定…");
+                  notifyLibraryChanged(username ?? undefined);
                   await director.newStoryEnhance(world, idea);
                 });
               } catch (e) {
                 // 壳已就绪、增强失败：任务标 failed 但书名已在（前端页面内提示"世界已生成，增强未完成"，可手动重试蓝图）
                 console.error("[api/novel/new] 后台立项增强失败:", e);
                 failNewStoryTask(taskId, `世界已生成，但蓝图/章节增强失败（${errorDetail(e, "可在小说内手动生成")}）`);
+                notifyLibraryChanged(username ?? undefined);
                 return;
               }
               completeNewStoryTask(taskId, world.title);
+              notifyLibraryChanged(username ?? undefined);
               console.log(`[api/novel/new] 立项完成: ${world.title}（task=${taskId}）`);
             } catch (e) {
               // 段 1 失败（壳未就绪）：任务 failed，前端列表占位卡提示失败。
               // 保留真实原因（ECONNRESET/超时/空内容等）供用户感知与诊断，不再笼统吞掉
               console.error("[api/novel/new] 后台立项失败:", e);
               failNewStoryTask(taskId, `立项失败：${errorDetail(e, "请稍后重试")}`);
+              notifyLibraryChanged(username ?? undefined);
             }
           })();
         }
@@ -1576,6 +1582,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         visualTasks.delete(delKey);
         deletedStories.add(delKey);
         setTimeout(() => deletedStories.delete(delKey), 30 * 60_000).unref?.();
+        notifyLibraryChanged(currentUser() ?? undefined);
         return json({ ok });
       } catch (e) {
         console.error("[api/novel/delete]", e);

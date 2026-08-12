@@ -18,6 +18,9 @@ import { getSystemSyncSnapshot, listMediaTaskStates, listPendingMediaTasks } fro
 import { listSyncSessionSnapshots, sessionHasAsyncState, updateMediaFormCardValues } from "./brain-sessions";
 import { MAX_IMAGES_PER_CHAPTER, imageOccupiesQuota } from "../shared/media-const";
 import { runtimeReadiness } from "./runtime-readiness";
+import { listStoriesMeta } from "./storage";
+import { loadNewStoryTasks } from "./newtask";
+import { recordProjectionSnapshot } from "./control-plane";
 
 /** WS 端点路径（dev/prod 共用） */
 export const SYNC_WS_PATH = "/api/sync";
@@ -25,6 +28,22 @@ export const SYNC_WS_PATH = "/api/sync";
 /** 频道 key：用户 + 书名 slug（跨账号隔离；同一账号同一书的所有连接同一频道） */
 export function syncChannelKey(user: string, title: string): string {
   return `sync::${user}::${slugify(title)}`;
+}
+
+function userChannelKey(user: string): string {
+  return `sync::${user}::user`;
+}
+
+function sendLibrarySnapshot(ws: ServerWebSocket<SyncWsData>): void {
+  const data = runAsUser(ws.data.user.username, () => ({
+    stories: listStoriesMeta(),
+    tasks: loadNewStoryTasks().map((t) => ({
+      id: t.id, idea: t.idea, genre: t.genre ?? "", status: t.status, title: t.title,
+      stage: t.stage, error: t.error, createdAt: t.startedAt, updatedAt: t.updatedAt,
+    })),
+  }));
+  const version = recordProjectionSnapshot(ws.data.user.username, "user", "library", data);
+  ws.send(JSON.stringify({ type: "library-snapshot", scope: "user", document: "library", ...version, data }));
 }
 
 /** WS 连接附加数据：登录用户 + 已订阅的频道集合 + 心跳时间戳 */
@@ -86,13 +105,24 @@ function brainStatusPayload(ws: ServerWebSocket<SyncWsData>, title: string, full
 
 function sendBrainStatus(ws: ServerWebSocket<SyncWsData>, title: string): boolean {
   const payload = brainStatusPayload(ws, title, true);
-  ws.send(JSON.stringify(payload));
+  const { at: _at, ...stable } = payload;
+  const version = recordProjectionSnapshot(ws.data.user.username, `story/${title}`, "brain", stable);
+  ws.send(JSON.stringify({ ...payload, ...version }));
   return payload.active;
+}
+
+function sendBrainStatusFrame(ws: ServerWebSocket<SyncWsData>, payload: ReturnType<typeof brainStatusPayload>): void {
+  const { at: _at, ...stable } = payload;
+  const version = recordProjectionSnapshot(ws.data.user.username, `story/${payload.title}`, "brain", stable);
+  ws.send(JSON.stringify({ ...payload, ...version }));
 }
 
 function sendSystemSnapshot(ws: ServerWebSocket<SyncWsData>, title: string, heal = false): void {
   const snapshot = runAsUser(ws.data.user.username, () => getSystemSyncSnapshot(title, heal));
-  if (snapshot) ws.send(JSON.stringify({ type: "system-snapshot", ...snapshot, at: Date.now() }));
+  if (snapshot) {
+    const version = recordProjectionSnapshot(ws.data.user.username, `story/${title}`, "system", snapshot);
+    ws.send(JSON.stringify({ type: "system-snapshot", scope: `story/${title}`, document: "system", ...version, ...snapshot, at: Date.now() }));
+  }
 }
 
 /** 订阅消息体校验 */
@@ -105,13 +135,30 @@ type SubscribeMsg = {
   values?: { chapterIndex?: unknown; count?: unknown };
 };
 
+function unsubscribeStoryChannels(ws: ServerWebSocket<SyncWsData>): void {
+  const userChannel = userChannelKey(ws.data.user.username);
+  for (const channel of [...ws.data.channels]) {
+    if (channel === userChannel) continue;
+    ws.unsubscribe(channel);
+    ws.data.channels.delete(channel);
+  }
+  if (ws.data.brainTimer) {
+    clearInterval(ws.data.brainTimer);
+    ws.data.brainTimer = undefined;
+  }
+}
+
 /** websocket 配置（dev/prod 的 Bun.serve 共用） */
 export const syncWebsocket = {
   open(ws: ServerWebSocket<SyncWsData>) {
     ws.data.lastSeen = Date.now();
     allSockets.add(ws);
+    const userChannel = userChannelKey(ws.data.user.username);
+    ws.subscribe(userChannel);
+    ws.data.channels.add(userChannel);
     const runtime = runtimeReadiness();
     ws.send(JSON.stringify({ type: "hello", serverInstanceId: runtime.serverInstanceId, ready: runtime.ready }));
+    sendLibrarySnapshot(ws);
   },
   message(ws: ServerWebSocket<SyncWsData>, message: string | Buffer) {
     ws.data.lastSeen = Date.now(); // 任何消息（含 ping）都视为活跃
@@ -162,12 +209,20 @@ export const syncWebsocket = {
     }
     if (msg.type === "snapshot") {
       const title = String(msg.title ?? "").trim();
-      if (!title || !ws.data.channels.has(syncChannelKey(ws.data.user.username, title))) {
+      if (!title) {
+        sendLibrarySnapshot(ws);
+        return;
+      }
+      if (!ws.data.channels.has(syncChannelKey(ws.data.user.username, title))) {
         ws.send(JSON.stringify({ type: "error", error: "尚未订阅该书" }));
         return;
       }
       sendSystemSnapshot(ws, title);
       sendBrainStatus(ws, title);
+      return;
+    }
+    if (msg.type === "unsubscribe-story") {
+      unsubscribeStoryChannels(ws);
       return;
     }
     if (msg.type !== "subscribe") return; // 未知消息忽略
@@ -183,6 +238,7 @@ export const syncWebsocket = {
       return;
     }
     const key = syncChannelKey(ws.data.user.username, title);
+    unsubscribeStoryChannels(ws);
     ws.subscribe(key);
     ws.data.channels.add(key);
     ws.send(JSON.stringify({ type: "subscribed", title, version: worldVersion(title) }));
@@ -200,7 +256,7 @@ export const syncWebsocket = {
         if (payload.active || hadActive || hasPendingTasks || hadPendingTasks) {
           // 活跃期只发轻量状态；从 active 转入终态时补一帧完整消息，其他 Tab 同时拿到最终正文。
           if (hadActive && !payload.active) payload = brainStatusPayload(ws, title, true);
-          ws.send(JSON.stringify(payload));
+          sendBrainStatusFrame(ws, payload);
           // 任务快照也经同一条 WS 周期复推，避免页面休眠/事件丢失后 UI 无法确认仍在运行。
           for (const e of pending) ws.send(JSON.stringify(e));
         }
@@ -267,6 +323,14 @@ export function attachSyncPublish(server: Server<SyncWsData>): () => void {
   ensureHeartbeatSweep(server); // 启动心跳扫描（幂等）
   return subscribeSync((e: SyncEvent) => {
     if (!e.user) return; // 无 user 的事件（测试/遗留路径）无法定位频道，不推
+    if (e.type === "library-changed") {
+      for (const ws of allSockets) {
+        if (ws.data.user.username === e.user) {
+          try { sendLibrarySnapshot(ws); } catch { /* socket 已关闭 */ }
+        }
+      }
+      return;
+    }
     const msg = JSON.stringify(e);
     const channel = syncChannelKey(e.user, e.title);
     server.publish(channel, msg);

@@ -107,6 +107,19 @@ describe("WS 升级鉴权", () => {
 });
 
 describe("订阅与广播（协议）", () => {
+  test("建连即推 hello 与用户级 library-snapshot，无需先打开故事", async () => {
+    const { ws, msgs, waitFor } = await connectWs("u1");
+    const hello = msgs.map((m) => JSON.parse(m) as Record<string, unknown>).find((m) => m.type === "hello")
+      ?? await waitFor((m) => m.type === "hello");
+    expect(typeof hello.serverInstanceId).toBe("string");
+    const library = msgs.map((m) => JSON.parse(m) as Record<string, unknown>).find((m) => m.type === "library-snapshot")
+      ?? await waitFor((m) => m.type === "library-snapshot");
+    expect((library.data as { stories: { title: string }[] }).stories.some((s) => s.title === "ws-book-1")).toBe(true);
+    expect(typeof library.revision).toBe("number");
+    expect(typeof library.hash).toBe("string");
+    ws.close();
+  });
+
   test("订阅成功 → subscribed(含 version)；publish 后收到 world-changed(版本递增)", async () => {
     const { ws, waitFor } = await connectWs("u1");
     ws.send(JSON.stringify({ type: "subscribe", title: "ws-book-1" }));
@@ -183,13 +196,14 @@ describe("saveWorld → 事件总线 → WS 广播（真实链路集成）", () 
   });
 
   test("brain-status：建连立即推 pending，多 Tab 未轮询也会定时收到终态", async () => {
-    const { createSession, appendMessage, markStreaming, markMessageDone } = await import("../src/api/brain-sessions");
+    const { createSession, appendMessage, markStreaming, markMessageDone, registerSessionTask, finishSessionTask } = await import("../src/api/brain-sessions");
     const { runAsUser } = await import("../src/api/storage");
     const sid = "sync-brain-pending";
     runAsUser("sync_ws_user", () => {
       createSession("sync-ws-world", "生成插画", sid);
       appendMessage("sync-ws-world", sid, { id: "bm1", role: "assistant", text: "", at: Date.now(), pending: true });
       markStreaming("sync-ws-world", sid);
+      registerSessionTask("sync-ws-world", sid, () => {}).running = true;
     });
 
     const { ws, waitFor } = await connectWs("sync_ws_user");
@@ -198,7 +212,10 @@ describe("saveWorld → 事件总线 → WS 广播（真实链路集成）", () 
     expect((pending.sessions as { id: string; streaming: boolean }[]).find((s) => s.id === sid)?.streaming).toBe(true);
 
     // 不发 HTTP、不主动查询：仅改变服务端持久态，等待 3s 周期 WS 快照推送最终状态。
-    runAsUser("sync_ws_user", () => markMessageDone("sync-ws-world", sid, "bm1"));
+    runAsUser("sync_ws_user", () => {
+      markMessageDone("sync-ws-world", sid, "bm1");
+      finishSessionTask("sync-ws-world", sid);
+    });
     const done = await waitFor((m) => {
       if (m.type !== "brain-status") return false;
       const sessions = m.sessions as { id: string; streaming: boolean; messages: { id: string; pending?: boolean }[] }[];

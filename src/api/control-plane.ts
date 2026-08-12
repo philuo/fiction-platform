@@ -205,6 +205,21 @@ export function syncRevision(user: string | null, scope: string, document: strin
   return { revision: row?.revision ?? 0, hash: row?.content_hash ?? "" };
 }
 
+/** 为非 world 投影登记稳定 revision/hash；内容未变化时 revision 不前进。 */
+export function recordProjectionSnapshot(user: string | null, scope: string, document: string, data: unknown): { revision: number; hash: string } {
+  const username = durableUser(user);
+  const hash = contentHash(data);
+  const current = syncRevision(username, scope, document);
+  if (current.hash === hash) return current;
+  const revision = current.revision + 1;
+  const at = now();
+  getDb().query(`INSERT INTO sync_scopes(user_name,scope,document,revision,content_hash,updated_at)
+    VALUES (?,?,?,?,?,?) ON CONFLICT(user_name,scope,document) DO UPDATE SET
+    revision=excluded.revision,content_hash=excluded.content_hash,updated_at=excluded.updated_at`)
+    .run(username, scope, document, revision, hash, at);
+  return { revision, hash };
+}
+
 export type PreparedWorldCommit = { id: string; baseRevision: number; targetRevision: number; oldHash: string; newHash: string };
 
 export function prepareWorldCommit(input: { user: string | null; title: string; filePath: string; oldJson?: string; newJson: string }): PreparedWorldCommit {

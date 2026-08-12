@@ -9,6 +9,8 @@ export type SystemSyncState = {
   autoPending: Record<string, unknown> | null;
   advanceTask: Record<string, unknown> | null;
   at: number;
+  revision?: number;
+  hash?: string;
 };
 
 export type BrainSyncState = {
@@ -16,13 +18,26 @@ export type BrainSyncState = {
   sessions: Record<string, unknown>[];
   tasks: Record<string, unknown>[];
   at: number;
+  revision?: number;
+  hash?: string;
+};
+
+export type LibrarySyncState = {
+  stories: { slug: string; title: string; genre: string; chapters: number; updatedAt: string; cover?: string }[];
+  tasks: { id: string; idea: string; genre: string; status: string; title?: string; stage?: string; error?: string; createdAt: string; updatedAt: string }[];
+  revision: number;
+  hash: string;
 };
 
 const states = new Map<string, SystemSyncState>();
 const brainStates = new Map<string, BrainSyncState>();
+let libraryState: LibrarySyncState | null = null;
+let serverInstanceId: string | null = null;
 const listeners = new Set<() => void>();
 
 export function setSystemSyncState(state: SystemSyncState): void {
+  const previous = states.get(state.title);
+  if (previous?.revision != null && state.revision != null && state.revision < previous.revision) return;
   states.set(state.title, state);
   for (const listener of [...listeners]) listener();
 }
@@ -35,6 +50,24 @@ export function setBrainSyncState(state: BrainSyncState): void {
   brainStates.set(state.title, state);
   for (const listener of [...listeners]) listener();
 }
+
+export function setLibrarySyncState(state: LibrarySyncState): void {
+  if (libraryState && state.revision < libraryState.revision) return;
+  libraryState = state;
+  for (const listener of [...listeners]) listener();
+}
+
+export function acceptServerInstance(next: string): void {
+  if (serverInstanceId && serverInstanceId !== next) {
+    states.clear();
+    brainStates.clear();
+    libraryState = null;
+  }
+  serverInstanceId = next;
+  for (const listener of [...listeners]) listener();
+}
+
+export function getLibrarySyncState(): LibrarySyncState | null { return libraryState; }
 
 export function getBrainSyncState(title: string | null): BrainSyncState | null {
   return title ? brainStates.get(title) ?? null : null;
@@ -61,5 +94,13 @@ export function useBrainSyncState(title: string | null): BrainSyncState | null {
     (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
     () => getBrainSyncState(title),
     () => getBrainSyncState(title),
+  );
+}
+
+export function useLibrarySyncState(): LibrarySyncState | null {
+  return useSyncExternalStore(
+    (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
+    () => libraryState,
+    () => libraryState,
   );
 }

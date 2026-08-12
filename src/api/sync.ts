@@ -20,6 +20,11 @@ export type SyncEvent = {
   user?: string;
 } & (
   | {
+      type: "library-changed";
+      title: "";
+      at: number;
+    }
+  | {
       type: "system-snapshot";
       title: string;
       world: Record<string, unknown>;
@@ -149,6 +154,12 @@ function throttleKey(e: SyncEvent): string {
   if (e.type === "card-update") cardDim = `::${e.sessionId}::${e.messageId}::${e.cardId}`;
   else if (e.type === "card-replaced") cardDim = `::${e.sessionId}::${e.messageId}::${e.cardIndex}`;
   return `${e.user ?? ""}::${e.type}::${slugify(e.title)}${taskDim}${cardDim}`;
+}
+
+/** 用户级书架/立项投影发生变化；具体快照由 sync-server 在用户频道构建。 */
+export function notifyLibraryChanged(user?: string): void {
+  if (!user || listeners.size === 0) return;
+  publishSyncImmediate({ type: "library-changed", title: "", at: Date.now(), user });
 }
 
 function flushPending(key: string, p: Pending): void {

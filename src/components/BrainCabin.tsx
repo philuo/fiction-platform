@@ -387,30 +387,22 @@ export const BrainCabin: React.FC<{
   // 媒体生成交互面板即聊天流中的 form 卡（切换章节/张数后文案实时更新），底部上方不再复刻选项区
   /** 媒体 form 卡当前选中值（按消息 id）：驱动消息正文（bc-msg-text）跟随章节/张数选项实时更新 */
   const [mediaFormValues, setMediaFormValues] = useState<Record<string, Record<string, unknown>>>({});
-  /** 服务端系统状态快照（/api/brain/context 按需拉取）：自动连载/写作任务/媒体生成/视觉任务/待办——中枢全知的服务端权威部分 */
+  /** 中枢系统上下文由常驻 sync 投影派生，弹窗开关不触发网络请求。 */
   const [serverCtx, setServerCtx] = useState<{
     autoRunning?: boolean; autoPhase?: string; pendingCommit?: { index: number | null; title: string } | null;
     advanceTaskRunning?: boolean; advancePhase?: string; mediaGenerating?: boolean; visualRunning?: boolean;
     pendingProposals?: number; pendingCards?: number; openDebt?: number; reviseChapters?: number[];
   }>({});
-  // 打开面板时拉取服务端状态快照（索引式全知：按需，不每轮注入 LLM）
   useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    void (async () => {
-      try {
-        const res = await apiFetch("/api/brain/context", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title: world.title }),
-        });
-        if (!res.ok || cancelled) return;
-        const data = (await res.json()) as { context?: typeof serverCtx };
-        if (!cancelled && data.context) setServerCtx(data.context);
-      } catch { /* 静默：快照拉取失败不阻塞聊天 */ }
-    })();
-    return () => { cancelled = true; };
-  }, [open, world.title]);
+    setServerCtx({
+      autoRunning,
+      mediaGenerating: Boolean(storedBrainState?.tasks.some((t) => t.status === "pending" || t.status === "running")),
+      pendingProposals: (world.characterProposals ?? []).filter((p) => p.status === "pending").length,
+      pendingCards: (world.pendingCards ?? []).length,
+      openDebt: (world.qualityDebt ?? []).filter((d) => d.status === "open").length,
+      reviseChapters: world.chapters.filter((c) => c.review?.verdict === "revise").map((c) => c.index),
+    });
+  }, [autoRunning, storedBrainState, world]);
   /** 已手动展开的任务/指令类消息（默认折叠为摘要行，点击展开） */
   const [expandedMsgs, setExpandedMsgs] = useState<Set<string>>(new Set());
   /** 已展开思维链的消息（思考内容默认折叠，点击展开；无边框文字样式） */
