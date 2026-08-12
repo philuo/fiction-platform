@@ -80,6 +80,7 @@ const { step } = await import("../src/api/director");
 const { decideAction } = await import("../src/api/critic");
 const { detectAiTone, wordCountGuard } = await import("../src/api/style");
 const { locateParagraphs } = await import("../src/api/patch");
+const { closeDb } = await import("../src/api/db");
 
 let tmp: string;
 let oldCwd: string;
@@ -89,6 +90,7 @@ beforeAll(() => {
   process.chdir(tmp);
 });
 afterAll(() => {
+  closeDb();
   process.chdir(oldCwd);
   rmSync(tmp, { recursive: true, force: true });
 });

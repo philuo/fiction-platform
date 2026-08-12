@@ -8,14 +8,24 @@ import { join } from "node:path";
 let _db: Database | null = null;
 let _dbPath: string | null = null;
 
+/**
+ * 显式释放 SQLite 单例。测试切换临时 cwd、进程热重载与优雅停机都应调用它，
+ * 否则 Windows 会因 WAL/SHM 句柄仍打开而拒绝删除临时目录。
+ */
+export function closeDb(): void {
+  if (_db) {
+    try { _db.close(); } catch { /* 已关闭 */ }
+  }
+  _db = null;
+  _dbPath = null;
+}
+
 export function getDb(): Database {
   const dataDir = join(process.cwd(), "data");
   const path = process.env.APP_DB_PATH || join(dataDir, "app.db");
   // 测试与运维迁移可能在同一进程内切换数据库路径；绝不能继续复用旧路径的健康连接。
   if (_db && _dbPath !== path) {
-    try { _db.close(); } catch { /* 已关闭 */ }
-    _db = null;
-    _dbPath = null;
+    closeDb();
   }
   // 单例曾被 close（测试清理等）：bun:sqlite 无 isClosed 属性，用轻量查询探测后重建
   if (_db) {

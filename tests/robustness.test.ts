@@ -76,6 +76,7 @@ const { writeOneChapter } = await import("../src/api/director");
 const { runAuto } = await import("../src/api/autorun");
 const { chatJson } = await import("../src/api/jsonutil");
 const { autoRepair, auditWorld } = await import("../src/api/integrity");
+const { closeDb } = await import("../src/api/db");
 
 let tmp: string;
 let oldCwd: string;
@@ -85,6 +86,7 @@ beforeAll(() => {
   process.chdir(tmp);
 });
 afterAll(() => {
+  closeDb();
   process.chdir(oldCwd);
   rmSync(tmp, { recursive: true, force: true });
 });

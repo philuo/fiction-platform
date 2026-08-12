@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { BOOK_SPECS, installFullMock, setSpec } from "./mass-common";
+import { closeDb } from "../src/api/db";
 
 let tmp: string;
 let oldCwd: string;
@@ -15,6 +16,7 @@ beforeAll(() => {
   process.chdir(tmp);
 });
 afterAll(() => {
+  closeDb();
   process.chdir(oldCwd);
   rmSync(tmp, { recursive: true, force: true });
 });

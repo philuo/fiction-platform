@@ -108,7 +108,8 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
       wsRef.current = ws;
 
       ws.onopen = () => {
-        if (!mountedRef.current || closedByEffect) return;
+        // 旧连接的晚到回调不得覆盖新连接或创建第二条重连链。
+        if (!mountedRef.current || closedByEffect || wsRef.current !== ws) return;
         setConnected(true);
         optsRef.current.onStatusChange?.(true);
         if (cursorRef.current > 0) ws.send(JSON.stringify({ type: "resume", cursor: cursorRef.current }));
@@ -125,6 +126,7 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
         }, 30_000);
       };
       ws.onmessage = (ev) => {
+        if (wsRef.current !== ws) return;
         let obj: SyncChannelEvent;
         try {
           obj = JSON.parse(String(ev.data)) as SyncChannelEvent;
@@ -196,6 +198,7 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
         // pong / error：心跳无需处理 / 订阅失败等静默（onopen 重订阅会处理）
       };
       ws.onclose = () => {
+        if (wsRef.current !== ws) return;
         wsRef.current = null;
         if (pingTimerRef.current) { clearInterval(pingTimerRef.current); pingTimerRef.current = null; }
         if (closedByEffect) return;

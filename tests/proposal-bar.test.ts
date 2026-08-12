@@ -9,6 +9,7 @@ import Home from "../src/pages/Home";
 import { findProposalCardMessageId } from "../src/components/BrainCabin";
 import type { BrainCard } from "../src/components/brain-cards";
 import { emptyWorld, type WorldState, type CharacterProposal } from "../src/api/world";
+import { resetSyncStores, setSystemSyncState } from "../src/components/syncStateStore";
 
 let win: Window;
 let propClosedCalls: { url: string; body: { title: string; closed: boolean } }[] = [];
@@ -56,6 +57,14 @@ const mkWorld = (): WorldState => {
 
 /** 渲染 Home（playing 态，已登录）并等待一次宏任务 flush */
 async function mountHome(world: WorldState, opts: { propClosed?: boolean; serverClosed?: boolean } = {}) {
+  resetSyncStores();
+  // playing 首屏会锁定写操作，直到 sync 权威快照确认没有活动任务。
+  setSystemSyncState({
+    title: world.title, world,
+    visual: { running: false, pending: [], failed: [] },
+    autoSession: null, autoPending: null, advanceTask: null,
+    at: Date.now(), revision: 1, hash: `proposal-${Date.now()}`,
+  });
   serverClosed = opts.serverClosed ?? opts.propClosed ?? false;
   propClosedCalls = [];
   const mount = document.createElement("div");
@@ -71,6 +80,7 @@ async function mountHome(world: WorldState, opts: { propClosed?: boolean; server
       },
     }));
   });
+  await act(async () => { await tick(); });
   return { mount, root };
 }
 

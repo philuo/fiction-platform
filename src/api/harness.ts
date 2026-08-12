@@ -46,7 +46,7 @@ const C = (
   uiImpact?: string[],
 ): HarnessCommand => ({ id, name, category, trigger, entry, action, affects, llm, level, failure, governance, uiImpact });
 
-/** 全部 88 条指令（HARNESS §2 全量登记，与 docs/HARNESS.md 一一对应） */
+/** 全部已登记指令（HARNESS §2，与 docs/HARNESS.md 一一对应） */
 export const COMMANDS: HarnessCommand[] = [
   // ===== 2.1 叙事生成类（Narrative）=====
   C("CMD-N01", "立项建世界 newStory", "Narrative", "user", "/api/novel/new → director.ts:87", "灵感→世界设定+人物+自动蓝图确认", "全字段新建", "exec", "L1", "抛错不落盘", ["gate", "audit"], ["U06", "U08", "U13"]),
@@ -181,7 +181,7 @@ export function levelOf(id: string): ChangeLevel {
   return getCommand(id)?.level ?? "L0";
 }
 
-/** 指令统计（HARNESS §4：88 条 = N16 + W18 + L13 + M12 + G08 + S11 + Q10） */
+/** 指令统计由注册表实时派生，新增指令时不维护脆弱的固定总数。 */
 export const COMMAND_COUNTS = {
   total: COMMANDS.length,
   byCategory: Object.fromEntries(

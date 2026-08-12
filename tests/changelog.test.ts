@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { deleteChapter, gachaApply } from "../src/api/director";
 import { logChange, logCommandChange } from "../src/api/steering";
 import { emptyWorld, type Card, type WorldState } from "../src/api/world";
+import { closeDb } from "../src/api/db";
 
 // 隔离 data/：切到临时目录（saveWorld 落盘到临时区，不污染真实存档）
 let tmp: string;
@@ -18,6 +19,7 @@ beforeAll(() => {
   process.chdir(tmp);
 });
 afterAll(() => {
+  closeDb();
   process.chdir(oldCwd);
   rmSync(tmp, { recursive: true, force: true });
 });

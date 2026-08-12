@@ -701,7 +701,8 @@ test("媒体 form 卡：WS/world 更新额度后扩展选项，并把超额旧�
 
   remaining = 1;
   render();
-  await tick();
+  // DOM 选项随 render 立即收窄；受控值与父级回调由 effect 在提交后收敛。
+  await new Promise<void>((resolve) => setTimeout(resolve, 20));
   count = mount.querySelectorAll("select")[1] as HTMLSelectElement;
   expect(count.options.length).toBe(1);
   expect(count.value).toBe("1");
@@ -709,7 +710,7 @@ test("媒体 form 卡：WS/world 更新额度后扩展选项，并把超额旧�
 
   remaining = 2;
   render();
-  await tick();
+  await new Promise<void>((resolve) => setTimeout(resolve, 20));
   expect((mount.querySelectorAll("select")[1] as HTMLSelectElement).options.length).toBe(2);
   root.unmount();
 });

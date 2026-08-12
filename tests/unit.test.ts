@@ -14,6 +14,7 @@ import { durationToNumFrames, normalizeNumFrames, VIDEO_WIDTH, VIDEO_HEIGHT } fr
 import { activeLore } from "../src/api/lore";
 import { estimateTokens, contextTier, buildWriterContext, retrieveRelevant, upsertSummary } from "../src/api/memory";
 import { emptyWorld, genOf, activeForeshadows, DEFAULT_GEN, type Card, type WorldState } from "../src/api/world";
+import { closeDb } from "../src/api/db";
 
 // 隔离 data/：切到临时目录，避免污染真实存档
 let tmp: string;
@@ -24,6 +25,7 @@ beforeAll(() => {
   process.chdir(tmp);
 });
 afterAll(() => {
+  closeDb();
   process.chdir(oldCwd);
   rmSync(tmp, { recursive: true, force: true });
 });

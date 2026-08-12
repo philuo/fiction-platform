@@ -104,7 +104,8 @@ describe("SSR ↔ hydrate 一致性（hydration mismatch 防护）", () => {
 
   test("standby presence（2 条 open 质量债）：SSR 与 client 首帧一致，无 mismatch", async () => {
     const html = renderToString(React.createElement(Home, homeProps(mkWorld(2))));
-    expect(html).toContain('stroke="#191817"'); // standby 色
+    expect(html).toContain('data-presence="standby"');
+    expect(html).toContain('stroke="#7a6f5e"'); // 深色控制条上的可见色
     const warnings = await captureHydrationWarnings(html, mkWorld(2));
     expect(warnings).toEqual([]);
   });
@@ -119,6 +120,7 @@ describe("SSR ↔ hydrate 一致性（hydration mismatch 防护）", () => {
     expect(serverHtml).toContain('data-presence="weary"');
     expect(serverHtml).toContain('stroke="#7a6f5e"');
     expect(clientHtml).toContain('data-presence="standby"');
-    expect(clientHtml).toContain('stroke="#191817"');
+    expect(clientHtml).toContain('stroke="#7a6f5e"');
+    expect(serverHtml).not.toBe(clientHtml); // presence 与文案仍可检测出输入漂移
   });
 });

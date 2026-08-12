@@ -119,13 +119,21 @@ export function createJob(input: {
   if (active) return { job: rowToJob(active), created: false };
   const id = input.id ?? crypto.randomUUID();
   const at = now();
-  db.query(`INSERT INTO jobs
-    (id,command_id,user_name,scope_title,kind,dedupe_key,status,phase,recovery_json,deadline_at,created_at,updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-      id, input.commandId ?? null, username, input.title ?? null, input.kind, input.dedupeKey,
-      input.status ?? "queued", input.phase ?? "", input.recovery === undefined ? null : JSON.stringify(input.recovery),
-      input.deadlineAt ?? null, at, at,
-    );
+  try {
+    db.query(`INSERT INTO jobs
+      (id,command_id,user_name,scope_title,kind,dedupe_key,status,phase,recovery_json,deadline_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        id, input.commandId ?? null, username, input.title ?? null, input.kind, input.dedupeKey,
+        input.status ?? "queued", input.phase ?? "", input.recovery === undefined ? null : JSON.stringify(input.recovery),
+        input.deadlineAt ?? null, at, at,
+      );
+  } catch (error) {
+    // SELECT 与 INSERT 之间可能有另一个进程抢先登记；唯一索引是最终仲裁者。
+    const raced = db.query(`SELECT * FROM jobs WHERE user_name=? AND dedupe_key=?
+      AND status IN ('queued','running','waiting_external','paused') LIMIT 1`).get(username, input.dedupeKey) as Record<string, unknown> | null;
+    if (raced) return { job: rowToJob(raced), created: false };
+    throw error;
+  }
   return { job: getJob(id)!, created: true };
 }
 

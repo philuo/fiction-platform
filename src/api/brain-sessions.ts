@@ -8,7 +8,7 @@
 // 2. 会话级生成任务注册表：SSE 连接断开**不杀死**生成任务，任务继续写会话内存；
 //    刷新后新连接 attach 到同一任务，立即重放已生成文本（resume 事件）再收后续 delta，
 //    从而支撑"刷新恢复状态、流式输出完成"且不重复生成。
-import { mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { slugify, currentUser } from "./storage";
 import { uuid } from "../shared/uuid";
@@ -147,7 +147,21 @@ export function saveSessions(title: string, sessions: BrainSession[]): void {
   // 多 Tab/后台任务可能在相邻 tick 写同一会话文件；固定 .tmp 会在 Windows 上争用并 rename EPERM。
   const tmp = `${p}.tmp-${process.pid}-${crypto.randomUUID()}`;
   writeFileSync(tmp, JSON.stringify({ sessions }, null, 2), "utf-8");
-  renameSync(tmp, p);
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      renameSync(tmp, p);
+      return;
+    } catch (error) {
+      lastError = error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES") break;
+      // Windows 上另一个 Tab 的原子替换可能短暂占用目标文件。
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5 * (attempt + 1));
+    }
+  }
+  try { unlinkSync(tmp); } catch { /* best effort */ }
+  throw lastError;
 }
 
 export function getSession(title: string, id: string): BrainSession | undefined {

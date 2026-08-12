@@ -149,7 +149,7 @@ describe("P5 角色媒体自动生成", () => {
         method: "POST", headers: { "Content-Type": "application/json", cookie: authCookie }, body: JSON.stringify({ title: "任意书" }),
       }));
       expect(res?.status).toBe(404);
-      expect(((await res!.json()) as { error?: string }).error).toContain("未知 API");
+      expect(((await res!.json()) as { error?: string }).error).toContain("/api/sync");
     }
   });
   test("generateCharacterPortrait：立绘必须参考头像（无头像抛错；默认短改变 prompt 保参考图原样，改词回退全量描述，文件落盘）", async () => {

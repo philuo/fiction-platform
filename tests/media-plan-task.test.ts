@@ -93,7 +93,7 @@ afterAll(() => {
 });
 
 const { runAsUser } = require("../src/api/storage") as typeof import("../src/api/storage");
-const { getJob } = require("../src/api/control-plane") as typeof import("../src/api/control-plane");
+const { createJob, getJob, listJobs, updateJob } = require("../src/api/control-plane") as typeof import("../src/api/control-plane");
 
 async function api(url: string, body: Record<string, unknown>) {
   const { handleApi } = await import("../src/api/routes");
@@ -143,9 +143,7 @@ describe("media/plan 分镜任务化（异步 + sync 权威恢复）", () => {
 });
 
 describe("media/generate video 同书同章并发防护", () => {
-  test("视频生成中（同书同章）再提交 → 409 拒绝；完成后可再提交", async () => {
-    // 直接请求 /media/generate（kind=video）：mock 的 createSceneVideo 需可控延迟
-    // —— 用 Promise 阻塞第一个请求，观察第二个请求被 409 拦截；再释放第一个，随后新请求成功
+  test("持久视频任务活动时同书同章提交 → 409；终态后唯一键可重新占用", async () => {
     const { handleApi } = await import("../src/api/routes");
     const doGen = () => handleApi(
       "/api/novel/media/generate",
@@ -155,20 +153,27 @@ describe("media/generate video 同书同章并发防护", () => {
         body: JSON.stringify({ title: TITLE, chapterIndex: 1, kind: "video", scenes: [{ anchor: "沈夜负剑立于城楼", scene: "月色城楼，沈夜负剑而立", caption: "沈夜夜登城楼" }] }),
       }),
     );
-    // 第一个请求发起（videoGenBusy 标记后挂起）
-    const p1 = doGen();
-    await Bun.sleep(30);
-    // 同书同章第二个请求 → 409
-    const r2 = await doGen();
-    expect(r2!.status).toBe(409);
-    const d2 = (await r2!.json()) as { error?: string };
-    expect(String(d2.error ?? "")).toContain("正在生成");
-    // 等第一个完成（video 同步生成很快）
-    const r1 = await p1;
-    expect(r1!.status).toBe(200);
-    // 释放后新请求可再提交（busy 已清）
-    const r3 = await doGen();
-    expect(r3!.status).toBe(200);
+    const dedupeKey = `video-create:plan-task-test:1`;
+    for (const job of listJobs(USER, TITLE, true)) {
+      if (job.dedupeKey === dedupeKey) updateJob(job.id, { status: "interrupted", phase: "test-reset" });
+    }
+    const blocker = await runAsUser(USER, () => createJob({
+      user: USER, title: TITLE, kind: "video-create", dedupeKey,
+      status: "running", phase: "provider-create",
+    }));
+    expect(blocker.created).toBe(true);
+    const rejected = await doGen();
+    expect(rejected!.status).toBe(409);
+    const rejectedBody = (await rejected!.json()) as { error?: string };
+    expect(String(rejectedBody.error ?? "")).toContain("正在生成");
+
+    updateJob(blocker.job.id, { status: "succeeded", phase: "provider-created" });
+    const afterTerminal = await runAsUser(USER, () => createJob({
+      user: USER, title: TITLE, kind: "video-create", dedupeKey,
+      status: "running", phase: "provider-create",
+    }));
+    expect(afterTerminal.created).toBe(true);
+    updateJob(afterTerminal.job.id, { status: "cancelled", phase: "test-cleanup" });
   });
 });
 

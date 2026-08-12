@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { installMockAgnes } from "./mocks";
+import { closeDb } from "../src/api/db";
 
 let writerCalls = 0;
 let settleCalls = 0; // 记账调用计数（伏笔文本逐章差异化，验证文本去重下仍逐章入账）
@@ -86,6 +87,7 @@ beforeAll(() => {
   process.chdir(tmp);
 });
 afterAll(() => {
+  closeDb();
   process.chdir(oldCwd);
   rmSync(tmp, { recursive: true, force: true });
 });
