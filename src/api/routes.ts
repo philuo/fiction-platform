@@ -51,7 +51,7 @@ import type { CardType } from "./cards";
 import { renameSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { runtimeReadiness } from "./runtime-readiness";
-import { createJob, getActiveJob, listJobs, updateJob } from "./control-plane";
+import { acceptCommandOnce, CommandConflictError, createJob, getActiveJob, listJobs, updateCommand, updateJob, type CommandRequest } from "./control-plane";
 
 function json(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(data), {
@@ -1019,9 +1019,54 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
     pathname.startsWith("/api/novel") ||
     pathname.startsWith("/api/brain") ||
     pathname.startsWith("/api/chat") ||
+    pathname === "/api/commands" ||
     pathname === "/api/search";
   if (!user && requiresAuth) {
     return json({ error: "未登录" }, 401);
+  }
+
+  if (pathname === "/api/commands") {
+    if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+    const raw = await readBody(req);
+    const command = raw as unknown as CommandRequest;
+    const commandId = String(command.commandId ?? "").trim();
+    const type = String(command.type ?? "") as CommandRequest["type"];
+    const title = String(command.scope?.title ?? "").trim();
+    const routes: Partial<Record<CommandRequest["type"], string>> = {
+      "CMD-N01": "/api/novel/new",
+      "CMD-M01": "/api/novel/media/plan",
+      "CMD-M02": "/api/novel/media/generate",
+    };
+    const target = routes[type];
+    if (!commandId || !type || !command.scope || !("payload" in command)) return json({ error: "commandId/type/scope/payload 不能为空" }, 400);
+    if (!target) return json({ error: `命令尚未迁入统一入口: ${type}` }, 400);
+    if (type !== "CMD-N01" && !title) return json({ error: "该命令缺少 scope.title" }, 400);
+    try {
+      const accepted = acceptCommandOnce(user!.username, { ...command, commandId, type, scope: { ...command.scope, title: title || undefined } });
+      if (accepted.created) {
+        const username = user!.username;
+        void runAsUser(username, async () => {
+          updateCommand(commandId, "running");
+          try {
+            const payload = typeof command.payload === "object" && command.payload ? command.payload as Record<string, unknown> : {};
+            const forwarded = new Request(`http://internal${target}`, {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ ...payload, ...(title ? { title } : {}) }),
+            });
+            const response = await handleNovelApi(target, forwarded);
+            const result = response ? await response.clone().json().catch(() => ({})) as Record<string, unknown> : {};
+            if (!response || !response.ok) throw new Error(String(result.error ?? `命令执行器返回 ${response?.status ?? 500}`));
+            updateCommand(commandId, "succeeded", result);
+          } catch (error) {
+            updateCommand(commandId, "failed", undefined, errorDetail(error, "命令执行失败"));
+          }
+        });
+      }
+      return json(accepted.receipt, 202);
+    } catch (error) {
+      if (error instanceof CommandConflictError) return json({ error: error.message }, 409);
+      return json({ error: errorDetail(error, "命令提交失败") }, 400);
+    }
   }
 
   // 小说引擎路由优先

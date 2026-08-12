@@ -9,11 +9,12 @@ export type JobStatus = "queued" | "running" | "waiting_external" | "paused" | "
 
 export type CommandRequest = {
   commandId: string;
-  type: string;
+  type: HarnessCommandId;
   scope: { title?: string };
   expectedRevision?: number;
   payload: unknown;
 };
+export type HarnessCommandId = `CMD-${"N" | "W" | "L" | "M" | "G" | "S" | "Q"}${string}`;
 
 export type CommandReceipt = {
   accepted: true;
@@ -44,24 +45,40 @@ function parseJson<T>(raw: string | null | undefined): T | undefined {
   try { return JSON.parse(raw) as T; } catch { return undefined; }
 }
 
-export function acceptCommand(user: string | null, req: CommandRequest): CommandReceipt {
+export function acceptCommandOnce(user: string | null, req: CommandRequest): { receipt: CommandReceipt; created: boolean } {
   if (!req.commandId.trim() || !req.type.trim()) throw new Error("commandId/type 不能为空");
   const db = getDb();
   const requestHash = contentHash({ type: req.type, scope: req.scope, expectedRevision: req.expectedRevision, payload: req.payload });
-  const existing = db.query("SELECT request_hash, status FROM command_receipts WHERE command_id=?").get(req.commandId) as { request_hash: string; status: CommandStatus } | null;
+  const username = durableUser(user);
+  const existing = db.query("SELECT request_hash, status, user_name FROM command_receipts WHERE command_id=?").get(req.commandId) as { request_hash: string; status: CommandStatus; user_name: string } | null;
   if (existing) {
+    if (existing.user_name !== username) throw new CommandConflictError("commandId 已由其他用户使用");
     if (existing.request_hash !== requestHash) throw new CommandConflictError("同一 commandId 的请求内容不同");
     const status = existing.status === "succeeded" ? "succeeded" : existing.status === "running" ? "running" : "queued";
-    return { accepted: true, commandId: req.commandId, status };
+    return { receipt: { accepted: true, commandId: req.commandId, status }, created: false };
   }
   const at = now();
-  db.query(`INSERT INTO command_receipts
-    (command_id,request_hash,user_name,command_type,scope_title,expected_revision,status,created_at,updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?)`).run(
-      req.commandId, requestHash, durableUser(user), req.type, req.scope.title ?? null,
-      req.expectedRevision ?? null, "queued", at, at,
-    );
-  return { accepted: true, commandId: req.commandId, status: "queued" };
+  try {
+    db.query(`INSERT INTO command_receipts
+      (command_id,request_hash,user_name,command_type,scope_title,expected_revision,status,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`).run(
+        req.commandId, requestHash, username, req.type, req.scope.title ?? null,
+        req.expectedRevision ?? null, "queued", at, at,
+      );
+    return { receipt: { accepted: true, commandId: req.commandId, status: "queued" }, created: true };
+  } catch (error) {
+    // 跨进程同时重试同 commandId：主键是最终仲裁者。
+    const raced = db.query("SELECT request_hash, status, user_name FROM command_receipts WHERE command_id=?").get(req.commandId) as { request_hash: string; status: CommandStatus; user_name: string } | null;
+    if (!raced) throw error;
+    if (raced.user_name !== username) throw new CommandConflictError("commandId 已由其他用户使用");
+    if (raced.request_hash !== requestHash) throw new CommandConflictError("同一 commandId 的请求内容不同");
+    const status = raced.status === "succeeded" ? "succeeded" : raced.status === "running" ? "running" : "queued";
+    return { receipt: { accepted: true, commandId: req.commandId, status }, created: false };
+  }
+}
+
+export function acceptCommand(user: string | null, req: CommandRequest): CommandReceipt {
+  return acceptCommandOnce(user, req).receipt;
 }
 
 export function updateCommand(commandId: string, status: CommandStatus, result?: unknown, error?: string): void {

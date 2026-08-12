@@ -30,6 +30,7 @@ describe("command receipts", () => {
     expect(acceptCommand("alice", req).status).toBe("queued");
     expect(acceptCommand("alice", req)).toEqual({ accepted: true, commandId: "cmd-1", status: "queued" });
     expect(() => acceptCommand("alice", { ...req, payload: { text: "改写" } })).toThrow(CommandConflictError);
+    expect(() => acceptCommand("bob", req)).toThrow(CommandConflictError);
   });
 });
 
