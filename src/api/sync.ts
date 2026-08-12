@@ -225,11 +225,11 @@ export function worldVersion(title: string): number {
  *  regions：受影响 UI 区域（COUPLING §2 U01-U19；缺省=全部，前端全量刷新）。
  *  ——注意：storage.saveWorld 是通用落盘，不感知业务上下文，默认不传 regions（全量）；
  *    业务写点（routes/director 等）如需区域级刷新，可显式调用 publishSync 带 regions。 */
-export function notifyWorldSaved(title: string, reason = "save", user?: string, regions?: string[]): void {
-  if (listeners.size === 0) return;
+export function notifyWorldSaved(title: string, reason = "save", user?: string, regions?: string[], committedRevision?: number): void {
   const key = slugify(title);
-  const version = (worldVersions.get(key) ?? 0) + 1;
+  const version = committedRevision ?? (worldVersions.get(key) ?? 0) + 1;
   worldVersions.set(key, version);
+  if (listeners.size === 0) return;
   publishSync({ type: "world-changed", title, version, reason, regions, at: Date.now(), user });
 }
 

@@ -11,6 +11,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { Arc, ChangeLogEntry, ChapterVersion, PendingChapter, WorldState } from "./world";
 import type { EvalReport } from "./eval";
 import { notifyWorldSaved } from "./sync";
+import { abortWorldCommit, commitWorldCommit, prepareWorldCommit } from "./control-plane";
 
 export function slugify(title: string): string {
   const s = title.trim().replace(/[\\/:*?"<>|\s]+/g, "-").slice(0, 40);
@@ -238,8 +239,21 @@ export function saveWorld(w: WorldState, regions?: string[]): string {
       return { ...rest, versionFiles: files };
     }),
   };
-  // 原子写：tmp + rename（修 G3：写一半崩溃不损坏存档）
-  atomicWriteJson(path, snapshot);
+  // 世界提交采用 SQLite 写前日志：prepared → 原子替换 state.json → committed revision/outbox。
+  // 文件已替换但控制面事务未提交时保留 prepared，启动恢复会按磁盘 hash 补提交；调用方收到异常，
+  // 不得把尚未完成发布的写入伪装成成功。
+  const newJson = JSON.stringify(snapshot, null, 2);
+  const oldJson = existsSync(path) ? readFileSync(path, "utf-8") : undefined;
+  const prepared = prepareWorldCommit({ user: currentUser(), title: w.title, filePath: path, oldJson, newJson });
+  try {
+    const tmp = `${path}.tmp-${process.pid}`;
+    writeFileSync(tmp, newJson, "utf-8");
+    renameSync(tmp, path);
+  } catch (e) {
+    abortWorldCommit(prepared.id, `state.json 原子写失败：${(e as Error).message}`);
+    throw e;
+  }
+  const committed = commitWorldCommit(prepared.id);
   // 孤儿版本文件收敛：state.json 已落盘，删除不再被引用的版本文件（去重/删章后的磁盘清理）
   pruneVersionFiles(
     w.title,
@@ -254,7 +268,7 @@ export function saveWorld(w: WorldState, regions?: string[]): string {
   }
   // A 级广播点：world 已落盘 → 通知事件总线（无订阅者时零开销；节流合并高频写）
   // regions：受影响 UI 区域（COUPLING §2 U01-U19）；缺省=全部（全量刷新兜底）
-  notifyWorldSaved(w.title, "save", currentUser() ?? undefined, regions);
+  notifyWorldSaved(w.title, "save", currentUser() ?? undefined, regions, committed.targetRevision);
   return path;
 }
 

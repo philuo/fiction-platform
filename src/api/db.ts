@@ -45,6 +45,88 @@ CREATE TABLE IF NOT EXISTS proposal_closed (
   closed_at TEXT NOT NULL,
   PRIMARY KEY (user_id, title)
 );
+CREATE TABLE IF NOT EXISTS command_receipts (
+  command_id TEXT PRIMARY KEY,
+  request_hash TEXT NOT NULL,
+  user_name TEXT NOT NULL,
+  command_type TEXT NOT NULL,
+  scope_title TEXT,
+  expected_revision INTEGER,
+  status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','failed','cancelled')),
+  result_json TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_command_receipts_user_updated
+  ON command_receipts(user_name, updated_at DESC);
+CREATE TABLE IF NOT EXISTS jobs (
+  id TEXT PRIMARY KEY,
+  command_id TEXT REFERENCES command_receipts(command_id) ON DELETE SET NULL,
+  user_name TEXT NOT NULL,
+  scope_title TEXT,
+  kind TEXT NOT NULL,
+  dedupe_key TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('queued','running','waiting_external','paused','succeeded','failed','interrupted','cancelled')),
+  phase TEXT NOT NULL DEFAULT '',
+  progress_json TEXT,
+  recovery_json TEXT,
+  result_json TEXT,
+  error TEXT,
+  lease_owner TEXT,
+  lease_expires_at TEXT,
+  deadline_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_one_active
+  ON jobs(user_name, dedupe_key)
+  WHERE status IN ('queued','running','waiting_external','paused');
+CREATE INDEX IF NOT EXISTS idx_jobs_scope_updated
+  ON jobs(user_name, scope_title, updated_at DESC);
+CREATE TABLE IF NOT EXISTS sync_scopes (
+  user_name TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  document TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 0,
+  content_hash TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(user_name, scope, document)
+);
+CREATE TABLE IF NOT EXISTS sync_outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_name TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  document TEXT NOT NULL,
+  base_revision INTEGER NOT NULL,
+  revision INTEGER NOT NULL,
+  content_hash TEXT NOT NULL,
+  frame_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  delivered_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_outbox_revision
+  ON sync_outbox(user_name, scope, document, revision);
+CREATE INDEX IF NOT EXISTS idx_sync_outbox_pending
+  ON sync_outbox(delivered_at, id);
+CREATE TABLE IF NOT EXISTS world_commits (
+  id TEXT PRIMARY KEY,
+  user_name TEXT NOT NULL,
+  title TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  base_revision INTEGER NOT NULL,
+  target_revision INTEGER NOT NULL,
+  old_hash TEXT NOT NULL,
+  new_hash TEXT NOT NULL,
+  old_json TEXT,
+  new_json TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('prepared','committed','aborted','conflict')),
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_world_commits_status
+  ON world_commits(status, created_at);
 `);
   _db = db;
   return db;
