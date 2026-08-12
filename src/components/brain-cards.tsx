@@ -536,6 +536,7 @@ export const BrowseCardView: React.FC<{
   const [showAllList, setShowAllList] = useState(false);
   /** 章节正文是否显示全文（默认截断预览 + 展开全文交互，正文长内容可看全貌） */
   const [showFullText, setShowFullText] = useState(false);
+  const [showArrangement, setShowArrangement] = useState(false);
   let body: ReactNode = null;
   const d = card.data as Record<string, unknown> | null;
   if (card.browseType === "chapter" && d) {
@@ -554,43 +555,42 @@ export const BrowseCardView: React.FC<{
       </>
     );
   } else if (card.browseType === "character" && d) {
-    // 角色卡：立绘（CardFigure）+ 属性网格 + 动机 + 关系 + 出场 + 后续安排
+    // 角色卡：紧凑事实行 + 短段落 + 关系标签；后续安排默认折叠。
     const relations = (Array.isArray(d.relations) ? d.relations : []) as Record<string, unknown>[];
     const appeared = (Array.isArray(d.appeared) ? d.appeared : []) as number[];
     const arrangement = (Array.isArray(d.arrangement) ? d.arrangement : []) as string[];
     // 标题已是「{name} · {role}」（定位由标题 label 表达），网格不再重复展示定位
-    const attrRows: [string, unknown][] = [
-      ["状态", d.status], ["性别", d.gender], ["年龄", d.age],
-      ["身份", d.identity], ["声线", d.voice],
-    ];
+    const attrRows: [string, unknown][] = [["状态", d.status], ["年龄", d.age], ["身份", d.identity], ["声线", d.voice]];
+    const facts = attrRows.filter(([, value]) => value != null && value !== "");
     body = (
       <>
-        {attrRows.filter(([, v]) => v != null && v !== "").length > 0 && (
-          <div className="bc-stats">
-            {attrRows.filter(([, v]) => v != null && v !== "").map(([k, v]) => (
-              <span className="bc-stat" key={k}><b>{String(v)}</b>{k}</span>
+        {facts.length > 0 && (
+          <div className="bc-character-facts">
+            {facts.map(([key, value]) => (
+              <span className="bc-character-fact" key={key}><b>{key}</b>{String(value)}</span>
             ))}
           </div>
         )}
-        {d.look ? <p className="bc-browse-text">形象：{String(d.look)}</p> : null}
-        {d.motivation ? <p className="bc-browse-text">动机：{String(d.motivation)}</p> : null}
-        {d.exit ? <p className="bc-browse-text">离场：第 {String((d.exit as Record<string, unknown>).chapter)} 章 · {String((d.exit as Record<string, unknown>).reason ?? "")}</p> : null}
+        {d.look ? <p className="bc-character-copy"><b>形象</b>{String(d.look)}</p> : null}
+        {d.motivation ? <p className="bc-character-copy"><b>动机</b>{String(d.motivation)}</p> : null}
+        {d.exit ? <p className="bc-character-copy bc-character-exit"><b>离场</b>第 {String((d.exit as Record<string, unknown>).chapter)} 章 · {String((d.exit as Record<string, unknown>).reason ?? "")}</p> : null}
         {relations.length > 0 && (
-          <div className="bc-browse-list">
-            <div className="bc-browse-sec">关系（{relations.length}）</div>
+          <div className="bc-character-relations" aria-label={`关系 ${relations.length} 条`}>
             {relations.map((r, i) => (
-              <div key={i} className="bc-browse-item">
-                <span className="bc-browse-item-title">{String(r.relation ?? "")}</span>
-                <span className="bc-browse-meta">{String(r.name ?? "")}</span>
-              </div>
+              <span key={i} className="bc-character-relation"><b>{String(r.name ?? "")}</b>{String(r.relation ?? "")}</span>
             ))}
           </div>
         )}
-        <p className="bc-browse-meta">出场：第 {appeared.join("、") || "—"} 章（共 {String(d.appearedCount ?? appeared.length)} 次）</p>
+        <div className="bc-character-meta">
+          <span className="bc-badge bc-badge-info">出场 {String(d.appearedCount ?? appeared.length)} 次</span>
+          {appeared.length > 0 && <span>第 {appeared.join("、")} 章</span>}
+        </div>
         {arrangement.length > 0 && (
-          <div className="bc-browse-list">
-            <div className="bc-browse-sec">后续安排</div>
-            {arrangement.map((a, i) => <p key={i} className="bc-browse-text">{a}</p>)}
+          <div className="bc-character-arrangement">
+            <button className="bc-list-more" onClick={() => setShowArrangement((value) => !value)} aria-expanded={showArrangement}>
+              {showArrangement ? "收起后续安排" : `后续安排 ${arrangement.length} 项`}
+            </button>
+            {showArrangement && <div className="bc-character-arrangement-list">{arrangement.map((item, index) => <p key={index}>{item}</p>)}</div>}
           </div>
         )}
       </>

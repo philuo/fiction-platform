@@ -769,3 +769,27 @@ test("relationships 卡：有边渲染只读 Canvas，无关系显示空状态�
   root.unmount();
   mount.remove();
 });
+
+test("character 卡：使用紧凑事实行，后续安排默认折叠并可展开", async () => {
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root = createRoot(mount);
+  root.render(React.createElement(BrainCardView, { card: {
+    kind: "browse", title: "林墨 · 主角", browseType: "character",
+    data: {
+      status: "负伤", age: "二十出头", identity: "捕快", voice: "寡言",
+      look: "玄色长衫", motivation: "查明真相", relations: [{ name: "沈夜", relation: "宿敌" }],
+      appeared: [1, 3], appearedCount: 2, arrangement: ["第 5 章追查密信"],
+    },
+  } }));
+  await tick();
+  expect(mount.querySelector(".bc-stats")).toBeNull();
+  expect(mount.querySelectorAll(".bc-character-fact").length).toBe(4);
+  expect(mount.textContent).toContain("沈夜宿敌");
+  expect(mount.textContent).not.toContain("第 5 章追查密信");
+  (mount.querySelector(".bc-character-arrangement button") as HTMLButtonElement).click();
+  await tick();
+  expect(mount.textContent).toContain("第 5 章追查密信");
+  root.unmount();
+  mount.remove();
+});

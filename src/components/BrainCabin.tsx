@@ -810,8 +810,11 @@ export const BrainCabin: React.FC<{
   ) as (BrainCard & { options?: ChoiceOption[] }) | undefined;
   const ctxCardIdx = ctxCard ? lastCards.indexOf(ctxCard) : -1;
   /** ctx-bar 对应卡片是否已完成（confirm 已处理 / preview 已执行）：完成则禁用，防重复触发后端操作 */
-  const ctxCardDone = ctxCardIdx >= 0 && !!lastBrainMsg && completed.has(`${lastBrainMsg.id}:${ctxCardIdx}`);
-  const ctxBusy = streaming || executing;
+  const ctxExecutionState = ctxCard?.executionState;
+  const ctxCardDone = ctxExecutionState === "succeeded" || ctxExecutionState === "cancelled" || ctxExecutionState === "interrupted"
+    || (ctxCardIdx >= 0 && !!lastBrainMsg && completed.has(`${lastBrainMsg.id}:${ctxCardIdx}`));
+  const ctxCardRunning = ctxExecutionState === "submitting" || ctxExecutionState === "running";
+  const ctxBusy = streaming || executing || ctxCardRunning;
   const pendingAsk = findPendingAskCard(messages, askAnswered);
   /** 选择 ask 选项：记入已答（sessionStorage，刷新不恢复）并以选项文本继续对话 */
   function answerAsk(label: string, msgId: string) {
@@ -1127,7 +1130,7 @@ export const BrainCabin: React.FC<{
                   <>
                     <span className="bc-context-label">{ctxCard.kind === "plan" ? "计划选项" : "意见征询"}</span>
                     {ctxCard.options?.map((o, i) => (
-                      <button key={i} className="bc-ctx-btn" disabled={ctxBusy} onClick={() => handleOption(o)} title={o.description}>{o.label}</button>
+                      <button key={i} className="bc-ctx-btn" disabled={ctxBusy || ctxCardDone} onClick={() => handleOption(o, { messageId: lastBrainMsg?.id, cardIndex: ctxCardIdx, card: ctxCard })} title={o.description}>{o.label}</button>
                     ))}
                   </>
                 )}
