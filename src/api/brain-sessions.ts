@@ -13,6 +13,27 @@ import { join } from "node:path";
 import { slugify, currentUser } from "./storage";
 import { uuid } from "../shared/uuid";
 
+const EXECUTABLE_CARD_KINDS = new Set(["preview", "confirm", "form", "plan", "opinion", "browse", "progress"]);
+
+function normalizeCard(card: BrainChatCard): BrainChatCard {
+  const next = { ...card };
+  const kind = String(next.kind ?? "");
+  if (EXECUTABLE_CARD_KINDS.has(kind) && !next.cardId) next.cardId = `card-${uuid()}`;
+  const legacyOpen = next.open as { target?: unknown; opts?: Record<string, unknown> } | undefined;
+  if (legacyOpen?.target && !next.panelIntent) {
+    next.panelIntent = {
+      intentId: `panel-${uuid()}`,
+      target: String(legacyOpen.target),
+      opts: legacyOpen.opts,
+    };
+  }
+  return next;
+}
+
+function normalizeMessage(msg: BrainChatMsg): BrainChatMsg {
+  return msg.cards?.length ? { ...msg, cards: msg.cards.map(normalizeCard) } : msg;
+}
+
 export type BrainChatRole = "user" | "assistant";
 
 /** 卡片 JSON：与 components/brain-cards.tsx 的 BrainCard 一致（kind/title/…），后端透传前端渲染 */
@@ -59,6 +80,11 @@ export function listSyncSessionSnapshots(title: string): BrainSession[] {
   const sessions = loadSessions(title);
   let dirty = false;
   for (const s of sessions) {
+    const normalized = s.messages.map(normalizeMessage);
+    if (JSON.stringify(normalized) !== JSON.stringify(s.messages)) {
+      s.messages = normalized;
+      dirty = true;
+    }
     if ((!s.streaming && !s.messages.some((m) => m.pending)) || isSessionRunning(title, s.id)) continue;
     s.streaming = false;
     for (const m of s.messages) {
@@ -231,7 +257,7 @@ export function makeTitle(text: string): string {
 
 export function appendMessage(title: string, sessionId: string, msg: BrainChatMsg): void {
   mutateSession(title, sessionId, (s) => {
-    s.messages.push(msg);
+    s.messages.push(normalizeMessage(msg));
     if (!s.title || s.title === "新会话") s.title = makeTitle(msg.text);
   });
 }
@@ -302,10 +328,68 @@ export function markMessageDone(title: string, sessionId: string, messageId: str
     const m = s.messages.find((x) => x.id === messageId);
     if (m) {
       m.pending = false;
-      if (cards?.length) m.cards = cards;
+      if (cards?.length) m.cards = cards.map(normalizeCard);
     }
     s.streaming = false;
   });
+}
+
+export type BrainMutationImpact = {
+  reason: string;
+  commandId: string;
+  chapterIndexes?: number[];
+  characterIds?: string[];
+  characterNames?: string[];
+  mediaIds?: string[];
+};
+
+export type SettledBrainCard = {
+  sessionId: string;
+  messageId: string;
+  cardIndex: number;
+  card: BrainChatCard;
+};
+
+function cardMatchesImpact(card: BrainChatCard, impact: BrainMutationImpact): boolean {
+  const action = card.action as { body?: Record<string, unknown> } | undefined;
+  const body = action?.body ?? {};
+  const chapter = Number(body.chapterIndex ?? body.index ?? card.chapterIndex);
+  if (impact.chapterIndexes?.length && Number.isInteger(chapter) && impact.chapterIndexes.includes(chapter)) return true;
+  const mediaId = String(body.mediaId ?? card.mediaId ?? "");
+  if (mediaId && impact.mediaIds?.includes(mediaId)) return true;
+  const ids = [body.characterId, body.id, body.nameA, body.nameB].filter((v): v is string => typeof v === "string");
+  if (impact.characterIds?.some((id) => ids.includes(id))) return true;
+  const names = [body.name, body.nameA, body.nameB].filter((v): v is string => typeof v === "string");
+  return !!impact.characterNames?.some((name) => names.some((value) => value.includes(name) || name.includes(value)));
+}
+
+/** 世界被其它入口修改后，持久收敛已经失效的中枢命令卡。 */
+export function settleCardsAfterMutation(title: string, impact: BrainMutationImpact): SettledBrainCard[] {
+  const sessions = loadSessions(title);
+  const settled: SettledBrainCard[] = [];
+  for (const session of sessions) {
+    for (const message of session.messages) {
+      for (let index = 0; index < (message.cards ?? []).length; index++) {
+        const card = message.cards![index];
+        if (!cardMatchesImpact(card, impact)) continue;
+        const status = String(card.executionState ?? card.status ?? "idle");
+        if (["succeeded", "done", "failed", "interrupted", "cancelled"].includes(status)) continue;
+        if (!EXECUTABLE_CARD_KINDS.has(String(card.kind ?? ""))) continue;
+        const next = normalizeCard({
+          ...card,
+          executionState: status === "running" || status === "submitting" ? "interrupted" : "cancelled",
+          status: card.kind === "progress" || card.status ? "failed" : card.status,
+          detail: `${impact.reason}；该指令基于旧状态，已取消`,
+          settledAt: Date.now(),
+          settledBy: impact.commandId,
+        });
+        message.cards![index] = next;
+        settled.push({ sessionId: session.id, messageId: message.id, cardIndex: index, card: next });
+      }
+    }
+  }
+  if (settled.length) saveSessions(title, sessions);
+  return settled;
 }
 
 /** 回合中断：清 pending，标 interrupted，streaming=false，落盘 */

@@ -42,6 +42,8 @@ import {
   invalidateStoryBySlug,
   abortSessionTask,
   listSyncSessionSnapshots,
+  settleCardsAfterMutation,
+  type BrainMutationImpact,
 } from "./brain-sessions";
 import { startAdvanceTask, updateAdvanceTaskPhase, completeAdvanceTask, failAdvanceTask, getAdvanceTaskForClient, clearAdvanceTask } from "./advancetask";
 import { migrateChapterMedia, touchChapter, genOf, type WorldState, type Character as WorldCharacter, type ChapterMedia, type ConsistencyFinding, type PendingChapter } from "./world";
@@ -305,6 +307,26 @@ function publishBrainStatusSnapshot(title: string): void {
     at: Date.now(),
     user,
   });
+}
+
+/** 领域写操作成功后的统一中枢收敛：取消受影响 job、翻转旧命令卡并立即发布权威投影。 */
+function settleBrainAfterMutation(title: string, impact: BrainMutationImpact): void {
+  const chapterSet = new Set(impact.chapterIndexes ?? []);
+  const characterSet = new Set(impact.characterIds ?? []);
+  const mediaSet = new Set(impact.mediaIds ?? []);
+  for (const job of listJobs(currentUser(), title, true)) {
+    const recovery = (job.recovery ?? {}) as Record<string, unknown>;
+    const chapter = Number(recovery.chapterIndex ?? recovery.targetIndex);
+    const characterId = String(recovery.characterId ?? "");
+    const mediaId = String(recovery.mediaId ?? "");
+    if ((chapterSet.size && chapterSet.has(chapter)) || (characterSet.size && characterSet.has(characterId)) || (mediaSet.size && mediaSet.has(mediaId))) {
+      updateJob(job.id, { status: "cancelled", phase: "superseded", error: impact.reason });
+    }
+  }
+  for (const settled of settleCardsAfterMutation(title, impact)) {
+    publishCardReplaced(title, settled.sessionId, settled.messageId, settled.cardIndex, settled.card, currentUser() ?? undefined);
+  }
+  publishBrainStatusSnapshot(title);
 }
 
 // —— 分镜任务生命周期：真超时 / 失败翻转 / LRU（只淘汰终态，不丢 pending） ——
@@ -2090,6 +2112,9 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           // 干预分级（P3.5）：L2 回溯变更未携带策略时，返回影响报告交前端三选一
           const level = steering.classifyWorldPatch(w, { characters: patch.characters as { id?: string }[] | undefined, setting: patch.setting as { rules?: string[] } | undefined });
           const charIds = ((patch.characters ?? []) as { id?: string }[]).map((c) => String(c?.id ?? "")).filter(Boolean);
+          const charNames = ((patch.characters ?? []) as { id?: string; name?: string }[])
+            .flatMap((c) => [c.name, c.id ? w.characters.find((item) => item.id === c.id)?.name : undefined])
+            .filter((name): name is string => typeof name === "string" && !!name);
           const change = { kind: "world-edit", detail: JSON.stringify({ premise: !!patch.premise, setting: !!patch.setting, characters: charIds.length }).slice(0, 200), characterIds: charIds };
           if (level === "L2" && !body.strategy) {
             const report = await steering.impactReport(w, change);
@@ -2150,13 +2175,21 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           }
           // 任何 patch 均落盘（含关系/改名/设定/大纲等；对齐修复随存）
           saveWorld(updated);
-          return { world: sanitize(updated), autoFixed: aligned, newCharacterIds };
+          return {
+            world: sanitize(updated), autoFixed: aligned, newCharacterIds,
+            mutationImpact: charIds.length || charNames.length ? {
+              reason: "角色或关系已由其它入口更新", commandId: "CMD-W12",
+              characterIds: charIds, characterNames: charNames,
+            } satisfies BrainMutationImpact : undefined,
+          };
         });
         if ((out as { needIntervention?: boolean }).needIntervention) return json({ ok: false, ...out });
         // 手动新增角色自动生成头像+立绘（后台 fire-and-forget；状态经 sync WS 推送，
         // 期间中枢显示「自动生成角色头像/立绘中…」，完成后操作日志留 CMD-M07/CMD-M08 记录）
         const newCharIds = (out as { newCharacterIds?: string[] }).newCharacterIds ?? [];
         const outWorld = (out as { world: unknown }).world as WorldState | undefined;
+        const mutationImpact = (out as { mutationImpact?: BrainMutationImpact }).mutationImpact;
+        if (mutationImpact && outWorld) settleBrainAfterMutation(outWorld.title, mutationImpact);
         if (newCharIds.length && outWorld) {
           for (const id of newCharIds) {
             const c = outWorld.characters.find((x) => x.id === id);
@@ -3263,6 +3296,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           return m.path;
         });
         if (oldPath) deleteMediaFile(title, oldPath);
+        settleBrainAfterMutation(title, { reason: `媒体 ${mediaId} 已删除`, commandId: "CMD-M06", chapterIndexes: [idx], mediaIds: [mediaId] });
         return json({ ok: true });
       } catch (e) {
         console.error("[api/novel/media/delete]", e);
@@ -3339,6 +3373,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           if (!w) throw new AppError("故事不存在: " + title);
           return director.regenerateChapter(w, index, body.instruction ? String(body.instruction).slice(0, 500) : undefined);
         });
+        settleBrainAfterMutation(title, { reason: `第 ${index} 章已被重写`, commandId: "CMD-N05", chapterIndexes: [index] });
         console.log(`[regenerate] 完成 title=${title} index=${index} 耗时${((Date.now() - t0) / 1000).toFixed(1)}s`);
         return json({ ok: true, chapter: result.chapter, review: result.review, world: sanitize(result.world), report: result.report });
       } catch (e) {
@@ -3362,6 +3397,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           if (!w) throw new AppError("故事不存在: " + title);
           return await director.rollbackChapter(w, index, versionIndex);
         });
+        settleBrainAfterMutation(title, { reason: `第 ${index} 章已切换历史版本`, commandId: "CMD-N07", chapterIndexes: [index] });
         return json({ ok: true, world: sanitize(result.world), report: result.report });
       } catch (e) {
         console.error("[api/novel/chapter/rollback]", e);
@@ -3426,6 +3462,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         });
         for (const p of result.mediaPaths) deleteMediaFile(title, p);
         for (const p of result.versionFilePaths) deleteMediaFile(title, p); // 版本快照随章节删盘
+        settleBrainAfterMutation(title, { reason: `第 ${index} 章已删除`, commandId: "CMD-N08", chapterIndexes: [index] });
         return json({ ok: true, world: sanitize(result.world), report: result.report });
       } catch (e) {
         console.error("[api/novel/chapter/delete]", e);
@@ -3492,6 +3529,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             saveWorld(w);
             return { w, settleReport };
           });
+          settleBrainAfterMutation(title, { reason: `第 ${index} 章账本已重算`, commandId: "CMD-L04", chapterIndexes: [index] });
           return json({ ok: true, world: sanitize(result.w), settle: result.settleReport, report: { autoFixed: ["重算本章记账（摘要/伏笔/时间线/角色状态）"], findings: auditWorld(result.w), orphanMedia: [] } });
         }
         return json({ error: "action 必须为 scan/repair/resettle" }, 400);
