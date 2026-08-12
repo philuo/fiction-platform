@@ -106,16 +106,16 @@ describe("节流合并（同 key 窗口内取最新）", () => {
 });
 
 describe("版本戳（worldVersion / notifyWorldSaved）", () => {
-  test("无订阅者时 notifyWorldSaved 零开销不递增；有订阅者递增", () => {
+  test("无订阅者时仍推进版本事实；订阅者只影响事件分发", () => {
     expect(worldVersion("书F")).toBe(0);
-    notifyWorldSaved("书F"); // 无订阅者：不递增
-    expect(worldVersion("书F")).toBe(0);
+    notifyWorldSaved("书F");
+    expect(worldVersion("书F")).toBe(1);
     const got: SyncEvent[] = [];
     const unsub = subscribeSync((e) => got.push(e));
     notifyWorldSaved("书F");
-    expect(worldVersion("书F")).toBe(1);
-    notifyWorldSaved("书F");
     expect(worldVersion("书F")).toBe(2);
+    notifyWorldSaved("书F");
+    expect(worldVersion("书F")).toBe(3);
     flushSyncPending();
     unsub();
   });

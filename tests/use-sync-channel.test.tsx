@@ -4,12 +4,14 @@ import { test, expect, beforeAll, afterAll, beforeEach } from "bun:test";
 import { Window } from "happy-dom";
 import React from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { flushSync } from "react-dom";
 import { useSyncChannel, type SyncChannelEvent } from "../src/components/useSyncChannel";
 import { getSystemSyncState } from "../src/components/syncStateStore";
 
 // ============ FakeWebSocket（仿 brain-reconnect 的 SSE mock 思路，暴露控制点） ============
 
 class FakeWebSocket {
+  static OPEN = 1;
   static instances: FakeWebSocket[] = [];
   url: string;
   readyState = 0; // 0=CONNECTING
@@ -227,31 +229,33 @@ test("断线后自动重连：新连接 + 重新 subscribe + onReconnected 触�
   root.unmount();
 });
 
-test("title 变化 → 重建连接订阅新书", async () => {
+test("title 变化 → 复用用户级连接并切换故事订阅", async () => {
   const log: string[] = [];
   const mount = document.createElement("div");
   document.body.appendChild(mount);
   const root = createRoot(mount);
-  root.render(React.createElement(Harness, { title: "书E", log }));
+  root.render(React.createElement(Harness, { title: "书E", log: (e: string) => log.push(e) }));
   await afterMount();
   FakeWebSocket.instances[0].open();
   await tick(20);
 
-  root.render(React.createElement(Harness, { title: "书F", log }));
+  flushSync(() => {
+    root.render(React.createElement(Harness, { title: "书F", log: (e: string) => log.push(e) }));
+  });
   await afterMount();
-  // 旧连接关闭 + 新连接
-  expect(FakeWebSocket.instances.length).toBe(2);
-  FakeWebSocket.instances[1].open();
-  await tick(20);
-  expect(FakeWebSocket.instances[1].sent).toEqual([JSON.stringify({ type: "subscribe", title: "书F" })]);
+  expect(FakeWebSocket.instances.length).toBe(1);
+  expect(FakeWebSocket.instances[0].sent.at(-1)).toBe(JSON.stringify({ type: "subscribe", title: "书F" }));
   root.unmount();
 });
 
-test("title 为空 → 不连接", async () => {
+test("title 为空 → 仍建立用户级连接但不订阅故事", async () => {
   const log: string[] = [];
   const { root } = mountHarness(null, (e) => log.push(e));
   await afterMount();
-  expect(FakeWebSocket.instances.length).toBe(0);
+  expect(FakeWebSocket.instances.length).toBe(1);
+  FakeWebSocket.instances[0].open();
+  await tick(20);
+  expect(FakeWebSocket.instances[0].sent).toEqual([]);
   root.unmount();
 });
 
@@ -264,8 +268,9 @@ test("卸载 → 关闭连接且不再重连", async () => {
   await tick(20);
   root.unmount();
   await tick(20);
-  // 卸载后触发断线 → 不应重连
-  ws.drop();
+  expect(ws.readyState).toBe(3);
+  // 浏览器在主动 close 后可能异步补发 close；旧 socket 的回调不得重连。
+  ws.onclose?.();
   await tick(1300);
   expect(FakeWebSocket.instances.length).toBe(1);
 });

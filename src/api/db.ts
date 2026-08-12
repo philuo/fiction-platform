@@ -6,8 +6,17 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 let _db: Database | null = null;
+let _dbPath: string | null = null;
 
 export function getDb(): Database {
+  const dataDir = join(process.cwd(), "data");
+  const path = process.env.APP_DB_PATH || join(dataDir, "app.db");
+  // 测试与运维迁移可能在同一进程内切换数据库路径；绝不能继续复用旧路径的健康连接。
+  if (_db && _dbPath !== path) {
+    try { _db.close(); } catch { /* 已关闭 */ }
+    _db = null;
+    _dbPath = null;
+  }
   // 单例曾被 close（测试清理等）：bun:sqlite 无 isClosed 属性，用轻量查询探测后重建
   if (_db) {
     try {
@@ -15,11 +24,10 @@ export function getDb(): Database {
       return _db;
     } catch {
       _db = null; // 已关闭：重建
+      _dbPath = null;
     }
   }
-  const dataDir = join(process.cwd(), "data");
   mkdirSync(dataDir, { recursive: true });
-  const path = process.env.APP_DB_PATH || join(dataDir, "app.db");
   const db = new Database(path, { create: true });
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA foreign_keys = ON;");
@@ -129,5 +137,6 @@ CREATE INDEX IF NOT EXISTS idx_world_commits_status
   ON world_commits(status, created_at);
 `);
   _db = db;
+  _dbPath = path;
   return db;
 }

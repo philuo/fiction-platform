@@ -11,9 +11,13 @@ import {
 
 // mock agnes（brain.ts 导入链触发 agnes 加载，computeDisposition 本身是纯函数不调用 LLM）
 mock.module("../src/api/agnes", () => ({
+  LLMError: class LLMError extends Error {},
+  isRetryableError: () => false,
+  withSmartRetry: async <T>(fn: () => Promise<T>) => fn(),
   chat: async () => "",
   complete: async () => ({ content: "" }),
   chatStream: async () => "",
+  readStream: async () => "",
   ChatRole: {},
 }));
 

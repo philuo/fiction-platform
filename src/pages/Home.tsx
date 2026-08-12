@@ -581,12 +581,10 @@ const Home: React.FC<HomeProps> = (props) => {
     onTaskStatus: (e) => {
       // 推进任务完成广播（kind:"advance"）→ 清 advancePhase 释放运行锁（覆盖底部按钮/聊天/多 tab 发起路径；
       // 轮询降级后此广播是唯一不依赖本页 SSE 的释放通道）
-      if (e.kind === "advance") setAdvancePhase("");
       // 左侧章节媒体：消费 media task-status 的终态（ready/failed），全部收尾后刷新 world + 提示
       if (e.kind === "media" && e.id) consumeHomeMediaStatus(e.id, e.status, e.error);
       // media/visual 等任务完成广播 → 转发聊天舱（媒体生成 WS 事件驱动收尾，无轮询）
       taskStatusRef.current?.(e);
-      if (e.kind === "visual") setVisualGen(e.status === "running");
     },
     onAutoStatus: () => {}, // 紧随其后的 system-snapshot 统一更新连载状态
     onBrainNote: () => setSysTick((t) => t + 1),
@@ -792,12 +790,10 @@ const Home: React.FC<HomeProps> = (props) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: world.title }),
       });
-      setAutoRunning(false);
       setBusy(false);
       setBusyPhase("");
-      setAutoSession(null);
-      setAutoPending(null);
       setLiveDraft("");
+      requestSyncSnapshotRef.current?.();
       showToast("连载任务已取消，回到空闲状态，现在可以手动操作了。");
     } catch {
       showToast("取消任务失败");
@@ -885,7 +881,6 @@ const Home: React.FC<HomeProps> = (props) => {
       requestSyncSnapshotRef.current?.();
       setIntervene(null);
       // 手动新增角色：头像/立绘后台自动生成（轮询期间中枢显示「自动生成角色头像/立绘中…」，完成后刷新并恢复待命）
-      if (data.visualPending) setVisualGen(true);
       showToast(strategy === "merge" ? "设定已保存，弥合任务已注入后续章节计划。" : strategy === "rewrite" ? "设定已保存，受影响章节已入重写队列。" : "设定已保存，将影响后续写作。");
       return true;
     } catch (e) {
@@ -921,7 +916,6 @@ const Home: React.FC<HomeProps> = (props) => {
       if (!data.ok || !data.world) throw new Error(data.error ?? "操作失败");
       requestSyncSnapshotRef.current?.();
       // 入册新角色：头像/立绘后台自动生成（轮询期间中枢显示「自动生成角色头像/立绘中…」，完成后刷新并恢复待命）
-      if (data.visualPending) setVisualGen(true);
       showToast(action === "confirm" ? "新角色已入册，可在后续章节登场。" : "提案已拒绝。");
     } catch (e) {
       showToast("提案处理失败: " + (e as Error).message);
@@ -1670,10 +1664,6 @@ const Home: React.FC<HomeProps> = (props) => {
           if (ev.phase === "settling") setBusyPhase(`自动连载：第 ${ev.chapter} 章结算中…`);
           if (ev.phase === "review-failed") { setBusyPhase(`自动连载：第 ${ev.chapter} 章审查未通过，已停下`); }
           // SSE 事件同步控制台会话（实时进度：阶段 + 已写章数）
-          if (ev.phase === "writing" || ev.phase === "reviewing" || ev.phase === "settling" || ev.phase === "review-failed") {
-            const phaseText = ev.phase === "writing" ? `第 ${ev.chapter} 章写作中（第 ${ev.round ?? 1} 稿）` : ev.phase === "reviewing" ? `第 ${ev.chapter} 章审查中` : ev.phase === "settling" ? `第 ${ev.chapter} 章结算中` : `第 ${ev.chapter} 章审查未通过，已停下`;
-            setAutoSession((s) => (s && (s.status === "running" || s.status === "paused") ? { ...s, phase: phaseText, written: typeof ev.written === "number" && ev.written > 0 ? ev.written : s.written } : s));
-          }
           if (ev.phase === "interrupted") { interrupted = true; showToast("自动连载被干预打断（草稿未存档）。"); break; }
           if (ev.phase === "auto-status") {
             if (ev.reason === "resumed") showToast(`检测到上次中断的连载（已写至第 ${ev.resumedFrom ?? "?"} 章），已从断点继续。`);

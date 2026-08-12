@@ -268,9 +268,9 @@ describe("useBrainSession 首次对话发送", () => {
     expect(msgs.some((m) => m.role === "brain")).toBe(true);
     // 协议：newSession 创建时透传前端 id（listCalls 有 hasId=true 且 id === sid）
     expect(listCalls.some((c) => c.hasId && c.id === sid)).toBe(true);
-    // 协议：openSession 用同一 id 拉详情（detailCalls 含 sid），列表请求均为无 id 列表语义
+    // 会话正文仍按 id 读取；会话列表由 sync 权威快照提供，不再发 HTTP 列表查询。
     expect(detailCalls).toContain(sid);
-    expect(listCalls.filter((c) => !c.hasId).length).toBeGreaterThan(0);
+    expect(listCalls.filter((c) => !c.hasId)).toEqual([]);
     // 释放 SSE 完成收尾，避免悬挂
     releaseChat?.();
     await p;

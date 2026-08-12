@@ -199,9 +199,9 @@ describe("中枢会话隔离", () => {
 });
 
 describe("未登录访问小说/中枢 API 强制 401", () => {
-  test("未登录 /api/novel/list 与 /api/brain/state → 401；登录后正常", async () => {
+  test("已删除 /api/novel/list 固定 404；受保护的中枢命令仍要求登录", async () => {
     const anon = await routes.handleApi("/api/novel/list", new Request("http://x/api/novel/list"));
-    expect(anon!.status).toBe(401);
+    expect(anon!.status).toBe(404);
     const anonBrain = await routes.handleApi(
       "/api/brain/state",
       new Request("http://x/api/brain/state", {
@@ -225,9 +225,6 @@ describe("未登录访问小说/中枢 API 强制 401", () => {
     const loginData = (await login!.json()) as { token: string };
     expect(loginData.token).toBeTruthy();
     const list = await routes.handleApi("/api/novel/list", new Request("http://x/api/novel/list", { headers: { authorization: `Bearer ${loginData.token}` } }));
-    expect(list!.status).toBe(200);
-    const data = (await list!.json()) as { stories: { title: string }[] };
-    // firstuser 只看到自己目录里的书（含注册时认领 + 启动兜底迁移的旧书），看不到 alice/bob 的书
-    expect(data.stories.map((s) => s.title).sort()).toEqual(["首用户认领书", "启动认领书"].sort());
+    expect(list!.status).toBe(404);
   });
 });

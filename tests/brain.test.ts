@@ -10,12 +10,16 @@ import { isBookComplete } from "../src/api/planner";
 // —— mock LLM：chat 返回可配置的 JSON ——
 let nextChatContent = "";
 mock.module("../src/api/agnes", () => ({
+  LLMError: class LLMError extends Error {},
+  isRetryableError: () => false,
+  withSmartRetry: async <T>(fn: () => Promise<T>) => fn(),
   chat: async () => nextChatContent,
   complete: async () => ({ content: nextChatContent }),
   chatStream: async (_m: unknown, onChunk: (d: string) => void) => {
     onChunk(nextChatContent);
     return nextChatContent;
   },
+  readStream: async () => nextChatContent,
   ChatRole: {},
 }));
 

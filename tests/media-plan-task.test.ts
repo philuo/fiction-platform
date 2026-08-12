@@ -1,5 +1,5 @@
-// 分镜任务化端到端测试：/api/novel/media/plan 异步返回 planId（非 scenes）→ /media/plan-status 轮询
-// pending→ready 流转、ready 携带匹配正文的 scenes。mock 仅注入 LLM 层（agnes），planScenes 走真实归一化逻辑。
+// 分镜任务化端到端测试：/api/novel/media/plan 只返回回执；终态由 SQLite job/sync 投影承载。
+// pending→ready 流转和 scenes 持久结果不再依赖任何 HTTP 状态轮询。
 // 数据写入 data/tester/ 临时目录（与 media-auto.test 同款模式），测试结束清理。
 import { afterAll, beforeAll, describe, expect, test, mock } from "bun:test";
 import { mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
@@ -93,6 +93,7 @@ afterAll(() => {
 });
 
 const { runAsUser } = require("../src/api/storage") as typeof import("../src/api/storage");
+const { getJob } = require("../src/api/control-plane") as typeof import("../src/api/control-plane");
 
 async function api(url: string, body: Record<string, unknown>) {
   const { handleApi } = await import("../src/api/routes");
@@ -107,8 +108,8 @@ async function api(url: string, body: Record<string, unknown>) {
   return { status: res!.status, data: (await res!.json()) as Record<string, unknown> };
 }
 
-describe("media/plan 分镜任务化（异步 + 状态轮询恢复）", () => {
-  test("提交返回 planId（而非同步 scenes），plan-status pending→ready 流转并带匹配场景", async () => {
+describe("media/plan 分镜任务化（异步 + sync 权威恢复）", () => {
+  test("提交返回 planId（而非同步 scenes），SQLite job 收敛 ready 并保存匹配场景", async () => {
     const p = await runAsUser(USER, () => api("/api/novel/media/plan", { title: TITLE, chapterIndex: 1, kind: "image", count: 2 }));
     expect(p.status).toBe(200);
     expect(p.data.ok).toBe(true);
@@ -116,16 +117,16 @@ describe("media/plan 分镜任务化（异步 + 状态轮询恢复）", () => {
     expect(planId.length).toBeGreaterThan(0);
     expect(p.data.scenes).toBeUndefined(); // 不再同步返回场景
 
-    // 轮询 plan-status：mock LLM 立即返回 → 很快 ready
-    let got: Record<string, unknown> | null = null;
+    let got: ReturnType<typeof getJob> = null;
     for (let i = 0; i < 40; i++) {
-      const s = await runAsUser(USER, () => api("/api/novel/media/plan-status", { title: TITLE, planId }));
-      if (s.status === 200 && (s.data.status === "ready" || s.data.status === "failed")) { got = s.data; break; }
+      got = getJob(planId);
+      if (got && (got.status === "succeeded" || got.status === "failed")) break;
       await Bun.sleep(25);
     }
     expect(got).not.toBeNull();
-    expect(got!.status).toBe("ready");
-    const scenes = got!.scenes as { anchor: string; scene: string }[];
+    expect(got!.status).toBe("succeeded");
+    expect(got!.phase).toBe("ready");
+    const scenes = (got!.result as { scenes: { anchor: string; scene: string }[] }).scenes;
     expect(Array.isArray(scenes)).toBe(true);
     expect(scenes.length).toBe(2);
     // 场景 anchor 已归一化为正文原文（逐字匹配）
@@ -133,12 +134,11 @@ describe("media/plan 分镜任务化（异步 + 状态轮询恢复）", () => {
     expect(chapterText.includes(scenes[1].anchor)).toBe(true);
   });
 
-  test("未知 planId → notfound（前端提示重试）；缺参 400", async () => {
+  test("旧 plan-status 状态查询无论参数如何均返回 404", async () => {
     const nf = await runAsUser(USER, () => api("/api/novel/media/plan-status", { title: TITLE, planId: "plan-nonexistent" }));
-    expect(nf.status).toBe(200);
-    expect(nf.data.status).toBe("notfound");
+    expect(nf.status).toBe(404);
     const bad = await runAsUser(USER, () => api("/api/novel/media/plan-status", { title: TITLE }));
-    expect(bad.status).toBe(400);
+    expect(bad.status).toBe(404);
   });
 });
 
@@ -351,13 +351,10 @@ describe("/api/novel/media/cancel 幂等取消", () => {
       await Bun.sleep(50);
       const c = await runAsUser(USER, () => api("/api/novel/media/cancel", { title: TITLE, planId, reason: "用户取消" }));
       expect(c.status).toBe(200);
-      // 立即查：应为 failed
-      const s = await runAsUser(USER, () => api("/api/novel/media/plan-status", { title: TITLE, planId }));
-      expect(s.data.status).toBe("failed");
+      expect(getJob(planId)?.status).toBe("failed");
       // 等后台重试全部跑完（~2.4s），晚到结果不得把 failed 翻回 ready
       await Bun.sleep(2800);
-      const s2 = await runAsUser(USER, () => api("/api/novel/media/plan-status", { title: TITLE, planId }));
-      expect(s2.data.status).toBe("failed");
+      expect(getJob(planId)?.status).toBe("failed");
     } finally {
       planFailScenes = false;
     }
@@ -366,17 +363,16 @@ describe("/api/novel/media/cancel 幂等取消", () => {
   test("对已终态（ready）的 planId 取消为 no-op，不翻回 failed", async () => {
     const p = await runAsUser(USER, () => api("/api/novel/media/plan", { title: TITLE, chapterIndex: 1, kind: "image", count: 1 }));
     const planId = String(p.data.planId ?? "");
-    // 等 ready
+    // 等持久 job ready
     let ready = false;
     for (let i = 0; i < 40; i++) {
-      const s = await runAsUser(USER, () => api("/api/novel/media/plan-status", { title: TITLE, planId }));
-      if (s.data.status === "ready") { ready = true; break; }
+      const job = getJob(planId);
+      if (job?.status === "succeeded" && job.phase === "ready") { ready = true; break; }
       await Bun.sleep(25);
     }
     expect(ready).toBe(true);
     const c = await runAsUser(USER, () => api("/api/novel/media/cancel", { title: TITLE, planId }));
     expect(c.status).toBe(200);
-    const s = await runAsUser(USER, () => api("/api/novel/media/plan-status", { title: TITLE, planId }));
-    expect(s.data.status).toBe("ready");
+    expect(getJob(planId)?.status).toBe("succeeded");
   });
 });

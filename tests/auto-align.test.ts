@@ -47,6 +47,10 @@ beforeAll(() => {
   process.chdir(tmp);
 });
 afterAll(() => {
+  try {
+    const { getDb } = require("../src/api/db") as typeof import("../src/api/db");
+    getDb().close();
+  } catch { /* 尚未初始化 */ }
   process.chdir(oldCwd);
   rmSync(tmp, { recursive: true, force: true });
 });

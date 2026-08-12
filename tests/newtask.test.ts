@@ -1,8 +1,8 @@
 // 异步立项任务（newtask + /api/novel/new 异步化）：
 // ① 任务状态机：create(running) → complete(done,title) / fail(failed,error)，持久化落盘；
 // ② 防重入：已有 running 时复用 id；
-// ③ /api/novel/new 立即返回 taskId（不阻塞），后台任务终态可经 /api/novel/new/status 查询；
-// ④ /api/novel/list 合并 creating（进行中任务对前端可见）；
+// ③ /api/novel/new 立即返回 taskId（不阻塞），终态由持久任务与 sync library 投影恢复；
+// ④ 旧 /new/status 与 /list 状态查询接口固定 404；
 // ⑤ 启动清理：running/ready 一律标 failed（服务重启后台执行已死）。
 // 使用临时 cwd 隔离；后台任务在无 LLM key 环境下快速失败（401），不依赖真实模型。
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
@@ -164,7 +164,7 @@ describe("newtask 任务状态机", () => {
 });
 
 describe("/api/novel/new 异步提交", () => {
-  test("提交立即返回 taskId（不阻塞）；后台任务在无 LLM key 下快速 failed；status 可查终态", async () => {
+  test("提交立即返回 taskId（不阻塞）；后台任务在无 LLM key 下快速 failed；旧 status 接口不可用", async () => {
     storage.runAsUser(U, () => newtask._clearNewStoryTasks());
     const t0 = Date.now();
     const res = await storage.runAsUser(U, () =>
@@ -192,7 +192,7 @@ describe("/api/novel/new 异步提交", () => {
     expect(final?.status).toBe("failed");
     expect(final?.error).toBeTruthy();
 
-    // status 端点查询
+    // 状态查询已迁入 sync；旧端点固定 404。
     const st = await storage.runAsUser(U, () =>
       routes.handleNovelApi(
         "/api/novel/new/status",
@@ -203,10 +203,7 @@ describe("/api/novel/new 异步提交", () => {
         }),
       ),
     );
-    expect(st!.status).toBe(200);
-    const stData = (await st!.json()) as { status?: string; error?: string };
-    expect(stData.status).toBe("failed");
-    expect(stData.error).toBeTruthy();
+    expect(st!.status).toBe(404);
 
     // 不存在的任务 → 404
     const miss = await storage.runAsUser(U, () =>
@@ -237,19 +234,15 @@ describe("/api/novel/new 异步提交", () => {
   });
 });
 
-describe("/api/novel/list 合并 creating", () => {
-  test("running 任务出现在 creating；完成后消失", async () => {
+describe("用户书架状态只经 sync library 投影读取", () => {
+  test("旧 /api/novel/list 在任务运行及完成后均固定 404", async () => {
     storage.runAsUser(U, () => {
       newtask._clearNewStoryTasks();
       newtask.createNewStoryTask("进行中的书", "武侠");    });
     const res = await storage.runAsUser(U, () =>
       routes.handleNovelApi("/api/novel/list", new Request("http://x/api/novel/list")),
     );
-    expect(res!.status).toBe(200);
-    const data = (await res!.json()) as { stories: unknown[]; creating: { id: string; idea: string; genre: string }[] };
-    expect(data.creating.length).toBe(1);
-    expect(data.creating[0].idea).toContain("进行中的书");
-    expect(data.creating[0].genre).toBe("武侠");
+    expect(res!.status).toBe(404);
 
     // 完成后 creating 消失（无真实书落盘，stories 不含）
     const running = storage.runAsUser(U, () => newtask.listActiveNewStoryTasks());
@@ -257,8 +250,6 @@ describe("/api/novel/list 合并 creating", () => {
     const res2 = await storage.runAsUser(U, () =>
       routes.handleNovelApi("/api/novel/list", new Request("http://x/api/novel/list")),
     );
-    const data2 = (await res2!.json()) as { stories: { title: string }[]; creating: unknown[] };
-    expect(data2.creating).toHaveLength(0);
-    expect(data2.stories.map((s) => s.title)).not.toContain("完成的书");
+    expect(res2!.status).toBe(404);
   });
 });

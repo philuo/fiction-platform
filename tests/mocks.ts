@@ -12,6 +12,8 @@ export function installMockAgnes(responder: AgnesResponder): void {
     class LLMError extends Error {}
     return {
       LLMError,
+      isRetryableError: () => false,
+      withSmartRetry: async <T>(fn: () => Promise<T>) => fn(),
       chat: async (messages: ChatMessage[], opts?: { temperature?: number; maxTokens?: number }) => responder(messages, opts),
       complete: async (messages: ChatMessage[], opts?: { temperature?: number; maxTokens?: number }) => ({ content: responder(messages, opts) }),
       chatStream: async (messages: ChatMessage[], onChunk: (d: string) => void, opts?: { temperature?: number; maxTokens?: number }) => {
@@ -20,6 +22,7 @@ export function installMockAgnes(responder: AgnesResponder): void {
         for (let i = 0; i < full.length; i += 64) onChunk(full.slice(i, i + 64));
         return full;
       },
+      readStream: async () => "",
     };
   });
 }
