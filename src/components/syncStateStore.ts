@@ -47,6 +47,8 @@ export function getSystemSyncState(title: string | null): SystemSyncState | null
 }
 
 export function setBrainSyncState(state: BrainSyncState): void {
+  const previous = brainStates.get(state.title);
+  if (previous?.revision != null && state.revision != null && state.revision < previous.revision) return;
   brainStates.set(state.title, state);
   for (const listener of [...listeners]) listener();
 }
@@ -68,6 +70,15 @@ export function acceptServerInstance(next: string): void {
 }
 
 export function getLibrarySyncState(): LibrarySyncState | null { return libraryState; }
+
+/** 测试与登出隔离：清空全部权威投影和服务纪元。 */
+export function resetSyncStores(): void {
+  states.clear();
+  brainStates.clear();
+  libraryState = null;
+  serverInstanceId = null;
+  for (const listener of [...listeners]) listener();
+}
 
 export function getBrainSyncState(title: string | null): BrainSyncState | null {
   return title ? brainStates.get(title) ?? null : null;

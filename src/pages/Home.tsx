@@ -815,7 +815,7 @@ const Home: React.FC<HomeProps> = (props) => {
       });
       const data = (await res.json()) as { ok?: boolean; world?: WorldState; chapter?: Chapter; error?: string };
       if (!data.ok) throw new Error(data.error ?? "确认入册失败");
-      if (data.world) setWorld(data.world);
+      requestSyncSnapshotRef.current?.();
       setPendingCommitIdx(null);
       if (data.chapter) setStoryUrl(world.title, data.chapter.index);
       showToast(`第 ${data.chapter?.index ?? "?"} 章已确认入册，伏笔账已更新。`);
@@ -882,7 +882,7 @@ const Home: React.FC<HomeProps> = (props) => {
         return false;
       }
       if (!data.ok || !data.world) throw new Error(data.error ?? "保存失败");
-      setWorld(data.world);
+      requestSyncSnapshotRef.current?.();
       setIntervene(null);
       // 手动新增角色：头像/立绘后台自动生成（轮询期间中枢显示「自动生成角色头像/立绘中…」，完成后刷新并恢复待命）
       if (data.visualPending) setVisualGen(true);
@@ -919,7 +919,7 @@ const Home: React.FC<HomeProps> = (props) => {
       });
       const data = (await res.json()) as { ok?: boolean; world?: WorldState; visualPending?: boolean; error?: string };
       if (!data.ok || !data.world) throw new Error(data.error ?? "操作失败");
-      setWorld(data.world);
+      requestSyncSnapshotRef.current?.();
       // 入册新角色：头像/立绘后台自动生成（轮询期间中枢显示「自动生成角色头像/立绘中…」，完成后刷新并恢复待命）
       if (data.visualPending) setVisualGen(true);
       showToast(action === "confirm" ? "新角色已入册，可在后续章节登场。" : "提案已拒绝。");
@@ -975,7 +975,7 @@ const Home: React.FC<HomeProps> = (props) => {
       });
       const data = (await res.json()) as { ok?: boolean; world?: WorldState; review?: ReviewResult; report?: IntegrityReportView; error?: string };
       if (!data.ok || !data.world) throw new Error(data.error ?? "保存失败");
-      setWorld(data.world);
+      requestSyncSnapshotRef.current?.();
       setEditing(false);
       showChangeReport(data.report, c.index);
       showToast(
@@ -1010,7 +1010,7 @@ const Home: React.FC<HomeProps> = (props) => {
         error?: string;
       };
       if (!data.ok || !data.world) throw new Error(data.error ?? "重结算失败");
-      setWorld(data.world);
+      requestSyncSnapshotRef.current?.();
       showToast(
         `第 ${c.index} 章账本已按正文重算` +
           (data.report
@@ -1056,7 +1056,7 @@ const Home: React.FC<HomeProps> = (props) => {
         // 被干预打断：服务端已安全回滚（未保存），明确提示而非当成普通失败
         throw new Error(data.interrupted ? "重写被干预打断（未保存）" : (data.error ?? `重写失败（HTTP ${res.status}）`));
       }
-      setWorld(data.world);
+      requestSyncSnapshotRef.current?.();
       setEditing(false);
       showChangeReport(data.report, c.index);
       showToast(
@@ -1090,7 +1090,7 @@ const Home: React.FC<HomeProps> = (props) => {
       });
       const data = (await res.json()) as { ok?: boolean; world?: WorldState; review?: ReviewResult; error?: string };
       if (!data.ok || !data.world) throw new Error(data.error ?? "审查失败");
-      setWorld(data.world);
+      requestSyncSnapshotRef.current?.();
       showToast(
         data.review
           ? data.review.verdict === "pass"
@@ -1496,7 +1496,7 @@ const Home: React.FC<HomeProps> = (props) => {
       });
       const data = (await res.json()) as { ok?: boolean; world?: WorldState; report?: IntegrityReportView; error?: string };
       if (!data.ok || !data.world) throw new Error(data.error ?? "删除失败");
-      setWorld(data.world);
+      requestSyncSnapshotRef.current?.();
       setDeletePreview(null);
       // 删除的是当前选中章节 → 回退到相邻章节（上一章优先，其次下一章；无章节则 -1），
       // 避免正文区/左栏脉络停留在已删除章节——修「删除章节后脉络未更新」；同时同步 URL 阅读位置
@@ -1527,7 +1527,7 @@ const Home: React.FC<HomeProps> = (props) => {
               body: JSON.stringify({ title: world.title, index: last.index }),
             });
             const rd = (await rr.json()) as { ok?: boolean; world?: WorldState; error?: string };
-            if (rd.ok && rd.world) setWorld(rd.world);
+            if (rd.ok && rd.world) requestSyncSnapshotRef.current?.();
             showToast(`已删除；第 ${last.index} 章账本已自动重算，角色/伏笔状态已与正文对齐。`);
           } catch {
             showToast("已删除，但角色状态可能残留：请在「更多 → 重算本章账本」手动对齐。");
@@ -1583,7 +1583,7 @@ const Home: React.FC<HomeProps> = (props) => {
       });
       const data = (await res.json()) as { ok?: boolean; world?: WorldState; report?: IntegrityReportView; autoFixed?: string[]; error?: string };
       if (!data.ok) throw new Error(data.error ?? "修复失败");
-      if (data.world) setWorld(data.world);
+      if (data.world) requestSyncSnapshotRef.current?.();
       if (data.report) setIntegrityView({ title: "一致性修复完成", report: data.report });
       showToast(data.autoFixed?.length ? `已修复 ${data.autoFixed.length} 项` : "未发现需修复项");
     } catch (e) {
@@ -1750,8 +1750,7 @@ const Home: React.FC<HomeProps> = (props) => {
       });
     } catch { /* 清理失败不打扰 */ }
     stopSysPoll();
-    setAutoSession(null);
-    setAutoPending(null);
+    requestSyncSnapshotRef.current?.();
     setShowAutoPanel(false);
     setShowAutoStart(false);
   }
@@ -1912,7 +1911,7 @@ const Home: React.FC<HomeProps> = (props) => {
       });
       const data = (await res.json()) as { ok?: boolean; world?: WorldState; report?: IntegrityReportView; error?: string };
       if (!data.ok || !data.world) throw new Error(data.error ?? "回滚失败");
-      setWorld(data.world);
+      requestSyncSnapshotRef.current?.();
       setShowVersions(false);
       showChangeReport(data.report, c.index);
       showToast(`已回滚到第 ${c.index} 章的版本 ${versionIndex + 1}`);
@@ -1954,7 +1953,7 @@ const Home: React.FC<HomeProps> = (props) => {
       });
       const data = (await res.json()) as { ok?: boolean; world?: WorldState; error?: string };
       if (!data.ok || !data.world) throw new Error(data.error ?? "操作失败");
-      setWorld(data.world);
+      requestSyncSnapshotRef.current?.();
       showToast(locked ? "字段已上锁，AI 记账不再覆盖。" : "字段已解锁，恢复 AI 自动维护。");
       return true;
     } catch (e) {
@@ -2531,7 +2530,7 @@ const Home: React.FC<HomeProps> = (props) => {
 
       {/* 伏笔账编辑弹窗（底部控制条角色与关系旁入口） */}
       {showForeshadow && world && (
-        <ForeshadowModal world={world} onClose={() => setShowForeshadow(false)} onWorldUpdate={(nw) => setWorld(nw)} showToast={showToast} taskActive={taskActive} />
+        <ForeshadowModal world={world} onClose={() => setShowForeshadow(false)} onWorldUpdate={() => { requestSyncSnapshotRef.current?.(); }} showToast={showToast} taskActive={taskActive} />
       )}
 
       {showGacha && world && (
@@ -2604,7 +2603,7 @@ const Home: React.FC<HomeProps> = (props) => {
           outlineBusy={outlineBusy}
           onExport={exportStory}
           onViewPortrait={(c) => openPortrait(c)}
-          onWorldUpdate={(w) => setWorld(w)}
+          onWorldUpdate={() => { requestSyncSnapshotRef.current?.(); }}
           taskActive={taskActive}
         />
       )}
@@ -2628,7 +2627,7 @@ const Home: React.FC<HomeProps> = (props) => {
           world={world}
           onClose={() => setShowEval(false)}
           onToast={showToast}
-          onWorldUpdate={(nw) => setWorld(nw)}
+          onWorldUpdate={() => { requestSyncSnapshotRef.current?.(); }}
           taskActive={taskActive}
         />
       )}
