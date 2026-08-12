@@ -14,7 +14,7 @@ import type { Server, ServerWebSocket } from "bun";
 import { userFromRequest, type AuthUser } from "./auth";
 import { currentUser, loadWorld, runAsUser, slugify, storyExists } from "./storage";
 import { publishSyncImmediate, subscribeSync, worldVersion, type SyncEvent } from "./sync";
-import { listMediaTaskStates, listPendingMediaTasks } from "./routes";
+import { getSystemSyncSnapshot, listMediaTaskStates, listPendingMediaTasks } from "./routes";
 import { listSyncSessionSnapshots, sessionHasAsyncState, updateMediaFormCardValues } from "./brain-sessions";
 import { MAX_IMAGES_PER_CHAPTER, imageOccupiesQuota } from "../shared/media-const";
 
@@ -89,6 +89,11 @@ function sendBrainStatus(ws: ServerWebSocket<SyncWsData>, title: string): boolea
   return payload.active;
 }
 
+function sendSystemSnapshot(ws: ServerWebSocket<SyncWsData>, title: string, heal = false): void {
+  const snapshot = runAsUser(ws.data.user.username, () => getSystemSyncSnapshot(title, heal));
+  if (snapshot) ws.send(JSON.stringify({ type: "system-snapshot", ...snapshot, at: Date.now() }));
+}
+
 /** 订阅消息体校验 */
 type SubscribeMsg = {
   type?: string;
@@ -152,6 +157,16 @@ export const syncWebsocket = {
       publishSyncImmediate(event);
       return;
     }
+    if (msg.type === "snapshot") {
+      const title = String(msg.title ?? "").trim();
+      if (!title || !ws.data.channels.has(syncChannelKey(ws.data.user.username, title))) {
+        ws.send(JSON.stringify({ type: "error", error: "尚未订阅该书" }));
+        return;
+      }
+      sendSystemSnapshot(ws, title);
+      sendBrainStatus(ws, title);
+      return;
+    }
     if (msg.type !== "subscribe") return; // 未知消息忽略
     const title = String(msg.title ?? "").trim();
     if (!title) {
@@ -168,6 +183,8 @@ export const syncWebsocket = {
     ws.subscribe(key);
     ws.data.channels.add(key);
     ws.send(JSON.stringify({ type: "subscribed", title, version: worldVersion(title) }));
+    // 建连订阅立即推权威世界/运行态；连接生命周期与中枢弹窗完全无关。
+    sendSystemSnapshot(ws, title, true);
     let hadActive = sendBrainStatus(ws, title);
     let hadPendingTasks = false;
     if (ws.data.brainTimer) clearInterval(ws.data.brainTimer);
@@ -241,7 +258,15 @@ export function attachSyncPublish(server: Server<SyncWsData>): () => void {
   return subscribeSync((e: SyncEvent) => {
     if (!e.user) return; // 无 user 的事件（测试/遗留路径）无法定位频道，不推
     const msg = JSON.stringify(e);
-    server.publish(syncChannelKey(e.user, e.title), msg);
+    const channel = syncChannelKey(e.user, e.title);
+    server.publish(channel, msg);
+    // 世界/运行态变化后紧跟权威快照。这里直接发送到活跃 socket，避免再走 HTTP state/status。
+    if (e.type === "world-changed" || e.type === "auto-status" || e.type === "task-status") {
+      for (const ws of allSockets) {
+        if (ws.data.user.username !== e.user || !ws.data.channels.has(channel)) continue;
+        try { sendSystemSnapshot(ws, e.title); } catch { /* socket 已关闭 */ }
+      }
+    }
   });
 }
 

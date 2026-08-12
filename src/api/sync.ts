@@ -20,6 +20,16 @@ export type SyncEvent = {
   user?: string;
 } & (
   | {
+      type: "system-snapshot";
+      title: string;
+      world: Record<string, unknown>;
+      visual: { running: boolean; pending: { id: string; name: string }[]; failed: { id: string; name: string; reason?: string }[] };
+      autoSession: Record<string, unknown> | null;
+      autoPending: Record<string, unknown> | null;
+      advanceTask: Record<string, unknown> | null;
+      at: number;
+    }
+  | {
       type: "world-changed";
       /** 书名（原始 title，非 slug） */
       title: string;

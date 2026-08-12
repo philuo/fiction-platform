@@ -2,7 +2,7 @@
 // 原则：① 审计零 LLM、可重复幂等；② autoRepair 只做确定性可逆修复（孤儿条目/悬空键），
 //       任何删除正文/媒体/伏笔的动作一律不做，升级为 finding 交用户决策；③ 删章允许空洞、绝不重排 index。
 // 注：登场记录重算（recomputeAppearedIn）不在 autoRepair 内——正文变更路径（settle/编辑/回滚/重写/改名/删章）
-//     均已显式重算，读时自愈（/api/novel/state）兜底历史脏数据；避免每次伏笔/蓝图/设定写点
+//     均已显式重算，sync 订阅自愈兜底历史脏数据；避免每次伏笔/蓝图/设定写点
 //     的 alignWorld 都做 O(全书正文) 全量扫描。
 import { readdirSync } from "node:fs";
 import { join } from "node:path";

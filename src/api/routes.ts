@@ -5,7 +5,7 @@ import * as director from "./director";
 import { buildBlueprint, confirmBlueprint, expandArc, type BlueprintOption } from "./planner";
 import * as steering from "./steering";
 import { runAuto, stopAuto, pauseAuto } from "./autorun";
-import { evaluateBookCached, readEvalReport } from "./eval";
+import { evaluateBookCached } from "./eval";
 import { extractFingerprint } from "./style";
 import { loadWorld, listStories, listStoriesMeta, deleteStory, exportMarkdown, exportEpub, slugify as slug, saveWorld, storyDir, storyExists, loadAutoSession, clearAutoSession, loadPendingChapter, clearPendingChapter, currentUser, migrateLegacyStoriesTo, runAsUser, userDir } from "./storage";
 import { createNewStoryTask, completeNewStoryTask, failNewStoryTask, markNewStoryTaskReady, updateNewStoryTaskStage, getNewStoryTask, listActiveNewStoryTasks, removeNewStoryTaskByTitle } from "./newtask";
@@ -18,7 +18,6 @@ import { resetChapterLedger, settleChapter } from "./chronicler";
 import { applyStateChange, finalizeStateChange } from "./statechange";
 import { publishSync, publishSyncImmediate, publishCardReplaced, type SyncEvent } from "./sync";
 import { withTitleLock } from "./titlelock";
-import { deriveBrainState } from "./brain-state";
 import { brainChatStream } from "./brain-chat";
 import { imageOccupiesQuota } from "../shared/media-const";
 import {
@@ -665,10 +664,39 @@ function schedulePortraitFor(title: string, w0: WorldState, anchor: string): voi
   ensureCharacterVisuals(title, w0, c);
 }
 
-/** 角色视觉自动生成任务表（内存态）：slug(title) → 角色 id → 任务结果（running/done/failed，失败带原因）；
- * 前端 /api/novel/visual/status 轮询据此判断「角色头像/立绘自动生成」是否完成（完成后中枢恢复待命） */
+/** 角色视觉自动生成任务表（内存态）：由 sync WS system-snapshot/task-status 推送。 */
 type VisualTaskResult = { status: "running" | "done" | "failed"; reason?: string };
 const visualTasks = new Map<string, Map<string, VisualTaskResult>>();
+
+/** sync WS 权威系统快照：订阅即推世界与全部运行态。 */
+export function getSystemSyncSnapshot(title: string, heal = false): Omit<Extract<SyncEvent, { type: "system-snapshot" }>, "type" | "at"> | null {
+  const w = loadWorld(title);
+  if (!w) return null;
+  if (heal) {
+    scheduleReadSelfHeal(title);
+    const needy = w.characters.filter((c) => {
+      if (c.portrait?.path && c.image) return false;
+      return !c.visualTriedAt || Date.now() - c.visualTriedAt > VISUAL_RETRY_COOLDOWN;
+    });
+    for (const c of needy) ensureCharacterVisuals(w.title, w, c);
+    if (!w.cover && (!w.coverTriedAt || Date.now() - w.coverTriedAt > VISUAL_RETRY_COOLDOWN)) ensureCover(w.title, w);
+  }
+  const entries = [...(visualTasks.get(`${currentUser() ?? ""}::${slug(title)}`)?.entries() ?? [])];
+  const pending = entries.filter(([, v]) => v.status === "running")
+    .map(([id]) => w.characters.find((c) => c.id === id))
+    .filter((c): c is WorldCharacter => !!c && !(c.portrait?.path && c.image))
+    .map((c) => ({ id: c.id, name: c.name }));
+  const failed = entries.filter(([, v]) => v.status === "failed")
+    .map(([id, v]) => ({ id, name: w.characters.find((c) => c.id === id)?.name ?? id, reason: v.reason }));
+  return {
+    title,
+    world: sanitize(w) as unknown as Record<string, unknown>,
+    visual: { running: pending.length > 0, pending, failed },
+    autoSession: loadAutoSession(title) as unknown as Record<string, unknown> | null,
+    autoPending: loadPendingChapter(title) as unknown as Record<string, unknown> | null,
+    advanceTask: getAdvanceTaskForClient(title) as unknown as Record<string, unknown> | null,
+  };
+}
 /** 角色视觉生成中集合（进程级去重：同一角色同时只允许一个自动生成任务） */
 const visualInFlight = new Set<string>();
 /** 小说封面生成中集合（进程级去重：同一本书同时只允许一个自动封面任务） */
@@ -696,6 +724,7 @@ function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter
   const tasks = visualTasks.get(tKey) ?? new Map<string, VisualTaskResult>();
   tasks.set(c.id, { status: "running" });
   visualTasks.set(tKey, tasks);
+  publishSync({ type: "task-status", title, kind: "visual", id: c.id, status: "running", at: Date.now(), user: uk || undefined });
   void (async () => {
     const t0 = Date.now();
     const failures: string[] = [];
@@ -800,9 +829,9 @@ function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter
       visualInFlight.delete(key);
       const tasks = visualTasks.get(tKey);
       if (tasks) {
-        // 只写结果状态，不在任务结束时清表：failed/done 信息须由 /api/novel/visual/status
-        // 在返回给前端后清理（否则前端轮询永远拿不到 failed/reason，失败提示链路失效）
+        // 保留最近终态，供新连接的 system-snapshot 恢复失败原因。
         tasks.set(c.id, { status: failures.length ? "failed" : "done", reason: failures.join("；") });
+        publishSync({ type: "task-status", title, kind: "visual", id: c.id, status: failures.length ? "failed" : "done", error: failures.join("；") || undefined, at: Date.now(), user: uk || undefined });
       }
     }
   })();
@@ -863,7 +892,7 @@ function ensureCover(title: string, w: WorldState): void {
 }
 
 // —— 读时自愈后台化 ——
-// 原 /api/novel/state 在 withTitleLock 内同步执行 load→自愈→save，与自动连载的
+// 原 HTTP 世界读取在 withTitleLock 内同步执行 load→自愈→save，与自动连载的
 // writeOneChapter（锁内 5-15 分钟：多次 LLM 调用+重试）排同一把锁 → 连载期间打开小说
 // state 一直 pending。改为无锁读 + 自愈保存后台化：state 秒回（读到磁盘最新一致快照，
 // saveWorld 原子写，最多落后连载正在写的一章），自愈在后台锁内 load 最新再 save，
@@ -1501,48 +1530,6 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       return json({ status: t.status, title: t.title, error: t.error, idea: t.idea, stage: t.stage });
     }
 
-    case "/api/novel/state": {
-      const title = String(body.title ?? "").trim();
-      if (!title) return json({ error: "缺少 title" }, 400);
-      try {
-        // 无锁读（saveWorld 原子写 tmp+rename：磁盘永远是完整一致快照，最多落后连载正在写的一章）。
-        // 修复：连载每章在锁内执行 writeOneChapter（5-15 分钟），state 若同步等锁会一直 pending；
-        // 读时自愈保存已后台化（scheduleReadSelfHeal，锁内 load 最新再 save，与连载互斥不覆盖）
-        const w = loadWorld(title);
-        if (!w) throw new AppError("故事不存在: " + title);
-        scheduleReadSelfHeal(title);
-        // 读时自愈②：视觉缺失的角色 → 后台补头像+立绘（fire-and-forget，不阻塞打开）。
-        // 触发条件：未自动尝试过，或上次尝试失败已过冷却期（visualTriedAt 防高频烧配额，也避免 dev 热重启丢任务后永久缺视觉）；
-        // 前端据 visualPending 启动轮询，中枢显示「自动生成角色头像/立绘中…」，完成后刷新恢复待命
-        const needy = w.characters.filter((c) => {
-          if (c.portrait?.path && c.image) return false;
-          if (!c.visualTriedAt) return true;
-          return Date.now() - c.visualTriedAt > VISUAL_RETRY_COOLDOWN;
-        });
-        for (const c of needy) ensureCharacterVisuals(w.title, w, c);
-        // 封面读时自愈（兜底）：cover 缺失且未尝试（或过冷却）→ 后台自动生成（与角色视觉同策略）。
-        // 修复「立项段 2 旧快照覆盖并发落盘」等历史丢封面场景——此前封面无自愈路径，丢了就永久缺
-        if (!w.cover && (!w.coverTriedAt || Date.now() - w.coverTriedAt > VISUAL_RETRY_COOLDOWN)) {
-          ensureCover(w.title, w);
-        }
-        // 中枢四维状态（轻量：复用落盘 eval，不含完整性扫描——完整扫描见 /api/brain/state）
-        const stSession = loadAutoSession(title);
-        const stAutoRunning = stSession?.status === "running";
-        const brainState = deriveBrainState(w, {
-          busy: stAutoRunning,
-          phase: stAutoRunning ? stSession?.phase : undefined,
-          autoRunning: stAutoRunning,
-          evalReport: readEvalReport(title),
-        });
-        return json({ world: sanitize(w), visualPending: needy.length > 0, brainState });
-      } catch (e) {
-        // 业务错误（故事不存在）回 404 JSON；其余异常回 500 JSON，避免 throw 逃逸成非 JSON 500
-        if (e instanceof AppError) return json({ error: e.message }, 404);
-        console.error("[api/novel/state]", e);
-        return json({ error: "加载故事状态失败，请稍后重试" }, 500);
-      }
-    }
-
     case "/api/novel/list": {
       // creating：进行中的异步立项任务（running 壳未就绪 + ready 壳已就绪仍在增强）。
       // 失败任务不进列表——失败即时 toast 提示即可，不残留卡片；status 端点仍可查终态
@@ -2093,7 +2080,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           return { world: sanitize(updated), autoFixed: aligned, newCharacterIds };
         });
         if ((out as { needIntervention?: boolean }).needIntervention) return json({ ok: false, ...out });
-        // 手动新增角色自动生成头像+立绘（后台 fire-and-forget，不阻塞返回；前端轮询 /api/novel/visual/status，
+        // 手动新增角色自动生成头像+立绘（后台 fire-and-forget；状态经 sync WS 推送，
         // 期间中枢显示「自动生成角色头像/立绘中…」，完成后操作日志留 CMD-M07/CMD-M08 记录）
         const newCharIds = (out as { newCharacterIds?: string[] }).newCharacterIds ?? [];
         const outWorld = (out as { world: unknown }).world as WorldState | undefined;
@@ -2231,7 +2218,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           finalizeStateChange(w, { ok: true });
           return sanitize(w);
         });
-        // 入册新角色自动生成头像+立绘（后台 fire-and-forget，不阻塞返回；前端轮询 /api/novel/visual/status，
+        // 入册新角色自动生成头像+立绘（后台 fire-and-forget；状态经 sync WS 推送，
         // 期间中枢显示「自动生成角色头像/立绘中…」，完成后操作日志留 CMD-M07/CMD-M08 记录）
         const confirmedNew = world.characters.filter(
           (c) => c.status === "待登场（提案确认）" && !(c.portrait?.path && c.image),
@@ -3071,43 +3058,6 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       return json({ ok: true, cancelled });
     }
 
-    case "/api/novel/visual/status": {
-      // 角色头像/立绘自动生成任务状态（立项 / 确认入册 / 手动新增 / 读时自愈 / 中枢巡检后，前端轮询此端点）：
-      // pending 非空 = 生成中（中枢显示忙碌）；为空 = 全部结束（前端刷新世界、中枢恢复待命）；
-      // failed 带原因返回一次（操作日志另有 visual-fail 留痕），前端据此区分「成功/失败」提示
-      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
-      const title = String(body.title ?? "").trim();
-      if (!title) return json({ error: "缺少 title" }, 400);
-      const tKey = `${currentUser() ?? ""}::${slug(title)}`;
-      const tasks = visualTasks.get(tKey);
-      const entries = [...(tasks?.entries() ?? [])];
-      const w = loadWorld(title);
-      // 以落盘状态为准：任务表中 running 但视觉已完整（生成刚完成/落盘与任务表暂不一致）视为完成
-      const pending = entries
-        .filter(([, v]) => v.status === "running")
-        .map(([id]) => w?.characters.find((c) => c.id === id))
-        .filter((c): c is WorldCharacter => !!c && !(c.portrait?.path && c.image))
-        .map((c) => ({ id: c.id, name: c.name }));
-      const failed = entries
-        .filter(([, v]) => v.status === "failed")
-        .map(([id, v]) => ({ id, name: w?.characters.find((c) => c.id === id)?.name ?? id, reason: v.reason ?? "" }));
-      const done = entries.filter(([, v]) => v.status === "done").length;
-      // 任务全部结束（无 running）→ 清表（failed/done 随本次响应返回一次）
-      if (entries.length && !entries.some(([, v]) => v.status === "running")) {
-        visualTasks.delete(tKey);
-        // D 级广播点：角色视觉任务全部完成 → 事件总线（未在轮询的其他 tab 也能即时感知）
-        publishSync({
-          type: "task-status",
-          title,
-          kind: "visual",
-          status: failed.length ? "failed" : "done",
-          at: Date.now(),
-          user: currentUser() ?? undefined,
-        });
-      }
-      return json({ ok: true, pending, failed, done, count: pending.length });
-    }
-
     case "/api/novel/media/regenerate": {
       // 单张改词重生成（原地替换，id/anchor/kind/sceneType 不变 → 段落定位与轮询零改动）
       // 模式：锁内短事务取快照 → 锁外生成 → 锁内短事务交换 → 锁外删旧文件
@@ -3576,7 +3526,7 @@ function resumeAutoForDir(username: string): void {
 }
 
 /** 传输给前端的精简视图（剔除超长正文以外的敏感字段；这里主要控制体积；chapterDeltas 仅服务端内部使用） */
-function sanitize(w: import("./world").WorldState) {
+export function sanitize(w: import("./world").WorldState) {
   const { chapterDeltas: _cd, ...rest } = w;
   return {
     ...rest,

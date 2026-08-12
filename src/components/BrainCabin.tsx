@@ -10,6 +10,7 @@ import { History, Plus, Send, Square, X } from "./icons";
 import { BrainCardView, mediaPlanDerived, type BrainCard, type PreviewCard, type ChoiceOption, type FormCard, type FormField, type AskCard } from "./brain-cards";
 import { MarkdownView } from "./MarkdownView";
 import { useBrainSession, type BrainSyncSession, type ChatMessage } from "./useBrainSession";
+import { useBrainSyncState } from "./syncStateStore";
 import { apiFetch } from "../api/client";
 import { uuid } from "../shared/uuid";
 import { MAX_IMAGES_PER_CHAPTER, imageOccupiesQuota } from "../shared/media-const";
@@ -367,6 +368,7 @@ export const BrainCabin: React.FC<{
   /** 媒体参数选择经 sync WS 上行并由服务端持久化/广播到其它 Tab。 */
   syncMediaFormValues?: (payload: { sessionId: string; messageId: string; cardIndex: number; values: Record<string, unknown> }) => boolean;
 }> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk, onOpenPanel, currentChapter, autoRunning, buildingStage, sysTick = 0, registerCardPatch, registerCardReplace, registerBrainStatus, registerTaskStatus, onGoToMedia, registerWsStatus, registerIsStreaming, syncMediaFormValues }) => {
+  const storedBrainState = useBrainSyncState(world.title);
   const {
     sessions, activeId, messages, streaming, thinking, reconnecting,
     openSession, newSession, removeSession, truncate, appendCard, patchCard, replaceCard, send, stop, isStreaming,
@@ -637,12 +639,10 @@ export const BrainCabin: React.FC<{
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [registerCardReplace]);
 
-  const applySyncSnapshotRef = useRef(applySyncSnapshot);
-  applySyncSnapshotRef.current = applySyncSnapshot;
+  // 弹窗只订阅全局状态库；开关弹窗不创建、不关闭、不恢复 sync 连接。
   useEffect(() => {
-    if (registerBrainStatus) registerBrainStatus((snapshot) => applySyncSnapshotRef.current(snapshot));
-    return () => { if (registerBrainStatus) registerBrainStatus(() => {}); };
-  }, [registerBrainStatus]);
+    if (storedBrainState) applySyncSnapshot(storedBrainState.sessions as unknown as BrainSyncSession[]);
+  }, [storedBrainState, applySyncSnapshot]);
 
   // 任务状态事件注册（阶段 3b+）：Home 的 useSyncChannel 收到 task-status(kind:media) 后转发，
   // 媒体任务据此收尾（WS 广播 + 周期快照保证多 Tab 收敛）

@@ -170,6 +170,18 @@ describe("订阅与广播（协议）", () => {
 });
 
 describe("saveWorld → 事件总线 → WS 广播（真实链路集成）", () => {
+  test("订阅后立即推 system-snapshot（世界/视觉/连载/推进同一 WS）", async () => {
+    const { ws, waitFor } = await connectWs("sync_ws_user");
+    ws.send(JSON.stringify({ type: "subscribe", title: "sync-ws-world" }));
+    const snapshot = await waitFor((m) => m.type === "system-snapshot");
+    expect(snapshot.title).toBe("sync-ws-world");
+    expect((snapshot.world as { title?: string }).title).toBe("sync-ws-world");
+    expect(snapshot.visual).toBeTruthy();
+    expect(Object.prototype.hasOwnProperty.call(snapshot, "autoSession")).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(snapshot, "advanceTask")).toBe(true);
+    ws.close();
+  });
+
   test("brain-status：建连立即推 pending，多 Tab 未轮询也会定时收到终态", async () => {
     const { createSession, appendMessage, markStreaming, markMessageDone } = await import("../src/api/brain-sessions");
     const { runAsUser } = await import("../src/api/storage");

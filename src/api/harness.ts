@@ -133,13 +133,13 @@ export const COMMANDS: HarnessCommand[] = [
   C("CMD-S05", "磁盘孤儿媒体收集 collectOrphanMediaFiles", "System", "system", "integrity.ts:257", "收集磁盘孤儿媒体", "只读收集", "none", "L0", "—", ["none"], []),
   C("CMD-S06", "旧存档对齐 alignWorld", "System", "system", "integrity.ts:247", "迁移旧存档字段", "多字段", "none", "L1", "—", ["audit"], []),
   C("CMD-S07", "启动恢复连载 resumeAutoSessions", "System", "system", "routes.ts:1816（dev.ts/prod.ts 触发）", "重启后自动续跑 running 会话", "同 N03", "exec", "L2", "—", ["schedule", "control"], ["U16"]),
-  C("CMD-S08", "读时自愈钩子 state 钩子", "System", "system", "/api/novel/state", "打开后后台重算登场+媒体迁移+autoRepair（无锁读不阻塞，后台锁内落盘）", "appearedIn/ch.media（dirty 时 saveWorld）", "none", "L1", "—", ["audit"], ["U03", "U05", "U08"]),
+  C("CMD-S08", "sync 订阅自愈钩子", "System", "system", "sync system-snapshot", "连接后后台重算登场+媒体迁移+autoRepair", "appearedIn/ch.media（dirty 时 saveWorld）", "none", "L1", "—", ["audit"], ["U03", "U05", "U08"]),
   C("CMD-S09", "整书评估 evaluateBook", "System", "user", "/api/novel/eval → eval.ts:49", "8 维 LLM 评估（缓存指纹）", "只读（写 eval.json）", "brain", "L0", "缓存兜底", ["none"], ["U15"]),
   C("CMD-S10", "限流排队 limiter", "System", "system", "limiter.ts", "text 5/40、image 5/40、video 1/2 并发限流", "影响所有 LLM/媒体行为", "none", "L0", "排队不 429", ["schedule"], []),
   C("CMD-S11", "中枢视觉巡检 sweepVisualGaps", "System", "system", "routes.ts:236（dev.ts/prod.ts 启动触发，每 60s）", "扫描所有故事角色，头像/立绘缺失自动补全（1 分钟冷却）", "characters[].portrait/image", "image", "L1", "冷却兜底防烧配额", ["schedule", "audit"], ["U13"]),
 
   // ===== 2.7 查询只读类（Query）=====
-  C("CMD-Q01", "读世界状态", "Query", "user", "/api/novel/state", "读世界+自愈钩子", "只读（条件写见 S08）", "none", "L0", "—", ["none"], ["U03", "U06", "U08"]),
+  C("CMD-Q01", "同步世界状态", "Query", "user", "sync system-snapshot", "订阅即推世界+运行态", "只读（条件写见 S08）", "none", "L0", "—", ["none"], ["U03", "U06", "U08"]),
   C("CMD-Q02", "故事列表", "Query", "user", "/api/novel/list", "列表", "只读", "none", "L0", "—", ["none"], ["U01"]),
   C("CMD-Q03", "导出 md/epub", "Query", "user", "/api/novel/export", "导出", "只读", "none", "L0", "—", ["none"], []),
   C("CMD-Q04", "变更日志", "Query", "user", "/api/novel/changelog", "审计日志读", "只读", "none", "L0", "—", ["none"], ["U20"]),

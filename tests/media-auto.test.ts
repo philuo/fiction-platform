@@ -142,6 +142,16 @@ async function waitVisual(title: string, cid: string, timeoutMs = 5000): Promise
 }
 
 describe("P5 角色媒体自动生成", () => {
+  test("旧 state/visual-status HTTP 接口已移除，系统状态只走 sync WS", async () => {
+    const { handleApi } = await import("../src/api/routes");
+    for (const pathname of ["/api/novel/state", "/api/novel/visual/status"]) {
+      const res = await handleApi(pathname, new Request(`http://localhost${pathname}`, {
+        method: "POST", headers: { "Content-Type": "application/json", cookie: authCookie }, body: JSON.stringify({ title: "任意书" }),
+      }));
+      expect(res?.status).toBe(404);
+      expect(((await res!.json()) as { error?: string }).error).toContain("未知 API");
+    }
+  });
   test("generateCharacterPortrait：立绘必须参考头像（无头像抛错；默认短改变 prompt 保参考图原样，改词回退全量描述，文件落盘）", async () => {
     const { generateCharacterPortrait } = await import("../src/api/media");
     const { saveWorld } = await import("../src/api/storage");
@@ -256,14 +266,10 @@ describe("P5 角色媒体自动生成", () => {
     expect(autoLogs.some((e) => e.kind === "portrait-auto" && e.detail.includes("新角色乙"))).toBe(true);
     expect(autoLogs.some((e) => e.kind === "avatar-auto" && e.detail.includes("新角色乙"))).toBe(true);
 
-    // 幂等：视觉已完整，再次确认/读时自愈不再触发自动生成
-    const res2 = await handleApi("/api/novel/state", new Request("http://localhost/api/novel/state", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", cookie: authCookie },
-      body: JSON.stringify({ title: w.title }),
-    }));
-    const st2 = (await res2!.json()) as { visualPending?: boolean };
-    expect(st2.visualPending).toBe(false);
+    // 幂等：视觉已完整，再次 sync 订阅自愈不再触发自动生成
+    const { getSystemSyncSnapshot } = await import("../src/api/routes");
+    const st2 = getSystemSyncSnapshot(w.title, true)!;
+    expect(st2.visual.running).toBe(false);
     });
   });
 
@@ -305,21 +311,9 @@ describe("P5 角色媒体自动生成", () => {
     expect(nc2.visualTriedAt).toBeGreaterThan(0); // 已尝试标记（防反复烧配额）
     // 失败写操作日志（而非静默）：失败可见
     expect(after.changeLog.some((e) => e.kind === "visual-fail" && e.actor === "system" && e.detail.includes("失败角色"))).toBe(true);
-    // 状态链路：轮询 /api/novel/visual/status 必须能拿到 failed + reason（前端据此提示失败，而非假成功）
-    const t1 = Date.now();
-    let statusRes: { pending?: unknown[]; failed?: { id: string; name: string; reason?: string }[] };
-    for (;;) {
-      const rs = await handleApi("/api/novel/visual/status", new Request("http://localhost/api/novel/visual/status", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", cookie: authCookie },
-        body: JSON.stringify({ title: w.title }),
-      }));
-      statusRes = (await rs!.json()) as typeof statusRes;
-      if (!statusRes.pending?.length || (statusRes.failed ?? []).some((f) => f.name === "失败角色")) break;
-      if (Date.now() - t1 > 5000) throw new Error("等待 status 返回 failed 超时");
-      await new Promise((r) => setTimeout(r, 50));
-    }
-    const failedEntry = (statusRes.failed ?? []).find((f) => f.name === "失败角色");
+    // 状态链路：sync 快照携带 failed + reason（前端据此提示失败，而非假成功）
+    const { getSystemSyncSnapshot } = await import("../src/api/routes");
+    const failedEntry = getSystemSyncSnapshot(w.title)!.visual.failed.find((f) => f.name === "失败角色");
     expect(failedEntry).toBeDefined();
     expect(failedEntry?.reason).toContain("模拟图像生成失败");
     });
@@ -340,13 +334,9 @@ describe("P5 角色媒体自动生成", () => {
     saveWorld(w);
 
     failImage = false;
-    const res = await handleApi("/api/novel/state", new Request("http://localhost/api/novel/state", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", cookie: authCookie },
-      body: JSON.stringify({ title: w.title }),
-    }));
-    const st = (await res!.json()) as { visualPending?: boolean };
-    expect(st.visualPending).toBe(true); // 触发后台补视觉
+    const { getSystemSyncSnapshot } = await import("../src/api/routes");
+    const st = getSystemSyncSnapshot(w.title, true)!;
+    expect(st.visual.running).toBe(true); // 订阅触发后台补视觉
 
     const finished = await waitVisual(w.title, "c2");
     const c2 = finished.characters.find((c) => c.id === "c2")!;
@@ -355,13 +345,8 @@ describe("P5 角色媒体自动生成", () => {
     expect(finished.changeLog.some((e) => e.kind === "portrait-auto" && e.actor === "system" && e.detail.includes("配角甲"))).toBe(true);
 
     // 幂等：视觉已完整 → 再次打开不触发
-    const res2 = await handleApi("/api/novel/state", new Request("http://localhost/api/novel/state", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", cookie: authCookie },
-      body: JSON.stringify({ title: w.title }),
-    }));
-    const st2 = (await res2!.json()) as { visualPending?: boolean };
-    expect(st2.visualPending).toBe(false);
+    const st2 = getSystemSyncSnapshot(w.title, true)!;
+    expect(st2.visual.running).toBe(false);
     });
   });
 

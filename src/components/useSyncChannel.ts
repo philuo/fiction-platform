@@ -5,9 +5,11 @@
 // - world-changed 版本去重：服务端事件已按 1s 窗口节流合并，version 单调递增；客户端只处理 version 更新的事件
 // - 与 sysPoll 双跑（阶段 1 策略）：事件驱动即时刷新 + 轮询兜底校验；断线时 onStatusChange(false) 通知可启用降级
 import { useCallback, useEffect, useRef, useState } from "react";
+import { setBrainSyncState, setSystemSyncState, type SystemSyncState } from "./syncStateStore";
 
 /** 事件类型（与 src/api/sync.ts SyncEvent 一致；服务端透传原样 JSON） */
 export type SyncChannelEvent =
+  | { type: "system-snapshot"; title: string; world: Record<string, unknown>; visual: { running: boolean; pending: { id: string; name: string }[]; failed: { id: string; name: string; reason?: string }[] }; autoSession: Record<string, unknown> | null; autoPending: Record<string, unknown> | null; advanceTask: Record<string, unknown> | null; at: number }
   | { type: "world-changed"; title: string; version: number; reason?: string; regions?: string[]; at: number }
   | { type: "auto-status"; title: string; status: string; phase?: string; written?: number; updatedAt?: string; at: number }
   | { type: "task-status"; title: string; kind: "build" | "advance" | "media" | "visual"; id?: string; sub?: "plan"; scenes?: { anchor: string; scene: string; caption?: string }[]; status: string; error?: string; at: number }
@@ -24,6 +26,7 @@ export type UseSyncChannelOpts = {
   /** 当前书 title；null/空 时不连接 */
   title: string | null;
   onWorldChanged?: (e: Extract<SyncChannelEvent, { type: "world-changed" }>) => void;
+  onSystemSnapshot?: (e: Extract<SyncChannelEvent, { type: "system-snapshot" }>) => void;
   onAutoStatus?: (e: Extract<SyncChannelEvent, { type: "auto-status" }>) => void;
   onTaskStatus?: (e: Extract<SyncChannelEvent, { type: "task-status" }>) => void;
   /** 系统事件注入聊天成功（brain-note）：其他 tab/入口收到后重拉会话显示系统条 */
@@ -46,6 +49,7 @@ const MAX_RETRY_MS = 8000;
 
 export function useSyncChannel(opts: UseSyncChannelOpts): {
   connected: boolean;
+  requestSnapshot: () => boolean;
   syncMediaFormValues: (payload: { sessionId: string; messageId: string; cardIndex: number; values: Record<string, unknown> }) => boolean;
 } {
   const { title } = opts;
@@ -126,6 +130,11 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
           lastVersionRef.current = obj.version;
           return;
         }
+        if (obj.type === "system-snapshot") {
+          setSystemSyncState(obj as unknown as SystemSyncState);
+          optsRef.current.onSystemSnapshot?.(obj);
+          return;
+        }
         if (obj.type === "world-changed") {
           // 版本去重：只处理比已见更新的（节流合并后 version 单调）
           if (obj.version <= lastVersionRef.current) return;
@@ -158,6 +167,7 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
           return;
         }
         if (obj.type === "brain-status") {
+          setBrainSyncState({ title: obj.title, sessions: obj.sessions, tasks: obj.tasks, at: obj.at });
           optsRef.current.onBrainStatus?.(obj);
           return;
         }
@@ -232,5 +242,12 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
     }
   }, [title]);
 
-  return { connected, syncMediaFormValues };
+  const requestSnapshot = useCallback((): boolean => {
+    const ws = wsRef.current;
+    if (!title || !ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify({ type: "snapshot", title }));
+    return true;
+  }, [title]);
+
+  return { connected, requestSnapshot, syncMediaFormValues };
 }

@@ -2,6 +2,7 @@
 // 交互：立项一句话 / 指令输入 / 抽卡筛选 / 世界观·设定·角色·大纲编辑 / 章节段落编辑 / 推进
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSyncChannel } from "../components/useSyncChannel";
+import { getBrainSyncState, getSystemSyncState, useSystemSyncState } from "../components/syncStateStore";
 import { AlertTriangle, BookMarked, BookOpen, ChevronDown, Dices, History, List, LogOut, MoreHorizontal, PenLine, Play, RefreshCw, Search, Sparkles, Trash2, Users, Video, Wand2, X } from "../components/icons";
 import type { Card, Chapter, ChapterMedia, Character, LoreEntry, ReviewResult, WorldPatch, WorldState } from "../api/world";
 import { imageOccupiesQuota } from "../shared/media-const";
@@ -132,6 +133,8 @@ const Home: React.FC<HomeProps> = (props) => {
   // 当前登录用户（SSR 注入 / 登录成功后设置；null = 未登录 → 渲染登录页）
   const [user, setUser] = useState<AuthUser | null>(props.initialData?.user ?? null);
   const [world, setWorld] = useState<WorldState | null>(props.initialData?.world ?? null);
+  const [syncTitle, setSyncTitle] = useState<string | null>(props.initialData?.world?.title ?? null);
+  const syncedSystem = useSystemSyncState(syncTitle);
   const [busy, setBusy] = useState(false);
   const [busyPhase, setBusyPhase] = useState("");
   // 初始选中章节：SSR 预载时按 URL chapter（服务端）恢复 → localStorage 上次选中 → 第一章。
@@ -379,6 +382,7 @@ const Home: React.FC<HomeProps> = (props) => {
     return onAuthChange(() => {
       setUser(null);
       setWorld(null);
+      setSyncTitle(null);
       setPhase("landing");
       setActiveIdx(-1);
       setEditing(false);
@@ -403,25 +407,22 @@ const Home: React.FC<HomeProps> = (props) => {
     setBusy(true);
     setBusyPhase("加载中…");
     try {
-      const res = await apiFetch("/api/novel/state", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title }),
-      });
-      const data = (await res.json()) as { world?: WorldState; error?: string };
-      if (data.error || !data.world) throw new Error(data.error ?? "加载失败");
-      setWorld(data.world);
-      setPhase("playing");
+      // 书架列表只负责导航；设置 title 即建立 sync，首帧权威快照到达后才进入三栏页面。
+      const cached = getSystemSyncState(title)?.world;
+      if (!cached && !stories.some((s) => s.title === title)) throw new Error("故事不存在");
+      setSyncTitle(title);
+      if (cached) { setWorld(cached); setPhase("playing"); }
       // 关闭/展开态不跨书残留：关闭状态按书持久化（useSyncExternalStore 随 propCloseKey 自动读该书存储），此处仅重置展开态
       setProposalExpanded(false);
       // 恢复上次选中章节：URL chapter（服务端）优先 → localStorage 上次选中 → 第一章。
       // localStorage 仅增强体验；章节缺失时 resolveInitialChapter 自动忽略（服务端权威兜底）
       const urlIdx = readUrlChapter();
-      const prefIdx = loadReadingPref(data.world.title);
-      const initIdx = resolveInitialChapter(data.world, urlIdx ?? prefIdx);
+      const initialWorld = cached;
+      const prefIdx = loadReadingPref(title);
+      const initIdx = initialWorld ? resolveInitialChapter(initialWorld, urlIdx ?? prefIdx) : -1;
       setActiveIdx(initIdx);
-      setStoryUrl(data.world.title, initIdx > 0 ? initIdx : undefined);
-      showToast(`《${data.world.title}》已加载`);
+      setStoryUrl(title, initIdx > 0 ? initIdx : undefined);
+      showToast(`《${title}》已连接`);
       // 单章推进任务状态恢复已收敛到协调 effect（restoringTasks 锁持有者）统一触发——
       // 此处不再调用 restoreAdvanceTask，避免与协调 effect 双路并发（done/failed 分支无防重，会重复提示/刷新）
     } catch (e) {
@@ -436,6 +437,7 @@ const Home: React.FC<HomeProps> = (props) => {
   function backToList() {
     setPhase("landing");
     setWorld(null);
+    setSyncTitle(null);
     setActiveIdx(-1);
     setEditing(false);
     setStoryUrl();
@@ -450,6 +452,7 @@ const Home: React.FC<HomeProps> = (props) => {
     clearToken();
     setUser(null);
     setWorld(null);
+    setSyncTitle(null);
     setPhase("landing");
     setActiveIdx(-1);
     setEditing(false);
@@ -652,29 +655,15 @@ const Home: React.FC<HomeProps> = (props) => {
   }, [creating, phase, world?.title, currentTaskId]);
 
   async function refreshWorld(regions?: string[]) {
-    if (!world) return;
-    const res = await apiFetch("/api/novel/state", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: world.title }),
-    });
-    const data = (await res.json()) as { world?: WorldState; visualPending?: boolean };
-    const dw = data.world;
-    // C7 守卫：异步刷新返回时若用户已切到别的书/回首页，丢弃旧书结果，不覆盖当前书状态
-    if (dw && worldTitleRef.current === dw.title) setWorld(dw);
-    // 区域级刷新：仅受影响区域变化时，跳过重副作用（如视觉轮询探测/媒体恢复）——
-    // 但 world 是整包对象，React 按 props 引用重渲染子树；regions 用于「跳过无关副作用」决策
-    // （缺省/全量：保留视觉轮询等既有副作用）
-    const isFull = !regions || regions.length === 0 || regions.includes("U01");
-    // 读时自愈/新增角色触发的视觉自动生成：启动轮询（中枢显示「自动生成角色头像/立绘中…」，完成后恢复待命）
-    if (dw && data.visualPending && isFull && worldTitleRef.current === dw.title) startVisualPolling(dw.title);
+    void regions;
+    requestSyncSnapshotRef.current?.();
   }
 
   /** 全量状态即时刷新（聊天卡片执行后 / 连载 SSE 结束后调用）：
    *  world（章节/角色）+ 系统运行时状态（连载会话/推进任务）一步到位——
    *  解决「聊天中触发的指令/任务卡片状态与系统 UI 不同步」：不只刷 world，连载控制台/任务中心/中枢指示器同步更新 */
   async function refreshAllStates() {
-    await Promise.all([refreshWorld().catch(() => {}), pollSysStateOnce().catch(() => {})]);
+    requestSyncSnapshotRef.current?.();
   }
 
   // 阶段 1b/2：状态同步 WebSocket 频道——服务端事件推送即时刷新（与 sysPoll 双跑，轮询兜底校验）。
@@ -697,7 +686,8 @@ const Home: React.FC<HomeProps> = (props) => {
   const lastBrainStatusRef = useRef<{ title: string; sessions: BrainSyncSession[] } | null>(null);
   const registerBrainStatus = useCallback((fn: (sessions: BrainSyncSession[]) => void) => {
     brainStatusRef.current = fn;
-    const last = lastBrainStatusRef.current;
+    const stored = getBrainSyncState(world?.title ?? null);
+    const last = stored ? { title: stored.title, sessions: stored.sessions as unknown as BrainSyncSession[] } : lastBrainStatusRef.current;
     if (last && last.title === world?.title) fn(last.sessions);
   }, [world?.title]);
   /** 任务状态事件注册（阶段 3b+）：BrainCabin 挂载时注册 media task-status 处理器，
@@ -723,9 +713,11 @@ const Home: React.FC<HomeProps> = (props) => {
     brainStreamingRef.current = fn;
   }, []);
 
-  const { syncMediaFormValues } = useSyncChannel({
-    title: world?.title ?? null,
-    onWorldChanged: (e) => { void refreshWorld(e.regions); },
+  const requestSyncSnapshotRef = useRef<(() => boolean) | null>(null);
+  const { syncMediaFormValues, requestSnapshot } = useSyncChannel({
+    title: syncTitle,
+    onSystemSnapshot: () => {},
+    onWorldChanged: () => {},
     onTaskStatus: (e) => {
       // 推进任务完成广播（kind:"advance"）→ 清 advancePhase 释放运行锁（覆盖底部按钮/聊天/多 tab 发起路径；
       // 轮询降级后此广播是唯一不依赖本页 SSE 的释放通道）
@@ -734,9 +726,9 @@ const Home: React.FC<HomeProps> = (props) => {
       if (e.kind === "media" && e.id) consumeHomeMediaStatus(e.id, e.status, e.error);
       // media/visual 等任务完成广播 → 转发聊天舱（媒体生成 WS 事件驱动收尾，无轮询）
       taskStatusRef.current?.(e);
-      void refreshWorld(e.kind === "advance" ? ["U03", "U06", "U08", "U10"] : undefined);
+      if (e.kind === "visual") setVisualGen(e.status === "running");
     },
-    onAutoStatus: () => { void fetchAutoStatus(); },
+    onAutoStatus: () => {}, // 紧随其后的 system-snapshot 统一更新连载状态
     onBrainNote: () => setSysTick((t) => t + 1),
     onBrainAppend: (e) => {
       // 该会话正在 SSE 流式生成时不重拉（卡片/正文由同条 SSE 事件就地更新，reload 会覆盖未完成正文）
@@ -757,22 +749,35 @@ const Home: React.FC<HomeProps> = (props) => {
         }
         taskStatusRef.current?.({ kind: "media", ...task });
       }
-      if (hasTerminalMedia) void refreshWorld(["U06", "U07"]);
+      void hasTerminalMedia;
     },
     // 降级通道（阶段 5）：WS 连接时停 sysPoll（事件驱动）；WS 断开时启动 sysPoll（轮询兜底防漏事件）。
     // 与连载 SSE 直连（startAutoRun stopSysPoll）叠加：WS 断 + 连载 SSE 在 → 仍不轮询（SSE 自身实时）。
     onStatusChange: (connected) => {
       wsConnectedRef.current = connected;
       wsStatusRef.current?.(connected);
-      if (connected) stopSysPoll();
-      else if (!autoRunning) startSysPoll(); // 连载 SSE 直连时即使 WS 断也不轮询（SSE 实时）
+      stopSysPoll();
     },
     onReconnected: () => {
       // 全量补偿：刷新世界 + 重拉当前会话（断线期间完成的媒体任务由服务端权威落盘，reload 后卡片即终态）
       setSysTick((t) => t + 1);
-      void refreshAllStates();
+      requestSyncSnapshotRef.current?.();
     },
   });
+  requestSyncSnapshotRef.current = requestSnapshot;
+
+  useEffect(() => {
+    if (!syncedSystem || syncedSystem.title !== syncTitle) return;
+    const nextWorld = syncedSystem.world;
+    setWorld(nextWorld);
+    setPhase("playing");
+    setVisualGen(syncedSystem.visual.running);
+    setAutoSession(syncedSystem.autoSession as unknown as AutoSessionView | null);
+    setAutoPending(syncedSystem.autoPending as unknown as PendingChapterView | null);
+    const advance = syncedSystem.advanceTask as { status?: string; phase?: string } | null;
+    setAdvancePhase(advance?.status === "running" ? (advance.phase ?? "推进中") : "");
+    if (activeIdx === -1 && nextWorld.chapters.length) setActiveIdx(resolveInitialChapter(nextWorld, loadReadingPref(nextWorld.title)));
+  }, [syncedSystem, syncTitle, activeIdx]);
 
   /** 单章推进任务恢复（刷新/重进页面后）：查询持久化任务状态——
    * running → 恢复忙碌态 + 轮询直到完成（后台仍在执行，不重复发起）；
@@ -1121,7 +1126,7 @@ const Home: React.FC<HomeProps> = (props) => {
       setWorld(data.world);
       setIntervene(null);
       // 手动新增角色：头像/立绘后台自动生成（轮询期间中枢显示「自动生成角色头像/立绘中…」，完成后刷新并恢复待命）
-      if (data.visualPending) startVisualPolling(data.world.title);
+      if (data.visualPending) setVisualGen(true);
       showToast(strategy === "merge" ? "设定已保存，弥合任务已注入后续章节计划。" : strategy === "rewrite" ? "设定已保存，受影响章节已入重写队列。" : "设定已保存，将影响后续写作。");
       return true;
     } catch (e) {
@@ -1157,7 +1162,7 @@ const Home: React.FC<HomeProps> = (props) => {
       if (!data.ok || !data.world) throw new Error(data.error ?? "操作失败");
       setWorld(data.world);
       // 入册新角色：头像/立绘后台自动生成（轮询期间中枢显示「自动生成角色头像/立绘中…」，完成后刷新并恢复待命）
-      if (data.visualPending) startVisualPolling(data.world.title);
+      if (data.visualPending) setVisualGen(true);
       showToast(action === "confirm" ? "新角色已入册，可在后续章节登场。" : "提案已拒绝。");
     } catch (e) {
       showToast("提案处理失败: " + (e as Error).message);
@@ -1385,9 +1390,8 @@ const Home: React.FC<HomeProps> = (props) => {
   const [mediaGen, setMediaGen] = useState<MediaGen | null>(null);
   // 改词重生成：编辑弹窗状态（预填 prompt，风格后缀服务端自动保留）
   const [regenMedia, setRegenMedia] = useState<{ chapterIndex: number; media: ChapterMedia; prompt: string } | null>(null);
-  // 角色视觉后台自动生成中（立项 / 确认入册 / 手动新增角色后轮询 /api/novel/visual/status；期间中枢显示「自动生成角色头像/立绘中…」）
+  // 角色视觉后台自动生成状态由常驻 sync WS 的 system-snapshot/task-status 驱动。
   const [visualGen, setVisualGen] = useState(false);
-  const visualTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   // 中枢四维状态派生（零 LLM，前端从 world + 运行时信号确定性派生；驱动底部状态条中枢图标的神态与脉冲）
   // busy 口径：单章推进 busyPhase / 角色视觉后台生成 / 连载运行 / 世界构建中 任一即视为中枢忙碌（图标脉动表达 loading）
   const brainBusy = Boolean(busyPhase) || visualGen || autoSession?.status === "running" || Boolean(buildingStage);
@@ -1420,7 +1424,6 @@ const Home: React.FC<HomeProps> = (props) => {
   // 一致性治理：巡检/变更报告弹窗 与 删章两阶段预览
   const [integrityView, setIntegrityView] = useState<{ title: string; desc?: string; tip?: string; report: IntegrityReportView; repairable?: boolean } | null>(null);
   const [deletePreview, setDeletePreview] = useState<{ index: number; chapterTitle: string; report: IntegrityReportView } | null>(null);
-  useEffect(() => () => { stopVisualPolling(); }, []);
 
   // —— 左侧章节媒体：纯 sync WS 事件驱动收尾 ——
   // 提交后登记 mediaId；刷新后从 world 恢复 pending UI；服务端订阅快照与周期 task-status 推送负责收敛终态。
@@ -1560,65 +1563,6 @@ const Home: React.FC<HomeProps> = (props) => {
     }
     setMediaGen({ chapterIndex, mediaIds: ids, progress: 0 });
   }
-
-  /** 角色视觉后台自动生成轮询（立项 / 确认入册 / 手动新增角色后触发）：每 5s 查 /api/novel/visual/status，
-   * pending 为空 = 全部生成完毕 → 停止轮询、刷新世界、中枢恢复待命；
-   * 期间不锁全局 busy（不阻塞写作/媒体操作，与媒体异步任务一致），仅中枢指示器显示「自动生成角色头像/立绘中…」 */
-  function startVisualPolling(storyTitle: string) {
-    stopVisualPolling();
-    setVisualGen(true);
-    visualTimer.current = setInterval(async () => {
-      try {
-        const r = await apiFetch("/api/novel/visual/status", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title: storyTitle }),
-        });
-        const st = (await r.json()) as {
-          ok?: boolean;
-          pending?: { id: string; name: string }[];
-          failed?: { id: string; name: string; reason?: string }[];
-          error?: string;
-        };
-        if (!st.ok) throw new Error(st.error ?? "查询角色视觉状态失败");
-        if (!st.pending?.length) {
-          stopVisualPolling();
-          setVisualGen(false);
-          await refreshWorld();
-          // 区分成功/失败提示（失败原因同时落在操作日志 visual-fail 与角色面板手动生成兜底）
-          const failed = st.failed ?? [];
-          if (failed.length) {
-            showToast(`${failed.length} 个角色头像/立绘自动生成失败（${failed.map((f) => f.name).join("、")}），可在角色面板手动生成（详见操作日志）`);
-          } else {
-            showToast("角色头像/立绘已自动生成");
-          }
-        }
-      } catch (e) {
-        // 网络抖动/任务短暂中断：保留轮询重试
-        console.warn("[visual] 轮询失败，稍后重试:", (e as Error).message);
-      }
-    }, 5000);
-  }
-  function stopVisualPolling() {
-    if (visualTimer.current) { clearInterval(visualTimer.current); visualTimer.current = undefined; }
-  }
-  // 角色视觉生成中恢复轮询：刷新/重新进入页面时任务表仍有 running（服务未重启）→ 自动续接，保证刷新不丢进度/不丢中枢忙碌态
-  useEffect(() => {
-    if (!world || visualTimer.current) return;
-    let cancelled = false;
-    apiFetch("/api/novel/visual/status", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: world.title }),
-    })
-      .then((r) => r.json())
-      .then((st: { ok?: boolean; pending?: unknown[] }) => {
-        if (!cancelled && st.ok && st.pending?.length) startVisualPolling(world.title);
-      })
-      .catch(() => {});
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [world]);
 
   // SSR 预载路径（initialData 直接进 playing，不走 openStory）的任务状态恢复已收敛到协调 effect
   // （依赖 [phase, world?.title]，SSR 首帧 phase=playing 即触发），此处不再单独调用 restoreAdvanceTask
@@ -2016,6 +1960,8 @@ const Home: React.FC<HomeProps> = (props) => {
     stopSysPoll();
     sysPollRef.current = setInterval(() => void pollSysStateOnce(), 3000);
   }
+  // 仅保留旧变化检测实现供后续迁移审计；运行时不再启用，sync WS 是唯一状态通道。
+  void startSysPoll;
   function stopSysPoll() {
     if (sysPollRef.current) {
       clearInterval(sysPollRef.current);
@@ -2026,7 +1972,7 @@ const Home: React.FC<HomeProps> = (props) => {
   const mountedRef = useRef(true);
   useEffect(() => () => { mountedRef.current = false; stopSysPoll(); }, []);
 
-  // 打开小说 / 刷新恢复：启动统一状态轮询（常驻同步），并检查未完成会话（running/paused → 连载控制台）
+  // 打开小说 / 刷新恢复：状态完全由常驻 sync WS 恢复，不启动 HTTP 状态轮询。
   useEffect(() => {
     // L17 修复：回首页（world=null）时停止轮询并重置防重——否则定时器空转（闭包抓旧书），
     // 且重开同一本书时 autoCheckedRef 仍命中旧 title 导致轮询不重启
@@ -2038,12 +1984,7 @@ const Home: React.FC<HomeProps> = (props) => {
     if (autoCheckedRef.current === world.title) return;
     autoCheckedRef.current = world.title;
     prevSysRef.current = null; // 重置变化检测基线（切书防串书误报：书 A 连载结束判定不能注入书 B）
-    startSysPoll();
-    void (async () => {
-      const s = await fetchAutoStatus();
-      if (!s) return;
-      if (s.status === "running" || s.status === "paused") setShowAutoPanel(true);
-    })();
+    stopSysPoll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [world]);
 
@@ -2062,8 +2003,8 @@ const Home: React.FC<HomeProps> = (props) => {
     setAutoRunning(true);
     setBusy(true);
     setLiveDraft("");
-    stopSysPoll(); // 本页 SSE 直连，无需轮询
-    void fetchAutoStatus(); // 运行前同步会话基础数据（控制台可用）
+    stopSysPoll();
+    requestSyncSnapshotRef.current?.();
     let interrupted = false;
     try {
       const res = await apiFetch("/api/novel/auto/start", {
@@ -2135,7 +2076,7 @@ const Home: React.FC<HomeProps> = (props) => {
       setLiveDraft("");
       // SSE 断开：WS 连接时由事件驱动（task-status/auto-status 覆盖连载完成）；仅 WS 也断时恢复轮询兜底。
       // C7：仅当仍在发起时的书上才重启轮询——切书后旧 SSE 结束不能用旧闭包 pollSysStateOnce 覆盖新书轮询
-      if (mountedRef.current && !wsConnectedRef.current && stillSameBook()) startSysPoll();
+      if (mountedRef.current && stillSameBook()) requestSyncSnapshotRef.current?.();
     }
   }
 

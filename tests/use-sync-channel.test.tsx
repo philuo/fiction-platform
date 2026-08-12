@@ -5,6 +5,7 @@ import { Window } from "happy-dom";
 import React from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { useSyncChannel, type SyncChannelEvent } from "../src/components/useSyncChannel";
+import { getSystemSyncState } from "../src/components/syncStateStore";
 
 // ============ FakeWebSocket（仿 brain-reconnect 的 SSE mock 思路，暴露控制点） ============
 
@@ -187,6 +188,22 @@ test("brain-status 权威快照分发到回调", async () => {
   await tick(20);
   expect(log).toEqual(["brain:1:true"]);
   root.unmount();
+});
+
+test("system-snapshot 写入全局状态库，弹窗生命周期之外仍可读取", async () => {
+  const { root } = mountHarness("状态库书", () => {});
+  await afterMount();
+  const ws = FakeWebSocket.instances[0];
+  ws.open();
+  await tick(20);
+  ws.emit({
+    type: "system-snapshot", title: "状态库书", world: { title: "状态库书", chapters: [] },
+    visual: { running: false, pending: [], failed: [] }, autoSession: null, autoPending: null, advanceTask: null, at: 10,
+  });
+  await tick(20);
+  expect(getSystemSyncState("状态库书")?.world.title).toBe("状态库书");
+  root.unmount();
+  expect(getSystemSyncState("状态库书")?.at).toBe(10);
 });
 
 test("断线后自动重连：新连接 + 重新 subscribe + onReconnected 触发", async () => {
