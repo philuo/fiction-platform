@@ -7,6 +7,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { flushSync } from "react-dom";
 import { useSyncChannel, type SyncChannelEvent } from "../src/components/useSyncChannel";
 import { getSystemSyncState } from "../src/components/syncStateStore";
+import { createJsonPatch, sha256Json } from "../src/shared/json-patch";
 
 // ============ FakeWebSocket（仿 brain-reconnect 的 SSE mock 思路，暴露控制点） ============
 
@@ -206,6 +207,34 @@ test("system-snapshot 写入全局状态库，弹窗生命周期之外仍可读�
   expect(getSystemSyncState("状态库书")?.world.title).toBe("状态库书");
   root.unmount();
   expect(getSystemSyncState("状态库书")?.at).toBe(10);
+});
+
+test("system patch 连续时应用并回调，revision 缺口时请求完整快照", async () => {
+  const snapshots: number[] = [];
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root = createRoot(mount);
+  function PatchHarness() {
+    useSyncChannel({ title: "Patch书", onSystemSnapshot: (event) => snapshots.push(Number((event.world as { nextChapter?: number }).nextChapter)) });
+    return React.createElement("div");
+  }
+  root.render(React.createElement(PatchHarness));
+  await afterMount();
+  const ws = FakeWebSocket.instances[0];
+  ws.open();
+  await tick(20);
+  const initial = { title: "Patch书", world: { title: "Patch书", chapters: [], nextChapter: 1 }, visual: { running: false, pending: [], failed: [] }, autoSession: null, autoPending: null, advanceTask: null };
+  ws.emit({ type: "system-snapshot", ...initial, revision: 1, hash: await sha256Json(initial), cursor: 1, at: 1 });
+  await tick(20);
+  const next = { ...initial, world: { ...initial.world, nextChapter: 2 } };
+  ws.emit({ type: "patch", scope: "story/Patch书", document: "system", baseRevision: 1, revision: 2, hash: await sha256Json(next), ops: createJsonPatch(initial, next), cursor: 2 });
+  await tick(30);
+  expect(getSystemSyncState("Patch书")?.world.nextChapter).toBe(2);
+  expect(snapshots).toEqual([1, 2]);
+  ws.emit({ type: "patch", scope: "story/Patch书", document: "system", baseRevision: 5, revision: 6, hash: "gap", ops: [], cursor: 3 });
+  await tick(20);
+  expect(ws.sent.at(-1)).toBe(JSON.stringify({ type: "snapshot", title: "Patch书" }));
+  root.unmount();
 });
 
 test("断线后自动重连：新连接 + 重新 subscribe + onReconnected 触发", async () => {

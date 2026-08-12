@@ -34,6 +34,25 @@ function userChannelKey(user: string): string {
   return `sync::${user}::user`;
 }
 
+function projectionKey(scope: string, document: string): string { return `${scope}\u0000${document}`; }
+
+function sendProjection(
+  ws: ServerWebSocket<SyncWsData>, scope: string, document: string, data: unknown,
+  snapshot: Record<string, unknown>, forceSnapshot = false,
+): void {
+  const commit = recordProjectionSnapshot(ws.data.user.username, scope, document, data);
+  const key = projectionKey(scope, document);
+  const revisions = ws.data.revisions ??= new Map<string, number>();
+  const localRevision = revisions.get(key);
+  if (!forceSnapshot && localRevision === commit.revision) return;
+  if (!forceSnapshot && commit.frame && localRevision === commit.frame.baseRevision) {
+    ws.send(JSON.stringify({ ...commit.frame, cursor: commit.frameCursor ?? commit.cursor }));
+  } else {
+    ws.send(JSON.stringify({ ...snapshot, scope, document, revision: commit.revision, hash: commit.hash, cursor: commit.cursor }));
+  }
+  revisions.set(key, commit.revision);
+}
+
 function sendLibrarySnapshot(ws: ServerWebSocket<SyncWsData>): void {
   const data = runAsUser(ws.data.user.username, () => ({
     stories: listStoriesMeta(),
@@ -42,8 +61,7 @@ function sendLibrarySnapshot(ws: ServerWebSocket<SyncWsData>): void {
       stage: t.stage, error: t.error, createdAt: t.startedAt, updatedAt: t.updatedAt,
     })),
   }));
-  const version = recordProjectionSnapshot(ws.data.user.username, "user", "library", data);
-  ws.send(JSON.stringify({ type: "library-snapshot", scope: "user", document: "library", ...version, cursor: latestOutboxCursor(ws.data.user.username), data }));
+  sendProjection(ws, "user", "library", data, { type: "library-snapshot", data });
 }
 
 /** WS 连接附加数据：登录用户 + 已订阅的频道集合 + 心跳时间戳 */
@@ -53,6 +71,8 @@ type SyncWsData = {
   /** 最近一次收到消息（含 ping）的时间戳；open 时置位 */
   lastSeen: number;
   brainTimer?: ReturnType<typeof setInterval>;
+  /** 该连接已确认落地的投影 revision；决定可发 patch 还是必须发完整 snapshot。 */
+  revisions?: Map<string, number>;
 };
 
 /** 心跳超时（ms）：超过此间隔未收到任何消息视为僵尸连接，主动断开 */
@@ -105,23 +125,21 @@ function brainStatusPayload(ws: ServerWebSocket<SyncWsData>, title: string, full
 
 function sendBrainStatus(ws: ServerWebSocket<SyncWsData>, title: string): boolean {
   const payload = brainStatusPayload(ws, title, true);
-  const { at: _at, ...stable } = payload;
-  const version = recordProjectionSnapshot(ws.data.user.username, `story/${title}`, "brain", stable);
-    ws.send(JSON.stringify({ ...payload, ...version, cursor: latestOutboxCursor(ws.data.user.username) }));
+  const stable = { title: payload.title, sessions: payload.sessions, tasks: payload.tasks };
+  sendProjection(ws, `story/${title}`, "brain", stable, payload, true);
   return payload.active;
 }
 
 function sendBrainStatusFrame(ws: ServerWebSocket<SyncWsData>, payload: ReturnType<typeof brainStatusPayload>): void {
-  const { at: _at, ...stable } = payload;
-  const version = recordProjectionSnapshot(ws.data.user.username, `story/${payload.title}`, "brain", stable);
-  ws.send(JSON.stringify({ ...payload, ...version, cursor: latestOutboxCursor(ws.data.user.username) }));
+  const stable = { title: payload.title, sessions: payload.sessions, tasks: payload.tasks };
+  sendProjection(ws, `story/${payload.title}`, "brain", stable, payload);
 }
 
 function sendSystemSnapshot(ws: ServerWebSocket<SyncWsData>, title: string, heal = false): void {
   const snapshot = runAsUser(ws.data.user.username, () => getSystemSyncSnapshot(title, heal));
   if (snapshot) {
-    const version = recordProjectionSnapshot(ws.data.user.username, `story/${title}`, "system", snapshot);
-    ws.send(JSON.stringify({ type: "system-snapshot", scope: `story/${title}`, document: "system", ...version, cursor: latestOutboxCursor(ws.data.user.username), ...snapshot, at: Date.now() }));
+    const data = { ...snapshot, title };
+    sendProjection(ws, `story/${title}`, "system", data, { type: "system-snapshot", ...data, at: Date.now() }, heal);
   }
 }
 
@@ -147,6 +165,7 @@ function unsubscribeStoryChannels(ws: ServerWebSocket<SyncWsData>): void {
     clearInterval(ws.data.brainTimer);
     ws.data.brainTimer = undefined;
   }
+  for (const key of [...(ws.data.revisions?.keys() ?? [])]) if (key.startsWith("story/")) ws.data.revisions?.delete(key);
 }
 
 /** websocket 配置（dev/prod 的 Bun.serve 共用） */
@@ -324,7 +343,7 @@ export function handleSyncUpgrade(pathname: string, req: Request, server: Server
       headers: { "Content-Type": "application/json; charset=utf-8", "Retry-After": "1" },
     });
   }
-  const ok = server.upgrade(req, { data: { user, channels: new Set<string>(), lastSeen: Date.now() } satisfies SyncWsData });
+  const ok = server.upgrade(req, { data: { user, channels: new Set<string>(), revisions: new Map<string, number>(), lastSeen: Date.now() } satisfies SyncWsData });
   if (!ok) {
     return new Response("WebSocket 升级失败", { status: 400 });
   }

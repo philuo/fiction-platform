@@ -2,10 +2,10 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { getDb } from "../src/api/db";
+import { closeDb } from "../src/api/db";
 import {
   acceptCommand, CommandConflictError, commitWorldCommit, contentHash, createJob, getJob,
-  latestOutboxCursor, listJobs, prepareWorldCommit, recoverPreparedWorldCommits, settleOrphanedJobs, syncRevision, updateJob, userOutboxAfter,
+  latestOutboxCursor, listJobs, prepareWorldCommit, recordProjectionSnapshot, recoverPreparedWorldCommits, settleOrphanedJobs, syncRevision, updateJob, userOutboxAfter,
 } from "../src/api/control-plane";
 
 const root = join(tmpdir(), `control-plane-${crypto.randomUUID()}`);
@@ -16,10 +16,12 @@ beforeAll(() => {
   process.env.APP_DB_PATH = dbPath;
 });
 
-afterAll(() => {
-  try { getDb().close(); } catch { /* 未打开 */ }
+afterAll(async () => {
+  closeDb();
   delete process.env.APP_DB_PATH;
-  rmSync(root, { recursive: true, force: true });
+  Bun.gc(true);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  try { rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }); } catch { /* Windows 可能延迟释放 WAL 句柄 */ }
 });
 
 describe("command receipts", () => {
@@ -62,6 +64,30 @@ describe("durable jobs", () => {
     expect(getJob(plan.id)?.status).toBe("interrupted");
     expect(getJob(video.id)?.status).toBe("waiting_external");
     expect(getJob(auto.id)?.status).toBe("queued");
+  });
+});
+
+describe("projection outbox", () => {
+  test("正文、revision/hash 和 RFC 6902 patch 同事务提交", () => {
+    const first = recordProjectionSnapshot("alice", "story/投影书", "system", { world: { title: "投影书", chapters: [{ text: "大正文" }] }, running: true });
+    expect(first.changed).toBe(true);
+    expect(first.frame?.ops).toEqual([{ op: "replace", path: "", value: { world: { title: "投影书", chapters: [{ text: "大正文" }] }, running: true } }]);
+    const second = recordProjectionSnapshot("alice", "story/投影书", "system", { world: { title: "投影书", chapters: [{ text: "大正文" }] }, running: false });
+    expect(second.revision).toBe(first.revision + 1);
+    expect(second.frame?.baseRevision).toBe(first.revision);
+    expect(second.frame?.ops).toEqual([{ op: "replace", path: "/running", value: false }]);
+    expect(JSON.stringify(second.frame)).not.toContain("大正文");
+    const replay = userOutboxAfter("alice", first.cursor);
+    expect(replay.at(-1)?.frame.type).toBe("patch");
+  });
+
+  test("相同投影不推进 revision 或重复写 outbox", () => {
+    const value = { stories: [{ title: "A" }] };
+    const first = recordProjectionSnapshot("alice", "user", "library-stable", value);
+    const second = recordProjectionSnapshot("alice", "user", "library-stable", value);
+    expect(second.changed).toBe(false);
+    expect(second.revision).toBe(first.revision);
+    expect(second.frameCursor).toBe(first.cursor);
   });
 });
 

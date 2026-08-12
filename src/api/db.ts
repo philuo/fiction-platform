@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS sync_scopes (
   document TEXT NOT NULL,
   revision INTEGER NOT NULL DEFAULT 0,
   content_hash TEXT NOT NULL DEFAULT '',
+  document_json TEXT,
   updated_at TEXT NOT NULL,
   PRIMARY KEY(user_name, scope, document)
 );
@@ -146,6 +147,10 @@ CREATE TABLE IF NOT EXISTS world_commits (
 CREATE INDEX IF NOT EXISTS idx_world_commits_status
   ON world_commits(status, created_at);
 `);
+  const syncColumns = db.query("PRAGMA table_info(sync_scopes)").all() as { name: string }[];
+  if (!syncColumns.some((column) => column.name === "document_json")) {
+    db.exec("ALTER TABLE sync_scopes ADD COLUMN document_json TEXT;");
+  }
   _db = db;
   _dbPath = path;
   return db;

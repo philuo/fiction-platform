@@ -5,7 +5,8 @@
 // - world-changed 版本去重：服务端事件已按 1s 窗口节流合并，version 单调递增；客户端只处理 version 更新的事件
 // - 与 sysPoll 双跑（阶段 1 策略）：事件驱动即时刷新 + 轮询兜底校验；断线时 onStatusChange(false) 通知可启用降级
 import { useCallback, useEffect, useRef, useState } from "react";
-import { acceptServerInstance, setBrainSyncState, setLibrarySyncState, setSystemSyncState, type SystemSyncState } from "./syncStateStore";
+import { acceptServerInstance, applyProjectionPatch, getBrainSyncState, getSystemSyncState, setBrainSyncState, setLibrarySyncState, setSystemSyncState, type SystemSyncState } from "./syncStateStore";
+import type { JsonPatchOperation } from "../shared/json-patch";
 
 /** 事件类型（与 src/api/sync.ts SyncEvent 一致；服务端透传原样 JSON） */
 export type SyncChannelEvent =
@@ -23,6 +24,7 @@ export type SyncChannelEvent =
   | { type: "subscribed"; title: string; version: number }
   | { type: "pong" }
   | { type: "document-changed"; scope: string; document: string; baseRevision: number; revision: number; hash: string; cursor: number }
+  | { type: "patch"; scope: string; document: string; baseRevision: number; revision: number; hash: string; ops: JsonPatchOperation[]; cursor: number }
   | { type: "resync-required"; cursor: number }
   | { type: "error"; error: string };
 
@@ -125,7 +127,7 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
           }
         }, 30_000);
       };
-      ws.onmessage = (ev) => {
+      ws.onmessage = async (ev) => {
         if (wsRef.current !== ws) return;
         let obj: SyncChannelEvent;
         try {
@@ -149,7 +151,12 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
         }
         if (obj.type === "system-snapshot") {
           if (typeof obj.cursor === "number") cursorRef.current = Math.max(cursorRef.current, obj.cursor);
-          if (setSystemSyncState(obj as unknown as SystemSyncState) === "conflict") { requestCurrentSnapshot(); return; }
+          const state: SystemSyncState = {
+            title: obj.title, world: obj.world as SystemSyncState["world"], visual: obj.visual,
+            autoSession: obj.autoSession, autoPending: obj.autoPending, advanceTask: obj.advanceTask,
+            at: obj.at, revision: obj.revision, hash: obj.hash,
+          };
+          if (setSystemSyncState(state) === "conflict") { requestCurrentSnapshot(); return; }
           optsRef.current.onSystemSnapshot?.(obj);
           return;
         }
@@ -190,6 +197,30 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
           optsRef.current.onBrainStatus?.(obj);
           return;
         }
+        if (obj.type === "patch") {
+          if (obj.scope.startsWith("story/") && obj.scope.slice("story/".length) !== optsRef.current.title) {
+            cursorRef.current = Math.max(cursorRef.current, obj.cursor);
+            return;
+          }
+          const result = await applyProjectionPatch(obj);
+          if (wsRef.current !== ws) return;
+          if (result !== "accepted" && result !== "stale") {
+            requestCurrentSnapshot(obj.scope === "user" ? "" : obj.scope.slice("story/".length));
+            return;
+          }
+          cursorRef.current = Math.max(cursorRef.current, obj.cursor);
+          if (result === "accepted" && obj.scope.startsWith("story/")) {
+            const patchedTitle = obj.scope.slice("story/".length);
+            if (obj.document === "system") {
+              const state = getSystemSyncState(patchedTitle);
+              if (state) optsRef.current.onSystemSnapshot?.({ type: "system-snapshot", ...state } as Extract<SyncChannelEvent, { type: "system-snapshot" }>);
+            } else if (obj.document === "brain") {
+              const state = getBrainSyncState(patchedTitle);
+              if (state) optsRef.current.onBrainStatus?.({ type: "brain-status", ...state, full: true } as Extract<SyncChannelEvent, { type: "brain-status" }>);
+            }
+          }
+          return;
+        }
         if (obj.type === "document-changed" || obj.type === "resync-required") {
           cursorRef.current = Math.max(cursorRef.current, obj.cursor);
           requestCurrentSnapshot();
@@ -223,9 +254,9 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
       }, retryMsRef.current);
     };
 
-    const requestCurrentSnapshot = () => {
+    const requestCurrentSnapshot = (snapshotTitle = optsRef.current.title ?? "") => {
       const cur = wsRef.current;
-      if (cur?.readyState === WebSocket.OPEN) cur.send(JSON.stringify({ type: "snapshot", title: optsRef.current.title ?? "" }));
+      if (cur?.readyState === WebSocket.OPEN) cur.send(JSON.stringify({ type: "snapshot", title: snapshotTitle }));
     };
 
     connect();

@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { emptyWorld } from "../src/api/world";
 import { attachSyncPublish, handleSyncUpgrade, syncWebsocket } from "../src/api/sync-server";
 import { clearSyncPending, notifyWorldSaved, resetSyncState } from "../src/api/sync";
+import { applyJsonPatch } from "../src/shared/json-patch";
 
 let srv: ReturnType<typeof Bun.serve> | null = null;
 let worldDataDir = ""; // saveWorld 集成测试落盘目录（临时 cwd/data 替代不可行，用真实 data/ 临时用户名目录 + 清理）
@@ -216,13 +217,16 @@ describe("saveWorld → 事件总线 → WS 广播（真实链路集成）", () 
       markMessageDone("sync-ws-world", sid, "bm1");
       finishSessionTask("sync-ws-world", sid);
     });
+    const pendingDocument = { title: "sync-ws-world", sessions: pending.sessions, tasks: pending.tasks };
     const done = await waitFor((m) => {
-      if (m.type !== "brain-status") return false;
-      const sessions = m.sessions as { id: string; streaming: boolean; messages: { id: string; pending?: boolean }[] }[];
+      if (m.type !== "patch" || m.document !== "brain") return false;
+      const document = applyJsonPatch(pendingDocument, m.ops as Parameters<typeof applyJsonPatch>[1]);
+      const sessions = (document as typeof pendingDocument).sessions as { id: string; streaming: boolean; messages: { id: string; pending?: boolean }[] }[];
       const session = sessions.find((s) => s.id === sid);
       return session?.streaming === false && session.messages.find((x) => x.id === "bm1")?.pending === false;
     }, 5000);
-    expect((done.sessions as { id: string; streaming: boolean }[]).find((s) => s.id === sid)?.streaming).toBe(false);
+    const doneDocument = applyJsonPatch(pendingDocument, done.ops as Parameters<typeof applyJsonPatch>[1]);
+    expect((doneDocument.sessions as { id: string; streaming: boolean }[]).find((s) => s.id === sid)?.streaming).toBe(false);
     ws.close();
   });
 

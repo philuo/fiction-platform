@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
   acceptServerInstance, getBrainSyncState, getLibrarySyncState, getSystemSyncState,
-  resetSyncStores, setBrainSyncState, setLibrarySyncState, setSystemSyncState,
+  applyProjectionPatch, resetSyncStores, setBrainSyncState, setLibrarySyncState, setSystemSyncState,
 } from "../src/components/syncStateStore";
 import { emptyWorld } from "../src/api/world";
+import { createJsonPatch, sha256Json } from "../src/shared/json-patch";
 
 beforeEach(resetSyncStores);
 
@@ -37,5 +38,17 @@ describe("sync projection store", () => {
     setBrainSyncState({ title: "书", sessions: [], tasks: [{ id: "pending", status: "running" }], at: 1, revision: 1 });
     setBrainSyncState({ title: "书", sessions: [], tasks: [], at: 2, revision: 2 });
     expect(getBrainSyncState("书")?.tasks).toEqual([]);
+  });
+
+  test("连续 patch 应用后校验 hash，缺口和篡改均拒绝", async () => {
+    setLibrarySyncState({ stories: [], tasks: [], revision: 1, hash: await sha256Json({ stories: [], tasks: [] }) });
+    const next = { stories: [{ slug: "a", title: "A", genre: "", chapters: 0, updatedAt: "now" }], tasks: [] };
+    expect(await applyProjectionPatch({
+      scope: "user", document: "library", baseRevision: 1, revision: 2,
+      hash: await sha256Json(next), ops: createJsonPatch({ stories: [], tasks: [] }, next),
+    })).toBe("accepted");
+    expect(getLibrarySyncState()?.stories[0]?.title).toBe("A");
+    expect(await applyProjectionPatch({ scope: "user", document: "library", baseRevision: 1, revision: 3, hash: "bad", ops: [] })).toBe("gap");
+    expect(await applyProjectionPatch({ scope: "user", document: "library", baseRevision: 2, revision: 3, hash: "bad", ops: [] })).toBe("conflict");
   });
 });

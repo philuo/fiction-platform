@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import type { WorldState } from "../api/world";
+import { applyJsonPatch, sha256Json, type JsonPatchOperation } from "../shared/json-patch";
 
 export type SystemSyncState = {
   title: string;
@@ -36,6 +37,7 @@ let serverInstanceId: string | null = null;
 const listeners = new Set<() => void>();
 
 export type ProjectionWrite = "accepted" | "stale" | "conflict";
+export type ProjectionPatchWrite = ProjectionWrite | "missing" | "gap" | "invalid";
 
 export function setSystemSyncState(state: SystemSyncState): ProjectionWrite {
   const previous = states.get(state.title);
@@ -84,6 +86,50 @@ export function acceptServerInstance(next: string): void {
 }
 
 export function getLibrarySyncState(): LibrarySyncState | null { return libraryState; }
+
+export async function applyProjectionPatch(frame: {
+  scope: string; document: string; baseRevision: number; revision: number; hash: string; ops: JsonPatchOperation[];
+}): Promise<ProjectionPatchWrite> {
+  let current: Record<string, unknown> | null = null;
+  if (frame.scope === "user" && frame.document === "library" && libraryState) {
+    const { revision: _revision, hash: _hash, ...data } = libraryState;
+    current = data;
+  } else if (frame.scope.startsWith("story/") && frame.document === "system") {
+    const state = states.get(frame.scope.slice("story/".length));
+    if (state) {
+      const { revision: _revision, hash: _hash, at: _at, ...data } = state;
+      current = data as unknown as Record<string, unknown>;
+    }
+  } else if (frame.scope.startsWith("story/") && frame.document === "brain") {
+    const state = brainStates.get(frame.scope.slice("story/".length));
+    if (state) current = { title: state.title, sessions: state.sessions, tasks: state.tasks };
+  }
+  if (!current) return "missing";
+  const currentRevision = frame.document === "library" ? libraryState?.revision
+    : frame.document === "system" ? states.get(frame.scope.slice("story/".length))?.revision
+      : brainStates.get(frame.scope.slice("story/".length))?.revision;
+  if (currentRevision == null) return "missing";
+  if (frame.revision <= currentRevision) return "stale";
+  if (frame.baseRevision !== currentRevision) return "gap";
+  try {
+    const next = applyJsonPatch(current, frame.ops);
+    if (await sha256Json(next) !== frame.hash) return "conflict";
+    if (frame.scope === "user" && frame.document === "library") {
+      return setLibrarySyncState({ ...(next as unknown as Omit<LibrarySyncState, "revision" | "hash">), revision: frame.revision, hash: frame.hash });
+    }
+    const title = frame.scope.slice("story/".length);
+    if (frame.document === "system") {
+      return setSystemSyncState({ ...(next as unknown as SystemSyncState), title, at: Date.now(), revision: frame.revision, hash: frame.hash });
+    }
+    if (frame.document === "brain") {
+      const data = next as { sessions: Record<string, unknown>[]; tasks: Record<string, unknown>[] };
+      return setBrainSyncState({ title, sessions: data.sessions, tasks: data.tasks, at: Date.now(), revision: frame.revision, hash: frame.hash });
+    }
+    return "invalid";
+  } catch {
+    return "invalid";
+  }
+}
 
 /** 测试与登出隔离：清空全部权威投影和服务纪元。 */
 export function resetSyncStores(): void {
