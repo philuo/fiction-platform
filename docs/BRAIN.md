@@ -59,6 +59,28 @@ received -> queued -> running -> waiting_external -> succeeded
 - 刷新后以 sync 快照恢复权威状态；只有服务端仍显示活动任务时才允许继续附着文本流。
 - 服务重启后无法安全续跑的模型调用标 interrupted，不自动重复消耗额度。
 
+### 3.1 卡片执行状态机与人工操作收敛
+
+所有可执行卡在服务端进入会话前获得稳定 `cardId` 和初始 `executionState`。状态机为：
+
+```text
+idle -> submitting -> running -> succeeded|failed|interrupted|cancelled
+  |          |
+  +----------+-> waiting_confirmation -> submitting
+```
+
+- 同步命令在原卡更新状态、详情和时间，不追加成功/失败 result 卡；独立系统通知才允许新增消息。
+- 终态更新幂等，终态卡拒绝晚到的 `running/submitting` 帧，防止乱序或重复 sync 重新激活指令。
+- L2 干预表单原地转换成确认卡，沿用原 `cardId/commandId`；确认、放弃和失败继续更新同一卡片。
+- 章节删除/回滚/重写/续写/账本重算、角色及关系变更、媒体删除会先取消匹配 job，再将关联未决卡收敛为 `interrupted/cancelled`，并发布 `card-replaced` 与完整 brain 投影。匹配基于章节、角色和媒体锚点，不中断无关会话任务。
+- 完整 brain 快照覆盖本地消息、卡片和会话集合；没有服务端持久活动态支撑的本地 loading 必须消失。
+
+### 3.2 面板意图与关系查询
+
+自动打开弹窗使用持久 `panelIntent { intentId,target,opts,consumedAt,consumedBy }`。客户端只处理最新未消费意图，并在服务端原子消费成功后才打开；其它 Tab、刷新、切会话和服务重启看到 `consumedAt` 后不得重放。旧 `open` 卡和旧“新角色提案”标题卡在服务端快照阶段迁移，前端不保留依赖挂载次数的标题兜底。
+
+关系查询输出规范化 `RelationshipSubgraph`，边以角色 id 表达；兼容旧 `label -> name` 与当前 `name -> label` 格式，双向关系去重。指定角色时只保留焦点及一跳邻居；中枢卡和关系弹窗只读模式复用 `RelationshipGraphCanvas`，编辑模式仍由关系弹窗持有写能力。
+
 ## 4. 内存对象与遗留存储审计
 
 | 对象 | 当前用途 | 风险/结论 |
@@ -66,6 +88,7 @@ received -> queued -> running -> waiting_external -> succeeded
 | `titleLocks` | 单进程书级串行化 | 可留作执行优化；跨进程冲突必须靠 revision/job 约束 |
 | sync socket/listener/throttle timer、`videoWatchers` timer | 连接、合并通知、provider 查询句柄 | 可留内存；重启由持久 provider id/job 重建或收敛 |
 | brain task emitter/AbortController、前端 abort/cache/展开集合 | 流式执行和 UI 缓存 | 可留内存；会话检查点/job 才能决定用户可见终态 |
+| `panelConsumingRef`、Canvas 布局/缩放/拖拽状态 | 一次请求防抖和纯 UI 状态 | 可留内存；权威消费时间及关系数据均已持久化 |
 | `activeAuto`、autorun stop/pause flags | 连载执行镜像及控制意图 | 仍有遗留风险；会话 JSON/部分 job 已持久，但应彻底迁入 job 与持久取消意图 |
 | `planTasks`、`imageGenTasks` | 分镜/生图执行句柄和部分结果 | 已有 job/世界 pending 投影，但 Map 仍混合业务结果；需缩减为 jobId→句柄 |
 | `visualTasks`、`visualInFlight`、`coverInFlight` | 视觉终态缓存与并发控制 | 部分接入 job，仍应移除终态缓存并用数据库唯一约束 |

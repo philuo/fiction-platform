@@ -103,6 +103,17 @@
 
 RFC 6902 `patch` 已用于 library/system/brain；world 文件提交仍发送 `document-changed`，两者语义不可混用。M04 是服务端 provider watcher 的内部指令，不存在公开媒体状态查询 API。
 
+### 3.3 中枢卡片命令契约
+
+| 入口/事件 | 输入与幂等 | 持久化与投影 | 失败语义 |
+|---|---|---|---|
+| `POST /api/brain/sessions/update-card` | session/message/cardId + patch；同终态重放幂等 | 原卡写入会话 JSON并发布 `card-update` | 非法终态回滚返回 409；不得追加替代结果卡 |
+| `POST /api/brain/sessions/replace-card` | messageId + cardIndex；替换后沿用稳定 cardId | 原位替换并发布 brain 变更 | 用于 form -> confirm、媒体阶段迁移；不存在返回 replaced=false |
+| `POST /api/brain/sessions/consume-panel` | intentId + cardId；一次性 compare-and-set | 写 `consumedAt/consumedBy` 并立即发布 `card-update` | 已消费返回 consumed=false；客户端不得再次打开 |
+| 人工领域写操作收敛 | commandId + 章节/角色/媒体影响范围 | 取消匹配 SQLite job，相关卡改 interrupted/cancelled，发布 `card-replaced` + brain snapshot | 持久化失败不得显示成功；无关卡不得误取消 |
+
+所有 `preview/form/confirm/plan/opinion/browse/progress` 卡在服务端发送前获得稳定 `cardId`；执行态统一为 `idle/submitting/running/waiting_confirmation/succeeded/failed/interrupted/cancelled`。SSE 只能提前展示同一张卡，不得创建无 ID 的第二份卡片。
+
 ### 3.2 已删除的状态读取接口
 
 下列路径固定返回 404，且客户端不得引用：
@@ -137,6 +148,8 @@ RFC 6902 `patch` 已用于 library/system/brain；world 文件提交仍发送 `d
 4. 已接入命令账本的入口中，同一 commandId 不会重复产生外部调用或世界写入；旧入口仍需统一迁移。
 5. 服务启动恢复完成前不监听业务请求、不发送业务快照。
 6. sync 是状态唯一来源；HTTP/SSE 不能直接覆盖客户端权威 store。
+7. 自动弹窗只能由未消费的持久 panelIntent 触发；组件重新挂载不是新意图。
+8. 卡片终态不得被重复/乱序帧回滚；人工世界变更后，基于旧世界的关联 pending/running 卡必须立即收敛。
 
 ## 6. 当前实现边界
 
