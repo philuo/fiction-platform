@@ -484,6 +484,47 @@ describe("update-card 路由（卡片就地更新，阶段 3a）", () => {
     expect(miss.status).toBe(200);
     expect(((await miss.json()) as { updated: boolean }).updated).toBe(false);
   });
+
+  test("终态卡幂等，拒绝晚到 running 帧回滚", async () => {
+    cookieA = await register("e2e_uc_state_" + Math.random().toString(36).slice(2, 8));
+    const sid = "e2e-uc-state-" + Math.random().toString(36).slice(2, 8);
+    await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "执行" }, cookieA);
+    await api("/api/brain/sessions/append", "POST", {
+      title: "e2e-book", sessionId: sid,
+      message: { id: "state-msg", role: "assistant", text: "", at: Date.now(), cards: [{ kind: "preview", cardId: "state-card", executionState: "running", title: "执行", summary: "" }] },
+    }, cookieA);
+    const done = await api("/api/brain/sessions/update-card", "POST", { title: "e2e-book", sessionId: sid, messageId: "state-msg", cardId: "state-card", patch: { executionState: "succeeded" } }, cookieA);
+    expect(done.status).toBe(200);
+    const duplicate = await api("/api/brain/sessions/update-card", "POST", { title: "e2e-book", sessionId: sid, messageId: "state-msg", cardId: "state-card", patch: { executionState: "succeeded" } }, cookieA);
+    expect(duplicate.status).toBe(200);
+    const stale = await api("/api/brain/sessions/update-card", "POST", { title: "e2e-book", sessionId: sid, messageId: "state-msg", cardId: "state-card", patch: { executionState: "running" } }, cookieA);
+    expect(stale.status).toBe(409);
+  });
+});
+
+describe("panelIntent 持久一次性消费", () => {
+  test("旧 open_proposals 卡迁移后只消费一次，刷新详情保持 consumedAt", async () => {
+    cookieA = await register("e2e_panel_" + Math.random().toString(36).slice(2, 8));
+    const sid = "e2e-panel-" + Math.random().toString(36).slice(2, 8);
+    await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "打开提案" }, cookieA);
+    await api("/api/brain/sessions/append", "POST", {
+      title: "e2e-book", sessionId: sid,
+      message: { id: "panel-msg", role: "assistant", text: "", at: Date.now(), cards: [{ kind: "result", title: "新角色提案", success: true, detail: "已为你打开底部新角色提案面板" }] },
+    }, cookieA);
+    const detail = await api("/api/brain/sessions/detail", "POST", { title: "e2e-book", id: sid }, cookieA);
+    const data = await detail.json() as { session: { messages: { id: string; cards?: { cardId?: string; panelIntent?: { intentId: string } }[] }[] } };
+    const card = data.session.messages.find((message) => message.id === "panel-msg")!.cards![0];
+    expect(card.cardId).toBeTruthy();
+    expect(card.panelIntent?.intentId).toBeTruthy();
+    const body = { title: "e2e-book", sessionId: sid, messageId: "panel-msg", cardId: card.cardId, intentId: card.panelIntent!.intentId };
+    const first = await api("/api/brain/sessions/consume-panel", "POST", body, cookieA);
+    expect(await first.json()).toMatchObject({ consumed: true });
+    const second = await api("/api/brain/sessions/consume-panel", "POST", body, cookieA);
+    expect(await second.json()).toMatchObject({ consumed: false });
+    const refreshed = await api("/api/brain/sessions/detail", "POST", { title: "e2e-book", id: sid }, cookieA);
+    const refreshedData = await refreshed.json() as { session: { messages: { id: string; cards?: { panelIntent?: { consumedAt?: number } }[] }[] } };
+    expect(refreshedData.session.messages.find((message) => message.id === "panel-msg")!.cards![0].panelIntent?.consumedAt).toBeNumber();
+  });
 });
 
 describe("progress 路由（任务进度卡，阶段 3b）", () => {

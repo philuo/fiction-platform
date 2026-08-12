@@ -217,7 +217,7 @@ describe("中枢话题恢复（findProposalCardMessageId）", () => {
     ] as unknown as { id: string; cards?: BrainCard[] }[];
     expect(findProposalCardMessageId(msgs as never)).toBeUndefined();
   });
-  test("「打开新角色提案」的已打开 result 卡同样被识别（open_proposals 意图 → 恢复底部提案区）", () => {
+  test("旧的打开结果卡不再走本地标题兜底（由服务端迁移为可持久消费 panelIntent）", () => {
     const resultCard: BrainCard = {
       kind: "result", title: "新角色提案", success: true, detail: "已为你打开底部新角色提案面板",
     };
@@ -225,6 +225,6 @@ describe("中枢话题恢复（findProposalCardMessageId）", () => {
       { id: "m1", role: "user", text: "打开新角色提案", at: "" },
       { id: "m2", role: "brain", cards: [resultCard], at: "" },
     ] as unknown as { id: string; cards?: BrainCard[] }[];
-    expect(findProposalCardMessageId(msgs as never)).toBe("m2");
+    expect(findProposalCardMessageId(msgs as never)).toBeUndefined();
   });
 });

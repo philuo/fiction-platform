@@ -37,6 +37,11 @@ function normalizeCard(card: BrainChatCard): BrainChatCard {
       opts: legacyOpen.opts,
     };
   }
+  if (!next.panelIntent && kind === "result" && next.success === true && next.title === "新角色提案"
+    && String(next.detail ?? "").includes("打开")) {
+    next.panelIntent = { intentId: `panel-${uuid()}`, target: "proposals" };
+  }
+  if (next.panelIntent && !next.cardId) next.cardId = `card-${uuid()}`;
   return { ...next };
 }
 
@@ -128,7 +133,8 @@ export function listSyncSessionSnapshots(title: string): BrainSession[] {
 
 export function sessionHasAsyncState(s: BrainSession): boolean {
   return s.streaming || s.messages.some((m) =>
-    m.pending || (m.cards ?? []).some((c) => c?.status === "running" || c?.status === "pending"),
+    m.pending || (m.cards ?? []).some((c) => c?.status === "running" || c?.status === "pending"
+      || c?.executionState === "submitting" || c?.executionState === "running"),
   );
 }
 

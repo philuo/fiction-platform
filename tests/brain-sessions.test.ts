@@ -30,6 +30,7 @@ import {
   updateMessageText,
   createProgressMessage,
   isCardExecutionTransition,
+  settleCardsAfterMutation,
 } from "../src/api/brain-sessions";
 
 const TITLE = "brain-sessions-test";
@@ -44,6 +45,22 @@ test("卡片执行状态机：允许正常推进，终态幂等且拒绝乱序�
   expect(isCardExecutionTransition("succeeded", "running")).toBe(false);
   expect(isCardExecutionTransition("failed", "submitting")).toBe(false);
   expect(isCardExecutionTransition("idle", "bogus")).toBe(false);
+});
+
+test("人工章节变更收敛关联卡片，不影响无关卡片", () => {
+  const session = createSession(TITLE, "mutation-settle", "处理章节");
+  appendMessage(TITLE, session.id, {
+    id: "mutation-msg", role: "assistant", text: "", at: Date.now(), cards: [
+      { kind: "preview", cardId: "chapter-3", executionState: "running", title: "重写第三章", action: { body: { chapterIndex: 3 } } },
+      { kind: "preview", cardId: "chapter-4", executionState: "running", title: "重写第四章", action: { body: { chapterIndex: 4 } } },
+    ],
+  });
+  const settled = settleCardsAfterMutation(TITLE, { reason: "第三章已人工删除", commandId: "CMD-N08", chapterIndexes: [3] });
+  expect(settled).toHaveLength(1);
+  expect(settled[0].card.cardId).toBe("chapter-3");
+  expect(settled[0].card.executionState).toBe("interrupted");
+  const cards = getSession(TITLE, session.id)!.messages[0].cards!;
+  expect(cards[1].executionState).toBe("running");
 });
 let sessionIds: string[] = [];
 

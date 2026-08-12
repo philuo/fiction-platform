@@ -191,8 +191,7 @@ export function guardAction(
 export function findProposalCardMessageId(messages: ChatMessage[]): string | undefined {
   return messages.find((m) =>
     (m.cards ?? []).some((c) =>
-      (c.kind === "browse" && c.browseType === "proposal") || // 提案浏览卡（read_proposals 查询）
-      (c.kind === "result" && c.title === "新角色提案"), // 「打开新角色提案」已打开 result 卡（open_proposals 意图，兼容旧协议）
+      c.kind === "browse" && c.browseType === "proposal", // 提案浏览卡（read_proposals 查询）
     ),
   )?.id;
 }
@@ -580,7 +579,7 @@ export const BrainCabin: React.FC<{
       }).finally(() => panelConsumingRef.current.delete(open.panelIntent.intentId));
       return;
     }
-    // 兼容旧协议：open_proposals 老卡（无 open 字段，仅 title 约定）
+    // 提案浏览卡属于会话内容提示，不是弹窗命令；仅恢复底部提案区。
     if (!open && onProposalTalk) {
       const id = findProposalCardMessageId(messages);
       if (id && !panelConsumingRef.current.has(id)) {
