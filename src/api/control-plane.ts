@@ -177,7 +177,7 @@ export function settleOrphanedJobs(): number {
   let interrupted = 0;
   for (const row of rows) {
     const recovery = parseJson<Record<string, unknown>>(row.recovery_json);
-    const resumableVideo = row.kind === "video" && typeof recovery?.videoId === "string" && Boolean(recovery.videoId);
+    const resumableVideo = (row.kind === "video" || row.kind === "media-regenerate") && typeof recovery?.videoId === "string" && Boolean(recovery.videoId);
     const resumableAuto = row.kind === "auto";
     if (resumableVideo || resumableAuto) {
       updateJob(row.id, {

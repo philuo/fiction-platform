@@ -51,6 +51,7 @@ import type { CardType } from "./cards";
 import { renameSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { runtimeReadiness } from "./runtime-readiness";
+import { createJob, listJobs, updateJob } from "./control-plane";
 
 function json(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(data), {
@@ -175,17 +176,19 @@ export function listPendingMediaTasks(username: string, title: string): SyncEven
   const now = Date.now();
   const out: SyncEvent[] = [];
   const seen = new Set<string>();
-  for (const [pid, t] of planTasks) {
-    if (t.user === username && t.title === title && t.status === "pending") {
-      out.push({ type: "task-status", title, kind: "media", sub: "plan", id: pid, status: "pending", at: now, user: username });
-      seen.add(`plan::${pid}`);
-    }
-  }
   const pushMedia = (mediaId: string) => {
     if (seen.has(`media::${mediaId}`)) return;
     seen.add(`media::${mediaId}`);
     out.push({ type: "task-status", title, kind: "media", id: mediaId, status: "pending", at: now, user: username });
   };
+  for (const job of listJobs(username, title, true)) {
+    if (job.kind === "media-plan") {
+      out.push({ type: "task-status", title, kind: "media", sub: "plan", id: job.id, status: job.status, at: now, user: username });
+      seen.add(`plan::${job.id}`);
+    } else if (job.kind === "image" || job.kind === "video") {
+      pushMedia(String((job.recovery as { mediaId?: string } | undefined)?.mediaId ?? job.id));
+    }
+  }
   for (const [key, g] of imageGenTasks) {
     if (g.title !== title || !key.startsWith(username + "::")) continue;
     pushMedia(g.mediaId || key.slice(username.length + 2));
@@ -216,9 +219,15 @@ export function listMediaTaskStates(username: string, title: string): {
   scenes?: { anchor: string; scene: string; caption?: string }[];
 }[] {
   const out: { id: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[] }[] = [];
-  for (const [id, t] of planTasks) {
-    if (t.user !== username || t.title !== title) continue;
-    out.push({ id, status: t.status, sub: "plan", error: t.error, scenes: t.scenes });
+  for (const job of listJobs(username, title)) {
+    if (job.kind !== "media-plan") continue;
+    out.push({
+      id: job.id,
+      status: job.status === "succeeded" ? "ready" : job.status,
+      sub: "plan",
+      error: job.error,
+      scenes: (job.result as { scenes?: ScenePlan[] } | undefined)?.scenes,
+    });
   }
   const w = loadWorld(title);
   for (const ch of w?.chapters ?? []) {
@@ -265,6 +274,7 @@ function failPlanTask(id: string, error: string, opts: { abort?: boolean } = {})
   const wasPending = t.status === "pending";
   t.status = "failed";
   t.error = error;
+  updateJob(id, { status: "failed", phase: "failed", error });
   if (opts.abort && !t.controller.signal.aborted) t.controller.abort();
   if (!wasPending) return; // 终态不重复落盘/广播
   const sess = t.session;
@@ -279,6 +289,7 @@ function failPlanTask(id: string, error: string, opts: { abort?: boolean } = {})
     if (ok) publishCardReplaced(t.title, sess.sessionId, sess.messageId, sess.cardIndex, failCard, t.user || undefined);
   }
   publishSync({ type: "task-status", title: t.title, kind: "media", sub: "plan", id, status: "failed", error, at: Date.now(), user: t.user || undefined });
+  planTasks.delete(id);
 }
 
 /** 超 PLAN_TASK_MAX 时只淘汰最旧的终态任务；无终态可淘汰则保留 pending（宁可超上限也不丢在途任务）并告警 */
@@ -452,6 +463,13 @@ export function watchVideoTask(title: string, idx: number, id: string, session?:
     if (session && !existing.session) existing.session = session;
     return;
   }
+  const worldMedia = loadWorld(title)?.chapters.find((c) => c.index === idx)?.media?.find((m) => m.id === id);
+  const durable = createJob({
+    id, user: currentUser(), title, kind: "video", dedupeKey: `video:${id}`,
+    status: "waiting_external", phase: "provider-poll",
+    recovery: { mediaId: id, chapterIndex: idx, videoId: worldMedia?.videoId, session },
+    deadlineAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+  });
   const entry = { title, idx, id, session } as { title: string; idx: number; id: string; session?: VideoWatchSession; timer?: ReturnType<typeof setTimeout> };
   videoWatchers.set(key, entry);
   const tick = async () => {
@@ -460,6 +478,7 @@ export function watchVideoTask(title: string, idx: number, id: string, session?:
       const res = await getMediaStatus(title, idx, id);
       if (res.ok && (res.status === "ready" || res.status === "failed")) {
         videoWatchers.delete(key); // 终态：停止轮询（getMediaStatus 已落盘章节媒体 + 广播 task-status）
+        updateJob(durable.job.id, { status: res.status === "ready" ? "succeeded" : "failed", phase: res.status, error: res.status === "failed" ? res.error : null });
         // 服务端权威翻 brain 卡为终态（card-replaced），不依赖前端回写
         const sess = entry.session;
         if (sess) {
@@ -682,13 +701,16 @@ export function getSystemSyncSnapshot(title: string, heal = false): Omit<Extract
     for (const c of needy) ensureCharacterVisuals(w.title, w, c);
     if (!w.cover && (!w.coverTriedAt || Date.now() - w.coverTriedAt > VISUAL_RETRY_COOLDOWN)) ensureCover(w.title, w);
   }
-  const entries = [...(visualTasks.get(`${currentUser() ?? ""}::${slug(title)}`)?.entries() ?? [])];
-  const pending = entries.filter(([, v]) => v.status === "running")
-    .map(([id]) => w.characters.find((c) => c.id === id))
+  const visualJobs = listJobs(currentUser(), title).filter((j) => j.kind === "visual");
+  const pending = visualJobs.filter((j) => j.status === "queued" || j.status === "running")
+    .map((j) => w.characters.find((c) => c.id === (j.recovery as { characterId?: string } | undefined)?.characterId))
     .filter((c): c is WorldCharacter => !!c && !(c.portrait?.path && c.image))
     .map((c) => ({ id: c.id, name: c.name }));
-  const failed = entries.filter(([, v]) => v.status === "failed")
-    .map(([id, v]) => ({ id, name: w.characters.find((c) => c.id === id)?.name ?? id, reason: v.reason }));
+  const failed = visualJobs.filter((j) => j.status === "failed").slice(0, 20)
+    .map((j) => {
+      const id = String((j.recovery as { characterId?: string } | undefined)?.characterId ?? j.id);
+      return { id, name: w.characters.find((c) => c.id === id)?.name ?? id, reason: j.error };
+    });
   return {
     title,
     world: sanitize(w) as unknown as Record<string, unknown>,
@@ -719,7 +741,11 @@ function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter
   if (c.portrait?.path && c.image) return; // 视觉已完整，跳过
   const uk = currentUser() ?? "";
   const key = `${uk}::${slug(title)}::${c.id}`;
-  if (visualInFlight.has(key)) return; // 已在生成中
+  const durable = createJob({
+    user: uk, title, kind: "visual", dedupeKey: `visual:${slug(title)}:${c.id}`,
+    status: "running", phase: "generating", recovery: { characterId: c.id },
+  });
+  if (!durable.created || visualInFlight.has(key)) return;
   visualInFlight.add(key);
   const tKey = `${uk}::${slug(title)}`;
   const tasks = visualTasks.get(tKey) ?? new Map<string, VisualTaskResult>();
@@ -828,10 +854,15 @@ function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter
       } catch { /* 日志尽力而为 */ }
     } finally {
       visualInFlight.delete(key);
+      updateJob(durable.job.id, {
+        status: failures.length ? "failed" : "succeeded",
+        phase: failures.length ? "failed" : "ready",
+        error: failures.join("；") || null,
+      });
       const tasks = visualTasks.get(tKey);
       if (tasks) {
-        // 保留最近终态，供新连接的 system-snapshot 恢复失败原因。
-        tasks.set(c.id, { status: failures.length ? "failed" : "done", reason: failures.join("；") });
+        tasks.delete(c.id);
+        if (tasks.size === 0) visualTasks.delete(tKey);
         publishSync({ type: "task-status", title, kind: "visual", id: c.id, status: failures.length ? "failed" : "done", error: failures.join("；") || undefined, at: Date.now(), user: uk || undefined });
       }
     }
@@ -845,7 +876,8 @@ function ensureCover(title: string, w: WorldState): void {
   if (w.cover) return; // 已有封面跳过
   const uk = currentUser() ?? "";
   const tKey = `${uk}::${slug(title)}`;
-  if (coverInFlight.has(tKey)) return; // 已在生成中
+  const durable = createJob({ user: uk, title, kind: "cover", dedupeKey: `cover:${slug(title)}`, status: "running", phase: "generating" });
+  if (!durable.created || coverInFlight.has(tKey)) return;
   coverInFlight.add(tKey);
   const deleted = () => deletedStories.has(tKey);
   void (async () => {
@@ -888,6 +920,8 @@ function ensureCover(title: string, w: WorldState): void {
       } catch { /* 日志尽力而为 */ }
     } finally {
       coverInFlight.delete(tKey);
+      const done = loadWorld(title)?.cover;
+      updateJob(durable.job.id, { status: done ? "succeeded" : "failed", phase: done ? "ready" : "failed", error: done ? null : "封面生成未产生持久产物" });
     }
   })();
 }
@@ -2219,8 +2253,6 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       if (!title) return json({ error: "缺少 title" }, 400);
       const lockKey = slug(title);
       const autoKey = `${currentUser() ?? ""}::${slug(title)}`;
-      // 运行中守卫：同一用户同一书名同时只允许一个连载循环（防双跑重复写章/停止信号串扰）
-      if (activeAuto.has(autoKey)) return json({ error: "该书自动连载已在运行中，请先停止" }, 409);
       // 会话恢复：暂停态（审查未过）继续 → 复用原目标与已写章数；running 说明后台恢复中，拒绝双跑
       const session = loadAutoSession(title);
       if (session?.status === "running") return json({ error: "该书自动连载已在后台运行中，请先停止" }, 409);
@@ -2231,6 +2263,11 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const autoGacha = typeof body.autoGacha === "boolean" ? body.autoGacha : undefined;
       const rawEvalEvery = Number(body.runEvalEvery);
       const runEvalEvery = Number.isInteger(rawEvalEvery) && rawEvalEvery >= 0 ? Math.min(rawEvalEvery, 50) : undefined;
+      const durableAuto = createJob({
+        user: currentUser(), title, kind: "auto", dedupeKey: `auto:${slug(title)}`,
+        status: "running", phase: "starting", recovery: { target: maxChapters, written: initialWritten },
+      });
+      if (!durableAuto.created) return json({ error: "该书自动连载已在运行中，请先停止" }, 409);
       activeAuto.add(autoKey);
       // 原 autoGacha 值：运行结束后还原（修：临时覆盖不得持久化污染后续手动写作）
       const savedAutoGacha = (() => { const w = loadWorld(title); return w?.gen?.autoGacha; })();
@@ -2266,7 +2303,11 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             (e) => send(e),
             initialWritten,
           );
+          updateJob(durableAuto.job.id, { status: "succeeded", phase: "done", result: report });
           send({ phase: "auto-done", report });
+        } catch (error) {
+          updateJob(durableAuto.job.id, { status: "failed", phase: "failed", error: errorDetail(error, "自动连载失败") });
+          throw error;
         } finally {
           // 还原 autoGacha 临时覆盖（锁内短事务，保证持久化一致）
           if (autoGacha !== undefined) {
@@ -2288,6 +2329,9 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const title = String(body.title ?? "").trim();
       if (!title) return json({ error: "缺少 title" }, 400);
       stopAuto(title);
+      for (const job of listJobs(currentUser(), title, true).filter((j) => j.kind === "auto")) {
+        updateJob(job.id, { status: "cancelled", phase: "stopping", error: "用户请求停止" });
+      }
       return json({ ok: true });
     }
 
@@ -2296,6 +2340,9 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const title = String(body.title ?? "").trim();
       if (!title) return json({ error: "缺少 title" }, 400);
       pauseAuto(title);
+      for (const job of listJobs(currentUser(), title, true).filter((j) => j.kind === "auto")) {
+        updateJob(job.id, { status: "paused", phase: "paused" });
+      }
       return json({ ok: true });
     }
 
@@ -2588,6 +2635,12 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const cardId = `media-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
       const session = sessionBase ? { ...sessionBase, cardId } : undefined;
       const task: PlanTask = { user, title, chapterIndex: idx, kind: kind as "image" | "video", count, status: "pending", at: Date.now(), controller, session };
+      createJob({
+        id, user, title, kind: "media-plan", dedupeKey: `media-plan:${idx}:${kind}`,
+        status: "running", phase: "planning",
+        recovery: { chapterIndex: idx, mediaKind: kind, count, session },
+        deadlineAt: new Date(Date.now() + PLAN_TASK_TIMEOUT).toISOString(),
+      });
       // 真超时：180s 到点 abort 后台 LLM 并翻 failed（旧版是懒超时，不 abort，晚到结果还会覆盖回 ready）
       task.timer = setTimeout(() => failPlanTask(id, "分镜任务超时（AI 服务响应过慢），请重试", { abort: true }), PLAN_TASK_TIMEOUT);
       planTasks.set(id, task);
@@ -2618,6 +2671,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           if (t.timer) { clearTimeout(t.timer); t.timer = undefined; }
           t.status = "ready";
           t.scenes = scenes;
+          updateJob(id, { status: "succeeded", phase: "ready", result: { scenes } });
           // ① 服务端权威落盘：带会话上下文时直接把会话卡翻成「分镜完成」确认卡——
           //    刷新/重开面板读落盘卡即最新，不依赖前端消费事件（关闭面板期间 WS 事件会丢失）
           if (sess) {
@@ -2646,6 +2700,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           }
           // ② WS 广播（面板打开时实时就地翻卡，免轮询）
           publishSync({ type: "task-status", title, kind: "media", sub: "plan", id, status: "ready", scenes, at: Date.now(), user: user || undefined });
+          planTasks.delete(id);
         } catch (e) {
           if (e instanceof DOMException && e.name === "AbortError") {
             // 超时/取消触发的 abort：failPlanTask 已负责翻状态（若尚未翻则这里补一次）
@@ -2815,6 +2870,10 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             // 每张图独立 controller：删除会话/卡片消失时可单独 abort 底层 fetch
             const controller = new AbortController();
             imageGenTasks.set(mediaKey(item.id), { title, chapterIndex: idx, at: Date.now(), kind: "image", mediaId: item.id, controller, session: genSession });
+            const imageJob = createJob({
+              user: currentUser(), title, kind: "image", dedupeKey: `image:${item.id}`,
+              status: "running", phase: "generating", recovery: { mediaId: item.id, chapterIndex: idx, session: genSession },
+            });
             let mediaOk = false;
             let mediaErr = "";
             try {
@@ -2885,6 +2944,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
               });
             } finally {
               imageGenTasks.delete(mediaKey(item.id));
+              updateJob(imageJob.job.id, { status: mediaOk ? "succeeded" : "failed", phase: mediaOk ? "ready" : "failed", error: mediaOk ? null : mediaErr });
               // D 级广播点：媒体任务完成翻转（成功 ready / 失败 failed）→ 事件总线
               publishSync({
                 type: "task-status",
@@ -2962,6 +3022,11 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       if (!title || !mediaId) return json({ error: "缺少参数" }, 400);
       if (!Number.isInteger(idx) || idx < 1) return json({ error: "缺少有效的章节号" }, 400);
       if (regenBusy.has(mediaKey(mediaId))) return json({ error: "该媒体正在重生成中，请稍候" }, 409);
+      const regenJob = createJob({
+        user: currentUser(), title, kind: "media-regenerate", dedupeKey: `media-regenerate:${mediaId}`,
+        status: "running", phase: "generating", recovery: { mediaId, chapterIndex: idx },
+      });
+      if (!regenJob.created) return json({ error: "该媒体正在重生成中，请稍候" }, 409);
       try {
         // ① 锁内短事务：校验存在 + 记录快照（oldPath/oldPrompt）
         const snap = await withTitleLock(slug(title), async () => {
@@ -3028,7 +3093,12 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           } else {
             // 视频重生成：保留旧 mp4（m.path 不清空）继续播放，等新视频在 /media/status 落盘后再替换；
             // 旧 videoId/path 登记到 videoRegen，失败/超时据此回滚为 ready（旧文件 swap 期不删）
-            videoRegen.set(vKey, { oldVideoId: m.videoId, oldPath: m.path });
+            const rollback = { oldVideoId: m.videoId, oldPath: m.path };
+            videoRegen.set(vKey, rollback);
+            updateJob(regenJob.job.id, {
+              status: "waiting_external", phase: "provider-poll",
+              recovery: { mediaId, chapterIndex: idx, videoId: newMedia.videoId, rollback },
+            });
             m.videoId = newMedia.videoId;
             m.status = "pending";
             m.createdAt = newMedia.createdAt; // 重置创建时间，超时回收从新任务起算
@@ -3050,9 +3120,11 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         // 视频旧 mp4 不在此删——延迟到 /media/status 新视频落盘成功后删除（失败则回滚继续用旧文件）
         if (snap.kind === "image" && snap.oldPath) deleteMediaFile(title, snap.oldPath);
         if (snap.kind === "video") watchVideoTask(title, idx, mediaId);
+        if (snap.kind === "image") updateJob(regenJob.job.id, { status: "succeeded", phase: "ready" });
         return json({ ok: true, mediaId, status: snap.kind === "image" ? "ready" : "pending", videoId: newMedia.videoId });
       } catch (e) {
         regenBusy.delete(mediaKey(mediaId));
+        updateJob(regenJob.job.id, { status: "failed", phase: "failed", error: errorDetail(e, "重生成失败") });
         console.error("[api/novel/media/regenerate]", e);
         const st = (e as { status?: number }).status;
         return json({ error: e instanceof AppError ? e.message : "重生成失败，请稍后重试" }, st === 429 ? 429 : 502);

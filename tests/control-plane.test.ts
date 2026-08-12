@@ -53,6 +53,16 @@ describe("durable jobs", () => {
     expect(getJob(image.id)?.status).toBe("interrupted");
     expect(getJob(video.id)?.status).toBe("waiting_external");
   });
+
+  test("Provider 视频与自动连载保留恢复点，其它业务任务收敛 interrupted", () => {
+    const plan = createJob({ user: "recovery-user", title: "书", kind: "media-plan", dedupeKey: "plan:x", status: "running" }).job;
+    const video = createJob({ user: "recovery-user", title: "书", kind: "video", dedupeKey: "video:x", status: "waiting_external", recovery: { videoId: "provider-1" } }).job;
+    const auto = createJob({ user: "recovery-user", title: "书", kind: "auto", dedupeKey: "auto:x", status: "running", recovery: { written: 2 } }).job;
+    settleOrphanedJobs();
+    expect(getJob(plan.id)?.status).toBe("interrupted");
+    expect(getJob(video.id)?.status).toBe("waiting_external");
+    expect(getJob(auto.id)?.status).toBe("queued");
+  });
 });
 
 describe("world commit journal", () => {
