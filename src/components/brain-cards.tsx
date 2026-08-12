@@ -16,6 +16,17 @@ export type BrainCardLevel = "L0" | "L1" | "L2" | "L3";
 export type BrainCardBase = {
   /** 卡片稳定标识（阶段 3a）：系统事件可就地更新该卡（如任务完成翻转状态）；未产出则跳过更新 */
   cardId?: string;
+  executionState?: "idle" | "submitting" | "running" | "waiting_confirmation" | "succeeded" | "failed" | "interrupted" | "cancelled";
+  detail?: string;
+  settledAt?: number;
+};
+
+export type PanelIntent = {
+  intentId: string;
+  target: string;
+  opts?: Record<string, unknown>;
+  consumedAt?: number;
+  consumedBy?: string;
 };
 
 export type PreviewCard = BrainCardBase & {
@@ -71,6 +82,7 @@ export type ResultCard = BrainCardBase & {
   image?: CardImage;
   /** open_* 意图 result 卡：打开面板/弹窗的显式协议（target + 定位 opts） */
   open?: { target: string; opts?: Record<string, unknown> };
+  panelIntent?: PanelIntent;
 };
 
 export type BrowseCardAction = {

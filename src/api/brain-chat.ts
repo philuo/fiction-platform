@@ -1779,6 +1779,12 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
         }
         const card: BrainChatCard = {
           kind: "result", title: def.title, success: true, detail: def.detail,
+          cardId: `card-${uid()}`,
+          panelIntent: {
+            intentId: `panel-${uid()}`,
+            target: def.target,
+            ...(def.opts ? { opts: def.opts(params, activePrompt) } : {}),
+          },
           open: { target: def.target, ...(def.opts ? { opts: def.opts(params, activePrompt) } : {}) },
         };
         markMessageDone(title, sessionId, messageId, [card]);

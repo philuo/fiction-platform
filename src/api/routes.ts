@@ -1452,6 +1452,33 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       return json({ ok: true, updated });
     }
 
+    case "/api/brain/sessions/consume-panel": {
+      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
+      const cpBody = await readBody(req);
+      const cpTitle = String(cpBody.title ?? "").trim();
+      const cpSessionId = String(cpBody.sessionId ?? "").trim();
+      const cpMessageId = String(cpBody.messageId ?? "").trim();
+      const cpCardId = String(cpBody.cardId ?? "").trim();
+      const cpIntentId = String(cpBody.intentId ?? "").trim();
+      if (!cpTitle || !cpSessionId || !cpMessageId || !cpCardId || !cpIntentId) {
+        return json({ error: "缺少 title/sessionId/messageId/cardId/intentId" }, 400);
+      }
+      const session = getBrainSession(cpTitle, cpSessionId);
+      const message = session?.messages.find((item) => item.id === cpMessageId);
+      const card = message?.cards?.find((item) => item.cardId === cpCardId);
+      const intent = card?.panelIntent as { intentId?: unknown; target?: unknown; opts?: Record<string, unknown>; consumedAt?: unknown } | undefined;
+      if (!intent || intent.intentId !== cpIntentId || typeof intent.target !== "string") return json({ error: "面板意图不存在" }, 404);
+      if (intent.consumedAt) return json({ ok: true, consumed: false, panelIntent: intent });
+      const panelIntent = { ...intent, consumedAt: Date.now(), consumedBy: currentUser() ?? "" };
+      const updated = updateBrainMessageCard(cpTitle, cpSessionId, cpMessageId, cpCardId, { panelIntent });
+      if (!updated) return json({ error: "面板意图更新失败" }, 409);
+      publishSyncImmediate({
+        type: "card-update", title: cpTitle, sessionId: cpSessionId, messageId: cpMessageId,
+        cardId: cpCardId, patch: { panelIntent }, at: Date.now(), user: currentUser() ?? undefined,
+      });
+      return json({ ok: true, consumed: true, panelIntent });
+    }
+
     case "/api/brain/sessions/replace-card": {
       // 卡片就地整体替换（阶段 3b：媒体生成 form→preview 单面板流转，含 kind/action 变更）。
       // 按「消息内下标」替换；update-card 只能按 cardId 合并字段，无法改变卡片类型。

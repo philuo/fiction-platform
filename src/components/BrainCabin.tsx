@@ -7,7 +7,7 @@
 import { useEffect, useRef, useState } from "react";
 import { BrainCore } from "./BrainCore";
 import { History, Plus, Send, Square, X } from "./icons";
-import { BrainCardView, mediaPlanDerived, type BrainCard, type PreviewCard, type ChoiceOption, type FormCard, type FormField, type AskCard } from "./brain-cards";
+import { BrainCardView, mediaPlanDerived, type BrainCard, type PreviewCard, type ChoiceOption, type FormCard, type FormField, type AskCard, type PanelIntent } from "./brain-cards";
 import { MarkdownView } from "./MarkdownView";
 import { useBrainSession, type BrainSyncSession, type ChatMessage } from "./useBrainSession";
 import { useBrainSyncState } from "./syncStateStore";
@@ -209,15 +209,14 @@ export function findPendingAskCard(messages: ChatMessage[], answeredIds?: Readon
 }
 
 /** 打开面板卡（open_* 意图 result 卡带 open 字段，显式协议）：返回面板目标与定位参数 */
-export function findOpenPanelCard(messages: ChatMessage[]): { messageId: string; target: string; opts?: Record<string, unknown> } | null {
-  for (const m of messages) {
-    const card = (m.cards ?? []).find((c) => {
-      const o = (c as { open?: { target?: unknown } }).open;
-      return !!o && typeof o.target === "string";
-    });
-    if (card) {
-      const open = (card as { open: { target: string; opts?: Record<string, unknown> } }).open;
-      return { messageId: m.id, target: open.target, opts: open.opts };
+export function findOpenPanelCard(messages: ChatMessage[]): { messageId: string; cardId: string; panelIntent: PanelIntent } | null {
+  for (let mi = messages.length - 1; mi >= 0; mi--) {
+    const m = messages[mi];
+    for (let ci = (m.cards?.length ?? 0) - 1; ci >= 0; ci--) {
+      const card = m.cards![ci] as BrainCard & { open?: { target?: unknown; opts?: Record<string, unknown> }; panelIntent?: PanelIntent };
+      if (card.panelIntent && !card.panelIntent.consumedAt && card.cardId) {
+        return { messageId: m.id, cardId: card.cardId, panelIntent: card.panelIntent };
+      }
     }
   }
   return null;
@@ -559,22 +558,31 @@ export const BrainCabin: React.FC<{
   // 打开面板卡（open_* 显式协议）→ onOpenPanel 统一分发触发对应弹窗；
   // 用户与中枢聊「新角色提案」话题（返回提案浏览卡）→ 通知 Home 恢复底部提案区显示（无 onOpenPanel 时兼容旧回调）；
   // 同一消息只通知一次（历史会话加载旧卡片也视为已浏览，可接受）
-  const panelNotifiedRef = useRef<string>("");
+  const panelConsumingRef = useRef(new Set<string>());
   useEffect(() => {
     if (!onOpenPanel && !onProposalTalk) return;
     const open = findOpenPanelCard(messages);
-    const key = open ? `${open.messageId}:${open.target}` : "";
-    if (open && key && key !== panelNotifiedRef.current) {
-      panelNotifiedRef.current = key;
-      if (onOpenPanel) onOpenPanel(open.target, open.opts);
-      else if (open.target === "proposals" && onProposalTalk) onProposalTalk();
+    if (open && activeId && !panelConsumingRef.current.has(open.panelIntent.intentId)) {
+      panelConsumingRef.current.add(open.panelIntent.intentId);
+      void apiFetch("/api/brain/sessions/consume-panel", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: world.title, sessionId: activeId, messageId: open.messageId,
+          cardId: open.cardId, intentId: open.panelIntent.intentId,
+        }),
+      }).then(async (response) => {
+        const data = await response.json().catch(() => ({})) as { consumed?: boolean };
+        if (!response.ok || !data.consumed) return;
+        if (onOpenPanel) onOpenPanel(open.panelIntent.target, open.panelIntent.opts);
+        else if (open.panelIntent.target === "proposals" && onProposalTalk) onProposalTalk();
+      }).finally(() => panelConsumingRef.current.delete(open.panelIntent.intentId));
       return;
     }
     // 兼容旧协议：open_proposals 老卡（无 open 字段，仅 title 约定）
     if (!open && onProposalTalk) {
       const id = findProposalCardMessageId(messages);
-      if (id && id !== panelNotifiedRef.current) {
-        panelNotifiedRef.current = id;
+      if (id && !panelConsumingRef.current.has(id)) {
+        panelConsumingRef.current.add(id);
         onProposalTalk();
       }
     }
