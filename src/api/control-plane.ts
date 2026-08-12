@@ -168,6 +168,37 @@ export function updateJob(id: string, patch: {
   return getJob(id);
 }
 
+/** 收敛重启后已失去进程执行句柄的任务；仅保留有安全恢复点的任务。 */
+export function settleOrphanedJobs(): number {
+  const rows = getDb().query(`SELECT id,kind,recovery_json FROM jobs
+    WHERE status IN ('queued','running','waiting_external')`).all() as {
+      id: string; kind: string; recovery_json: string | null;
+    }[];
+  let interrupted = 0;
+  for (const row of rows) {
+    const recovery = parseJson<Record<string, unknown>>(row.recovery_json);
+    const resumableVideo = row.kind === "video" && typeof recovery?.videoId === "string" && Boolean(recovery.videoId);
+    const resumableAuto = row.kind === "auto";
+    if (resumableVideo || resumableAuto) {
+      updateJob(row.id, {
+        status: resumableVideo ? "waiting_external" : "queued",
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      });
+      continue;
+    }
+    updateJob(row.id, {
+      status: "interrupted",
+      phase: "interrupted",
+      error: "服务重启中断了任务；已核对持久状态，无法证明任务完成",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+    });
+    interrupted++;
+  }
+  return interrupted;
+}
+
 export function syncRevision(user: string | null, scope: string, document: string): { revision: number; hash: string } {
   const row = getDb().query("SELECT revision,content_hash FROM sync_scopes WHERE user_name=? AND scope=? AND document=?")
     .get(durableUser(user), scope, document) as { revision: number; content_hash: string } | null;

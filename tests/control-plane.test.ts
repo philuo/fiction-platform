@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { getDb } from "../src/api/db";
 import {
   acceptCommand, CommandConflictError, commitWorldCommit, contentHash, createJob, getJob,
-  listJobs, prepareWorldCommit, recoverPreparedWorldCommits, syncRevision, updateJob,
+  listJobs, prepareWorldCommit, recoverPreparedWorldCommits, settleOrphanedJobs, syncRevision, updateJob,
 } from "../src/api/control-plane";
 
 const root = join(tmpdir(), `control-plane-${crypto.randomUUID()}`);
@@ -44,6 +44,14 @@ describe("durable jobs", () => {
     expect(retry.job.id).not.toBe(first.job.id);
     expect(listJobs("alice", "书", true)).toHaveLength(1);
     expect(getJob(first.job.id)?.error).toBe("interrupted");
+  });
+
+  test("启动时仅保留有安全恢复点的活动任务", () => {
+    const image = createJob({ user: "boot-user", title: "书", kind: "image", dedupeKey: "image:boot", status: "running" }).job;
+    const video = createJob({ user: "boot-user", title: "书", kind: "video", dedupeKey: "video:boot", status: "waiting_external", recovery: { videoId: "v-1" } }).job;
+    expect(settleOrphanedJobs()).toBeGreaterThanOrEqual(1);
+    expect(getJob(image.id)?.status).toBe("interrupted");
+    expect(getJob(video.id)?.status).toBe("waiting_external");
   });
 });
 

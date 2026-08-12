@@ -121,17 +121,10 @@ async function recoverForUser(): Promise<void> {
   }
 }
 
-/** 服务启动入口：扫描所有用户（含遗留无用户目录）的所有书，收敛陈旧媒体/卡片。
- *  fire-and-forget：恢复在后台串行跑完，不阻塞服务端口；内部已逐书 try/catch。 */
-export function cleanupStaleMediaTasksOnBoot(): void {
-  void (async () => {
-    try {
-      await runAsUser(null, () => recoverForUser());
-      for (const username of listUsernames()) {
-        await runAsUser(username, () => recoverForUser());
-      }
-    } catch (e) {
-      console.warn("[boot/media] 启动媒体恢复异常（不影响启动）:", (e as Error).message);
-    }
-  })();
+/** 服务启动入口：在监听端口前扫描全部用户并收敛陈旧媒体/卡片。 */
+export async function cleanupStaleMediaTasksOnBoot(): Promise<void> {
+  await runAsUser(null, () => recoverForUser());
+  for (const username of listUsernames()) {
+    await runAsUser(username, () => recoverForUser());
+  }
 }

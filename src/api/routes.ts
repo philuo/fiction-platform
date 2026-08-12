@@ -50,6 +50,7 @@ import type { AuthUser } from "./auth";
 import type { CardType } from "./cards";
 import { renameSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { runtimeReadiness } from "./runtime-readiness";
 
 function json(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(data), {
@@ -1060,8 +1061,18 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       const textOk = Boolean(process.env.TEXT_API_KEY ?? process.env.AGNES_API_KEY);
       const mediaOk = Boolean(process.env.AGNES_API_KEY);
       const anysearchOk = Boolean(process.env.ANYSEARCH_API_KEY);
+      const runtime = runtimeReadiness();
       return json({
-        ok: textOk && mediaOk && anysearchOk,
+        ok: runtime.ready && textOk && mediaOk && anysearchOk,
+        ready: runtime.ready,
+        serverInstanceId: runtime.serverInstanceId,
+        recovery: {
+          startedAt: runtime.startedAt,
+          readyAt: runtime.readyAt,
+          error: runtime.recoveryError,
+          worldCommits: runtime.recoveredWorldCommits,
+          interruptedJobs: runtime.interruptedJobs,
+        },
         agnes: mediaOk,
         text: textOk,
         textModel: process.env.TEXT_MODEL ?? process.env.AGNES_MODEL ?? "agnes-2.5-flash",

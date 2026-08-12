@@ -1,16 +1,16 @@
 // 生产服务器：bun run start（先 bun run build 生成 dist/）
 // 纯 Bun.serve：静态资源（dist/client）+ API + SSR（bun build 的 server bundle）
-import { handleApi, migrateLegacyOnBoot, resumeAutoSessions, startVisualSweep } from "../src/api/routes";
+import { handleApi } from "../src/api/routes";
 import { handleSyncUpgrade, syncWebsocket, attachSyncPublish } from "../src/api/sync-server";
-import { cleanupStaleAdvanceTasks } from "../src/api/advancetask";
-import { cleanupNewStoryTasks } from "../src/api/newtask";
-import { cleanupStaleMediaTasksOnBoot } from "../src/api/media-recovery";
+import { ensureBootRecovery } from "../src/api/boot-recovery";
 import { loadWorld, runAsUser } from "../src/api/storage";
 import { userFromRequest, getPropClosed } from "../src/api/auth";
 import { buildHtml } from "./render";
 
 const port = Number(process.env.PORT) || 3000;
 const clientDir = process.cwd() + "/dist/client";
+
+await ensureBootRecovery();
 
 // 加载 SSR 入口（bun build ./server/entry-server.tsx 的产物）
 // 用 URL 动态导入：避免 TS 对构建产物的静态解析（dist 在 build 后生成）
@@ -106,7 +106,7 @@ attachSyncPublish(server);
 console.log(`[prod] 墨枢 SSR 服务器: http://localhost:${port}`);
 
 // 服务重启恢复：未被人工停止的自动连载会话自动续跑（不阻塞启动，失败仅记日志）
-setTimeout(() => {
+/* Recovery now runs through ensureBootRecovery before Bun.serve.
   // 旧数据兜底迁移：data/ 根遗留书目录迁给第一个注册用户（首用户认领语义，幂等）
   try {
     migrateLegacyOnBoot();
@@ -142,4 +142,4 @@ setTimeout(() => {
   } catch (e) {
     console.error("[prod] 媒体任务恢复失败:", e);
   }
-}, 0);
+*/

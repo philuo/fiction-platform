@@ -6,11 +6,9 @@
 import { render } from "./entry-server";
 import { buildHtml } from "./render";
 import { watch } from "node:fs";
-import { handleApi, migrateLegacyOnBoot, resumeAutoSessions, startVisualSweep } from "../src/api/routes";
+import { handleApi } from "../src/api/routes";
 import { handleSyncUpgrade, syncWebsocket, attachSyncPublish } from "../src/api/sync-server";
-import { cleanupStaleAdvanceTasks } from "../src/api/advancetask";
-import { cleanupNewStoryTasks } from "../src/api/newtask";
-import { cleanupStaleMediaTasksOnBoot } from "../src/api/media-recovery";
+import { ensureBootRecovery } from "../src/api/boot-recovery";
 import { loadWorld, runAsUser } from "../src/api/storage";
 import { userFromRequest, getPropClosed } from "../src/api/auth";
 // 仅注册到 --hot 监听图（客户端代码 / CSS 变化触发重建）；SSR 环境下无副作用（内部有 window 保护）
@@ -18,6 +16,8 @@ import "../src/entry-client";
 
 const port = Number(process.env.PORT) || 3000;
 const isProd = process.env.NODE_ENV === "production";
+
+await ensureBootRecovery();
 
 if (isProd) {
   console.error("dev.ts 仅用于开发，生产请用 bun run start");
@@ -168,7 +168,7 @@ attachSyncPublish(server);
 console.log(`[dev] 墨枢 SSR 服务器: http://localhost:${port}（bun --hot 热重启，Ctrl+C 停止）`);
 
 // 服务重启恢复：未被人工停止的自动连载会话自动续跑（bun --hot 重启 / 手动重启均生效；不阻塞启动）
-setTimeout(() => {
+/* Recovery now runs through ensureBootRecovery before Bun.serve.
   // 旧数据兜底迁移：data/ 根遗留书目录迁给第一个注册用户（首用户认领语义，幂等）
   try {
     migrateLegacyOnBoot();
@@ -205,4 +205,4 @@ setTimeout(() => {
   } catch (e) {
     console.error("[dev] 媒体任务恢复失败:", e);
   }
-}, 0);
+*/

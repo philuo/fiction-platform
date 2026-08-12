@@ -17,6 +17,7 @@ import { publishSyncImmediate, subscribeSync, worldVersion, type SyncEvent } fro
 import { getSystemSyncSnapshot, listMediaTaskStates, listPendingMediaTasks } from "./routes";
 import { listSyncSessionSnapshots, sessionHasAsyncState, updateMediaFormCardValues } from "./brain-sessions";
 import { MAX_IMAGES_PER_CHAPTER, imageOccupiesQuota } from "../shared/media-const";
+import { runtimeReadiness } from "./runtime-readiness";
 
 /** WS 端点路径（dev/prod 共用） */
 export const SYNC_WS_PATH = "/api/sync";
@@ -109,6 +110,8 @@ export const syncWebsocket = {
   open(ws: ServerWebSocket<SyncWsData>) {
     ws.data.lastSeen = Date.now();
     allSockets.add(ws);
+    const runtime = runtimeReadiness();
+    ws.send(JSON.stringify({ type: "hello", serverInstanceId: runtime.serverInstanceId, ready: runtime.ready }));
   },
   message(ws: ServerWebSocket<SyncWsData>, message: string | Buffer) {
     ws.data.lastSeen = Date.now(); // 任何消息（含 ping）都视为活跃
@@ -240,6 +243,13 @@ export function handleSyncUpgrade(pathname: string, req: Request, server: Server
     return new Response(JSON.stringify({ error: "未登录" }), {
       status: 401,
       headers: { "Content-Type": "application/json; charset=utf-8" },
+    });
+  }
+  const runtime = runtimeReadiness();
+  if (!runtime.ready) {
+    return new Response(JSON.stringify({ error: "服务正在恢复持久状态", ready: false, serverInstanceId: runtime.serverInstanceId }), {
+      status: 503,
+      headers: { "Content-Type": "application/json; charset=utf-8", "Retry-After": "1" },
     });
   }
   const ok = server.upgrade(req, { data: { user, channels: new Set<string>(), lastSeen: Date.now() } satisfies SyncWsData });
