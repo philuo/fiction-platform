@@ -56,6 +56,33 @@ type Phase = "landing" | "playing";
 
 type StoryMeta = { slug: string; title: string; genre: string; chapters: number; updatedAt: string; cover?: string };
 
+export type ScenePlan = { anchor: string; scene: string; caption?: string; type?: string; subject?: string; extraChars?: string[] };
+export type MediaPlan = { kind: "image" | "video"; chapterIndex: number; scenes: ScenePlan[] };
+export type PendingMediaPlan = Omit<MediaPlan, "scenes"> & { id: string };
+
+/** Match an async media-plan sync terminal frame to the request that originated in this tab. */
+export function mediaPlanFromTask(
+  pending: PendingMediaPlan | null,
+  task: { id?: string; status: string; scenes?: ScenePlan[] },
+): MediaPlan | null {
+  if (!pending || task.id !== pending.id || task.status !== "ready" || !task.scenes?.length) return null;
+  return { kind: pending.kind, chapterIndex: pending.chapterIndex, scenes: task.scenes };
+}
+
+/** Decide whether navigation may subscribe to a story before its system snapshot arrives.
+ * The library frame that triggered an effect must win over the external-store getter: React can
+ * run that effect after a newer render/server-instance transition has changed the getter. */
+export function storyExistsForOpen(
+  title: string,
+  triggeringLibrary: { stories: { title: string }[] } | null | undefined,
+  currentLibrary: { stories: { title: string }[] } | null | undefined,
+  fallbackStories: { title: string }[],
+): boolean {
+  return triggeringLibrary?.stories.some((story) => story.title === title)
+    ?? currentLibrary?.stories.some((story) => story.title === title)
+    ?? fallbackStories.some((story) => story.title === title);
+}
+
 // —— 新角色提案区关闭状态（服务端权威：bun:sqlite 按用户 + 书名存储）——
 // SSR 时服务端读会话 cookie → 查库 → 注入 initialData.propClosed，首帧 HTML 即正确（不渲染提案区），
 // 客户端与 SSR 快照一致、无修正 re-render —— 根治「刷新闪现后自动关」。
@@ -335,12 +362,12 @@ const Home: React.FC<HomeProps> = (props) => {
       lastTaskIdRef.current = null;
       setCurrentTaskId(task.id);
       setBuildingStage(task.stage ?? "世界已就绪，正在生成故事蓝图…");
-      void openStory(task.title);
+      void openStory(task.title, syncedLibrary);
     } else if (task.status === "done") {
       lastTaskIdRef.current = null;
       setCurrentTaskId(null);
       setBuildingStage(null);
-      if (task.title && phase !== "playing") void openStory(task.title);
+      if (task.title && phase !== "playing") void openStory(task.title, syncedLibrary);
     } else if (task.status === "failed") {
       lastTaskIdRef.current = null;
       setCurrentTaskId(null);
@@ -403,15 +430,14 @@ const Home: React.FC<HomeProps> = (props) => {
   }
 
   // 打开已有小说
-  async function openStory(title: string) {
+  async function openStory(title: string, triggeringLibrary?: { stories: { title: string }[] }) {
     setBusy(true);
     setBusyPhase("加载中…");
     try {
       // 书架列表只负责导航；设置 title 即建立 sync，首帧权威快照到达后才进入三栏页面。
       const cached = getSystemSyncState(title)?.world;
       const authoritativeLibrary = getLibrarySyncState();
-      const exists = authoritativeLibrary?.stories.some((story) => story.title === title)
-        ?? stories.some((story) => story.title === title);
+      const exists = storyExistsForOpen(title, triggeringLibrary, authoritativeLibrary, stories);
       if (!cached && !exists) throw new Error("故事不存在");
       setSyncTitle(title);
       if (cached) { setWorld(cached); setPhase("playing"); }
@@ -575,6 +601,7 @@ const Home: React.FC<HomeProps> = (props) => {
   }, []);
 
   const requestSyncSnapshotRef = useRef<(() => boolean) | null>(null);
+  const pendingMediaPlanRef = useRef<PendingMediaPlan | null>(null);
   const { syncMediaFormValues, requestSnapshot } = useSyncChannel({
     title: syncTitle,
     enabled: Boolean(user),
@@ -583,7 +610,8 @@ const Home: React.FC<HomeProps> = (props) => {
     onTaskStatus: (e) => {
       // 推进任务完成广播（kind:"advance"）释放运行锁，覆盖底部按钮、聊天和多 tab 发起路径。
       // 左侧章节媒体：消费 media task-status 的终态（ready/failed），全部收尾后刷新 world + 提示
-      if (e.kind === "media" && e.id) consumeHomeMediaStatus(e.id, e.status, e.error);
+      if (e.kind === "media" && e.sub === "plan") consumeHomeMediaPlanStatus(e);
+      else if (e.kind === "media" && e.id) consumeHomeMediaStatus(e.id, e.status, e.error);
       // media/visual 等任务完成广播 → 转发聊天舱（媒体生成 WS 事件驱动收尾，无轮询）
       taskStatusRef.current?.(e);
     },
@@ -602,7 +630,9 @@ const Home: React.FC<HomeProps> = (props) => {
       brainStatusRef.current?.(snapshot);
       let hasTerminalMedia = false;
       for (const task of e.tasks) {
-        if (task.sub !== "plan") {
+        if (task.sub === "plan") {
+          consumeHomeMediaPlanStatus(task);
+        } else {
           const tracked = consumeHomeMediaStatus(task.id, task.status, task.error);
           if (tracked && (task.status === "ready" || task.status === "failed")) hasTerminalMedia = true;
         }
@@ -1107,8 +1137,6 @@ const Home: React.FC<HomeProps> = (props) => {
   }
 
   // 段落锚定媒体生成（plan → 确认选中段落 → generate；异步任务 + 轮询，不阻塞页面，刷新可恢复）
-  type ScenePlan = { anchor: string; scene: string; caption?: string; type?: string; subject?: string; extraChars?: string[] };
-  type MediaPlan = { kind: "image" | "video"; chapterIndex: number; scenes: ScenePlan[] };
   const [mediaPlan, setMediaPlan] = useState<MediaPlan | null>(null);
   type MediaGen = { chapterIndex: number; mediaIds: string[]; progress: number };
   const [mediaGen, setMediaGen] = useState<MediaGen | null>(null);
@@ -1288,6 +1316,29 @@ const Home: React.FC<HomeProps> = (props) => {
     setMediaGen({ chapterIndex, mediaIds: ids, progress: 0 });
   }
 
+  /** The plan endpoint accepts a durable job; only sync may deliver its authoritative terminal result. */
+  function consumeHomeMediaPlanStatus(task: { id?: string; status: string; scenes?: ScenePlan[]; error?: string }): boolean {
+    const pending = pendingMediaPlanRef.current;
+    if (!pending || task.id !== pending.id) return false;
+    if (task.status === "ready") {
+      const plan = mediaPlanFromTask(pending, task);
+      pendingMediaPlanRef.current = null;
+      setBusy(false);
+      setBusyPhase("");
+      if (plan) setMediaPlan(plan);
+      else showToast("场景规划失败: 服务端未返回分镜场景");
+      return true;
+    }
+    if (["failed", "interrupted", "cancelled"].includes(task.status)) {
+      pendingMediaPlanRef.current = null;
+      setBusy(false);
+      setBusyPhase("");
+      showToast("场景规划失败: " + (task.error ?? "分镜任务未完成"));
+      return true;
+    }
+    return false;
+  }
+
   // SSR 预载路径（initialData 直接进 playing，不走 openStory）的任务状态恢复已收敛到协调 effect
   // （依赖 [phase, world?.title]，SSR 首帧 phase=playing 即触发），此处不再单独调用 restoreAdvanceTask
 
@@ -1297,19 +1348,31 @@ const Home: React.FC<HomeProps> = (props) => {
     const chapterIndex = shownChapter.index;
     setBusy(true);
     setBusyPhase("AI 分镜中（挑选关键场景）…");
+    let awaitingSync = false;
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 240_000); // 服务端单次分镜最长约 90s，失败自动重试（预留重试预算）
       const res = await mediaCommands.plan({ title: world.title, chapterIndex, kind, count }, { signal: ctrl.signal });
       clearTimeout(timer);
-      const data = (await res.json()) as { ok?: boolean; scenes?: ScenePlan[]; error?: string };
-      if (!data.ok || !data.scenes?.length) throw new Error(data.error ?? "场景规划失败");
-      setMediaPlan({ kind, chapterIndex, scenes: data.scenes });
+      const data = (await res.json()) as { ok?: boolean; planId?: string; scenes?: ScenePlan[]; error?: string };
+      if (!data.ok) throw new Error(data.error ?? "场景规划失败");
+      if (data.scenes?.length) {
+        // Legacy synchronous response compatibility.
+        setMediaPlan({ kind, chapterIndex, scenes: data.scenes });
+      } else if (data.planId) {
+        pendingMediaPlanRef.current = { id: data.planId, kind, chapterIndex };
+        awaitingSync = true;
+        requestSyncSnapshotRef.current?.();
+      } else {
+        throw new Error("服务端未返回分镜任务");
+      }
     } catch (e) {
       showToast("场景规划失败: " + ((e as Error).name === "AbortError" ? "分镜超时（超过 4 分钟，已自动重试），请稍后重试" : (e as Error).message));
     } finally {
-      setBusy(false);
-      setBusyPhase("");
+      if (!awaitingSync) {
+        setBusy(false);
+        setBusyPhase("");
+      }
     }
   }
 

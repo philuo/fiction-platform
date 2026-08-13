@@ -1,94 +1,104 @@
-# 模块化迁移交接记录
+# 重构与真实浏览器验收交接
 
-> 用于跨设备或新 Codex 任务继续开发。当前开发规范仍以 `docs/INSTRUCTION.md` 为准；本文只记录本轮执行状态和下一步。
+> 当前开发规范仍以 `docs/INSTRUCTION.md` 为准；本文记录 `codex/brain-reliability-ui` 分支截至 2026-08-13 的真实验收结果。
 
-## 代码位置
+## 本轮结论
 
-- 仓库：`git@github.com:philuo/fiction-platform.git`
-- 分支：`codex/brain-reliability-ui`
-- 模块化检查点：`b1ae62c refactor: modularize server transport and command flow`
-- 原 Codex 任务 ID：`019ff9c1-e143-7f81-a93c-ed11255c0c7c`
+本轮使用独立临时 SQLite、数据目录、Brain 会话、媒体目录和端口，以唯一临时账号和故事《雨夜验尸簿》完成真实浏览器验收。仓库 `data/` 未被使用。
 
-新设备先执行：
+非 provider 流程全部通过；真实文本、图片和视频 provider 均产出成功。两个浏览器 Tab 最终收敛到同一权威世界，无重复章节、幽灵 loading 或应用 console warning/error。
 
-```bash
-git fetch origin
-git switch codex/brain-reliability-ui
-git pull --ff-only
-bun install
-bun run check
-```
+## 本轮修复
 
-## 已完成
+1. **新故事 ready 后自动打开偶发“故事不存在”**
+   - 原因：ready library frame 触发 effect 后，`openStory` 又读取可能已切换的外部 store/React fallback。
+   - 修复：把触发导航的 library frame 传入存在性判定；仍以 sync projection 为权威。
+   - 回归：`tests/home-story-open.test.ts`。
 
-1. 建立 `contracts / application / infrastructure / transport / frontend` 分层骨架和依赖检查。
-2. 拆分模块化 HTTP 路径 owner：brain、query、story、chapter、planning、governance、media、autorun。
-3. 旧公开写 URL 强制通过 CommandBus v1，统一 commandId、command type、expectedRevision、幂等重放及冲突响应。
-4. 建立 StoryRepository、WorldCommitter、JobStore、ProjectionPublisher、ModelProvider、MediaProvider 端口及兼容适配器。
-5. 前端建立 typed command client 和 story/chapter/media/autorun/governance feature hooks。
-6. sync system projection 新增 `worldRevision`；CommandBus 的 expectedRevision 使用 world projection revision，不再误用 system projection revision。
-7. proposalClosed、world、job、Brain 状态继续以 sync projection 为唯一权威；前端未重新引入旧状态 HTTP 轮询。
-8. 更新 `docs/INSTRUCTION.md`、README、BRAIN、HARNESS 及历史计划状态。
+2. **固定名生产 bundle 被浏览器长期缓存**
+   - 原因：`/assets/entry-client.js` 与 CSS 使用固定文件名，却带一年 `immutable`，重建后浏览器仍执行旧代码，导致旧 world revision 发出 409。
+   - 修复：生产 HTML 为 JS/CSS 附加基于内容的 `?v=<hash>`，保留原资源 URL 和构建结构。
+   - 回归：`tests/prod-assets.test.ts`。
 
-## 真实浏览器验证发现及修复
+3. **Home 与持久异步分镜接口契约脱节**
+   - 原因：后端 `/api/novel/media/plan` 已立即返回 `planId`，随后由 sync 发布 `ready/failed + scenes`；Home 仍按旧同步响应读取 `scenes`，把成功 job 误报为“场景规划失败”。
+   - 修复：Home 登记当前 `planId`，只消费匹配的 sync 权威终态来打开确认弹窗或显示失败；继续兼容旧同步 `scenes` 响应，不新增 API 或轮询。
+   - 回归：`tests/home-media-plan.test.ts`。
 
-真实验证使用隔离 SQLite、唯一账号和唯一故事，未使用正式数据。
+以上修复未改变公开 URL、命令类型、receipt、expectedRevision 或 projection 结构，因此未修改 BRAIN/HARNESS/INSTRUCTION 协议说明。
 
-发现并修复：
+## 真实浏览器验收
 
-1. 新书 ready projection 与 React state 同帧更新时，`openStory` 读取旧 stories 闭包并误报“故事不存在”。现在直接读取权威 library sync store。
-2. system projection revision 被误当成 state.json world revision，造成合法章节推进返回 409。现在 system snapshot 显式携带 `worldRevision`。
+### 认证、立项和资源
 
-真实通过：
+- 注册唯一账号后自动登录，空书架正确。
+- 真实文本 provider 立项一次，ready projection 后自动打开成功。
+- 封面、3 个角色头像和 3 个全身立绘均由真实 provider 生成并落盘。
+- 直接 URL、刷新和服务重启后恢复正常。
 
-- 未登录页、注册、自动登录。
-- 真实文本 provider 立项。
-- 封面、三个角色头像和立绘真实生成并落盘。
-- 刷新及直接 URL 恢复故事。
-- 第一章 SSE 写作、审查、记账、入册，最终 1552 字、两个伏笔，运行锁正确释放。
-- Brain 查询角色，返回三个角色及可展开卡片。
-- 两个浏览器 Tab 恢复同一章节；两个 Tab 控制台均无 error/warn。
-- 服务重启把未完成 media-plan job 收敛为 interrupted，并把 Brain running 卡收敛为失败卡。
+### 多 Tab 写传播
 
-未通过且不得声称通过：
+- 两个 Tab 同时打开同一故事，每页由单根 `/api/sync` 收敛状态。
+- Tab A 将作者改为“`双窗验收署名`”，Tab B 无刷新收到结果；刷新和直接 URL 后一致。
+- SQLite 存在 `CMD-W12` 成功 receipt；world revision 单调增长。
+- 客户端没有重新引入 `/api/novel/state`、`/api/novel/auto/status`、`/api/novel/media/status*`、`/api/novel/visual/status` 等已删除状态轮询。
 
-- 插画分镜真实调用遇到上游 `ECONNRESET`；有限重试后通过重启恢复收敛，没有进入真实图片生成。
-- 因分镜失败，没有继续发起真实视频 provider 调用。
-- 自动连载、proposal 关闭/重开、多 Tab 实际写传播尚未完成完整真实浏览器验收。
+### Proposal 关闭、重开和拒绝
 
-测试数据、媒体目录、Brain 会话、临时 SQLite 和 dev server 已全部清理。
+- 真实角色抽卡一次，生成 3 张角色卡；应用 1 张产生“白无常” pending proposal。
+- Tab A 关闭提示后 Tab B 同步关闭，刷新仍关闭。
+- Brain 真实输入“打开新角色提案”一次，两个 Tab 均重新显示。
+- 最终从可见抽屉点击“拒绝”，`CMD-L11` receipt 成功，两个 Tab 同步移除；没有创建新的角色视觉 job。
+- 早先“拒绝按钮无反应”是自动化选中了高度为 0 的折叠抽屉 DOM，真实可见按钮没有事件缺陷。
+
+### 两章自动连载和重启恢复
+
+- 自动连载仅启动一次，目标 2 章。期间上游出现一次 HTTP 503，代码内有限重试后第 1 章成功提交。
+- 在第 2 章生成期间精确终止隔离服务；重启日志识别 `target=2, written=1`，从最后提交边界恢复。
+- 恢复期间 provider 有若干 120 秒内部超时，未做人工重提；最终第 2 章成功提交。
+- `checkpoint.jsonl` 恰好只有 chapter 1、2 各一条 commit；世界恰好 2 章，无重复入册。
+- `CMD-N03` receipt 为 `succeeded`；autorun job 为 `written=2/target=2`、`phase=连载结束（done）`，运行锁释放。
+- Tab A 的旧 SSE 因服务重启显示一次 `network error` toast，但权威 world 未被草稿覆盖；最终两个 Tab 均显示 2 章且中枢待命。
+
+### 插画与视频
+
+- 插画分镜仅提交一次；真实文本 provider 在 7.0 秒生成 1 个场景。该成功 job 暴露并促成“异步分镜契约”修复，没有重复分镜调用。
+- 修复后复用已持久场景，插画 provider 仅进入生成一次；约 9.8 秒完成，`CMD-M02`、image-batch 和 image job 均成功。
+- 视频分镜仅提交一次，4.2 秒成功；视频生成仅提交一次，约 3 分 20 秒从 `waiting_external/provider-poll` 收敛到 ready，`CMD-M03` 与 video job 成功。
+- 两个 Tab 刷新后均真实解码插画（896×560），视频 `readyState=4` 且无 media error；媒体文件存在于隔离磁盘。
+- 插画确认曾有一条请求在 provider 前因 `expectedRevision 18 -> 19` 被 CommandBus 拒绝；按 revision 19 重基线后才创建唯一图片 provider job。该 409 不计 provider 调用，也未绕过并发控制。
+
+## 用户提交与 provider 计数
+
+- 故事立项：1 次。
+- 角色抽卡：1 次。
+- Brain 打开提案：1 次。
+- 两章自动连载启动：1 次（仅使用代码已有有限内部重试）。
+- 插画分镜：1 次；插画 provider 生成：1 次。
+- 视频分镜：1 次；视频 provider 生成：1 次。
+- 没有通过重复点击消耗 provider 配额。
+
+## 浏览器与持久状态证据
+
+- 两个 Tab 应用 console 的 warning/error 均为 0；工具自身 Statsig telemetry 超时不属于应用页面日志。
+- 两个 Tab 刷新后章节、proposal、作者、插画和视频一致。
+- command receipt 覆盖立项、设置、抽卡、proposal 偏好/拒绝、autorun、媒体分镜与生成。
+- 所有 autorun/media job 均处于持久终态；无 running/interrupted 悬挂项。
 
 ## 最终自动化基线
 
-- `bun run check:architecture`：133 files、411 imports、0 cycles、49 public commands。
+- `bun run check:architecture`：133 files、409 imports、0 cycles、49 public commands。
 - `bun run typecheck`：通过。
-- `bun test`：682 pass / 0 fail，62 files，3863 assertions。
+- `bun test`：687 pass、0 fail、3873 assertions、65 files。
 - `bun run build`：client 与 SSR 均通过。
 - `git diff --check`：通过。
 
-## 尚未完成，估计剩余 35%～45%
+## 后续重构边界
 
-1. 模块 handler 仍委托 `src/api/routes.ts`；要逐域迁移为 application use case + port 调用。
-2. `routes.ts` 仍约 3600 行，需要收敛为认证、上下文、CommandBus、模块 dispatcher 和错误映射。
-3. `Home.tsx` 仍约 2900 行，需要继续迁移到 `src/frontend/features/*`。
-4. BrainCabin、brain-cards、brain-chat 尚需按会话编排、意图、查询、表单、renderer registry 拆分。
-5. 全部调用方迁移前不得删除旧 URL 或兼容重导出。
-6. provider 稳定后补完图片、视频、自动连载、proposal 和多 Tab 写传播的真实验收。
+- `src/api/routes.ts` 与 `src/pages/Home.tsx` 仍然较大，后续可继续按 application use case / feature 拆分。
+- 不得删除 canonical/legacy URL、兼容重导出、既有命令契约或 sync 唯一权威约束。
+- 每个迁移域继续运行 architecture、typecheck、test、build 和 diff-check，并做隔离浏览器回归。
 
-## 下一步建议顺序
+## 清理
 
-1. 先选 chapter 或 story 中一个低耦合写域，建立 application use case，让对应模块 handler 不再委托 legacy route。
-2. 为该域增加 handler method/body/auth/error、legacy/canonical 契约一致性和 command receipt 测试。
-3. 迁移对应 Home 调用及状态派生，保持 sync 为唯一权威。
-4. 每完成一个域运行：
-
-```bash
-bun run check:architecture
-bun run typecheck
-bun test
-bun run build
-git diff --check
-```
-
-5. 所有域及恢复流程切换后，最后删除兼容入口并重新执行隔离浏览器验收。
-
+验收完成后关闭两个测试 Tab，精确停止端口 3100 的测试 PID，并删除包含账号、故事、媒体、Brain 会话、SQLite、日志和临时 `.env` 的整个隔离目录。仓库不保留测试凭证或 provider 密钥。

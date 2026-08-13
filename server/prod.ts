@@ -6,9 +6,16 @@ import { ensureBootRecovery } from "../src/api/boot-recovery";
 import { loadWorld, runAsUser } from "../src/api/storage";
 import { userFromRequest, getPropClosed } from "../src/api/auth";
 import { buildHtml } from "./render";
+import { assetContentVersion } from "./asset-version";
 
 const port = Number(process.env.PORT) || 3000;
 const clientDir = process.cwd() + "/dist/client";
+
+// Fixed output filenames are cached immutably; content-derived query strings prevent stale bundles after deploys.
+const assetVersion = assetContentVersion([
+  new Uint8Array(await Bun.file(clientDir + "/entry-client.js").arrayBuffer()),
+  new Uint8Array(await Bun.file(clientDir + "/entry-client.css").arrayBuffer()),
+]);
 
 await ensureBootRecovery();
 
@@ -86,8 +93,8 @@ const server = Bun.serve({
       }
       const appHtml = serverEntry.render(pathname + url.search, initialData);
       const html = buildHtml(appHtml, {
-        clientJs: "/assets/entry-client.js",
-        clientCss: "/assets/entry-client.css",
+        clientJs: `/assets/entry-client.js?v=${assetVersion}`,
+        clientCss: `/assets/entry-client.css?v=${assetVersion}`,
         initialData,
       });
       return new Response(html, {
