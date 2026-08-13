@@ -2,6 +2,23 @@
 
 ## 2026-08-13 真实浏览器深度验收
 
+### BROWSER-BUG-005 [P1] Brain 导出卡吞掉附件响应并把未下载误报为成功
+
+- **首次发现**：2026-08-14 00:45（Asia/Shanghai）
+- **场景**：`BRAIN-ACTION-EXPORT-01`，展开已有“导出全书”预览卡并点击“执行”。
+- **复现**：在真实 Brain 历史会话展开导出卡；监听浏览器 download 事件后点击执行。
+- **预期**：`/api/novel/export` 返回的 Markdown 附件触发浏览器下载，卡片只在下载已开始后进入 succeeded，并显示文件名。
+- **实际**：卡片显示“执行成功”并持久为 succeeded，但浏览器没有 download 事件，也没有可验证文件。
+- **浏览器证据**：执行按钮点击一次，`download=null`，卡片成功态；应用 console 无 warn/error。
+- **服务 / SQLite / 磁盘证据**：服务端路由返回 `text/markdown` 和 `Content-Disposition: attachment`；该流程不创建 job/receipt，隔离故事目录也没有导出文件。
+- **影响**：用户认为全书已经导出，实际没有获得任何文件；所有经 Brain 执行器返回附件的动作均可能假成功。
+- **根因**：`fetchAction()` 只区分 SSE 与 JSON；附件响应被调用 `res.json()`，解析异常被吞为 `{}`，随后 `!data.error` 被判为成功，没有消费 Blob 或触发下载。
+- **修复方案**：统一成功响应处理器识别 `Content-Disposition: attachment` 并解析 UTF-8 文件名；`/api/novel/export` 复用页面菜单已有的同源 GET 原生下载 URL，使浏览器下载管理器接管附件，避免先 fetch 再 Blob 的受限环境不可观测问题。
+- **回归测试**：新增 `tests/brain-action-response.test.ts`，覆盖 RFC 5987 文件名、附件必须被消费后才成功以及导出原生 URL；与 `tests/brain-cards.test.ts` 合计 27 项通过，`bun run typecheck`、`bun run build`、`git diff --check` 通过。
+- **commit / push**：待提交；推送目标 `origin/codex/brain-reliability-ui`。
+- **复验结果**：共三次导出动作且未超过上限。第一次复现旧实现假成功；第二次 Blob 实现显示开始下载但浏览器无下载事件、磁盘无文件；最终原生 URL 实现只点击一次即捕获真实 download 事件。页面保持在故事 SPA，卡片显示“已请求下载：雨夜档案.md”并进入已完成；应用 console 无 warn/error。`C:\Users\Administrator\Downloads\雨夜档案.md` 实际落盘 222 字节，UTF-8 可解码，首行为 `# 《雨夜档案》`，SHA-256 为 `16C98B8F03C2E52B441BCB5E4B611A3A1C6B97A87D58BD12D06DD1BECA5656B4`。
+- **状态**：已修复并通过真实浏览器复验，待提交推送。
+
 ### BROWSER-BUG-004 [P2] 伏笔账二次删除确认态被父级点击立即清除
 
 - **首次发现**：2026-08-14 00:33（Asia/Shanghai）

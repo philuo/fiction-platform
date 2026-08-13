@@ -71,8 +71,66 @@ function flattenFormValues(fields: FormField[], values: Record<string, unknown>)
   return out;
 }
 
-/** 统一 fetch 执行：检测 SSE 响应（推进/连载等长任务）与 JSON 响应，返回结果摘要 */
+export function attachmentFilename(disposition: string | null): string | null {
+  if (!disposition || !/\battachment\b/i.test(disposition)) return null;
+  const utf8 = disposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i)?.[1];
+  if (utf8) {
+    try { return decodeURIComponent(utf8.replace(/^"|"$/g, "")); } catch { return utf8; }
+  }
+  return disposition.match(/filename\s*=\s*"([^"]+)"/i)?.[1]
+    ?? disposition.match(/filename\s*=\s*([^;]+)/i)?.[1]?.trim()
+    ?? "download";
+}
+
+async function triggerAttachmentDownload(res: Response, filename: string): Promise<void> {
+  const blob = await res.blob();
+  const href = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = href;
+  link.download = filename;
+  link.style.display = "none";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(href), 0);
+}
+
+export async function consumeActionSuccess(
+  res: Response,
+  download: (response: Response, filename: string) => Promise<void> = triggerAttachmentDownload,
+): Promise<{ success: boolean; detail: string }> {
+  const ct = res.headers.get("content-type") ?? "";
+  if (ct.includes("text/event-stream")) {
+    res.body?.cancel().catch(() => {});
+    return { success: true, detail: "操作已启动，请查看页面进度" };
+  }
+  const filename = attachmentFilename(res.headers.get("content-disposition"));
+  if (filename) {
+    await download(res, filename);
+    return { success: true, detail: `已开始下载：${filename}` };
+  }
+  const data = await res.json().catch(() => ({})) as Record<string, unknown>;
+  return { success: !data.error, detail: data.error ? String(data.error) : "执行成功" };
+}
+
+export function nativeDownloadUrl(endpoint: string, body: Record<string, unknown>): string | null {
+  if (endpoint !== "/api/novel/export") return null;
+  const title = String(body.title ?? "").trim();
+  if (!title) return null;
+  const params = new URLSearchParams({ title });
+  const format = String(body.format ?? "").trim();
+  if (format) params.set("format", format);
+  return `${endpoint}?${params.toString()}`;
+}
+
+/** 统一 fetch 执行：检测 SSE、附件与 JSON 响应，返回结果摘要 */
 async function fetchAction(endpoint: string, method: string, body: Record<string, unknown>): Promise<{ success: boolean; detail: string }> {
+  const downloadUrl = nativeDownloadUrl(endpoint, body);
+  if (downloadUrl) {
+    window.location.href = downloadUrl;
+    const suffix = String(body.format ?? "md").toLowerCase() === "epub" ? "epub" : "md";
+    return { success: true, detail: `已请求下载：${String(body.title)}.${suffix}` };
+  }
   const res = await apiFetch(endpoint, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   if (!res.ok) {
     const errData = await res.json().catch(() => ({})) as Record<string, unknown>;
@@ -82,13 +140,7 @@ async function fetchAction(endpoint: string, method: string, body: Record<string
     if (res.status === 401) return { success: false, detail: "登录状态已失效，请重新登录后重试。" };
     return { success: false, detail: String(errData.error ?? `操作失败（HTTP ${res.status}），请重试`) };
   }
-  const ct = res.headers.get("content-type") ?? "";
-  if (ct.includes("text/event-stream")) {
-    res.body?.cancel().catch(() => {});
-    return { success: true, detail: "操作已启动，请查看页面进度" };
-  }
-  const data = await res.json().catch(() => ({})) as Record<string, unknown>;
-  return { success: !data.error, detail: data.error ? String(data.error) : "执行成功" };
+  return consumeActionSuccess(res);
 }
 
 // —— Phase 3：中枢本地偏好（localStorage，纯用户体验增强；服务端始终权威） ——
