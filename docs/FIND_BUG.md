@@ -2,6 +2,23 @@
 
 ## 2026-08-13 真实浏览器深度验收
 
+### BROWSER-BUG-004 [P2] 伏笔账二次删除确认态被父级点击立即清除
+
+- **首次发现**：2026-08-14 00:33（Asia/Shanghai）
+- **场景**：`FORESHADOW-CRUD-01`，通过 Brain 表单新增伏笔后，在伏笔账将状态依次改为“推进中”“已回收”，再点击“删除”。
+- **复现**：关闭 Brain，点击底栏“伏笔账（增删改）”；对已回收伏笔点击一次“删除”。
+- **预期**：按钮切换为“确认删除？”，第二次点击才调用删除接口；点击遮罩、关闭或切换筛选时取消确认。
+- **实际**：第一次点击后按钮仍显示“删除”，确认态不可见且第二次点击仍不会调用删除接口，导致 UI 删除路径不可达。
+- **浏览器证据**：真实伏笔 `fs_msrqksmr_kbss` 已经由 UI 改为 `resolved`，弹窗显示“已回收 1”；点击“删除”后 DOM 仍为同一“删除”按钮，无“确认删除？”且记录仍存在。应用 console 无 warn/error。
+- **服务 / SQLite / 磁盘证据**：`state.json` 中该伏笔仍存在且 `status=resolved`；没有 delete changeLog，证明请求未发出。
+- **影响**：用户无法从可见 UI 删除符合服务端约束的已回收伏笔；新增、修改不受影响，有安全绕过但 CRUD 不完整。
+- **根因**：删除按钮把 `confirmDelId` 设为伏笔 ID 后，点击事件继续冒泡到 `.fs-modal`；其 `onClick` 无条件执行 `setConfirmDelId(null)`，在同一交互中立即清除确认态。
+- **修复方案**：弹窗内容区只阻止冒泡，不再清除确认态；遮罩、关闭和筛选仍负责取消确认。
+- **回归测试**：新增 `tests/foreshadow-modal.test.tsx`，覆盖第一次点击只显示确认、第二次点击才发 `delete` 请求；`bun test tests/foreshadow-modal.test.tsx`、`bun run typecheck`、`bun run build`、`git diff --check` 通过。
+- **commit / push**：待提交；推送目标 `origin/codex/brain-reliability-ui`。
+- **复验结果**：隔离生产实例加载修复构建后，真实点击第一次出现“确认删除？”，第二次删除成功；`state.json.foreshadowing=[]`，changeLog 完整记录新增、推进中、已回收、删除，Tab B 不刷新同步到活跃伏笔 0，两个应用页面无 warn/error。
+- **状态**：已修复并复验。
+
 ### BROWSER-BUG-003 [P1] 只读查询正文与同回合权威卡片事实分叉
 
 - **首次发现**：2026-08-14 00:12（Asia/Shanghai）

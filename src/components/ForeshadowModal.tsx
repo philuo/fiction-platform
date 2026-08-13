@@ -90,7 +90,7 @@ export const ForeshadowModal: React.FC<Props> = (p) => {
 
   return (
     <div className="modal-overlay" onClick={() => { p.onClose(); setConfirmDelId(null); }}>
-      <div className="fs-modal" onClick={(e) => { e.stopPropagation(); setConfirmDelId(null); }}>
+      <div className="fs-modal" onClick={(e) => e.stopPropagation()}>
         <div className="mem-modal-head">
           <b style={{ fontFamily: "var(--sans)" }}><BookMarked size={15} /> 伏笔账（{list.length}：活跃 {activeCount}）</b>
           <div className="mem-tabs">
