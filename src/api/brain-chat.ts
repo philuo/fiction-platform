@@ -252,6 +252,7 @@ ${INTENT_ENUM.map((k) => `- ${k}：${INTENT_HINT[k] ?? k}`).join("\n")}
   · create_character（新建角色）→ {name:"角色名", role:"定位（主角/反派/配角/关键人物，可省略）"}
   · edit_character（修改角色）→ {name:"角色名", role|status|age|identity|motivation|look|voice: "修改后的值"}
   · delete_character（删除角色）→ {name:"角色名"}
+  · edit_world（修改全局信息）→ {author:"作者署名"} 或 {premise|current|time|place|tone|rules: "修改后的值"}
   · 用户未指定具体章节时，**不要填 chapterIndex**（系统会自动用其当前选中的章节兜底）
 - 「打开新角色提案」「新角色提案」「打开提案面板」等**打开类**表达（用户想直接看底部面板）→ intent 为 "open_proposals"，reply 用一句话说明已打开
 - 「有哪些角色推荐」「列出提案」「查看提案内容」等**查询列表**表达 → intent 为 "read_proposals"（在聊天中列提案卡）
@@ -1075,6 +1076,17 @@ export function extractNameFromHistory(w: WorldState, userHist?: string[]): stri
   return "";
 }
 
+/** 明确的作者修改问法兜底：优先使用意图识别器的结构化 author；当 provider
+ * 漏参时只接受带“作者/署名”锚点的短句，避免把其它全局编辑内容误当作者。 */
+export function authorFromEditPrompt(params: Record<string, unknown>, prompt = ""): string {
+  const structured = String(params.author ?? "").trim();
+  if (structured) return structured;
+  const text = prompt.replace(/\s+/g, " ").trim();
+  if (!/(?:作者|署名)/.test(text)) return "";
+  const match = text.match(/(?:作者(?:署名)?|署名)(?:修改|改|设置|设|换|署)?(?:为|成|叫|是)?[：:「『“\s]*([^」』”。，,；;！!？?]{1,30})/);
+  return match?.[1]?.replace(/^(?:改为|改成|设置为|设为)/, "").trim() ?? "";
+}
+
 /** 追问选择卡（ask）构建：信息不足时给结构化候选选项（输入框上方询问面板，不混入聊天流），
  * 无法生成候选时返回 null（调用方降级为自然追问）。
  * 用户选完后把选项 label 作为新输入继续，AI 据此补全参数。 */
@@ -1156,10 +1168,20 @@ export function buildFormCard(w: WorldState, intent: string, params: Record<stri
     }
     // 用户明确要编辑角色但说不清是谁 → 返回 null，由中枢主动询问补充（而非误弹设定表单）
     if (/角色/.test(opts?.prompt ?? "")) return null;
+    const author = authorFromEditPrompt(params, opts?.prompt);
+    if (author || /(?:作者|署名)/.test(opts?.prompt ?? "")) {
+      return {
+        kind: "form", title: "修改作者署名", commandId: "CMD-W12", level: "L2",
+        summary: author ? `请确认将作者署名修改为「${author}」。` : "请输入新的作者署名，确认后写入故事信息。",
+        fields: [{ key: "author", label: "作者署名", type: "text", value: author || (w.author ?? ""), placeholder: "可留空" }],
+        action: { endpoint: "/api/novel/world", method: "POST", body: {} },
+        submitLabel: "保存署名",
+      };
+    }
     // 设定/全局编辑（无角色语境 → 设定表单）
     return {
       kind: "form", title: "编辑设定与全局信息", commandId: "CMD-W12", level: "L0",
-      summary: summary || "修改故事设定/梗概/当前状态（L0 前瞻，不回溯已写章节）",
+      summary: summary || "修改故事设定/梗概/当前状态（不回溯已写章节）",
       fields: [
         { key: "premise", label: "梗概", type: "textarea", value: w.premise, array: false },
         { key: "current", label: "全局当前状态", type: "text", value: w.current ?? "", placeholder: "季节/天气/局势（单行）" },
@@ -1667,14 +1689,14 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
 
     // 表单类（编辑设定/角色/伏笔/任务/草稿/章纲/参数）：reply 开场 + 结构化表单卡（字段→填写→提交→结果回执）
     if (["edit_world", "foreshadow_edit", "task_ops", "draft_confirm", "expand_arc", "settings"].includes(intent)) {
-      const text = reply || meta.title;
+      const text = intent === "edit_world" ? "请核对下方待修改内容；提交前不会写入故事。" : (reply || meta.title);
       if (text) {
         updateMessageText(title, sessionId, messageId, text, true);
         send({ type: "delta", messageId, text });
       }
       // 从对话历史收集表单参数：最近用户消息原文（供 buildFormCard 预填角色名等，需求：信息可从对话收集）
       const userHist = (session?.messages ?? []).filter((m) => m.role === "user").slice(-5).map((m) => m.text ?? "");
-      const card = buildFormCard(w, intent, params, reply, { userHist, prompt: activePrompt });
+      const card = buildFormCard(w, intent, params, intent === "edit_world" ? undefined : reply, { userHist, prompt: activePrompt });
       if (card) {
         markMessageDone(title, sessionId, messageId, [card]);
         send({ type: "card", messageId, card });

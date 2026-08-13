@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { emptyWorld, type WorldState } from "../src/api/world";
 import type { Card as WorldCard } from "../src/api/world";
-import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, explicitSettingsQuery, extractNameFromHistory, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard } from "../src/api/brain-chat";
+import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, explicitSettingsQuery, extractNameFromHistory, authorFromEditPrompt, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard } from "../src/api/brain-chat";
 import { getSession as sessGet, lastPendingMessage as sessLastPending } from "../src/api/brain-sessions";
 import type { ChatMessage } from "../src/api/agnes";
 
@@ -435,6 +435,19 @@ describe("buildFormCard（表单卡构建）", () => {
     expect(fields.map((f) => f.key)).toContain("setting.time");
   });
 
+  test("edit_world 作者问法 → 只展示作者字段并从结构化参数/明确问句预填", () => {
+    const w = mkWorld();
+    w.author = "旧署名";
+    expect(authorFromEditPrompt({ author: "新署名" }, "忽略这里")).toBe("新署名");
+    expect(authorFromEditPrompt({}, "请把故事作者署名改为测试作者")).toBe("测试作者");
+    expect(authorFromEditPrompt({}, "把基调改成冷峻")).toBe("");
+    const card = buildFormCard(w, "edit_world", {}, "已修改", { prompt: "请把故事作者署名改为测试作者" });
+    expect(card?.title).toBe("修改作者署名");
+    expect(card?.level).toBe("L2");
+    expect(card?.summary).toBe("请确认将作者署名修改为「测试作者」。");
+    expect(card?.fields).toEqual([{ key: "author", label: "作者署名", type: "text", value: "测试作者", placeholder: "可留空" }]);
+  });
+
   test("edit_world 无 name 但对话历史提到角色 → 从历史收集角色名并预填（信息可从对话收集）", () => {
     const w = mkWorld();
     const card = buildFormCard(w, "edit_world", {}, "编辑角色", { userHist: ["昨天写的林墨不太对", "帮他改改"], prompt: "帮我改一下林墨" });
@@ -811,6 +824,17 @@ describe("brainChatStream（SSE 编排，事件协议 v2）", () => {
     expect(options.length).toBeGreaterThanOrEqual(2);
     expect(options[0].label).toBe("保持现状"); // 兜底选项
     expect(events[events.length - 1].type).toBe("done");
+  });
+
+  test("edit_world 表单回合不把 provider 的已完成文案当成已写入回执", async () => {
+    mockWorld = mkWorld();
+    nextChatContent = JSON.stringify({ intent: "edit_world", params: { author: "测试作者" }, reply: "已将作者署名改为测试作者" });
+    const events = await runTurn("请把故事作者署名改为测试作者", { sessionId: "author-edit-neutral" });
+    const delta = events.find((e) => e.type === "delta") as { text?: string } | undefined;
+    expect(delta?.text).toBe("请核对下方待修改内容；提交前不会写入故事。");
+    const card = (events.find((e) => e.type === "card") as { card?: Record<string, unknown> } | undefined)?.card;
+    expect(card?.title).toBe("修改作者署名");
+    expect((card?.fields as { key: string; value?: string }[])[0]).toMatchObject({ key: "author", value: "测试作者" });
   });
 
   test("中途取消 → interrupted 事件，消息保留已生成文本", async () => {

@@ -20,6 +20,22 @@
 
 > `BRAIN-UI-NEW-STORY-STATE-01` 曾在立项 `ready` 阶段观察到顶层 job 仍为 running；继续等待后真实蓝图/首弧 provider 在既定时限内完成，job 收敛为 succeeded，刷新解除只读。`ready` 在现协议中明确表示“基础世界可进入、后台增强仍运行”，因此该过程归为预期运行态，不登记缺陷。
 
+### BROWSER-BUG-010 [P1] 作者编辑问答遗漏目标字段并产生成功假回执
+
+- **首次发现**：2026-08-14 02:25（Asia/Shanghai）
+- **场景/testId**：`BRAIN-UI-FORM-STATE-01`，真实询问“请把故事作者署名改为测试作者”。
+- **复现步骤**：在《雨夜档案》当前中枢会话提交上述问句；等待真实文本 provider 返回；展开“编辑设定与全局信息”卡；检查字段后按页面顺序在唯一空文本框输入“测试作者”，只点击一次“保存设定”；刷新页面、关闭并重开中枢，再展开同一持久卡。
+- **预期**：问题明确指定作者和值，卡片应只呈现或至少预填作者字段，并以写操作级别说明影响；提交后权威 `state.json.author` 为“测试作者”，回复只能陈述实际保存结果。完成态刷新后不可再次提交。
+- **实际**：卡片没有作者字段，唯一空文本框实际标注“全局当前状态”；卡片却使用 `CMD-W12 / L0·只读`。提交后 UI 显示“已将故事作者署名改为「测试作者」”“已保存”“✓ 已执行”，但 `state.json` 完全没有 `author`，实际把 `current` 写成了“测试作者”。刷新后 `executionState=succeeded` 能阻止重复提交，但错误业务结果和假成功摘要被持久保留。
+- **浏览器/服务/SQLite/磁盘证据**：真实卡 `card-87663393-7503-4cff-81fd-d134c769cece`、消息 `35aa98ea-397d-4345-8dff-e6efff4f1580`；字段依次为 `premise/current/setting.time/setting.place/setting.tone/setting.rules`，无 `author`；持久卡终态 `executionState=succeeded, detail=已保存`。SQLite receipt `07e8ec69-b580-4686-a1cf-e516ad39ccde` 为 succeeded，证明错误字段写入成功而非请求失败。磁盘 `state.json` 无 `author`/“测试作者”作者值。刷新、关闭重开后保存按钮未复活，完成态恢复这一子项通过。
+- **影响范围**：所有通过中枢修改作者的问法；用户会误以为作者已修改，同时无意污染全局当前状态。卡片风险级别错误会弱化写操作提示。
+- **根因**：`buildFormCard(edit_world)` 的全局表单遗漏 `/api/novel/world` 已支持的 `author` 字段；作者问法因此落入无关的“全局当前状态”字段。provider 生成的开场 `reply` 被同时用作表单 summary，在真正提交前就可能声称操作已完成。
+- **修复方案**：新增作者参数结构化提示和明确“作者/署名”句式兜底；作者问法走只含“作者署名”字段的专用表单，预填目标值并标为 `CMD-W12/L2`；编辑类回合统一发送“提交前不会写入故事”的中性正文，不再把 provider 的已完成句子当作事实。普通设定表单保持 `L0` 只读影响等级，避免改变既有契约。
+- **回归测试**：`bun test tests/brain-chat.test.ts tests/brain-cards.test.ts`，115 pass / 0 fail；新增作者参数/句式预填、专用字段、L2 标识和 provider 误报中性正文回归。`bun run typecheck`、`bun run check:architecture`、`bun run build`、`git diff --check` 通过。
+- **commit / push**：本条独立提交；实际 SHA 与 push 结果见本批次最终记录。
+- **复验结果**：隔离实例 PID `12684`、端口 `3229` 加载修复构建；真实新问法“请把故事作者署名改为修复后作者”只调用文本 provider 一次。浏览器卡片显示“请核对下方待修改内容；提交前不会写入故事”、标题“修改作者署名”、`CMD-W12`、`L2·回溯`，唯一字段“作者署名”预填“修复后作者”。只点击一次“保存署名”后页面显示“已保存/✓ 已执行”；磁盘 `state.json.author=修复后作者` 且 `current` 未变化，SQLite receipt `81b44fdf-9d0c-4de8-a618-ef1c96cb1050` 为 succeeded。刷新、关闭重开、继续只读聊天、新建并切换会话 Tab 后卡片仍只有完成标记，按钮没有复活。应用页面无 console/network 异常；Statsig POST 超时属于 Browser 插件工具噪声，单独排除。
+- **最终状态**：已修复，真实浏览器复验通过，待本条提交推送。
+
 ## 2026-08-13 真实浏览器深度验收
 
 ### 2026-08-14 批次收尾
