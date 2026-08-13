@@ -16,11 +16,10 @@ import { planScenes, generateSceneImage, createSceneVideo, styleAnchor, findChar
 import { auditWorld, autoRepair, alignWorld, collectOrphanMediaFiles } from "./integrity";
 import { resetChapterLedger, settleChapter } from "./chronicler";
 import { applyStateChange, finalizeStateChange } from "./statechange";
-import { notifyLibraryChanged, publishSync, publishSyncImmediate, publishCardReplaced, type SyncEvent } from "./sync";
+import { notifyLibraryChanged, notifySystemInvalidated, publishSync, publishSyncImmediate, publishCardReplaced, type SyncEvent } from "./sync";
 import { withTitleLock } from "./titlelock";
 import { brainChatStream } from "./brain-chat";
 import { imageOccupiesQuota } from "../shared/media-const";
-import { publicCommandFor } from "../shared/commands";
 import {
   attachSessionTask,
   broadcastToSession,
@@ -49,92 +48,32 @@ import {
 } from "./brain-sessions";
 import { startAdvanceTask, updateAdvanceTaskPhase, completeAdvanceTask, failAdvanceTask, getAdvanceTaskForClient, clearAdvanceTask } from "./advancetask";
 import { migrateChapterMedia, touchChapter, genOf, type WorldState, type Character as WorldCharacter, type ChapterMedia, type ConsistencyFinding, type PendingChapter } from "./world";
-import { AuthError, clearSessionCookieValue, firstUsername, getPropClosed, listUsernames, loginUser, logoutSession, registerUser, sessionCookieValue, setPropClosed, userFromRequest, validateCredentials, SESSION_COOKIE } from "./auth";
+import { firstUsername, getPropClosed, getPropClosedForUsername, listUsernames, setPropClosed, userFromRequest, userByUsername } from "./auth";
 import type { AuthUser } from "./auth";
 import type { CardType } from "./cards";
 import { renameSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { runtimeReadiness } from "./runtime-readiness";
-import { acceptCommandOnce, clearScopeDeleted, CommandConflictError, createJob, getActiveJob, getCommandReceipt, isScopeGenerationCurrent, listJobs, listScheduledJobs, markScopeDeleted, scopeGeneration, syncRevision, transitionJob, updateCommand, updateJob, RevisionConflictError, type CommandReceipt, type CommandRequest, type DurableJob } from "./control-plane";
+import { clearScopeDeleted, createJob, getActiveJob, isScopeGenerationCurrent, listJobs, listScheduledJobs, markScopeDeleted, scopeGeneration, transitionJob, updateJob, type DurableJob } from "./control-plane";
+import { runtimeMap, runtimeSet } from "../application/runtime/job-runner-registry";
+import { CommandBus } from "../transport/http/command-bus";
+import { errorDetail, jsonResponse as json, readJsonBody as readBody } from "../transport/http/responses";
+import { sseResponse } from "../transport/http/sse";
+import { handleAuthRoute } from "../transport/http/auth-routes";
+import type { RequestContext } from "../contracts/auth";
+import { dispatchHttpRoute, type RouteDependencies } from "../transport/http/routes";
+import { fileStoryRepository, fileWorldCommitter } from "../infrastructure/persistence/story-repository";
+import { sqliteJobStore } from "../infrastructure/persistence/control-plane-store";
+import { syncProjectionPublisher } from "../infrastructure/projections/sync-publisher";
+import { agnesModelProvider, createLegacyMediaProvider } from "../infrastructure/providers/legacy-providers";
 
-function json(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "Content-Type": "application/json; charset=utf-8", ...extraHeaders },
-  });
-}
-
-type StoredHttpResponse = {
-  __httpResponse: true;
-  status: number;
-  contentType: string;
-  body: unknown;
-};
-
-function storedHttpResponse(response: Response, body: unknown): StoredHttpResponse {
-  return {
-    __httpResponse: true,
-    status: response.status,
-    contentType: response.headers.get("content-type") ?? "application/json",
-    body,
-  };
-}
-
-function replayCommandReceipt(receipt: CommandReceipt): Response {
-  const stored = receipt.result as Partial<StoredHttpResponse> | undefined;
-  const terminal = receipt.status === "succeeded" || receipt.status === "failed" || receipt.status === "cancelled";
-  const replayStored = receipt.status === "succeeded"
-    || ((receipt.status === "failed" || receipt.status === "cancelled") && typeof stored?.status === "number" && stored.status >= 400);
-  if (terminal && replayStored && stored?.__httpResponse && typeof stored.status === "number") {
-    if (stored.contentType?.includes("application/json")) return json(stored.body, stored.status);
-    return new Response(typeof stored.body === "string" ? stored.body : JSON.stringify(stored.body), {
-      status: stored.status,
-      headers: { "Content-Type": stored.contentType ?? "application/octet-stream" },
-    });
-  }
-  if (receipt.status === "failed") return json({ error: receipt.error ?? "命令执行失败", ...receipt }, 409);
-  if (receipt.status === "cancelled") return json({ error: receipt.error ?? "命令已取消", ...receipt }, 409);
-  if (receipt.status === "succeeded" && receipt.result !== undefined) return json(receipt.result);
-  return json(receipt, 202);
-}
+const commandBus = new CommandBus(handleNovelApi);
 
 function sseStream(produce: (send: (obj: unknown) => void) => Promise<void>): Response {
-  const encoder = new TextEncoder();
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      // 客户端断开（如 curl 超时）后 enqueue 会抛错：吞掉，保证服务端回合完整执行到存档
-      const send = (obj: unknown) => {
-        try {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
-        } catch {
-          /* 客户端已断开，忽略 */
-        }
-      };
-      // 心跳：长回合（写+审+修可达数分钟）每 8s 发 ping 保活（必须小于 Bun.serve 的 idleTimeout=255s，并防中间代理断连）
-      const heartbeat = setInterval(() => send({ phase: "ping" }), 8_000);
-      try {
-        await produce(send);
-      } catch (e) {
-        // 干预打断：推 interrupted 事件（非错误）；业务错误（AppError）可回显；内部异常只记日志
-        if (e instanceof director.InterruptedError) {
-          send({ phase: "interrupted", item: e.item });
-        } else {
-          console.error("[api] 请求失败:", e);
-          const msg = e instanceof AppError ? e.message : "内部错误，请稍后重试";
-          send({ error: msg });
-        }
-      } finally {
-        clearInterval(heartbeat);
-        try {
-          controller.close();
-        } catch {
-          /* 已关闭 */
-        }
-      }
-    },
-  });
-  return new Response(stream, {
-    headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive" },
+  return sseResponse(produce, (error) => {
+    if (error instanceof director.InterruptedError) return { phase: "interrupted", item: error.item };
+    console.error("[api] 请求失败:", error);
+    return { error: error instanceof AppError ? error.message : "内部错误，请稍后重试" };
   });
 }
 
@@ -143,13 +82,9 @@ export class AppError extends Error {}
 
 /** 错误信息归一（入库/回显）：取首行（剥离 stack 尾部）、截断 300 字符；
  *  非 AppError（LLMError/TypeError 等）也保留真实原因（如 ECONNRESET/超时），不笼统吞掉 */
-function errorDetail(e: unknown, fallback: string): string {
-  const msg = e instanceof Error && e.message ? e.message.split("\n")[0].trim() : "";
-  return msg ? msg.slice(0, 300) : fallback;
-}
 
 // 自动连载活跃运行注册表：同一用户名下同一书名同时只允许一个 runAuto 循环（防双跑重复写章/停止信号串扰）
-const activeAuto = new Set<string>();
+const activeAuto = runtimeSet<string>("autorun");
 /** 进程内注册表 key：前缀当前用户，不同账号的同名书 / 相同 mediaId 互不串扰 */
 function mediaKey(id: string): string {
   return `${currentUser() ?? ""}::${id}`;
@@ -159,13 +94,6 @@ function activeMediaRegen(mediaId: string) {
   return getActiveJob(currentUser(), `media-regenerate:${mediaId}`);
 }
 
-async function readBody(req: Request): Promise<Record<string, unknown>> {
-  try {
-    return (await req.json()) as Record<string, unknown>;
-  } catch {
-    return {};
-  }
-}
 
 /** 插画/视频异步生成任务表（内存态）：'user::mediaId' → 生成中任务；
  *  status 轮询据此区分“生成中”与“服务重启中断”；WS 订阅快照据此推送该书进行中任务（前端免轮询）。
@@ -179,8 +107,8 @@ type GenTask = {
   controller: AbortController;
   session?: { sessionId: string; messageId: string; cardIndex: number; cardId: string };
 };
-const imageGenTasks = new Map<string, GenTask>();
-const scheduledMediaTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const imageGenTasks = runtimeMap<GenTask>("media-image");
+const scheduledMediaTimers = runtimeMap<ReturnType<typeof setTimeout>>("media-scheduled");
 
 function scheduleMediaAutoJob(job: DurableJob): void {
   if (scheduledMediaTimers.has(job.id)) return;
@@ -242,7 +170,7 @@ type PlanTask = {
   timer?: ReturnType<typeof setTimeout>;
   session?: { sessionId: string; messageId: string; cardIndex: number; cardId: string };
 };
-const planTasks = new Map<string, PlanTask>();
+const planTasks = runtimeMap<PlanTask>("media-plan");
 const PLAN_TASK_MAX = 200; // 防膨胀上限：超出只清最旧终态
 const PLAN_TASK_TIMEOUT = 180_000; // pending 真超时：180s（与 media.ts PLAN_SCENE_TIMEOUT_MS 对齐），到点 abort
 function planId(): string { return `plan-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`; }
@@ -407,7 +335,7 @@ function evictFinishedPlanTasks(): void {
   }
 }
 
-// —— 单媒体状态查询（/media/status 与 /media/status-batch 共用；含视频下载落盘、中断置 failed 等副作用） ——
+// —— provider 媒体状态 reconciler（仅由服务端 watcher/recovery 调用，不是 HTTP 状态查询） ——
 
 type MediaStatusResult =
   | { ok: true; status: "ready"; progress: 100; path?: string }
@@ -415,7 +343,7 @@ type MediaStatusResult =
   | { ok: true; status: "pending"; progress: number; rateLimited?: boolean }
   | { ok: false; error: string; httpStatus: number };
 
-async function getMediaStatus(title: string, idx: number, id: string): Promise<MediaStatusResult> {
+async function reconcileMediaProviderStatus(title: string, idx: number, id: string): Promise<MediaStatusResult> {
   const w0 = loadWorld(title);
   const ch0 = w0?.chapters.find((x) => x.index === idx);
   const media = (ch0?.media ?? []).find((m) => m.id === id);
@@ -541,18 +469,30 @@ async function getMediaStatus(title: string, idx: number, id: string): Promise<M
     }
     return { ok: true, status: "pending", progress: st.progress };
   } catch (e) {
-    console.error("[api/novel/media/status]", e);
+    console.error("[media/provider-reconciler]", e);
     return { ok: false, error: e instanceof AppError ? e.message : "查询视频状态失败", httpStatus: 502 };
   }
 }
 
-// —— 视频远端任务服务端轮询（Agnes 视频为异步任务，无回调；前端改为 WS 驱动后，由此在服务端
-//    周期 poll provider → 落盘 ready/failed → publishSync 广播，前端零轮询收敛）——
+const routeDependencies: RouteDependencies = {
+  storyRepository: fileStoryRepository,
+  worldCommitter: fileWorldCommitter,
+  jobStore: sqliteJobStore,
+  projectionPublisher: syncProjectionPublisher,
+  modelProvider: agnesModelProvider,
+  mediaProvider: createLegacyMediaProvider(async (title, chapterIndex, mediaId) => {
+    const result = await reconcileMediaProviderStatus(title, chapterIndex, mediaId);
+    return result.ok ? result.status : "failed";
+  }),
+};
+
+// —— 视频远端任务服务端 watcher（Agnes 视频为异步任务，无回调；服务端周期查询 provider，
+//    落盘 ready/failed 后 publishSync 广播，前端只消费权威事件）——
 const VIDEO_WATCH_INTERVAL_MS = 15_000; // provider 查询间歇（视频 RPM=2，留裕量；429 自动跳过本轮）
 type VideoWatchSession = { sessionId: string; messageId: string; cardIndex: number; cardId: string };
-const videoWatchers = new Map<string, { title: string; idx: number; id: string; generation: string; session?: VideoWatchSession; timer?: ReturnType<typeof setTimeout> }>();
+const videoWatchers = runtimeMap<{ title: string; idx: number; id: string; generation: string; session?: VideoWatchSession; timer?: ReturnType<typeof setTimeout> }>("media-video-watch");
 
-/** 开始（或复用）一个视频 pending 任务的服务端轮询；幂等。getMediaStatus 负责落盘 + 广播终态。
+/** 开始（或复用）一个视频 pending 任务的服务端轮询；幂等。reconcileMediaProviderStatus 负责落盘 + 广播终态。
  *  传入 session 时，终态（ready/failed）由服务端权威翻 brain 卡并推 card-replaced（刷新/重启后仍能收敛）。
  *  插画不进此表（后台 Promise 完成时直接落盘广播），视频拿 videoId 后才需要持续查询远端。 */
 export function watchVideoTask(title: string, idx: number, id: string, session?: VideoWatchSession, commandId?: string): void {
@@ -581,9 +521,9 @@ export function watchVideoTask(title: string, idx: number, id: string, session?:
       return;
     }
     try {
-      const res = await getMediaStatus(title, idx, id);
+      const res = await reconcileMediaProviderStatus(title, idx, id);
       if (res.ok && (res.status === "ready" || res.status === "failed")) {
-        videoWatchers.delete(key); // 终态：停止轮询（getMediaStatus 已落盘章节媒体 + 广播 task-status）
+        videoWatchers.delete(key); // 终态：停止 provider watcher（reconciler 已落盘章节媒体 + 广播 task-status）
         updateJob(durable.job.id, { status: res.status === "ready" ? "succeeded" : "failed", phase: res.status, error: res.status === "failed" ? res.error : null });
         // 服务端权威翻 brain 卡为终态（card-replaced），不依赖前端回写
         const sess = entry.session;
@@ -822,17 +762,18 @@ export function getSystemSyncSnapshot(title: string, heal = false): Omit<Extract
     });
   return {
     title,
-    world: sanitize(w) as unknown as Record<string, unknown>,
+    world: sanitize(w) as unknown as WorldState,
     visual: { running: pending.length > 0, pending, failed },
     autoSession: loadAutoSession(title) as unknown as Record<string, unknown> | null,
     autoPending: loadPendingChapter(title) as unknown as Record<string, unknown> | null,
     advanceTask: getAdvanceTaskForClient(title) as unknown as Record<string, unknown> | null,
+    proposalClosed: getPropClosedForUsername(currentUser(), title),
   };
 }
 /** 角色视觉生成中集合（进程级去重：同一角色同时只允许一个自动生成任务） */
-const visualInFlight = new Set<string>();
+const visualInFlight = runtimeSet<string>("visual-character");
 /** 小说封面生成中集合（进程级去重：同一本书同时只允许一个自动封面任务） */
-const coverInFlight = new Set<string>();
+const coverInFlight = runtimeSet<string>("visual-cover");
 /** 视觉自动重试冷却：失败/尝试后 1 分钟内不再自动触发（防高频烧配额；手动生成不受影响）。入口触发与中枢巡检共用 */
 const VISUAL_RETRY_COOLDOWN = 60_000;
 
@@ -1108,6 +1049,7 @@ export async function handleApi(pathname: string, req: Request): Promise<Respons
 }
 
 async function handleApiInner(pathname: string, req: Request, user: AuthUser | null): Promise<Response | null> {
+  const context: RequestContext | null = user ? { userId: user.id, username: user.username } : null;
   const removedStateRoutes = new Set([
     "/api/brain/context", "/api/novel/list", "/api/novel/new/status", "/api/novel/step/status",
     "/api/novel/step/clear", "/api/novel/auto/status", "/api/novel/media/plan-status",
@@ -1126,195 +1068,40 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
     return json({ error: "未登录" }, 401);
   }
 
-  if (pathname === "/api/commands") {
-    if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
-    const raw = await readBody(req);
-    const command = raw as unknown as CommandRequest;
-    const commandId = String(command.commandId ?? "").trim();
-    const type = String(command.type ?? "") as CommandRequest["type"];
-    const title = String(command.scope?.title ?? "").trim();
-    const routes: Partial<Record<CommandRequest["type"], string>> = {
-      "CMD-N01": "/api/novel/new", "CMD-N02": "/api/novel/step", "CMD-N03": "/api/novel/auto/start",
-      "CMD-N05": "/api/novel/chapter/regenerate", "CMD-N06": "/api/novel/chapter/edit", "CMD-N07": "/api/novel/chapter/rollback",
-      "CMD-N08": "/api/novel/chapter/delete", "CMD-N09": "/api/novel/chapter/review", "CMD-N13": "/api/novel/auto/stop",
-      "CMD-N14": "/api/novel/auto/skip", "CMD-N15": "/api/novel/auto/clear-session", "CMD-N16": "/api/novel/intervene",
-      "CMD-N17": "/api/novel/chapter/confirm", "CMD-N18": "/api/novel/chapter/reject", "CMD-N19": "/api/novel/auto/pause",
-      "CMD-W01": "/api/novel/outline", "CMD-W02": "/api/novel/blueprint", "CMD-W03": "/api/novel/blueprint",
-      "CMD-W04": "/api/novel/blueprint", "CMD-W05": "/api/novel/plans", "CMD-W07": "/api/novel/plans",
-      "CMD-W12": "/api/novel/world", "CMD-W14": "/api/novel/lore", "CMD-W16": "/api/novel/style",
-      "CMD-W17": "/api/novel/gacha", "CMD-W18": "/api/novel/gacha",
-      "CMD-L03": "/api/novel/chapter/resettle", "CMD-L04": "/api/novel/integrity", "CMD-L07": "/api/novel/foreshadow",
-      "CMD-L11": "/api/novel/proposal", "CMD-L13": "/api/novel/debt",
-      "CMD-M01": "/api/novel/media/plan", "CMD-M02": "/api/novel/media/generate", "CMD-M03": "/api/novel/media/generate",
-      "CMD-M05": "/api/novel/media/regenerate", "CMD-M06": "/api/novel/media/delete", "CMD-M07": "/api/novel/character/portrait",
-      "CMD-M13": "/api/novel/media/cancel",
-      "CMD-M08": "/api/novel/image", "CMD-M09": "/api/novel/image", "CMD-M10": "/api/novel/cover/upload",
-      "CMD-G02": "/api/novel/intervene", "CMD-G03": "/api/novel/lock", "CMD-G06": "/api/novel/rewrite", "CMD-G07": "/api/novel/rewrite",
-      "CMD-S02": "/api/novel/integrity", "CMD-S09": "/api/novel/eval", "CMD-S12": "/api/novel/delete", "CMD-S13": "/api/novel/proposal-closed",
-    };
-    const target = routes[type];
-    if (!commandId || !type || !command.scope || !("payload" in command)) return json({ error: "commandId/type/scope/payload 不能为空" }, 400);
-    if (!target) return json({ error: `命令尚未迁入统一入口: ${type}` }, 400);
-    if (type !== "CMD-N01" && !title) return json({ error: "该命令缺少 scope.title" }, 400);
-    try {
-      if (command.expectedRevision !== undefined && title) {
-        const current = syncRevision(user!.username, `story/${title}`, "world").revision;
-        if (current !== command.expectedRevision) throw new RevisionConflictError(`世界版本已变化：期望 ${command.expectedRevision}，当前 ${current}`);
-      }
-      const accepted = acceptCommandOnce(user!.username, { ...command, commandId, type, scope: { ...command.scope, title: title || undefined } });
-      if (accepted.created) {
-        const username = user!.username;
-        void runAsUser(username, async () => {
-          updateCommand(commandId, "running");
-          try {
-            const payload = typeof command.payload === "object" && command.payload ? command.payload as Record<string, unknown> : {};
-            const forwarded = new Request(`http://internal${target}`, {
-              method: "POST", headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ ...payload, ...(title ? { title } : {}), commandId }),
-            });
-            const response = await handleNovelApi(target, forwarded);
-            const result = response ? await response.clone().json().catch(() => ({})) as Record<string, unknown> : {};
-            if (!response || !response.ok) throw new Error(String(result.error ?? `命令执行器返回 ${response?.status ?? 500}`));
-            const asyncCommand = target === "/api/novel/new" || target === "/api/novel/media/plan" || target === "/api/novel/media/generate" || target === "/api/novel/auto/start" || target === "/api/novel/step";
-            if (asyncCommand) updateCommand(commandId, "running", result);
-            else updateCommand(commandId, "succeeded", result);
-          } catch (error) {
-            updateCommand(commandId, "failed", undefined, errorDetail(error, "命令执行失败"));
-          }
-        });
-      }
-      const receiptStatus = accepted.receipt.status === "queued" || accepted.receipt.status === "running"
-        ? 202 : accepted.receipt.status === "succeeded" ? 200 : 409;
-      return json(accepted.receipt, receiptStatus);
-    } catch (error) {
-      if (error instanceof CommandConflictError) return json({ error: error.message }, 409);
-      if (error instanceof RevisionConflictError) return json({ error: error.message }, 409);
-      return json({ error: errorDetail(error, "命令提交失败") }, 400);
-    }
+  if (user) {
+    const resourceResponse = await commandBus.handleResource(pathname, req, user.username);
+    if (resourceResponse) return resourceResponse;
+    const legacyResponse = await commandBus.handleLegacy(pathname, req, user.username);
+    if (legacyResponse) return legacyResponse;
   }
 
-  if (pathname.startsWith("/api/commands/")) {
-    if (req.method !== "GET") return json({ error: "仅支持 GET" }, 405);
-    const commandId = decodeURIComponent(pathname.slice("/api/commands/".length)).trim();
-    if (!commandId) return json({ error: "缺少 commandId" }, 400);
-    const receipt = getCommandReceipt(user!.username, commandId);
-    return receipt ? json(receipt) : json({ error: "命令不存在" }, 404);
+  const authResponse = await handleAuthRoute(pathname, req, user, context, { migrateLegacyStories: migrateLegacyStoriesTo });
+  if (authResponse) return authResponse;
+
+  // 功能路由按 transport/http/routes 分组；适配器委托既有实现，
+  // 依赖注入接口为后续 application/domain 迁移保留稳定边界。
+  if (user) {
+    const routed = await dispatchHttpRoute({
+      request: req,
+      pathname,
+      body: {},
+      user,
+      requestContext: context!,
+    }, routeDependencies, handleLegacyRoute);
+    if (routed) return routed;
   }
 
-  if (pathname.startsWith("/api/novel/") && req.method === "POST" && req.headers.get("x-command-contract") === "v1") {
-    const payload = await readBody(req.clone());
-    const route = publicCommandFor(pathname, payload);
-    if (route) {
-      const commandId = String(req.headers.get("x-command-id") ?? "").trim();
-      const claimedType = String(req.headers.get("x-command-type") ?? "").trim();
-      const title = String(payload.title ?? "").trim();
-      const expectedRaw = req.headers.get("x-expected-revision");
-      const expectedRevision = expectedRaw == null ? undefined : Number(expectedRaw);
-      if (!commandId || claimedType !== route.type) return json({ error: "命令契约与业务入口不匹配" }, 400);
-      if (route.requiresRevision && title && (!Number.isInteger(expectedRevision) || expectedRevision! < 0)) return json({ error: "覆盖性命令缺少 expectedRevision" }, 409);
-      if (expectedRevision !== undefined && title) {
-        const current = syncRevision(user!.username, `story/${title}`, "world").revision;
-        if (current !== expectedRevision) return json({ error: `世界版本已变化：期望 ${expectedRevision}，当前 ${current}` }, 409);
-      }
-      try {
-        const accepted = acceptCommandOnce(user!.username, { commandId, type: route.type, scope: { title: title || undefined }, expectedRevision, payload });
-        if (!accepted.created) return replayCommandReceipt(accepted.receipt);
-        updateCommand(commandId, "running");
-        const headers = new Headers(req.headers);
-        headers.set("x-command-accepted", "1");
-        const forwarded = new Request(req.url, { method: req.method, headers, body: JSON.stringify({ ...payload, commandId }) });
-        const response = await handleNovelApi(pathname, forwarded);
-        if (!response) throw new AppError("命令执行器不存在");
-        const isStream = response.headers.get("content-type")?.includes("text/event-stream");
-        const asyncJob = pathname === "/api/novel/new" || pathname === "/api/novel/media/plan" || pathname === "/api/novel/media/generate" || pathname === "/api/novel/auto/start" || pathname === "/api/novel/step";
-        if (!response.ok) {
-          const result = await response.clone().json().catch(() => ({})) as Record<string, unknown>;
-          updateCommand(commandId, "failed", storedHttpResponse(response, result), String(result.error ?? `命令执行器返回 ${response.status}`));
-        } else if (!isStream && !asyncJob) {
-          const result = await response.clone().json().catch(() => ({}));
-          updateCommand(commandId, "succeeded", storedHttpResponse(response, result));
-        } else if (!isStream && asyncJob) {
-          const result = await response.clone().json().catch(() => ({}));
-          updateCommand(commandId, "running", storedHttpResponse(response, result));
-        }
-        return response;
-      } catch (error) {
-        if (error instanceof CommandConflictError) return json({ error: error.message }, 409);
-        updateCommand(commandId, "failed", undefined, errorDetail(error, "命令提交失败"));
-        return json({ error: errorDetail(error, "命令提交失败") }, 400);
-      }
-    }
-  }
-
-  // 小说引擎路由优先
   const novelRes = await handleNovelApi(pathname, req);
   if (novelRes) return novelRes;
+  return handleGeneralApi(pathname, req);
+}
 
+async function handleLegacyRoute(pathname: string, req: Request): Promise<Response | null> {
+  return pathname.startsWith("/api/novel") ? handleNovelApi(pathname, req) : handleGeneralApi(pathname, req);
+}
+
+async function handleGeneralApi(pathname: string, req: Request): Promise<Response | null> {
   switch (pathname) {
-    case "/api/auth/register": {
-      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
-      const body = await readBody(req);
-      const username = String(body.username ?? "").trim();
-      const password = String(body.password ?? "");
-      const displayName = String(body.displayName ?? "").trim();
-      const err = validateCredentials(username, password);
-      if (err) return json({ error: err }, 400);
-      try {
-        const user = await registerUser(username, password, displayName);
-        // 首个注册用户：认领 data/ 根下的遗留旧数据（迁移到其用户目录，登录后立即可见）
-        if (user.isFirstUser) {
-          try {
-            migrateLegacyStoriesTo(user.username);
-          } catch (e) {
-            console.warn("[api/auth/register] 旧数据迁移失败:", (e as Error).message);
-          }
-        }
-        // 注册即登录：下发业务 token（响应体，前端存 localStorage 供 Authorization header）+ 只读会话 cookie（SSR 首帧识别）
-        const session = await loginUser(username, password);
-        const token = session?.token ?? "";
-        return json({ ok: true, token, user: { id: user.id, username: user.username, displayName: user.displayName } }, 200, token ? { "Set-Cookie": sessionCookieValue(token) } : undefined);
-      } catch (e) {
-        if (e instanceof AuthError) return json({ error: e.message }, 409);
-        console.error("[api/auth/register]", e);
-        return json({ error: "注册失败，请稍后重试" }, 500);
-      }
-    }
-
-    case "/api/auth/login": {
-      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
-      const body = await readBody(req);
-      const username = String(body.username ?? "").trim();
-      const password = String(body.password ?? "");
-      const result = await loginUser(username, password);
-      if (!result) return json({ error: "用户名或密码错误" }, 401);
-      // 响应体带业务 token（前端存 localStorage 走 Authorization header）+ 只读会话 cookie（SSR 首帧识别）
-      return json({ ok: true, token: result.token, user: result.user }, 200, { "Set-Cookie": sessionCookieValue(result.token) });
-    }
-
-    case "/api/auth/logout": {
-      if (req.method !== "POST") return json({ error: "仅支持 POST" }, 405);
-      // 按凭证注销：Authorization header token 优先，回退 cookie（旧客户端/SSR 兼容）
-      const auth = req.headers.get("authorization");
-      let token = "";
-      if (auth?.startsWith("Bearer ")) token = auth.slice("Bearer ".length).trim();
-      if (!token) {
-        const cookie = req.headers.get("cookie") ?? "";
-        const pair = cookie
-          .split(";")
-          .map((s) => s.trim())
-          .find((s) => s.startsWith(`${SESSION_COOKIE}=`));
-        if (pair) token = pair.slice(SESSION_COOKIE.length + 1);
-      }
-      if (token) logoutSession(token);
-      return json({ ok: true }, 200, { "Set-Cookie": clearSessionCookieValue() });
-    }
-
-    case "/api/auth/me": {
-      const user = userFromRequest(req);
-      if (!user) return json({ error: "未登录" }, 401);
-      return json({ ok: true, user });
-    }
-
     case "/api/health": {
       // 文本 key 检查 TEXT_* 优先（当前文本走基元），媒体固定 AGNES_*
       const textOk = Boolean(process.env.TEXT_API_KEY ?? process.env.AGNES_API_KEY);
@@ -2411,7 +2198,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
 
     case "/api/novel/proposal-closed": {
       // 新角色提案区关闭状态（按用户 + 书名存服务端，SSR 首帧读库，刷新不闪现）
-      const user = userFromRequest(req);
+      const user = userFromRequest(req) ?? userByUsername(currentUser());
       if (!user) return json({ error: "未登录" }, 401);
       const query = new URL(req.url).searchParams;
       const title = String(body.title ?? query.get("title") ?? "").trim();
@@ -2419,6 +2206,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       if (req.method === "POST") {
         const closed = body.closed === true;
         setPropClosed(user.id, title, closed);
+        notifySystemInvalidated(title, user.username);
         return json({ ok: true, closed });
       }
       return json({ closed: getPropClosed(user.id, title) });
@@ -3091,7 +2879,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
               replaceBrainMessageCard(title, genSession.sessionId, genSession.messageId, genSession.cardIndex, runningCard as never);
               publishCardReplaced(title, genSession.sessionId, genSession.messageId, genSession.cardIndex, runningCard, currentUser() ?? undefined);
             }
-            // 视频远端任务已创建（chapter media 落盘为 pending）：启动服务端轮询，由 getMediaStatus
+            // 视频远端任务已创建（chapter media 落盘为 pending）：启动服务端轮询，由 reconciler
             // 落盘 ready/failed 并广播 task-status（前端 WS 驱动收敛，零轮询）；携带会话定位以便终态翻 brain 卡。
             watchVideoTask(
               title, idx, media.id,
@@ -3397,7 +3185,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           throw e;
         }
         // ③ 锁内短事务：按 mediaId 重新定位（防期间被删/回滚）后交换
-        // 视频重生成交换期 key（与 /media/status 一致；mediaId 重生成前后不变）
+            // 视频重生成交换期 key（与 provider reconciler 一致；mediaId 重生成前后不变）
         const swapped = await withTitleLock(slug(title), async () => {
           const w = loadWorld(title);
           const ch = w?.chapters.find((x) => x.index === idx);
@@ -3409,7 +3197,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             m.status = "ready";
             m.error = undefined;
           } else {
-            // 视频重生成：保留旧 mp4（m.path 不清空）继续播放，等新视频在 /media/status 落盘后再替换；
+            // 视频重生成：保留旧 mp4（m.path 不清空）继续播放，等 provider reconciler 落盘后再替换；
             // 旧 videoId/path 持久写入 job recovery；失败/超时及服务重启后均可据此回滚。
             const rollback = { oldVideoId: m.videoId, oldPath: m.path };
             updateJob(regenJob.job.id, {
@@ -3433,7 +3221,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           return json({ error: "媒体已被删除，重生成结果已丢弃" }, 404);
         }
         // ④ 锁外删旧文件（best-effort，引用守卫在 deleteMediaFile 内）；
-        // 视频旧 mp4 不在此删——延迟到 /media/status 新视频落盘成功后删除（失败则回滚继续用旧文件）
+        // 视频旧 mp4 不在此删——延迟到 provider reconciler 新视频落盘成功后删除（失败则回滚继续用旧文件）
         if (snap.kind === "image" && snap.oldPath) deleteMediaFile(title, snap.oldPath);
         if (snap.kind === "video") watchVideoTask(title, idx, mediaId);
         if (snap.kind === "image") updateJob(regenJob.job.id, { status: "succeeded", phase: "ready" });

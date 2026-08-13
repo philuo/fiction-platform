@@ -241,9 +241,15 @@ describe("P5 角色媒体自动生成", () => {
     saveWorld(w);
 
     failImage = false;
+    const { syncRevision } = await import("../src/api/control-plane");
+    const proposalRevision = syncRevision(TEST_USER, `story/${w.title}`, "world").revision;
     const res = await handleApi("/api/novel/proposal", new Request("http://localhost/api/novel/proposal", {
       method: "POST",
-      headers: { "Content-Type": "application/json", cookie: authCookie },
+      headers: {
+        "Content-Type": "application/json", cookie: authCookie,
+        "x-command-contract": "v1", "x-command-id": "media-proposal-success", "x-command-type": "CMD-L11",
+        "x-expected-revision": String(proposalRevision),
+      },
       body: JSON.stringify({ title: w.title, proposalId: "cp1", action: "confirm" }),
     }));
     const data = (await res!.json()) as { ok?: boolean; world?: import("../src/api/world").WorldState };
@@ -286,9 +292,15 @@ describe("P5 角色媒体自动生成", () => {
     saveWorld(w);
 
     failImage = true; // 图像生成全部失败（模拟图像服务不可用）
+    const { syncRevision } = await import("../src/api/control-plane");
+    const proposalRevision = syncRevision(TEST_USER, `story/${w.title}`, "world").revision;
     const res = await handleApi("/api/novel/proposal", new Request("http://localhost/api/novel/proposal", {
       method: "POST",
-      headers: { "Content-Type": "application/json", cookie: authCookie },
+      headers: {
+        "Content-Type": "application/json", cookie: authCookie,
+        "x-command-contract": "v1", "x-command-id": "media-proposal-failure", "x-command-type": "CMD-L11",
+        "x-expected-revision": String(proposalRevision),
+      },
       body: JSON.stringify({ title: w.title, proposalId: "cp1", action: "confirm" }),
     }));
     const data = (await res!.json()) as { ok?: boolean; world?: import("../src/api/world").WorldState };

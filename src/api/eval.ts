@@ -5,27 +5,15 @@ import { join } from "node:path";
 import { chatJson, clampScore } from "./jsonutil";
 import { storyDir } from "./storage";
 import { isPendingForeshadow, type Foreshadow, type WorldState } from "./world";
+import { EVAL_DIMENSIONS, type EvalDimensionResult, type EvalReport } from "../contracts/evaluation";
+
+export { EVAL_DIMENSIONS } from "../contracts/evaluation";
+export type { EvalDimensionResult, EvalReport } from "../contracts/evaluation";
 
 /** 伏笔状态标注（评估提示词用）：待埋设=预登记尚未写入正文，避免 LLM 误判已埋设章节 */
 function foreshadowLabel(f: Foreshadow): string {
   return f.status === "planted" ? "已埋设待回收" : "推进中未兑现";
 }
-
-export const EVAL_DIMENSIONS = ["剧情逻辑", "人物塑造", "节奏张力", "文笔风格", "爽点钩子", "伏笔管理", "设定一致", "主题立意"] as const;
-
-export type EvalDimensionResult = {
-  name: (typeof EVAL_DIMENSIONS)[number];
-  score: number;
-  evidence: string; // 举证（引用摘要/正文）
-};
-
-export type EvalReport = {
-  at: string;
-  chaptersEvaluated: number;
-  dimensions: EvalDimensionResult[];
-  overall: number; // 等权均值（PCA 简化，计划 4.14）
-  suggestions: string[]; // Top3 质量债务修复建议
-};
 
 const EVAL_SYSTEM = `你是资深网文主编。对一部连载中的小说做整体质量评估。
 评估 8 个维度（各 1-10 分）：剧情逻辑 / 人物塑造 / 节奏张力 / 文笔风格 / 爽点钩子 / 伏笔管理 / 设定一致 / 主题立意。

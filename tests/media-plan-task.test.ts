@@ -8,6 +8,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { emptyWorld, type WorldState } from "../src/api/world";
 import { updateJob } from "../src/api/control-plane";
+import { publicCommandFor } from "../src/contracts/commands";
+import { syncRevision } from "../src/api/control-plane";
 
 // —— mock LLM 层（必须在 import 任何 src/api 模块之前） ——
 let nextScenesJson = "";
@@ -91,13 +93,23 @@ afterAll(() => {
 const { runAsUser } = require("../src/api/storage") as typeof import("../src/api/storage");
 const { createJob, getJob, listJobs, updateJob } = require("../src/api/control-plane") as typeof import("../src/api/control-plane");
 
+let commandSequence = 0;
 async function api(url: string, body: Record<string, unknown>) {
   const { handleApi } = await import("../src/api/routes");
+  const route = publicCommandFor(url, body);
+  const headers = new Headers({ "Content-Type": "application/json", Cookie: cookie });
+  if (route) {
+    headers.set("x-command-contract", "v1");
+    headers.set("x-command-id", `plan-test-${++commandSequence}`);
+    headers.set("x-command-type", route.type);
+    const title = String(body.title ?? "");
+    if (route.requiresRevision && title) headers.set("x-expected-revision", String(syncRevision(USER, `story/${title}`, "world").revision));
+  }
   const res = await handleApi(
     url,
     new Request(`http://x${url}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Cookie: cookie },
+      headers,
       body: JSON.stringify(body),
     }),
   );
@@ -157,14 +169,10 @@ describe("media/plan 分镜任务化（异步 + sync 权威恢复）", () => {
 describe("media/generate video 同书同章并发防护", () => {
   test("持久视频任务活动时同书同章提交 → 409；终态后唯一键可重新占用", async () => {
     const { handleApi } = await import("../src/api/routes");
-    const doGen = () => handleApi(
-      "/api/novel/media/generate",
-      new Request("http://x/api/novel/media/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Cookie: cookie },
-        body: JSON.stringify({ title: TITLE, chapterIndex: 1, kind: "video", scenes: [{ anchor: "沈夜负剑立于城楼", scene: "月色城楼，沈夜负剑而立", caption: "沈夜夜登城楼" }] }),
-      }),
-    );
+    const doGen = async () => {
+      const response = await api("/api/novel/media/generate", { title: TITLE, chapterIndex: 1, kind: "video", scenes: [{ anchor: "沈夜负剑立于城楼", scene: "月色城楼，沈夜负剑而立", caption: "沈夜夜登城楼" }] });
+      return new Response(JSON.stringify(response.data), { status: response.status, headers: { "Content-Type": "application/json" } });
+    };
     const dedupeKey = `video-create:plan-task-test:1`;
     for (const job of listJobs(USER, TITLE, true)) {
       if (job.dedupeKey === dedupeKey) updateJob(job.id, { status: "interrupted", phase: "test-reset" });

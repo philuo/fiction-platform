@@ -10,7 +10,9 @@
     "build:ssr": "bun build ./server/entry-server.tsx --outdir ./dist/server --target bun --minify",
     "start": "bun run server/prod.ts",
     "preview": "bun run build && bun run start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check:architecture": "bun scripts/check-architecture.ts",
+    "check": "bun run check:architecture && bun run typecheck && bun test && bun run build"
   },
   "dependencies": {
     "@fontsource/cormorant-garamond": "^5.3.0",

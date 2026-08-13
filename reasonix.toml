@@ -1,2 +1,0 @@
-[permissions]
-allow = ["Bash=which bun node npm git make python3 2>&1; echo \"---\"; bun --version 2>&1; node --version 2>&1"]

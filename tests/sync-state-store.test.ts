@@ -5,6 +5,7 @@ import {
 } from "../src/components/syncStateStore";
 import { emptyWorld } from "../src/api/world";
 import { createJsonPatch, sha256Json } from "../src/shared/json-patch";
+import { getStoryRevision } from "../src/shared/command-revisions";
 
 beforeEach(resetSyncStores);
 
@@ -15,6 +16,11 @@ describe("sync projection store", () => {
     setSystemSyncState({ title: "书", world: newer, visual: { running: false, pending: [], failed: [] }, autoSession: null, autoPending: null, advanceTask: null, at: 2, revision: 8, hash: "new" });
     setSystemSyncState({ title: "书", world: older, visual: { running: true, pending: [], failed: [] }, autoSession: null, autoPending: null, advanceTask: null, at: 1, revision: 7, hash: "old" });
     expect(getSystemSyncState("书")?.world.nextChapter).toBe(9);
+  });
+
+  test("system snapshot uses worldRevision for command expectedRevision", () => {
+    setSystemSyncState({ title: "版本书", world: { title: "版本书", chapters: [] }, worldRevision: 11, revision: 1, at: 1, visual: { running: false, pending: [], failed: [] }, autoSession: null, autoPending: null, advanceTask: null, proposalClosed: false });
+    expect(getStoryRevision("版本书")).toBe(11);
   });
 
   test("同 revision 不同 hash 拒绝分叉快照并报告 conflict", () => {

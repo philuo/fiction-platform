@@ -3,7 +3,7 @@
 // - 鉴权：浏览器 WebSocket 不能自定义 header，握手走 httpOnly cookie（登录/注册已下发，自动携带）
 // - 断线自动重连（指数退避 1s→2s→4s，上限 8s），重连成功后自动重新订阅并触发 onReconnected（前端全量补偿一次）
 // - world-changed 版本去重：服务端事件已按 1s 窗口节流合并，version 单调递增；客户端只处理 version 更新的事件
-// - 与 sysPoll 双跑（阶段 1 策略）：事件驱动即时刷新 + 轮询兜底校验；断线时 onStatusChange(false) 通知可启用降级
+// - 断线通过 cursor resume 与权威 snapshot 收敛，不回退到 HTTP 状态轮询
 import { useCallback, useEffect, useRef, useState } from "react";
 import { acceptServerInstance, applyProjectionPatch, getBrainSyncState, getSystemSyncState, setBrainSyncState, setLibrarySyncState, setSystemSyncState, type SystemSyncState } from "./syncStateStore";
 import type { JsonPatchOperation } from "../shared/json-patch";
@@ -12,7 +12,8 @@ import type { JsonPatchOperation } from "../shared/json-patch";
 export type SyncChannelEvent =
   | { type: "hello"; serverInstanceId: string; ready: boolean }
   | { type: "library-snapshot"; scope: "user"; document: "library"; revision: number; hash: string; cursor?: number; data: { stories: { slug: string; title: string; genre: string; chapters: number; updatedAt: string; cover?: string }[]; tasks: { id: string; idea: string; genre: string; status: string; title?: string; stage?: string; error?: string; createdAt: string; updatedAt: string }[] } }
-  | { type: "system-snapshot"; title: string; world: Record<string, unknown>; visual: { running: boolean; pending: { id: string; name: string }[]; failed: { id: string; name: string; reason?: string }[] }; autoSession: Record<string, unknown> | null; autoPending: Record<string, unknown> | null; advanceTask: Record<string, unknown> | null; at: number; revision?: number; hash?: string; cursor?: number }
+  | { type: "system-snapshot"; title: string; world: Record<string, unknown>; worldRevision?: number; visual: { running: boolean; pending: { id: string; name: string }[]; failed: { id: string; name: string; reason?: string }[] }; autoSession: Record<string, unknown> | null; autoPending: Record<string, unknown> | null; advanceTask: Record<string, unknown> | null; proposalClosed: boolean; at: number; revision?: number; hash?: string; cursor?: number }
+  | { type: "system-invalidated"; title: string; at: number }
   | { type: "world-changed"; title: string; version: number; reason?: string; regions?: string[]; at: number }
   | { type: "auto-status"; title: string; status: string; phase?: string; written?: number; updatedAt?: string; at: number }
   | { type: "task-status"; title: string; kind: "build" | "advance" | "media" | "visual"; id?: string; sub?: "plan"; scenes?: { anchor: string; scene: string; caption?: string }[]; status: string; error?: string; at: number }
@@ -45,7 +46,7 @@ export type UseSyncChannelOpts = {
   /** 卡片消息追加（brain-append）：其他 tab 在会话中追加了卡片消息（preview/result 卡），重拉会话显示 */
   onBrainAppend?: (e: Extract<SyncChannelEvent, { type: "brain-append" }>) => void;
   onBrainStatus?: (e: Extract<SyncChannelEvent, { type: "brain-status" }>) => void;
-  /** 连接状态变化：true=已连接，false=断线（前端可据此决定降级轮询策略） */
+  /** 连接状态变化：true=已连接，false=断线（供 UI 状态与流式 attach 恢复使用） */
   onStatusChange?: (connected: boolean) => void;
   /** 重连成功后触发（前端应做一次全量补偿 refreshAllStates） */
   onReconnected?: () => void;
@@ -152,12 +153,18 @@ export function useSyncChannel(opts: UseSyncChannelOpts): {
         if (obj.type === "system-snapshot") {
           if (typeof obj.cursor === "number") cursorRef.current = Math.max(cursorRef.current, obj.cursor);
           const state: SystemSyncState = {
-            title: obj.title, world: obj.world as SystemSyncState["world"], visual: obj.visual,
+            title: obj.title, world: obj.world as SystemSyncState["world"], worldRevision: obj.worldRevision, visual: obj.visual,
             autoSession: obj.autoSession, autoPending: obj.autoPending, advanceTask: obj.advanceTask,
+            proposalClosed: obj.proposalClosed ?? false,
             at: obj.at, revision: obj.revision, hash: obj.hash,
           };
           if (setSystemSyncState(state) === "conflict") { requestCurrentSnapshot(); return; }
           optsRef.current.onSystemSnapshot?.(obj);
+          return;
+        }
+        if (obj.type === "system-invalidated") {
+          // 非 world 字段（例如提案偏好）变化只发送轻量失效通知；客户端重新请求权威投影。
+          requestCurrentSnapshot(obj.title);
           return;
         }
         if (obj.type === "world-changed") {

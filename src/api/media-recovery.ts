@@ -15,7 +15,6 @@ import { withTitleLock } from "./titlelock";
 import { touchChapter, type WorldState } from "./world";
 import { applyStateChange } from "./statechange";
 import { recoverRunningMediaCards } from "./brain-sessions";
-import { resumePendingVideoWatches } from "./routes";
 
 const VIDEO_STALE_MS = 30 * 60_000;
 
@@ -25,7 +24,7 @@ type RecoverTally = {
 };
 
 /** 收敛单本书：返回翻转数量（供日志） */
-async function recoverStory(title: string): Promise<RecoverTally> {
+async function recoverStory(title: string, resumePendingVideos: (title: string) => void): Promise<RecoverTally> {
   const tally = { imgReady: 0, imgFailed: 0, vidFailed: 0, vidKept: 0 };
   const mediaStatusById = new Map<string, string>();
   const now = Date.now();
@@ -85,7 +84,7 @@ async function recoverStory(title: string): Promise<RecoverTally> {
   // 用收敛后的真实媒体状态翻转中枢 running 卡（planId 卡一律 failed——planTasks 是纯内存态）
   const cards = recoverRunningMediaCards(title, mediaStatusById);
   // 重启后仍 pending 的视频（有 videoId 未超时）：续上服务端轮询（Agnes 视频无回调，需服务端查询驱动落盘+广播）
-  resumePendingVideoWatches(title);
+  resumePendingVideos(title);
   return { ...tally, cards };
 }
 
@@ -102,12 +101,12 @@ function titleFromSlug(slugName: string): string | null {
 }
 
 /** 恢复当前用户上下文下所有书（串行，启动期无并发写） */
-async function recoverForUser(): Promise<void> {
+async function recoverForUser(resumePendingVideos: (title: string) => void): Promise<void> {
   for (const slugName of listStories()) {
     const title = titleFromSlug(slugName);
     if (!title) continue;
     try {
-      const r = await recoverStory(title);
+      const r = await recoverStory(title, resumePendingVideos);
       const total = r.imgReady + r.imgFailed + r.vidFailed + r.vidKept;
       if (total || r.cards.planFailed || r.cards.mediaDone || r.cards.mediaFailed || r.cards.stuckFailed) {
         console.log(
@@ -122,9 +121,9 @@ async function recoverForUser(): Promise<void> {
 }
 
 /** 服务启动入口：在监听端口前扫描全部用户并收敛陈旧媒体/卡片。 */
-export async function cleanupStaleMediaTasksOnBoot(): Promise<void> {
-  await runAsUser(null, () => recoverForUser());
+export async function cleanupStaleMediaTasksOnBoot(resumePendingVideos: (title: string) => void = () => {}): Promise<void> {
+  await runAsUser(null, () => recoverForUser(resumePendingVideos));
   for (const username of listUsernames()) {
-    await runAsUser(username, () => recoverForUser());
+    await runAsUser(username, () => recoverForUser(resumePendingVideos));
   }
 }

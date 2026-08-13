@@ -1,35 +1,9 @@
 import { useSyncExternalStore } from "react";
-import type { WorldState } from "../api/world";
+import type { BrainSyncState, LibrarySyncState, SystemSyncState } from "../contracts/sync";
 import { applyJsonPatch, sha256Json, type JsonPatchOperation } from "../shared/json-patch";
 import { clearStoryRevisions, setStoryRevision } from "../shared/command-revisions";
 
-export type SystemSyncState = {
-  title: string;
-  world: WorldState;
-  visual: { running: boolean; pending: { id: string; name: string }[]; failed: { id: string; name: string; reason?: string }[] };
-  autoSession: Record<string, unknown> | null;
-  autoPending: Record<string, unknown> | null;
-  advanceTask: Record<string, unknown> | null;
-  at: number;
-  revision?: number;
-  hash?: string;
-};
-
-export type BrainSyncState = {
-  title: string;
-  sessions: Record<string, unknown>[];
-  tasks: Record<string, unknown>[];
-  at: number;
-  revision?: number;
-  hash?: string;
-};
-
-export type LibrarySyncState = {
-  stories: { slug: string; title: string; genre: string; chapters: number; updatedAt: string; cover?: string }[];
-  tasks: { id: string; idea: string; genre: string; status: string; title?: string; stage?: string; error?: string; createdAt: string; updatedAt: string }[];
-  revision: number;
-  hash: string;
-};
+export type { BrainSyncState, LibrarySyncState, SystemSyncState } from "../contracts/sync";
 
 const states = new Map<string, SystemSyncState>();
 const brainStates = new Map<string, BrainSyncState>();
@@ -47,7 +21,7 @@ export function setSystemSyncState(state: SystemSyncState): ProjectionWrite {
     if (state.revision === previous.revision && previous.hash && state.hash && previous.hash !== state.hash) return "conflict";
   }
   states.set(state.title, state);
-  setStoryRevision(state.title, state.revision);
+  setStoryRevision(state.title, state.worldRevision ?? state.revision);
   for (const listener of [...listeners]) listener();
   return "accepted";
 }

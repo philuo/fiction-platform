@@ -1,8 +1,8 @@
 // 主界面：启动页（立项）→ 创作游戏界面（日式报纸 HUD + 完整控制面板）
 // 交互：立项一句话 / 指令输入 / 抽卡筛选 / 世界观·设定·角色·大纲编辑 / 章节段落编辑 / 推进
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useSyncChannel } from "../components/useSyncChannel";
-import { getBrainSyncState, getSystemSyncState, useLibrarySyncState, useSystemSyncState } from "../components/syncStateStore";
+import { getBrainSyncState, getLibrarySyncState, getSystemSyncState, useLibrarySyncState, useSystemSyncState } from "../components/syncStateStore";
 import { AlertTriangle, BookMarked, BookOpen, ChevronDown, Dices, History, List, LogOut, MoreHorizontal, PenLine, Play, RefreshCw, Search, Sparkles, Trash2, Users, Video, Wand2, X } from "../components/icons";
 import type { Card, Chapter, ChapterMedia, Character, LoreEntry, ReviewResult, WorldPatch, WorldState } from "../api/world";
 import { imageOccupiesQuota } from "../shared/media-const";
@@ -26,10 +26,17 @@ import type { BrainSyncSession } from "../components/useBrainSession";
 import { TaskCenterModal } from "../components/TaskCenterModal";
 import { ForeshadowModal } from "../components/ForeshadowModal";
 import AuthPage from "./AuthPage";
-import type { AuthUser } from "../api/auth-types";
+import type { AuthUser } from "../contracts/auth";
 import { apiFetch, clearToken, onAuthChange } from "../api/client";
 import { lensCn, severityCn } from "../terms";
 import { deriveBrainState } from "../api/brain-state";
+import { parseSseLines } from "../frontend/shared/sse-parser";
+import { initialModalState, modalReducer } from "../frontend/app/modal-state";
+import { useStoryCommands } from "../frontend/features/story/useStoryCommands";
+import { useChapterCommands } from "../frontend/features/chapter/useChapterCommands";
+import { useMediaCommands } from "../frontend/features/media/useMediaCommands";
+import { useAutorunCommands } from "../frontend/features/autorun/useAutorunCommands";
+import { useGovernanceCommands } from "../frontend/features/governance/useGovernanceCommands";
 
 export type HomeProps = {
   url?: string;
@@ -129,6 +136,11 @@ function loadReadingPref(title: string): number | undefined {
 }
 
 const Home: React.FC<HomeProps> = (props) => {
+  const storyCommands = useStoryCommands();
+  const chapterCommands = useChapterCommands();
+  const mediaCommands = useMediaCommands();
+  const autorunCommands = useAutorunCommands();
+  const governanceCommands = useGovernanceCommands();
   const [phase, setPhase] = useState<Phase>(props.initialData?.world ? "playing" : "landing");
   // 当前登录用户（SSR 注入 / 登录成功后设置；null = 未登录 → 渲染登录页）
   const [user, setUser] = useState<AuthUser | null>(props.initialData?.user ?? null);
@@ -145,48 +157,43 @@ const Home: React.FC<HomeProps> = (props) => {
     const w = props.initialData.world;
     return resolveInitialChapter(w, props.initialData?.chapter ?? loadReadingPref(w.title));
   }); // -1 = 无章节
-  const [showGacha, setShowGacha] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
+  const [modalState, dispatchModal] = useReducer(modalReducer, initialModalState);
+  const showGacha = modalState.open === "gacha";
+  const showSettings = modalState.open === "settings";
   /** 中枢「打开设置-角色页」等定位的初始 tab（每次打开设置弹窗时应用） */
   const [settingsTab, setSettingsTab] = useState("");
-  const [showMemoryAudit, setShowMemoryAudit] = useState(false); // 中枢弹窗一：分层记忆·台账·操作日志
-  const [showBrainCabin, setShowBrainCabin] = useState(false); // 中枢对话舱：卡片式浏览 + 智能控制
-  const [showTaskCenter, setShowTaskCenter] = useState(false); // 任务中心（弹窗二）：连载/推进任务进度与控制
+  const showMemoryAudit = modalState.open === "memory";
+  const showBrainCabin = modalState.open === "brain";
+  const showTaskCenter = modalState.open === "tasks";
+  const setShowGacha = (open: boolean) => dispatchModal(open ? { type: "open", modal: "gacha" } : { type: "close" });
+  const setShowSettings = (open: boolean) => dispatchModal(open ? { type: "open", modal: "settings" } : { type: "close" });
+  const setShowMemoryAudit = (open: boolean) => dispatchModal(open ? { type: "open", modal: "memory" } : { type: "close" });
+  const setShowBrainCabin = (open: boolean) => dispatchModal(open ? { type: "open", modal: "brain" } : { type: "close" });
+  const setShowTaskCenter = (open: boolean) => dispatchModal(open ? { type: "open", modal: "tasks" } : { type: "close" });
   const [advanceMenu, setAdvanceMenu] = useState(false); // 底部"推进剧情"下拉（本章续写/章节连载）展开态
   const [pendingCommitIdx, setPendingCommitIdx] = useState<number | null>(null); // 推进剧情待人工确认入册的章节号（commitPolicy=confirm）
-  /** 页面内构建状态：currentTaskId 非空表示当前打开的书还在后台增强（壳已就绪），轮询 status 更新阶段文案。
+  /** 页面内构建状态：currentTaskId 非空表示当前打开的书还在后台增强（壳已就绪），sync task snapshot 更新阶段文案。
    *  声明须早于 taskActive（245 行）——世界构建中纳入运行锁，禁止手动推进/编辑（与章节续写一致） */
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
   const [buildingStage, setBuildingStage] = useState<string | null>(null);
-  const [showForeshadow, setShowForeshadow] = useState(false); // 伏笔账编辑弹窗（底部控制条角色与关系旁）
+  const showForeshadow = modalState.open === "foreshadow";
+  const setShowForeshadow = (open: boolean) => dispatchModal(open ? { type: "open", modal: "foreshadow" } : { type: "close" });
   const [proposalExpanded, setProposalExpanded] = useState(false); // 底部新角色提案区：抽屉展开态（覆盖三栏）
-  // 新角色提案区关闭状态（服务端按用户 + 书名存储）：
-  // - 初始值取 SSR 注入的 initialData.propClosed（刷新直达时首帧即正确）；
-  // - 打开书（openStory/startStory，无 SSR 预载时）按书名从服务端同步；
-  // - 关闭/恢复写入经 savePropClosed 持久化到服务端。
-  const [proposalClosed, setProposalClosed] = useState(props.initialData?.propClosed ?? false);
-  useEffect(() => {
-    if (!world) return;
-    let cancelled = false;
-    apiFetch(`/api/novel/proposal-closed?title=${encodeURIComponent(world.title)}`)
-      .then((r) => r.json())
-      .then((d) => { if (!cancelled && typeof d?.closed === "boolean") setProposalClosed(d.closed); })
-      .catch(() => { /* 网络失败保持当前状态 */ });
-    return () => { cancelled = true; };
-  }, [world?.title]);
+  // Sync is authoritative after bootstrap. SSR only prevents a first-paint flash on direct navigation.
+  const proposalClosed = syncedSystem?.proposalClosed ?? props.initialData?.propClosed ?? false;
   /** 中枢打开系统面板/弹窗（open_* 意图 result 卡带 open 字段）统一分发：target → 对应弹窗/区域 */
   function handleOpenPanel(target: string, opts?: Record<string, unknown>) {
     switch (target) {
       case "proposals": savePropClosed(false); break;
       case "settings":
         setSettingsTab(String(opts?.tab ?? ""));
-        setShowSettings(true);
+        dispatchModal({ type: "open", modal: "settings", settingsTab: String(opts?.tab ?? "") });
         break;
       case "relationships":
-        setRelModal({ editable: false, charId: null });
+        dispatchModal({ type: "open-relationship", editable: false, charId: null });
         break;
-      case "taskcenter": setShowTaskCenter(true); break;
-      case "foreshadow": setShowForeshadow(true); break;
+      case "taskcenter": dispatchModal({ type: "open", modal: "tasks" }); break;
+      case "foreshadow": dispatchModal({ type: "open", modal: "foreshadow" }); break;
       case "review": {
         // 服务端已校验指定/选中章有审查报告；opts.index 指定章时先切换到该章（activeIdx 为 1-based 章号）
         const idx = opts?.index != null ? Number(opts.index) : NaN;
@@ -196,9 +203,9 @@ const Home: React.FC<HomeProps> = (props) => {
         break;
       }
       case "eval": setShowEval(true); break;
-      case "gacha": setShowGacha(true); break;
+      case "gacha": dispatchModal({ type: "open", modal: "gacha" }); break;
       case "autostart": setShowAutoStart(true); break;
-      case "memory": setShowMemoryAudit(true); break;
+      case "memory": dispatchModal({ type: "open", modal: "memory" }); break;
       default: break;
     }
   }
@@ -218,21 +225,22 @@ const Home: React.FC<HomeProps> = (props) => {
     requestAnimationFrame(attempt);
   }
 
-  /** 持久化新角色提案区关闭状态（乐观更新，失败回滚）；供刷新/SSR 首帧正确渲染 */
+  /** Submit preference; UI changes only when the authoritative system projection arrives. */
   function savePropClosed(closed: boolean) {
     if (!world) return;
-    setProposalClosed(closed);
-    void apiFetch("/api/novel/proposal-closed", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: world.title, closed }),
-    })
-      .then((r) => r.json())
-      .then((d) => { if (!d?.ok) setProposalClosed(!closed); })
-      .catch(() => setProposalClosed(!closed));
+    void storyCommands.setProposalClosed(world.title, closed)
+      .then(async (r) => {
+        if (!r.ok) throw new Error((await r.json().catch(() => null))?.error ?? `HTTP ${r.status}`);
+      })
+      .catch(() => showToast("提案提示偏好保存失败"));
   }
   /** 角色与关系弹窗（底部按钮=可编辑模式；脉络/审查面板角色点击=只读模式，顶层共享同一实例渲染，避免弹窗被困在区域内部） */
-  const [relModal, setRelModal] = useState<{ editable: boolean; charId: string | null } | null>(null);
+  const relModal = modalState.open === "relationship" ? modalState.relationship ?? null : null;
+  const setRelModal = (value: { editable: boolean; charId: string | null } | null | ((current: { editable: boolean; charId: string | null } | null) => { editable: boolean; charId: string | null } | null)) => {
+    const next = typeof value === "function" ? value(relModal) : value;
+    if (next) dispatchModal({ type: "open-relationship", editable: next.editable, charId: next.charId });
+    else dispatchModal({ type: "close" });
+  };
   const [toast, setToast] = useState("");
   const [toastVisible, setToastVisible] = useState(false);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -264,7 +272,6 @@ const Home: React.FC<HomeProps> = (props) => {
   const [showAutoPanel, setShowAutoPanel] = useState(false);
   const [showAutoStart, setShowAutoStart] = useState(false);
   const [autoChapters, setAutoChapters] = useState(5);
-  const sysPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoCheckedRef = useRef<string | null>(null);
   // C7：当前选中书 title 的 ref 镜像。advance/startAutoRun 等长流闭包捕获点击时的 world，
   // 流结束后若用户已切书，用此 ref 校验「仍是发起时的书」才写回 setWorld/setStoryUrl，避免旧书覆盖新书
@@ -355,11 +362,7 @@ const Home: React.FC<HomeProps> = (props) => {
     if (delTimerRef.current) clearTimeout(delTimerRef.current);
     setPendingDelete(null);
     try {
-      const res = await apiFetch("/api/novel/delete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title }),
-      });
+      const res = await storyCommands.remove(title);
       const data = (await res.json()) as { ok?: boolean; error?: string };
       if (data.error || !data.ok) throw new Error(data.error ?? "删除失败");
       showToast(`《${title}》已删除`);
@@ -406,7 +409,10 @@ const Home: React.FC<HomeProps> = (props) => {
     try {
       // 书架列表只负责导航；设置 title 即建立 sync，首帧权威快照到达后才进入三栏页面。
       const cached = getSystemSyncState(title)?.world;
-      if (!cached && !stories.some((s) => s.title === title)) throw new Error("故事不存在");
+      const authoritativeLibrary = getLibrarySyncState();
+      const exists = authoritativeLibrary?.stories.some((story) => story.title === title)
+        ?? stories.some((story) => story.title === title);
+      if (!cached && !exists) throw new Error("故事不存在");
       setSyncTitle(title);
       if (cached) { setWorld(cached); setPhase("playing"); }
       // 关闭/展开态不跨书残留：关闭状态按书持久化（useSyncExternalStore 随 propCloseKey 自动读该书存储），此处仅重置展开态
@@ -481,11 +487,7 @@ const Home: React.FC<HomeProps> = (props) => {
   async function startStory() {
     if (!idea.trim()) return;
     try {
-      const res = await apiFetch("/api/novel/new", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ idea: idea.trim(), genre: genre.trim() || undefined }),
-      });
+      const res = await storyCommands.create(idea.trim(), genre.trim() || undefined);
       const data = (await res.json()) as { taskId?: string; created?: boolean; error?: string };
       if (data.error || !data.taskId) throw new Error(data.error ?? "立项提交失败");
       if (data.created === false) {
@@ -526,9 +528,9 @@ const Home: React.FC<HomeProps> = (props) => {
     requestSyncSnapshotRef.current?.();
   }
 
-  // 阶段 1b/2：状态同步 WebSocket 频道——服务端事件推送即时刷新（与 sysPoll 双跑，轮询兜底校验）。
+  // 状态同步 WebSocket 频道：权威 snapshot/patch 与任务事件统一从单根连接收敛。
   // world-changed → 刷新世界（新章/任务完成即时感知）；
-  // task-status → 刷新世界（任务完成已落盘，无需额外状态查询）；
+  // task-status → 刷新世界（任务完成已落盘，无需额外 HTTP 查询）；
   // auto-status → 连载会话；brain-note → 系统事件已注入聊天，sysTick 递增让 BrainCabin 重拉（多 tab 一致）；
   // 重连成功 → 全量补偿一次（事件可能错过）。
   // 卡片就地更新注册（阶段 3a）：BrainCabin 挂载时注册 patch 处理器；card-update 事件经此转发（聊天舱关闭时事件丢弃，重开拉服务端最新）
@@ -550,21 +552,20 @@ const Home: React.FC<HomeProps> = (props) => {
     const last = stored ? { title: stored.title, sessions: stored.sessions as unknown as BrainSyncSession[] } : lastBrainStatusRef.current;
     if (last && last.title === world?.title) fn(last.sessions);
   }, [world?.title]);
-  /** 任务状态事件注册（阶段 3b+）：BrainCabin 挂载时注册 media task-status 处理器，
-   *  媒体生成轮询据此在 WS 广播任务完成时提前收尾（减少 /media/status 冗余轮询）。 */
+  /** 任务状态事件注册：BrainCabin 挂载时注册 media task-status 处理器，
+   *  媒体生成由 WS 广播任务终态收敛，不读取 HTTP status。 */
   const taskStatusRef = useRef<((e: { kind: string; id?: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[] }) => void) | null>(null);
   const registerTaskStatus = useCallback((fn: (e: { kind: string; id?: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[] }) => void) => {
     taskStatusRef.current = fn;
   }, []);
-  /** WS 连接状态注册：BrainCabin 挂载时注册，onStatusChange 转发——连接时聊天舱停 HTTP 轮询（事件驱动），断开降级 */
+  /** WS 连接状态注册：BrainCabin 挂载时注册，供聊天舱展示连接状态和恢复 SSE attach。 */
   const wsStatusRef = useRef<((connected: boolean) => void) | null>(null);
   const registerWsStatus = useCallback((fn: (connected: boolean) => void) => {
     wsStatusRef.current = fn;
     // 注册时立即上报当前状态（BrainCabin 挂载晚于 WS 建立时也能拿到真实连接态）
     fn(wsConnectedRef.current);
   }, []);
-  /** WS 连接状态（阶段 5）：连接=true 时事件驱动不轮询；断开=false 时 sysPoll 降级。
-   *  ref 镜像供异步回调（startAutoRun finally）读最新值 */
+  /** WS 连接状态 ref：供异步回调读取最新连接态；断线由 resume/cursor + snapshot 补偿。 */
   const wsConnectedRef = useRef(false);
   /** BrainCabin 注册的「某会话是否正在 SSE 生成」查询：brain-append 期间若该会话仍在流式生成，
    *  跳过重拉（避免覆盖未完成正文；流式中的卡片更新由 card-update/task-status 就地处理）。 */
@@ -580,8 +581,7 @@ const Home: React.FC<HomeProps> = (props) => {
     onSystemSnapshot: () => {},
     onWorldChanged: () => {},
     onTaskStatus: (e) => {
-      // 推进任务完成广播（kind:"advance"）→ 清 advancePhase 释放运行锁（覆盖底部按钮/聊天/多 tab 发起路径；
-      // 轮询降级后此广播是唯一不依赖本页 SSE 的释放通道）
+      // 推进任务完成广播（kind:"advance"）释放运行锁，覆盖底部按钮、聊天和多 tab 发起路径。
       // 左侧章节媒体：消费 media task-status 的终态（ready/failed），全部收尾后刷新 world + 提示
       if (e.kind === "media" && e.id) consumeHomeMediaStatus(e.id, e.status, e.error);
       // media/visual 等任务完成广播 → 转发聊天舱（媒体生成 WS 事件驱动收尾，无轮询）
@@ -610,12 +610,10 @@ const Home: React.FC<HomeProps> = (props) => {
       }
       void hasTerminalMedia;
     },
-    // 降级通道（阶段 5）：WS 连接时停 sysPoll（事件驱动）；WS 断开时启动 sysPoll（轮询兜底防漏事件）。
-    // 与连载 SSE 直连（startAutoRun stopSysPoll）叠加：WS 断 + 连载 SSE 在 → 仍不轮询（SSE 自身实时）。
+    // sync 连接状态同时转发给 Brain 会话；断线恢复由游标重放和权威快照补偿。
     onStatusChange: (connected) => {
       wsConnectedRef.current = connected;
       wsStatusRef.current?.(connected);
-      stopSysPoll();
     },
     onReconnected: () => {
       // 全量补偿：刷新世界 + 重拉当前会话（断线期间完成的媒体任务由服务端权威落盘，reload 后卡片即终态）
@@ -649,11 +647,7 @@ const Home: React.FC<HomeProps> = (props) => {
     setLiveDraft("");
     setLiveDraftState("running");
     try {
-      const res = await apiFetch("/api/novel/step", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: world.title, instruction: cmd.trim() }),
-      });
+      const res = await chapterCommands.advance(world.title, cmd.trim());
       if (!res.ok) {
         const data = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(data?.error ?? `HTTP ${res.status}`);
@@ -666,23 +660,15 @@ const Home: React.FC<HomeProps> = (props) => {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        const lines = buf.split("\n");
-        buf = lines.pop() ?? "";
-        for (const line of lines) {
-          const t = line.trim();
-          if (!t.startsWith("data:")) continue;
-          let ev: {
+        const parsed = parseSseLines(buf, decoder.decode(value, { stream: true }));
+        buf = parsed.buffer;
+        for (const rawEvent of parsed.events) {
+          const ev = rawEvent as {
             phase?: string;
             round?: number;
             error?: string;
             result?: { chapter: Chapter; review: ReviewResult; rounds: number };
           };
-          try {
-            ev = JSON.parse(t.slice(5).trim());
-          } catch {
-            continue;
-          }
           if (ev.error) throw new Error(ev.error);
           if (ev.phase === "delta" && typeof (ev as { delta?: string }).delta === "string") setLiveDraft((d) => d + (ev as { delta: string }).delta);
           if (ev.phase === "writing") { setBusyPhase(`导演写作中（第 ${ev.round} 稿）…`); setLiveDraft(""); }
@@ -705,7 +691,7 @@ const Home: React.FC<HomeProps> = (props) => {
             if (stillSameBook()) {
               setPendingCommitIdx((ev as { chapterIndex?: number }).chapterIndex ?? null);
               showToast("本章审查通过，已暂存待你确认入册（可在任务中心确认或放弃）。");
-              setShowTaskCenter(true);
+              dispatchModal({ type: "open", modal: "tasks" });
             }
             return; // 不走常规入册收尾
           }
@@ -735,8 +721,7 @@ const Home: React.FC<HomeProps> = (props) => {
     } finally {
       setBusy(false);
       setBusyPhase("");
-      // 修复：SSE 直连结束必须同步清 advancePhase（推进期间轮询会置它；阶段 5 轮询降级后
-      // 不再有轮询兜底清空，残留会卡死运行锁 taskActive → 按钮永久 loading 直到刷新）
+      // SSE 直连结束同步清 advancePhase；否则残留会卡死运行锁直到刷新。
       setAdvancePhase("");
     }
   }
@@ -745,11 +730,7 @@ const Home: React.FC<HomeProps> = (props) => {
   async function pauseAutoRun() {
     if (!world) return;
     try {
-      await apiFetch("/api/novel/auto/pause", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: world.title }),
-      });
+      await autorunCommands.pause(world.title);
       showToast("已发送暂停指令，将在本章结束后停下（可随时恢复）。");
     } catch {
       showToast("暂停指令发送失败");
@@ -760,11 +741,7 @@ const Home: React.FC<HomeProps> = (props) => {
   async function resumeAutoRun() {
     if (!world) return;
     try {
-      const res = await apiFetch("/api/novel/auto/start", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: world.title }),
-      });
+      const res = await autorunCommands.start({ title: world.title });
       if (res.status === 409) throw new Error("连载已在运行中");
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       showToast("连载已恢复（断点续跑）。");
@@ -779,23 +756,11 @@ const Home: React.FC<HomeProps> = (props) => {
     if (!world) return;
     try {
       // ① 立即打断当前章（阶段边界丢弃草稿，零污染）
-      await apiFetch("/api/novel/intervene", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: world.title, action: "interrupt", kind: "user-stop", detail: "用户取消连载任务" }),
-      });
+      await governanceCommands.intervene({ title: world.title, action: "interrupt", kind: "user-stop", detail: "用户取消连载任务" });
       // ② 停止连载（章边界停下）
-      await apiFetch("/api/novel/auto/stop", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: world.title }),
-      });
+      await autorunCommands.stop(world.title);
       // ③ 清理会话与暂存区，回空闲
-      await apiFetch("/api/novel/auto/clear-session", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: world.title }),
-      });
+      await autorunCommands.clearSession(world.title);
       setBusy(false);
       setBusyPhase("");
       setLiveDraft("");
@@ -1335,12 +1300,7 @@ const Home: React.FC<HomeProps> = (props) => {
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 240_000); // 服务端单次分镜最长约 90s，失败自动重试（预留重试预算）
-      const res = await apiFetch("/api/novel/media/plan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: world.title, chapterIndex, kind, count }),
-        signal: ctrl.signal,
-      });
+      const res = await mediaCommands.plan({ title: world.title, chapterIndex, kind, count }, { signal: ctrl.signal });
       clearTimeout(timer);
       const data = (await res.json()) as { ok?: boolean; scenes?: ScenePlan[]; error?: string };
       if (!data.ok || !data.scenes?.length) throw new Error(data.error ?? "场景规划失败");
@@ -1358,17 +1318,13 @@ const Home: React.FC<HomeProps> = (props) => {
     setMediaPlan((p) => (p ? { ...p, scenes: p.scenes.map((s, j) => (j === i ? { ...s, ...patch } : s)) } : p));
   }
 
-  /** 确认生成：image/video 均异步提交任务 + 轮询（内联进度，不锁全局，刷新页面可恢复） */
+  /** 确认生成：image/video 均异步提交持久任务，内联进度由 sync task-status 驱动。 */
   async function confirmMediaGen() {
     if (!world || !mediaPlan) return;
     const plan = mediaPlan;
     setMediaPlan(null);
     try {
-      const res = await apiFetch("/api/novel/media/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: world.title, chapterIndex: plan.chapterIndex, kind: plan.kind, scenes: plan.scenes }),
-      });
+      const res = await mediaCommands.generate({ title: world.title, chapterIndex: plan.chapterIndex, kind: plan.kind, scenes: plan.scenes });
       const data = (await res.json()) as { ok?: boolean; mediaId?: string; mediaIds?: string[]; error?: string };
       if (!data.ok) throw new Error(data.error ?? "创建生成任务失败");
       if (plan.kind === "image") {
@@ -1387,7 +1343,7 @@ const Home: React.FC<HomeProps> = (props) => {
     }
   }
 
-  /** 单张改词重生成：image 同步（全局 busy）；video 异步任务 + 轮询（mediaId 不变，轮询自然续上） */
+  /** 单张改词重生成：image 同步（全局 busy）；video 异步任务由同一 mediaId 的 sync 终态收敛。 */
   async function regenerateMedia() {
     if (!world || !regenMedia) return;
     const { chapterIndex, media, prompt } = regenMedia;
@@ -1594,31 +1550,20 @@ const Home: React.FC<HomeProps> = (props) => {
     }
   }
 
-  // —— P4.5 自动连载（git 式）：会话状态查询 / 轮询 / 控制台操作 ——
+  // —— P4.5 自动连载（git 式）：持久会话 / SSE 增量 / sync 终态 / 控制台操作 ——
 
-  function stopSysPoll() {
-    if (sysPollRef.current) {
-      clearInterval(sysPollRef.current);
-      sysPollRef.current = null;
-    }
-  }
-  // 卸载时停止轮询（任务在服务端继续运行，不受页面影响）；mountedRef 防卸载后 SSE finally 重建轮询泄漏
+  // mountedRef 防卸载后的 SSE 回调继续写入页面状态。
   const mountedRef = useRef(true);
-  useEffect(() => () => { mountedRef.current = false; stopSysPoll(); }, []);
+  useEffect(() => () => { mountedRef.current = false; }, []);
 
-  // 打开小说 / 刷新恢复：状态完全由常驻 sync WS 恢复，不启动 HTTP 状态轮询。
+  // 打开小说 / 刷新恢复：状态完全由常驻 sync WS 恢复。
   useEffect(() => {
-    // L17 修复：回首页（world=null）时停止轮询并重置防重——否则定时器空转（闭包抓旧书），
-    // 且重开同一本书时 autoCheckedRef 仍命中旧 title 导致轮询不重启
     if (!world) {
-      stopSysPoll();
       autoCheckedRef.current = null;
       return;
     }
     if (autoCheckedRef.current === world.title) return;
     autoCheckedRef.current = world.title;
-    stopSysPoll();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [world]);
 
   // —— P4 自动连载：SSE 消费 auto 事件流（delta 流式预览；review-failed 停下；auto-done 报告） ——
@@ -1636,7 +1581,6 @@ const Home: React.FC<HomeProps> = (props) => {
     setAutoRunning(true);
     setBusy(true);
     setLiveDraft("");
-    stopSysPoll();
     requestSyncSnapshotRef.current?.();
     let interrupted = false;
     try {
@@ -1678,7 +1622,7 @@ const Home: React.FC<HomeProps> = (props) => {
           if (ev.phase === "auto-done" && ev.report) report = ev.report;
         }
       }
-      // C7：切书后丢弃旧书连载收尾（不再拉旧书状态/弹旧书 toast/面板），新书由其自身轮询/effect 管理
+      // C7：切书后丢弃旧书连载收尾，新书由其自身 sync projection 管理。
       if (stillSameBook()) {
         await refreshAllStates();
         const reasonText: Record<string, string> = {
@@ -1703,8 +1647,8 @@ const Home: React.FC<HomeProps> = (props) => {
       setBusy(false);
       setBusyPhase("");
       setLiveDraft("");
-      // SSE 断开：WS 连接时由事件驱动（task-status/auto-status 覆盖连载完成）；仅 WS 也断时恢复轮询兜底。
-      // C7：仅当仍在发起时的书上才重启轮询——切书后旧 SSE 结束不能用旧闭包 pollSysStateOnce 覆盖新书轮询
+      // SSE 断开后请求权威 snapshot；WS resume/cursor 负责补偿可能错过的终态。
+      // C7：仅在仍处于发起故事时请求，避免旧闭包覆盖新书投影。
       if (mountedRef.current && stillSameBook()) requestSyncSnapshotRef.current?.();
     }
   }
@@ -1745,7 +1689,6 @@ const Home: React.FC<HomeProps> = (props) => {
         body: JSON.stringify({ title: world.title }),
       });
     } catch { /* 清理失败不打扰 */ }
-    stopSysPoll();
     requestSyncSnapshotRef.current?.();
     setShowAutoPanel(false);
     setShowAutoStart(false);
@@ -2025,12 +1968,10 @@ const Home: React.FC<HomeProps> = (props) => {
         else if (regenMedia) setRegenMedia(null);
         else if (mediaPlan) setMediaPlan(null);
         else if (showNewStory) setShowNewStory(false);
-        else if (showGacha) setShowGacha(false);
-        else if (showSettings) setShowSettings(false);
+        else if (showGacha || showSettings || showMemoryAudit || showBrainCabin || showTaskCenter || showForeshadow || relModal) dispatchModal({ type: "close" });
         else if (showAutoStart) setShowAutoStart(false);
         else if (showAutoPanel) setShowAutoPanel(false);
         else if (portraitView) setPortraitView(null);
-        else if (relModal) setRelModal(null);
         else if (reviewOpen) setReviewOpen(false);
         else if (showVersions) setShowVersions(false);
       }
@@ -2100,7 +2041,7 @@ const Home: React.FC<HomeProps> = (props) => {
               <div className="story-list">
                 {/* 异步立项生成中的占位卡：点击进入编辑不可用，展示任务进行中（刷新列表仍可见） */}
                 {/* ready 任务书已落盘（stories 已有同名正式卡可打开）时隐藏占位卡，避免「两本同名书」视觉重复；
-                    构建进度由页面内构建徽章展示（creating 数组仍完整保留供恢复/轮询） */}
+                    构建进度由页面内构建徽章展示（creating 数组仍完整保留供 sync 恢复） */}
                 {creating
                   .filter((t) => !(t.status === "ready" && t.title && stories.some((s) => s.title === t.title)))
                   .map((t) => (

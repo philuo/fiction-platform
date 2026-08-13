@@ -11,121 +11,12 @@
 // 1. 无订阅者时 publish 直接 return（零开销，不启动定时器）——埋点对现有行为零影响；
 // 2. 同 key 事件 1s 合并窗口节流（连载每章多次 saveWorld / 媒体每张一次 → 合并为一条广播）；
 // 3. world-changed 带版本戳（per-title 递增），客户端按版本去重（防旧 tab 用旧快照覆盖）。
-import { slugify } from "./storage";
+import { slugify } from "../shared/slug";
+import type { SyncEvent } from "../contracts/sync";
 
-// ============ 事件类型（与前端 useSyncChannel 协议一致） ============
+export type { SyncEvent } from "../contracts/sync";
 
-export type SyncEvent = {
-  /** 所属用户（频道隔离维度；无 user 的事件不推 WS，测试/遗留路径可省略） */
-  user?: string;
-} & (
-  | {
-      type: "library-changed";
-      title: "";
-      at: number;
-    }
-  | {
-      type: "system-snapshot";
-      title: string;
-      world: Record<string, unknown>;
-      visual: { running: boolean; pending: { id: string; name: string }[]; failed: { id: string; name: string; reason?: string }[] };
-      autoSession: Record<string, unknown> | null;
-      autoPending: Record<string, unknown> | null;
-      advanceTask: Record<string, unknown> | null;
-      at: number;
-    }
-  | {
-      type: "world-changed";
-      /** 书名（原始 title，非 slug） */
-      title: string;
-      /** per-title 递增版本戳：客户端据此丢弃旧事件 */
-      version: number;
-      /** 触发语义（阶段 0 统一 "save"；后续可扩展 actor/field 语义） */
-      reason?: string;
-      /** 受影响 UI 区域（COUPLING §2 U01-U19；缺省=全部区域，前端全量刷新） */
-      regions?: string[];
-      at: number;
-    }
-  | {
-      type: "auto-status";
-      title: string;
-      status: string;
-      phase?: string;
-      written?: number;
-      updatedAt?: string;
-      at: number;
-    }
-  | {
-      type: "task-status";
-      title: string;
-      kind: "build" | "advance" | "media" | "visual";
-      id?: string;
-      /** 子类型（media 分支）：plan=分镜任务完成广播（前端据此就地翻「分镜完成」卡，免轮询）；缺省=媒体生成任务 */
-      sub?: "plan";
-      /** 分镜完成场景列表（sub:"plan" ready 时携带，前端就地翻卡直接可用） */
-      scenes?: { anchor: string; scene: string; caption?: string }[];
-      status: string;
-      error?: string;
-      at: number;
-    }
-  | {
-      type: "brain-note";
-      title: string;
-      eventId: string;
-      text: string;
-      at: number;
-    }
-  | {
-      type: "card-update";
-      title: string;
-      sessionId: string;
-      messageId: string;
-      cardId: string;
-      patch: Record<string, unknown>;
-      at: number;
-    }
-  | {
-      type: "card-replaced";
-      title: string;
-      sessionId: string;
-      messageId: string;
-      cardIndex: number;
-      card: Record<string, unknown>;
-      at: number;
-    }
-  | {
-      type: "brain-append";
-      title: string;
-      sessionId: string;
-      messageId: string;
-      at: number;
-    }
-  | {
-      type: "brain-status";
-      title: string;
-      sessions: {
-        id: string;
-        sessionTitle: string;
-        createdAt: number;
-        streaming: boolean;
-        updatedAt: number;
-        /** 仅订阅/变更快照携带；周期状态帧省略正文，避免反复传输整段聊天。 */
-        messages?: Record<string, unknown>[];
-        /** 周期帧的轻量消息状态：不含 text/thinking，只用于清 pending 与翻卡。 */
-        messageStates?: Record<string, unknown>[];
-        messageCount?: number;
-        completed?: string[];
-      }[];
-      tasks: {
-        id: string;
-        status: string;
-        sub?: "plan";
-        error?: string;
-        scenes?: { anchor: string; scene: string; caption?: string }[];
-      }[];
-      at: number;
-    }
-);
+// Event protocol types live in contracts/sync.ts; this module only implements the bus.
 
 // ============ 订阅注册 ============
 
@@ -160,6 +51,12 @@ function throttleKey(e: SyncEvent): string {
 export function notifyLibraryChanged(user?: string): void {
   if (!user || listeners.size === 0) return;
   publishSyncImmediate({ type: "library-changed", title: "", at: Date.now(), user });
+}
+
+/** A non-world story projection field changed and must be rebuilt for subscribed clients. */
+export function notifySystemInvalidated(title: string, user?: string): void {
+  if (!user || listeners.size === 0) return;
+  publishSyncImmediate({ type: "system-invalidated", title, at: Date.now(), user });
 }
 
 function flushPending(key: string, p: Pending): void {

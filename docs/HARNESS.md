@@ -1,6 +1,6 @@
 # 墨枢系统指令总表
 
-本文是系统指令的运行契约。代码注册表位于 `src/api/harness.ts`；凡会读取或改变小说、任务、会话、媒体、审计数据的入口，都必须先登记再接入执行器。HTTP 是命令提交通道，sync WebSocket 是状态发布通道，SSE 只传输可丢弃的文本增量。注册表当前为 88 条（N16/W18/L13/M12/G08/S11/Q10），但测试从注册表动态计算分类和总数，不再把 88 当作不可变协议。
+本文是系统指令的运行契约。治理目录位于 `src/api/harness.ts`，canonical 命令注册表位于 `src/contracts/commands.ts`；凡会读取或改变小说、任务、会话、媒体、审计数据的入口，都必须先登记再接入执行器。HTTP 是命令提交通道，sync WebSocket 是状态发布通道，SSE 只传输可丢弃的文本增量。治理目录当前为 88 条，公开命令注册表为 49 条；测试从代码动态计算分类和总数，不把数量当作不可变协议。
 
 ## 1. 通用指令契约
 
@@ -154,5 +154,7 @@ RFC 6902 `patch` 已用于 library/system/brain；world 文件提交仍发送 `d
 ## 6. 当前实现边界
 
 - 已实现：状态接口移除、登录级 sync、持久 revision/hash/outbox cursor、服务纪元、完整快照覆盖收敛、RFC 6902 patch、world journal、非 world 投影事务 outbox、统一命令入口骨架、视频回滚与自动生成 deadline 持久化。
-- 尚未实现：所有入口迁入统一 `CommandRequest/CommandReceipt`、所有遗留任务/取消/墓碑持久化，以及旧写入口全面强制 expectedRevision。
-- 因此 Harness 既是当前入口目录，也是迁移检查表；表中目标字段并不表示每个旧入口已完全满足统一命令契约。
+- 统一入口已覆盖 `src/contracts/commands.ts` 中的 49 个公开命令；旧写 URL 仍作为兼容适配层存在，前端和测试尚未全部切换前不得删除。
+- 遗留任务/取消/墓碑的持久化以 SQLite jobs、scope generation 和 recovery 字段为主，少数执行句柄仍在进程内 registry；多进程 claim/lease 属于后续可靠性阶段。
+- 覆盖性旧 URL 的 `expectedRevision` 强制迁移仍按命令逐步收口；新增命令不得绕过统一入口。
+- 因此 Harness 既是当前入口目录，也是迁移检查表；表中治理字段同时约束 canonical command 与兼容路由。

@@ -10,22 +10,9 @@ import type { BrainCard } from "./brain-cards";
 import { apiFetch } from "../api/client";
 import { cachePutSession, cacheClearBook, cacheGetSession } from "./brainCache";
 import { uuid } from "../shared/uuid";
+import type { ChatMessage } from "../frontend/features/brain/types";
 
-export type ChatMessage = {
-  id: string;
-  role: "user" | "brain";
-  text?: string;
-  /** DeepSeek 思维链内容（思考模式开启时流式累积，与正文分离）；折叠展示 */
-  thinking?: string;
-  cards?: BrainCard[];
-  /** 流式生成中（显示光标/停止按钮） */
-  pending?: boolean;
-  /** 被中断（可重新生成/编辑） */
-  interrupted?: boolean;
-  /** 系统事件消息（kind="system"）：系统状态变化自动注入，前端灰色系统条渲染 */
-  kind?: "system";
-  at: string;
-};
+export type { ChatMessage } from "../frontend/features/brain/types";
 
 export type SessionMeta = {
   id: string;

@@ -5,6 +5,9 @@ import { saveWorld, currentUser } from "./storage";
 import { getCommand } from "./harness";
 import type { ChangeLogEntry, SteeringItem, WorldState } from "./world";
 import { createJob, deleteJobs, findLatestJob, updateJob } from "./control-plane";
+import type { ChangeLevel } from "../contracts/governance";
+
+export type { ChangeLevel } from "../contracts/governance";
 
 // —— 立即打断（用户决策②）：内存态信号，writeOneChapter 每阶段边界轮询 ——
 function interruptJob(title: string) { return findLatestJob(currentUser(), "interrupt", title); }
@@ -62,8 +65,6 @@ export function logCommandChange(
 }
 
 // —— 变更分级（决定是否需要影响评估） ——
-export type ChangeLevel = "L0" | "L1" | "L2" | "L3";
-
 /** 已编辑的角色/伏笔是否构成 L2（回溯相关）：已登场角色字段改 / 已埋伏笔改 / 设定规则改 */
 export function isRetroactivePatch(w: WorldState, patch: {
   characters?: { id?: string }[];

@@ -9,16 +9,12 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Arc, ChangeLogEntry, ChapterVersion, PendingChapter, WorldState } from "./world";
-import type { EvalReport } from "./eval";
+import type { EvalReport } from "../contracts/evaluation";
 import { notifyWorldSaved } from "./sync";
 import { abortWorldCommit, commitWorldCommit, createJob, deleteJobs, findLatestJob, prepareWorldCommit, updateJob } from "./control-plane";
+import { slugify } from "../shared/slug";
 
-export function slugify(title: string): string {
-  const s = title.trim().replace(/[\\/:*?"<>|\s]+/g, "-").slice(0, 40);
-  // 排除 "." / ".." 等路径逃逸（安全审查 LOW：slugify 结果不得使路径回退到项目根）
-  if (!s || s === "." || s === ".." || /^\.+$/.test(s)) return "story";
-  return s;
-}
+export { slugify } from "../shared/slug";
 
 // —— 用户上下文（请求级隔离）：API / SSR 入口用 runAsUser 注入当前登录用户名，
 // 后续同步/异步调用（含 fire-and-forget 的后台任务链）经 AsyncLocalStorage 继承该上下文。

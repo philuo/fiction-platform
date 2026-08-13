@@ -3,7 +3,7 @@ import { recoverPreparedWorldCommits, settleOrphanedCommands, settleOrphanedJobs
 import { cleanupStaleAdvanceTasks } from "./advancetask";
 import { cleanupNewStoryTasks } from "./newtask";
 import { cleanupStaleMediaTasksOnBoot } from "./media-recovery";
-import { migrateLegacyOnBoot, resumeAutoSessions, resumeScheduledMediaJobs, startVisualSweep } from "./routes";
+import { migrateLegacyOnBoot, resumeAutoSessions, resumePendingVideoWatches, resumeScheduledMediaJobs, startVisualSweep } from "./routes";
 import { markRuntimeReady, markRuntimeRecovering, markRuntimeRecoveryFailed, runtimeReadiness } from "./runtime-readiness";
 
 const BOOT_PROMISE_KEY = "__moshift_boot_recovery_promise__";
@@ -23,7 +23,7 @@ export async function runBootRecovery(): Promise<void> {
     const interruptedCommands = settleOrphanedCommands();
     cleanupStaleAdvanceTasks();
     cleanupNewStoryTasks();
-    await cleanupStaleMediaTasksOnBoot();
+    await cleanupStaleMediaTasksOnBoot(resumePendingVideoWatches);
     resumeAutoSessions();
     resumeScheduledMediaJobs();
     startVisualSweep();

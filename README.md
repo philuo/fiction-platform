@@ -103,9 +103,12 @@ src/api/writer.ts      导演（写作，结构化伏笔/人物输出）
 src/api/critic.ts      审查者（对抗审查，evidence + 地板机制）
 src/api/cards.ts       抽卡系统
 src/api/director.ts    回合编排
-src/api/routes.ts      /api/* 路由
 data/                  小说存档（state.json + .bak）
-docs/ENGINE.md         引擎设计
+src/contracts/         跨端契约（命令、世界、sync、认证）
+src/application/       用例与端口
+src/infrastructure/    SQLite、存档和 provider 适配
+src/transport/         HTTP、SSE、WS 传输层
+src/frontend/          前端功能迁移目录
 ```
 
 ## 已知环境注意
@@ -122,8 +125,12 @@ docs/ENGINE.md         引擎设计
 - Phase 3 ✅ 增强（参数系统/世界书/弧线/图像/版本/脉络/流派模板）
 - 详见 [PLAN.md](PLAN.md)
 
-## 文档索引（后续 AI 迭代必读）
+## 文档索引（后续开发必读）
 
-- **[docs/FEATURES.md](docs/FEATURES.md)** — 功能全记录（架构/模块/API/数据模型/限制/迭代建议）
-- **[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)** — 详细需求计划表（M1-M8 + 参数字段 + 验收）
-- **[docs/ENGINE.md](docs/ENGINE.md)** — 引擎设计（回合循环/抽卡/伏笔/上下文压缩）
+- **[docs/INSTRUCTION.md](docs/INSTRUCTION.md)** — 当前开发规范、模块边界、状态源和验收清单
+- **[docs/BRAIN.md](docs/BRAIN.md)** — 中枢与 sync 协议详解
+- **[docs/HARNESS.md](docs/HARNESS.md)** — 命令注册表、治理级别和恢复语义
+- **[docs/PLAN.md](docs/PLAN.md)** — 可靠性重构实施记录（历史计划）
+- **[docs/FIND_BUG.md](docs/FIND_BUG.md)** — 缺陷审计证据和剩余风险（历史记录）
+
+`src/api/routes.ts`、`src/pages/Home.tsx`、`src/components/` 仍是兼容入口和迁移中的旧实现；新增代码应按 `docs/INSTRUCTION.md` 归属到目标层。

@@ -2,7 +2,7 @@
 // 中枢架构：所有「影响小说」的行为登记为一条指令，由中枢统一 审查(gate)/调度(schedule)/控制(control)/治理(audit)。
 // 用途：① 每条写操作的 changeLog 落 commandId，实现「所有操作可追溯」；② 状态变更闸门（applyStateChange）
 //      按指令查 level/affects 做分级；③ 前端操作日志面板展示指令名称/级别；④ 中枢审查取指令元数据。
-import type { ChangeLevel } from "./steering";
+import type { ChangeLevel } from "../contracts/governance";
 
 // —— 指令类别（HARNESS §1）——
 export type CommandCategory = "Narrative" | "World" | "Ledger" | "Media" | "Governance" | "System" | "Query";

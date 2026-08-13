@@ -63,6 +63,7 @@ async function mountHome(world: WorldState, opts: { propClosed?: boolean; server
     title: world.title, world,
     visual: { running: false, pending: [], failed: [] },
     autoSession: null, autoPending: null, advanceTask: null,
+    proposalClosed: opts.propClosed ?? false,
     at: Date.now(), revision: 1, hash: `proposal-${Date.now()}`,
   });
   serverClosed = opts.serverClosed ?? opts.propClosed ?? false;
@@ -136,16 +137,29 @@ test("点击展开箭头 → 抽屉 open 显示推荐原因与动机；点击收
   await tick();
 });
 
-test("点击 ✕ → 整个提案区关闭，并 POST /api/novel/proposal-closed { closed:true } 持久化到服务端", async () => {
+test("点击 ✕ → POST 偏好；仅权威 system 投影到达后关闭提案区", async () => {
   const { mount, root } = await mountHome(mkWorld());
   await click(findByTitle(mount, "关闭新角色提案提示"));
-  expect(mount.querySelector(".proposal-bar")).toBeNull();
-  expect(mount.querySelector(".proposal-drawer")).toBeNull();
   const call = propClosedCalls.find((c) => c.body.closed === true);
   expect(call).toBeTruthy();
   expect(call!.body.title).toBe("proposal-bar-test");
   expect(call!.body.closed).toBe(true);
   expect(serverClosed).toBe(true);
+  // HTTP 回执不直接改业务状态，避免与 sync 投影形成第二份权威来源。
+  expect(mount.querySelector(".proposal-bar")).toBeTruthy();
+  await act(async () => {
+    const world = mkWorld();
+    setSystemSyncState({
+      title: world.title, world,
+      visual: { running: false, pending: [], failed: [] },
+      autoSession: null, autoPending: null, advanceTask: null,
+      proposalClosed: true,
+      at: Date.now(), revision: 2, hash: `proposal-closed-${Date.now()}`,
+    });
+    await tick();
+  });
+  expect(mount.querySelector(".proposal-bar")).toBeNull();
+  expect(mount.querySelector(".proposal-drawer")).toBeNull();
   root.unmount();
   await tick();
 });

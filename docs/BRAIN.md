@@ -49,7 +49,7 @@ received -> queued -> running -> waiting_external -> succeeded
 
 `commandId + requestHash` 支持同内容重试返回原回执、不同内容冲突；job 活动态由 SQLite 部分唯一索引仲裁。`createJob` 同时处理“先查后插”的跨进程竞争，唯一索引命中后返回胜出的既有 job。视频创建已用此约束替代进程内 busy Set。
 
-`POST /api/commands` 已提供严格白名单的统一入口，当前开放 N01/M01/M02：请求先登记 `commandId + requestHash`，同内容重试返回原回执，不同内容或跨用户复用返回 409，后台执行与 HTTP 连接解耦。其余旧 HTTP 命令尚未全部迁入，覆盖性命令的 `expectedRevision` 也尚未在所有旧入口强制执行。
+`POST /api/commands` 已提供严格白名单的统一入口，49 个公开命令均在 `src/contracts/commands.ts` 登记并通过 HARNESS 完整性检查。同步命令等待 canonical handler 后返回 `200` 终态 receipt；持久任务返回 `202` 并由 SQLite job/sync 收敛终态。同内容重试返回原回执，不同内容或跨用户复用返回 409。旧业务 URL 仍保留兼容适配，调用方迁移完成前不得删除。
 
 ## 3. SSE 与中枢恢复
 

@@ -14,13 +14,13 @@ import type { Server, ServerWebSocket } from "bun";
 import { userFromRequest, type AuthUser } from "./auth";
 import { currentUser, loadWorld, runAsUser, slugify, storyExists } from "./storage";
 import { publishSyncImmediate, subscribeSync, worldVersion, type SyncEvent } from "./sync";
-import { getSystemSyncSnapshot, listMediaTaskStates, listPendingMediaTasks } from "./routes";
+import { legacyProjectionSnapshots } from "../infrastructure/projections/legacy-sync-snapshots";
 import { listSyncSessionSnapshots, sessionHasAsyncState, updateMediaFormCardValues } from "./brain-sessions";
 import { MAX_IMAGES_PER_CHAPTER, imageOccupiesQuota } from "../shared/media-const";
 import { runtimeReadiness } from "./runtime-readiness";
 import { listStoriesMeta } from "./storage";
 import { loadNewStoryTasks } from "./newtask";
-import { latestOutboxCursor, recordProjectionSnapshot, userOutboxAfter } from "./control-plane";
+import { latestOutboxCursor, recordProjectionSnapshot, syncRevision, userOutboxAfter } from "./control-plane";
 
 /** WS 端点路径（dev/prod 共用） */
 export const SYNC_WS_PATH = "/api/sync";
@@ -107,7 +107,7 @@ const allSockets = new Set<ServerWebSocket<SyncWsData>>();
 
 function brainStatusPayload(ws: ServerWebSocket<SyncWsData>, title: string, full: boolean) {
   const sessions = runAsUser(ws.data.user.username, () => listSyncSessionSnapshots(title));
-  const tasks = runAsUser(ws.data.user.username, () => listMediaTaskStates(ws.data.user.username, title));
+  const tasks = runAsUser(ws.data.user.username, () => legacyProjectionSnapshots.mediaStates(ws.data.user.username, title));
   return {
     type: "brain-status", title, full,
     sessions: sessions.map((s) => ({
@@ -136,9 +136,10 @@ function sendBrainStatusFrame(ws: ServerWebSocket<SyncWsData>, payload: ReturnTy
 }
 
 function sendSystemSnapshot(ws: ServerWebSocket<SyncWsData>, title: string, heal = false): void {
-  const snapshot = runAsUser(ws.data.user.username, () => getSystemSyncSnapshot(title, heal));
+  const snapshot = runAsUser(ws.data.user.username, () => legacyProjectionSnapshots.system(title, heal));
   if (snapshot) {
-    const data = { ...snapshot, title };
+    const worldRevision = syncRevision(ws.data.user.username, `story/${title}`, "world").revision;
+    const data = { ...snapshot, title, worldRevision };
     sendProjection(ws, `story/${title}`, "system", data, { type: "system-snapshot", ...data, at: Date.now() }, heal);
   }
 }
@@ -285,7 +286,7 @@ export const syncWebsocket = {
     ws.data.brainTimer = setInterval(() => {
       try {
         let payload = brainStatusPayload(ws, title, false);
-        const pending = runAsUser(ws.data.user.username, () => listPendingMediaTasks(ws.data.user.username, title));
+        const pending = runAsUser(ws.data.user.username, () => legacyProjectionSnapshots.pendingMedia(ws.data.user.username, title));
         const hasPendingTasks = pending.length > 0;
         // 进行中定时推；刚进入终态时再推最后一帧，确保 UI 清 loading。
         if (payload.active || hadActive || hasPendingTasks || hadPendingTasks) {
@@ -302,7 +303,7 @@ export const syncWebsocket = {
     // 订阅快照：推送该书当前「进行中」媒体任务（分镜 pending / 插画生成中 / state.json pending），
     // 刷新/重开后前端据此把对应卡标 loading——纯事件驱动，无需 HTTP 轮询。
     // runAsUser 包裹：快照新增的 state.json 扫描依赖 currentUser() 做账号目录隔离。
-    const pending = runAsUser(ws.data.user.username, () => listPendingMediaTasks(ws.data.user.username, title));
+    const pending = runAsUser(ws.data.user.username, () => legacyProjectionSnapshots.pendingMedia(ws.data.user.username, title));
     hadPendingTasks = pending.length > 0;
     for (const e of pending) {
       ws.send(JSON.stringify(e));
@@ -363,6 +364,14 @@ export function attachSyncPublish(server: Server<SyncWsData>): () => void {
         if (ws.data.user.username === e.user) {
           try { sendLibrarySnapshot(ws); } catch { /* socket 已关闭 */ }
         }
+      }
+      return;
+    }
+    if (e.type === "system-invalidated") {
+      const channel = syncChannelKey(e.user, e.title);
+      for (const ws of allSockets) {
+        if (ws.data.user.username !== e.user || !ws.data.channels.has(channel)) continue;
+        try { sendSystemSnapshot(ws, e.title); } catch { /* socket closed */ }
       }
       return;
     }

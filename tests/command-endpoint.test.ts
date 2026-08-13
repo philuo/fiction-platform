@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { closeDb, getDb } from "../src/api/db";
 import { registerUser, loginUser } from "../src/api/auth";
 import { handleApi } from "../src/api/routes";
+import { syncRevision } from "../src/api/control-plane";
 
 const root = mkdtempSync(join(tmpdir(), "command-endpoint-"));
 let token = "";
@@ -51,9 +52,12 @@ function contracted(pathname: string, commandId: string, type: string, body: Rec
 describe("POST /api/commands", () => {
   test("未登录拒绝，公开写指令均已迁入", async () => {
     expect((await command({ commandId: "unauth", type: "CMD-M01", scope: { title: "书" }, payload: {} }, false))?.status).toBe(401);
-    const migrated = await command({ commandId: "world-edit", type: "CMD-W12", scope: { title: "书" }, payload: {} });
-    expect(migrated?.status).toBe(202);
-    await Bun.sleep(20);
+    const title = "command-missing-story";
+    const migrated = await command({
+      commandId: "world-edit", type: "CMD-W12", scope: { title },
+      expectedRevision: syncRevision("command-user", `story/${title}`, "world").revision, payload: {},
+    });
+    expect(migrated?.status).toBe(409);
     const row = getDb().query("SELECT status,error FROM command_receipts WHERE command_id=?").get("world-edit") as { status: string; error: string };
     expect(row.status).toBe("failed");
     expect(row.error).toContain("故事不存在");
@@ -93,5 +97,35 @@ describe("POST /api/commands", () => {
     const replay = await contracted("/api/novel/proposal-closed", "sync-replay", "CMD-S13", { title: "重放书", closed: true });
     expect(replay?.status).toBe(200);
     expect(await replay!.json()).toEqual({ ok: true, closed: true });
+  });
+
+  test("公开旧写 URL 缺少 v1 命令契约时拒绝执行", async () => {
+    const response = await handleApi("/api/novel/proposal-closed", new Request("http://x/api/novel/proposal-closed", {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ title: "不得写入", closed: true }),
+    }));
+    expect(response?.status).toBe(400);
+    expect(String(((await response!.json()) as { error?: string }).error)).toContain("x-command-contract");
+  });
+
+  test("统一入口同步命令返回 200 终态 receipt，持久任务仍返回 202", async () => {
+    const sync = await command({
+      commandId: "cmd-sync-proposal",
+      type: "CMD-S13",
+      scope: { title: "同步入口书" },
+      payload: { title: "同步入口书", closed: true },
+    });
+    expect(sync?.status).toBe(200);
+    const syncBody = await sync!.json() as { commandId: string; status: string; result?: { ok?: boolean; closed?: boolean } };
+    expect(syncBody).toMatchObject({ commandId: "cmd-sync-proposal", status: "succeeded" });
+    expect(syncBody.result).toEqual({ ok: true, closed: true });
+
+    const async = await command({
+      commandId: "cmd-async-plan",
+      type: "CMD-M01",
+      scope: { title: "不存在的书-异步" },
+      payload: { title: "不存在的书-异步", chapterIndex: 1, kind: "image" },
+    });
+    expect(async?.status).toBe(202);
   });
 });

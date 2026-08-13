@@ -201,7 +201,8 @@ test("system-snapshot 写入全局状态库，弹窗生命周期之外仍可读�
   await tick(20);
   ws.emit({
     type: "system-snapshot", title: "状态库书", world: { title: "状态库书", chapters: [] },
-    visual: { running: false, pending: [], failed: [] }, autoSession: null, autoPending: null, advanceTask: null, at: 10,
+    visual: { running: false, pending: [], failed: [] }, autoSession: null, autoPending: null, advanceTask: null,
+    proposalClosed: false, at: 10,
   });
   await tick(20);
   expect(getSystemSyncState("状态库书")?.world.title).toBe("状态库书");
@@ -223,7 +224,7 @@ test("system patch 连续时应用并回调，revision 缺口时请求完整快�
   const ws = FakeWebSocket.instances[0];
   ws.open();
   await tick(20);
-  const initial = { title: "Patch书", world: { title: "Patch书", chapters: [], nextChapter: 1 }, visual: { running: false, pending: [], failed: [] }, autoSession: null, autoPending: null, advanceTask: null };
+  const initial = { title: "Patch书", world: { title: "Patch书", chapters: [], nextChapter: 1 }, visual: { running: false, pending: [], failed: [] }, autoSession: null, autoPending: null, advanceTask: null, proposalClosed: false };
   ws.emit({ type: "system-snapshot", ...initial, revision: 1, hash: await sha256Json(initial), cursor: 1, at: 1 });
   await tick(20);
   const next = { ...initial, world: { ...initial.world, nextChapter: 2 } };
@@ -234,6 +235,18 @@ test("system patch 连续时应用并回调，revision 缺口时请求完整快�
   ws.emit({ type: "patch", scope: "story/Patch书", document: "system", baseRevision: 5, revision: 6, hash: "gap", ops: [], cursor: 3 });
   await tick(20);
   expect(ws.sent.at(-1)).toBe(JSON.stringify({ type: "snapshot", title: "Patch书" }));
+  root.unmount();
+});
+
+test("system-invalidated 请求新的权威 system snapshot", async () => {
+  const { root } = mountHarness("失效书", () => {});
+  await afterMount();
+  const ws = FakeWebSocket.instances[0];
+  ws.open();
+  await tick(20);
+  ws.emit({ type: "system-invalidated", title: "失效书", at: Date.now() });
+  await tick(20);
+  expect(ws.sent.at(-1)).toBe(JSON.stringify({ type: "snapshot", title: "失效书" }));
   root.unmount();
 });
 
@@ -263,7 +276,7 @@ test("断线期间 outbox 游标重放后请求权威快照", async () => {
   await afterMount();
   const ws1 = FakeWebSocket.instances[0];
   ws1.open();
-  ws1.emit({ type: "system-snapshot", title: "游标书", world: { title: "游标书", chapters: [] }, visual: { running: false, pending: [], failed: [] }, autoSession: null, autoPending: null, advanceTask: null, revision: 2, hash: "h2", cursor: 7, at: 1 });
+  ws1.emit({ type: "system-snapshot", title: "游标书", world: { title: "游标书", chapters: [] }, visual: { running: false, pending: [], failed: [] }, autoSession: null, autoPending: null, advanceTask: null, proposalClosed: false, revision: 2, hash: "h2", cursor: 7, at: 1 });
   await tick(20);
   ws1.drop();
   await tick(1100);

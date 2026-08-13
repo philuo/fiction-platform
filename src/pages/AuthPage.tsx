@@ -1,7 +1,7 @@
 // 登录 / 注册页（未登录时首页展示）：墨枢品牌 · 宣纸墨印风 · 动效登录体验
 // 动效：canvas 墨点粒子（随鼠标微扰）+ 流动光晕背景 + 毛玻璃卡片入场 + 印章盖下 + 浮动 label + 表单切换过渡 + 错误抖动 + 成功打勾
 import { useEffect, useRef, useState } from "react";
-import type { AuthUser } from "../api/auth-types";
+import type { AuthUser } from "../contracts/auth";
 import { apiFetch, setToken } from "../api/client";
 
 type Mode = "login" | "register";

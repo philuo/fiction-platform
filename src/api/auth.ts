@@ -4,7 +4,7 @@
 // - 新角色提案关闭状态：按用户 + 书名存 proposal_closed 表（服务端权威，SSR 首帧直接读库，刷新不闪现）
 import { getDb } from "./db";
 import { randomBytes } from "node:crypto";
-import type { AuthUser } from "./auth-types";
+import type { AuthUser } from "../contracts/auth";
 
 export const SESSION_COOKIE = "ms_session";
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 天
@@ -93,6 +93,15 @@ export function userFromToken(token: string): AuthUser | null {
   return { id: row.id, username: row.username, displayName: row.display_name };
 }
 
+/** 兼容内部 CommandBus/恢复调用：业务层已由 runAsUser 建立上下文时按用户名解析 DTO。 */
+export function userByUsername(username: string | null): AuthUser | null {
+  if (!username) return null;
+  const row = getDb().query("SELECT id, username, display_name FROM users WHERE username = ?").get(username) as
+    | { id: number; username: string; display_name: string }
+    | undefined;
+  return row ? { id: row.id, username: row.username, displayName: row.display_name } : null;
+}
+
 /** 从请求解析当前登录用户：优先 `Authorization: Bearer <token>`（业务 API 凭证），
  * 回退 httpOnly 只读 cookie（SSR 首帧识别用户，浏览器自动携带）。
  * 服务端一次改动即让所有 API 同时支持两种凭证形态。 */
@@ -129,6 +138,17 @@ export function clearSessionCookieValue(): string {
 
 export function getPropClosed(userId: number, title: string): boolean {
   const row = getDb().query("SELECT 1 FROM proposal_closed WHERE user_id = ? AND title = ?").get(userId, title);
+  return !!row;
+}
+
+/** Sync projection builders run with an explicit username context, not an HTTP AuthUser. */
+export function getPropClosedForUsername(username: string | null, title: string): boolean {
+  if (!username) return false;
+  const row = getDb().query(
+    `SELECT 1 FROM proposal_closed p
+     JOIN users u ON u.id = p.user_id
+     WHERE u.username = ? AND p.title = ?`,
+  ).get(username, title);
   return !!row;
 }
 

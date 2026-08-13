@@ -4,7 +4,7 @@
 //  - 打开会话时：先展示缓存（秒开）→ 后台拉服务端 detail 覆盖（服务端最新为准）→ 写回缓存；
 //  - 缓存 key 含书名（用户目录隔离：不同书不串），value 带 savedAt（调试/清理用）；
 //  - SSR/无 indexedDB 环境静默降级（get 返回 null，put no-op）。
-import type { ChatMessage } from "./useBrainSession";
+import type { ChatMessage } from "../frontend/features/brain/types";
 
 const DB_NAME = "fp-brain-cache";
 const DB_VER = 1;

@@ -175,7 +175,10 @@ describe("API 层冒烟（handleApi）", () => {
       "/api/novel/proposal-closed",
       new Request("http://x/api/novel/proposal-closed", {
         method: "POST",
-        headers: { "Content-Type": "application/json", cookie },
+        headers: {
+          "Content-Type": "application/json", cookie,
+          "x-command-contract": "v1", "x-command-id": "auth-proposal-closed", "x-command-type": "CMD-S13",
+        },
         body: JSON.stringify({ title: "测试书", closed: true }),
       }),
     );

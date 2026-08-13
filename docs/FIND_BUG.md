@@ -427,11 +427,11 @@ src/components/BrainCabin.tsx     1809
 src/api/control-plane.ts           424
 ```
 
-`routes.ts` 同时承担命令协议、鉴权后的业务分派、媒体调度、恢复、WebSocket 快照辅助和后台任务。命令是否异步通过路径字符串硬编码判断，新增端点极易漏掉 commandId 关联或终态更新。建议按 command dispatcher、story mutations、media scheduler、recovery services 拆分，并用注册表描述 route、revision policy、response mode 和 job kind，消除两份手写路由映射。
+该问题已进入迁移态：命令协议已由 `src/contracts/commands.ts` 和 `src/transport/http/command-bus.ts` 统一处理，认证路由已迁至 `src/transport/http/auth-routes.ts`，sync transport 通过 projection port 访问旧快照构建器。`routes.ts` 仍承载故事业务、媒体调度和兼容 URL，后续按功能继续拆分；新增端点不得再扩大其职责。
 
 ### 5.3 文档已经明显漂移
 
-README 仍列出已删除的旧状态端点和不存在的文档索引，而当前实现强调状态只经 sync 投影下发。文档若继续描述 `/api/novel/state`、旧 list/status 轮询或过时目录，会误导后续重构再次引入双通道。应在控制面缺陷修复后统一更新 README、BRAIN、PLAN 和实际 API 注册表。
+README、BRAIN、HARNESS 和 INSTRUCTION 已完成一次状态校准；已删除状态端点继续固定返回 404，后续新增协议必须同时更新对应文档和兼容性测试。
 
 ## 6. 安全与持久化审查结论
 
