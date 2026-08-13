@@ -1,5 +1,5 @@
 // 中枢四维状态机测试（brain-state.ts）：覆盖 presence/activity/governance/vitals 各分支派生
-import { describe, expect, test, mock } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { emptyWorld, type WorldState, type ChangeLogEntry } from "../src/api/world";
 import type { EvalReport, EvalDimensionResult } from "../src/api/eval";
 import type { ConsistencyFinding } from "../src/api/world";
@@ -8,18 +8,6 @@ import {
   PRESENCE_LABEL, ACTIVITY_LABEL, GOVERNANCE_LABEL,
   type BrainRuntimeInput,
 } from "../src/api/brain-state";
-
-// mock agnes（brain.ts 导入链触发 agnes 加载，computeDisposition 本身是纯函数不调用 LLM）
-mock.module("../src/api/agnes", () => ({
-  LLMError: class LLMError extends Error {},
-  isRetryableError: () => false,
-  withSmartRetry: async <T>(fn: () => Promise<T>) => fn(),
-  chat: async () => "",
-  complete: async () => ({ content: "" }),
-  chatStream: async () => "",
-  readStream: async () => "",
-  ChatRole: {},
-}));
 
 function mkWorld(): WorldState {
   const w = emptyWorld();

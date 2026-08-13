@@ -19,7 +19,9 @@ export type HarnessCommandId = `CMD-${"N" | "W" | "L" | "M" | "G" | "S" | "Q"}${
 export type CommandReceipt = {
   accepted: true;
   commandId: string;
-  status: "queued" | "running" | "succeeded";
+  status: CommandStatus;
+  result?: unknown;
+  error?: string;
 };
 
 export class CommandConflictError extends Error {}
@@ -40,9 +42,35 @@ export function contentHash(value: string | unknown): string {
 }
 
 function now(): string { return new Date().toISOString(); }
+function lifecycleToken(): string { return `${now()}:${crypto.randomUUID()}`; }
 function parseJson<T>(raw: string | null | undefined): T | undefined {
   if (!raw) return undefined;
   try { return JSON.parse(raw) as T; } catch { return undefined; }
+}
+
+type CommandReceiptRow = {
+  command_id: string;
+  request_hash: string;
+  user_name: string;
+  status: CommandStatus;
+  result_json: string | null;
+  error: string | null;
+};
+
+function rowToCommandReceipt(row: CommandReceiptRow): CommandReceipt {
+  return {
+    accepted: true,
+    commandId: row.command_id,
+    status: row.status,
+    ...(row.result_json ? { result: parseJson(row.result_json) } : {}),
+    ...(row.error ? { error: row.error } : {}),
+  };
+}
+
+export function getCommandReceipt(user: string | null, commandId: string): CommandReceipt | null {
+  const row = getDb().query(`SELECT command_id,request_hash,user_name,status,result_json,error
+    FROM command_receipts WHERE command_id=? AND user_name=?`).get(commandId, durableUser(user)) as CommandReceiptRow | null;
+  return row ? rowToCommandReceipt(row) : null;
 }
 
 export function acceptCommandOnce(user: string | null, req: CommandRequest): { receipt: CommandReceipt; created: boolean } {
@@ -50,12 +78,12 @@ export function acceptCommandOnce(user: string | null, req: CommandRequest): { r
   const db = getDb();
   const requestHash = contentHash({ type: req.type, scope: req.scope, expectedRevision: req.expectedRevision, payload: req.payload });
   const username = durableUser(user);
-  const existing = db.query("SELECT request_hash, status, user_name FROM command_receipts WHERE command_id=?").get(req.commandId) as { request_hash: string; status: CommandStatus; user_name: string } | null;
+  const existing = db.query(`SELECT command_id,request_hash,user_name,status,result_json,error
+    FROM command_receipts WHERE command_id=?`).get(req.commandId) as CommandReceiptRow | null;
   if (existing) {
     if (existing.user_name !== username) throw new CommandConflictError("commandId 已由其他用户使用");
     if (existing.request_hash !== requestHash) throw new CommandConflictError("同一 commandId 的请求内容不同");
-    const status = existing.status === "succeeded" ? "succeeded" : existing.status === "running" ? "running" : "queued";
-    return { receipt: { accepted: true, commandId: req.commandId, status }, created: false };
+    return { receipt: rowToCommandReceipt(existing), created: false };
   }
   const at = now();
   try {
@@ -68,12 +96,12 @@ export function acceptCommandOnce(user: string | null, req: CommandRequest): { r
     return { receipt: { accepted: true, commandId: req.commandId, status: "queued" }, created: true };
   } catch (error) {
     // 跨进程同时重试同 commandId：主键是最终仲裁者。
-    const raced = db.query("SELECT request_hash, status, user_name FROM command_receipts WHERE command_id=?").get(req.commandId) as { request_hash: string; status: CommandStatus; user_name: string } | null;
+    const raced = db.query(`SELECT command_id,request_hash,user_name,status,result_json,error
+      FROM command_receipts WHERE command_id=?`).get(req.commandId) as CommandReceiptRow | null;
     if (!raced) throw error;
     if (raced.user_name !== username) throw new CommandConflictError("commandId 已由其他用户使用");
     if (raced.request_hash !== requestHash) throw new CommandConflictError("同一 commandId 的请求内容不同");
-    const status = raced.status === "succeeded" ? "succeeded" : raced.status === "running" ? "running" : "queued";
-    return { receipt: { accepted: true, commandId: req.commandId, status }, created: false };
+    return { receipt: rowToCommandReceipt(raced), created: false };
   }
 }
 
@@ -82,7 +110,11 @@ export function acceptCommand(user: string | null, req: CommandRequest): Command
 }
 
 export function updateCommand(commandId: string, status: CommandStatus, result?: unknown, error?: string): void {
-  getDb().query("UPDATE command_receipts SET status=?, result_json=?, error=?, updated_at=? WHERE command_id=?")
+  getDb().query(`UPDATE command_receipts SET
+    status=CASE WHEN status IN ('succeeded','failed','cancelled') THEN status ELSE ? END,
+    result_json=COALESCE(result_json,?),
+    error=CASE WHEN status IN ('succeeded','failed','cancelled') THEN error ELSE COALESCE(?,error) END,
+    updated_at=? WHERE command_id=?`)
     .run(status, result === undefined ? null : JSON.stringify(result), error ?? null, now(), commandId);
 }
 
@@ -100,6 +132,8 @@ export type DurableJob = {
   result?: unknown;
   error?: string;
   deadlineAt?: string;
+  leaseOwner?: string;
+  leaseExpiresAt?: string;
   updatedAt: string;
 };
 
@@ -111,6 +145,8 @@ function rowToJob(row: Record<string, unknown>): DurableJob {
     phase: String(row.phase ?? ""), progress: parseJson(String(row.progress_json ?? "")),
     recovery: parseJson(String(row.recovery_json ?? "")), result: parseJson(String(row.result_json ?? "")),
     error: row.error ? String(row.error) : undefined, deadlineAt: row.deadline_at ? String(row.deadline_at) : undefined,
+    leaseOwner: row.lease_owner ? String(row.lease_owner) : undefined,
+    leaseExpiresAt: row.lease_expires_at ? String(row.lease_expires_at) : undefined,
     updatedAt: String(row.updated_at),
   };
 }
@@ -186,16 +222,29 @@ export function deleteJobs(user: string | null, filter: { kind?: string; title?:
 export function markScopeDeleted(user: string | null, title: string, reason = "deleted"): void {
   getDb().query(`INSERT INTO scope_tombstones(user_name,scope_title,reason,created_at) VALUES (?,?,?,?)
     ON CONFLICT(user_name,scope_title) DO UPDATE SET reason=excluded.reason,created_at=excluded.created_at`)
-    .run(durableUser(user), title, reason, now());
+    .run(durableUser(user), title, reason, lifecycleToken());
 }
 
 export function clearScopeDeleted(user: string | null, title: string): void {
-  getDb().query("DELETE FROM scope_tombstones WHERE user_name=? AND scope_title=?").run(durableUser(user), title);
+  getDb().query(`INSERT INTO scope_tombstones(user_name,scope_title,reason,created_at) VALUES (?,?,?,?)
+    ON CONFLICT(user_name,scope_title) DO UPDATE SET reason=excluded.reason,created_at=excluded.created_at`)
+    .run(durableUser(user), title, "active", lifecycleToken());
 }
 
 export function isScopeDeleted(user: string | null, title: string): boolean {
-  return Boolean(getDb().query("SELECT 1 FROM scope_tombstones WHERE user_name=? AND scope_title=?")
-    .get(durableUser(user), title));
+  const row = getDb().query("SELECT reason FROM scope_tombstones WHERE user_name=? AND scope_title=?")
+    .get(durableUser(user), title) as { reason: string } | null;
+  return Boolean(row && row.reason !== "active");
+}
+
+export function scopeGeneration(user: string | null, title: string): string {
+  const row = getDb().query("SELECT created_at FROM scope_tombstones WHERE user_name=? AND scope_title=?")
+    .get(durableUser(user), title) as { created_at: string } | null;
+  return row?.created_at ?? "";
+}
+
+export function isScopeGenerationCurrent(user: string | null, title: string, generation: string): boolean {
+  return !isScopeDeleted(user, title) && scopeGeneration(user, title) === generation;
 }
 
 export function updateJob(id: string, patch: {
@@ -213,12 +262,12 @@ export function updateJob(id: string, patch: {
       patch.recovery === undefined ? null : JSON.stringify(patch.recovery),
       patch.result === undefined ? null : JSON.stringify(patch.result),
       patch.error === undefined ? prev.error ?? null : patch.error,
-      patch.leaseOwner === undefined ? null : patch.leaseOwner,
-      patch.leaseExpiresAt === undefined ? null : patch.leaseExpiresAt,
+      patch.leaseOwner === undefined ? prev.leaseOwner ?? null : patch.leaseOwner,
+      patch.leaseExpiresAt === undefined ? prev.leaseExpiresAt ?? null : patch.leaseExpiresAt,
       now(), id,
     );
-  if (prev.commandId && ["succeeded", "failed", "cancelled"].includes(status)) {
-    updateCommand(prev.commandId, status === "succeeded" ? "succeeded" : status === "cancelled" ? "cancelled" : "failed", patch.result, patch.error ?? undefined);
+  if (prev.commandId && ["succeeded", "failed", "interrupted", "cancelled"].includes(status)) {
+    updateCommand(prev.commandId, status === "succeeded" ? "succeeded" : status === "cancelled" ? "cancelled" : "failed", undefined, patch.error ?? undefined);
   }
   return getJob(id);
 }
@@ -267,6 +316,17 @@ export function settleOrphanedJobs(): number {
     interrupted++;
   }
   return interrupted;
+}
+
+/** 收敛没有活动持久任务承接的命令，避免重启后 queued/running 回执永久悬挂。 */
+export function settleOrphanedCommands(): number {
+  const result = getDb().query(`UPDATE command_receipts SET status='failed',
+    error='服务重启中断了命令；没有可恢复的活动任务',updated_at=?
+    WHERE status IN ('queued','running') AND NOT EXISTS (
+      SELECT 1 FROM jobs WHERE jobs.command_id=command_receipts.command_id
+      AND jobs.status IN ('queued','running','waiting_external','paused')
+    )`).run(now());
+  return Number(result.changes);
 }
 
 export function syncRevision(user: string | null, scope: string, document: string): { revision: number; hash: string } {

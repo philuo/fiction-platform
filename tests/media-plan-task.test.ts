@@ -1,7 +1,8 @@
 // 分镜任务化端到端测试：/api/novel/media/plan 只返回回执；终态由 SQLite job/sync 投影承载。
 // pending→ready 流转和 scenes 持久结果不再依赖任何 HTTP 状态轮询。
 // 数据写入 data/tester/ 临时目录（与 media-auto.test 同款模式），测试结束清理。
-import { afterAll, beforeAll, describe, expect, test, mock } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { setAgnesTestOverride } from "../src/api/agnes";
 import { mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -14,26 +15,19 @@ let nextScenesJson = "";
 let planFailScenes = false;
 let transientFailures = 0;
 let llmCalls = 0;
-mock.module("../src/api/agnes", () => ({
-  ChatMessage: Object,
-  ToolCall: Object,
-  ToolDef: Object,
-  AgnesOptions: Object,
-  LLMError: class LLMError extends Error {},
-  isRetryableError: () => false,
-  withSmartRetry: async (_fn: () => Promise<unknown>) => _fn(),
-  complete: async () => ({ content: planFailScenes ? JSON.stringify({ scenes: [] }) : nextScenesJson }),
-  chat: async () => (planFailScenes ? JSON.stringify({ scenes: [] }) : nextScenesJson),
-  readStream: async () => (planFailScenes ? JSON.stringify({ scenes: [] }) : nextScenesJson),
-  chatStream: async () => {
-    llmCalls++;
-    if (transientFailures > 0) {
-      transientFailures--;
-      throw new Error("HTTP 503: temporary cloud failure");
-    }
-    return planFailScenes ? JSON.stringify({ scenes: [] }) : nextScenesJson;
-  },
-}));
+const sceneResponse = () => {
+  llmCalls++;
+  if (transientFailures > 0) {
+    transientFailures--;
+    throw new Error("HTTP 503: temporary cloud failure");
+  }
+  return planFailScenes ? JSON.stringify({ scenes: [] }) : nextScenesJson;
+};
+setAgnesTestOverride({
+  complete: async () => ({ content: sceneResponse() }),
+  chat: async () => sceneResponse(),
+  chatStream: async () => sceneResponse(),
+});
 
 const TITLE = "plan-task-test";
 const USER = "tester";
@@ -83,6 +77,7 @@ beforeAll(async () => {
 });
 
 afterAll(() => {
+  setAgnesTestOverride(null);
   const dir = join(process.cwd(), "data", USER, "plan-task-test");
   if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
   // 关闭 sqlite 释放句柄后删临时 db（Windows EBUSY）
@@ -133,6 +128,22 @@ describe("media/plan 分镜任务化（异步 + sync 权威恢复）", () => {
     // 场景 anchor 已归一化为正文原文（逐字匹配）
     expect(chapterText.includes(scenes[0].anchor)).toBe(true);
     expect(chapterText.includes(scenes[1].anchor)).toBe(true);
+  });
+
+  test("并发重复分镜只启动一个 LLM 任务并返回已有 planId", async () => {
+    planFailScenes = true;
+    const callsBefore = llmCalls;
+    try {
+      const first = await runAsUser(USER, () => api("/api/novel/media/plan", { title: TITLE, chapterIndex: 1, kind: "video", count: 1 }));
+      expect(first.status).toBe(200);
+      const second = await runAsUser(USER, () => api("/api/novel/media/plan", { title: TITLE, chapterIndex: 1, kind: "video", count: 1 }));
+      expect(second.status).toBe(409);
+      expect(second.data.planId).toBe(first.data.planId);
+      expect(llmCalls - callsBefore).toBe(1);
+      await runAsUser(USER, () => api("/api/novel/media/cancel", { title: TITLE, planId: first.data.planId }));
+    } finally {
+      planFailScenes = false;
+    }
   });
 
   test("旧 plan-status 状态查询无论参数如何均返回 404", async () => {

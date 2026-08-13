@@ -1,5 +1,5 @@
 import { getDb } from "./db";
-import { recoverPreparedWorldCommits, settleOrphanedJobs } from "./control-plane";
+import { recoverPreparedWorldCommits, settleOrphanedCommands, settleOrphanedJobs } from "./control-plane";
 import { cleanupStaleAdvanceTasks } from "./advancetask";
 import { cleanupNewStoryTasks } from "./newtask";
 import { cleanupStaleMediaTasksOnBoot } from "./media-recovery";
@@ -20,13 +20,14 @@ export async function runBootRecovery(): Promise<void> {
       throw new Error(`存在 ${recoveredWorldCommits.conflicts} 个无法自动恢复的世界写入冲突`);
     }
     const interruptedJobs = settleOrphanedJobs();
+    const interruptedCommands = settleOrphanedCommands();
     cleanupStaleAdvanceTasks();
     cleanupNewStoryTasks();
     await cleanupStaleMediaTasksOnBoot();
     resumeAutoSessions();
     resumeScheduledMediaJobs();
     startVisualSweep();
-    markRuntimeReady({ recoveredWorldCommits, interruptedJobs });
+    markRuntimeReady({ recoveredWorldCommits, interruptedJobs, interruptedCommands });
   } catch (error) {
     markRuntimeRecoveryFailed(error);
     throw error;

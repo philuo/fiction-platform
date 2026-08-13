@@ -276,7 +276,7 @@ export const syncWebsocket = {
     unsubscribeStoryChannels(ws);
     ws.subscribe(key);
     ws.data.channels.add(key);
-    ws.send(JSON.stringify({ type: "subscribed", title, version: worldVersion(title) }));
+    ws.send(JSON.stringify({ type: "subscribed", title, version: worldVersion(title, ws.data.user.username) }));
     // 建连订阅立即推权威世界/运行态；连接生命周期与中枢弹窗完全无关。
     sendSystemSnapshot(ws, title, true);
     let hadActive = sendBrainStatus(ws, title);

@@ -2,11 +2,35 @@
 
 > 审计基线：分支 `codex/brain-reliability-ui`，提交 `8cbbf33`，审计日期 2026-08-13。
 >
-> 本报告只记录问题和修复建议，未修改任何业务代码、数据库结构或公开接口。
+> 修复状态：2026-08-13 已按本报告实施修复；原始问题描述保留作为审计证据，当前状态见下节。
+
+## 0. 修复后复验
+
+本轮已修复 BUG-001 至 BUG-008 及 RISK-001、RISK-002 的当前实现缺口，未改变数据库 schema。主要落点如下：
+
+- 命令回执保留完整终态、结果与错误，新增 `GET /api/commands/:commandId` 用户隔离查询；同步 JSON 业务端点可按原 HTTP 状态和 body 幂等重放。
+- 命令状态转换改为单调终态，启动时收敛没有活动 job 承接的孤立 `queued/running` 命令，健康检查暴露收敛数量。
+- 分镜只有成功创建持久 job 后才可启动模型调用；重复请求返回已有 `planId`，不会产生第二个内存任务。
+- 图片生成增加关联顶层 `commandId` 的批次聚合 job；视频命令关联最终 provider watcher job，由真实 `ready/failed` 收敛命令，而非在 provider 接受时提前成功。
+- 故事 tombstone 改为生命周期 generation：删除与同名重建均推进 generation，分镜、图片、视频、封面和角色视觉的晚到结果必须匹配原 generation 才可写回。
+- `worldVersion` key 增加用户维度；WebSocket 订阅读取对应用户版本。
+- `updateJob` 未显式传租约字段时保留原值，只有显式 `null` 才清理租约。
+- 测试模型替身改为显式调用 override，不再用不可恢复的 `mock.module` 替换整个 Agnes 模块；WebSocket 用例清理订阅阶段异步帧，测试夹具不再触发真实图片 provider。
+
+修复后验证：
+
+```text
+bun run typecheck  -> 通过
+bun run build      -> 通过
+bun test           -> 672 pass / 0 fail / 672 total
+git diff --check   -> 通过
+```
+
+仍保留的边界：流式响应正文没有持久化重放，重放时通过 command receipt/任务结果收敛；多进程 claim/lease、精确 kill 点和真实 provider 晚到行为仍需第 9 节所列故障注入。`scope_tombstones` 复用现有字段保存 generation，后续若引入正式 `storyId`，应迁移为显式故事实例外键。
 
 ## 1. 执行摘要
 
-本轮重点审计了最近重构最集中的统一命令入口、持久任务、世界存档提交、WebSocket 投影、中枢会话、媒体生成和启动恢复链路。类型检查和生产构建均通过，但行为层存在数个会让命令永久悬挂、重复执行或让新故事被旧删除状态污染的严重问题。
+本轮重点审计了最近重构最集中的统一命令入口、持久任务、世界存档提交、WebSocket 投影、中枢会话、媒体生成和启动恢复链路。以下统计是提交 `8cbbf33` 的原始审计结果；上述已确认实现缺陷已在本次修复中关闭。
 
 | 级别 | 已确认 | 高风险 | 含义 |
 | --- | ---: | ---: | --- |
@@ -27,7 +51,7 @@ bun run build      -> 通过
 bun test           -> 654 pass / 9 fail / 663 total
 ```
 
-全量测试失败项：
+修复前全量测试失败项：
 
 ```text
 3 个 Agnes SSE reasoning/content 解析断言失败
@@ -45,9 +69,9 @@ bun test tests/sync-ws.test.ts
 -> 14 pass / 0 fail
 ```
 
-因此不能把上述 9 项解释为各被测函数本身的稳定回归；它们证明了全量测试存在跨文件共享状态污染。具体污染来源见 BUG-008。
+因此不能把上述 9 项解释为各被测函数本身的稳定回归；它们证明了全量测试存在跨文件共享状态污染。具体污染来源见 BUG-008。修复测试注入与 WebSocket 夹具后，全量测试为 `672 pass / 0 fail`。
 
-## 3. 已确认缺陷
+## 3. 已确认缺陷（均已修复，保留原始证据）
 
 ### BUG-001 [P1] 失败或取消的命令被伪装成 `queued`，幂等重试永远不会再次执行
 
@@ -359,7 +383,7 @@ WebSocket 隔离用例也表现为全量失败、单文件 14/14 通过。仓库
 4. 为数据库、sync bus、brain cache、WebSocket server 提供严格 `beforeEach/afterEach` reset。
 5. 测试环境强制清空 provider key，并让任何真实网络请求立即失败。
 
-## 4. 高风险问题（尚未证明已在生产触发）
+## 4. 高风险问题（RISK-001/002 已修复，RISK-003 仍需持续治理）
 
 ### RISK-001 [P2] `updateJob` 的普通进度更新会无条件清空租约字段
 

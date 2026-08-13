@@ -56,6 +56,7 @@ beforeAll(async () => {
   const mk = (user: string, title: string) => {
     const w = emptyWorld();
     w.title = title;
+    w.cover = "images/test-cover.jpg";
     runAsUser(user, () => saveWorld(w));
   };
   mk("u1", "ws-book-1");
@@ -156,6 +157,9 @@ describe("订阅与广播（协议）", () => {
     wsA.send(JSON.stringify({ type: "subscribe", title: "shared-book" }));
     wsB.send(JSON.stringify({ type: "subscribe", title: "shared-book" }));
     await Promise.all([waitA((m) => m.type === "subscribed"), waitB((m) => m.type === "subscribed")]);
+    // 订阅快照可能触发视觉自愈并异步保存；隔离断言只观察此刻之后的显式事件。
+    msgsA.length = 0;
+    msgsB.length = 0;
 
     notifyWorldSaved("shared-book", "save", "uA");
     await waitA((m) => m.type === "world-changed");

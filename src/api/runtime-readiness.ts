@@ -6,6 +6,7 @@ export type RuntimeReadiness = {
   recoveryError?: string;
   recoveredWorldCommits: { committed: number; aborted: number; conflicts: number };
   interruptedJobs: number;
+  interruptedCommands: number;
 };
 
 const RUNTIME_KEY = "__moshift_runtime_readiness__";
@@ -19,6 +20,7 @@ function state(): RuntimeReadiness {
     startedAt: new Date().toISOString(),
     recoveredWorldCommits: { committed: 0, aborted: 0, conflicts: 0 },
     interruptedJobs: 0,
+    interruptedCommands: 0,
   };
   return root[RUNTIME_KEY];
 }
@@ -31,7 +33,7 @@ export function markRuntimeRecovering(): void {
   Object.assign(state(), { ready: false, readyAt: undefined, recoveryError: undefined });
 }
 
-export function markRuntimeReady(result: Pick<RuntimeReadiness, "recoveredWorldCommits" | "interruptedJobs">): void {
+export function markRuntimeReady(result: Pick<RuntimeReadiness, "recoveredWorldCommits" | "interruptedJobs" | "interruptedCommands">): void {
   Object.assign(state(), result, { ready: true, readyAt: new Date().toISOString(), recoveryError: undefined });
 }
 

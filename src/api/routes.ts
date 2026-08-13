@@ -55,13 +55,47 @@ import type { CardType } from "./cards";
 import { renameSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { runtimeReadiness } from "./runtime-readiness";
-import { acceptCommandOnce, clearScopeDeleted, CommandConflictError, createJob, getActiveJob, isScopeDeleted, listJobs, listScheduledJobs, markScopeDeleted, syncRevision, transitionJob, updateCommand, updateJob, RevisionConflictError, type CommandRequest, type DurableJob } from "./control-plane";
+import { acceptCommandOnce, clearScopeDeleted, CommandConflictError, createJob, getActiveJob, getCommandReceipt, isScopeGenerationCurrent, listJobs, listScheduledJobs, markScopeDeleted, scopeGeneration, syncRevision, transitionJob, updateCommand, updateJob, RevisionConflictError, type CommandReceipt, type CommandRequest, type DurableJob } from "./control-plane";
 
 function json(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: { "Content-Type": "application/json; charset=utf-8", ...extraHeaders },
   });
+}
+
+type StoredHttpResponse = {
+  __httpResponse: true;
+  status: number;
+  contentType: string;
+  body: unknown;
+};
+
+function storedHttpResponse(response: Response, body: unknown): StoredHttpResponse {
+  return {
+    __httpResponse: true,
+    status: response.status,
+    contentType: response.headers.get("content-type") ?? "application/json",
+    body,
+  };
+}
+
+function replayCommandReceipt(receipt: CommandReceipt): Response {
+  const stored = receipt.result as Partial<StoredHttpResponse> | undefined;
+  const terminal = receipt.status === "succeeded" || receipt.status === "failed" || receipt.status === "cancelled";
+  const replayStored = receipt.status === "succeeded"
+    || ((receipt.status === "failed" || receipt.status === "cancelled") && typeof stored?.status === "number" && stored.status >= 400);
+  if (terminal && replayStored && stored?.__httpResponse && typeof stored.status === "number") {
+    if (stored.contentType?.includes("application/json")) return json(stored.body, stored.status);
+    return new Response(typeof stored.body === "string" ? stored.body : JSON.stringify(stored.body), {
+      status: stored.status,
+      headers: { "Content-Type": stored.contentType ?? "application/octet-stream" },
+    });
+  }
+  if (receipt.status === "failed") return json({ error: receipt.error ?? "命令执行失败", ...receipt }, 409);
+  if (receipt.status === "cancelled") return json({ error: receipt.error ?? "命令已取消", ...receipt }, 409);
+  if (receipt.status === "succeeded" && receipt.result !== undefined) return json(receipt.result);
+  return json(receipt, 202);
 }
 
 function sseStream(produce: (send: (obj: unknown) => void) => Promise<void>): Response {
@@ -516,12 +550,12 @@ async function getMediaStatus(title: string, idx: number, id: string): Promise<M
 //    周期 poll provider → 落盘 ready/failed → publishSync 广播，前端零轮询收敛）——
 const VIDEO_WATCH_INTERVAL_MS = 15_000; // provider 查询间歇（视频 RPM=2，留裕量；429 自动跳过本轮）
 type VideoWatchSession = { sessionId: string; messageId: string; cardIndex: number; cardId: string };
-const videoWatchers = new Map<string, { title: string; idx: number; id: string; session?: VideoWatchSession; timer?: ReturnType<typeof setTimeout> }>();
+const videoWatchers = new Map<string, { title: string; idx: number; id: string; generation: string; session?: VideoWatchSession; timer?: ReturnType<typeof setTimeout> }>();
 
 /** 开始（或复用）一个视频 pending 任务的服务端轮询；幂等。getMediaStatus 负责落盘 + 广播终态。
  *  传入 session 时，终态（ready/failed）由服务端权威翻 brain 卡并推 card-replaced（刷新/重启后仍能收敛）。
  *  插画不进此表（后台 Promise 完成时直接落盘广播），视频拿 videoId 后才需要持续查询远端。 */
-export function watchVideoTask(title: string, idx: number, id: string, session?: VideoWatchSession): void {
+export function watchVideoTask(title: string, idx: number, id: string, session?: VideoWatchSession, commandId?: string): void {
   const key = mediaKey(id);
   const existing = videoWatchers.get(key);
   if (existing) {
@@ -531,15 +565,21 @@ export function watchVideoTask(title: string, idx: number, id: string, session?:
   }
   const worldMedia = loadWorld(title)?.chapters.find((c) => c.index === idx)?.media?.find((m) => m.id === id);
   const durable = createJob({
-    id, user: currentUser(), title, kind: "video", dedupeKey: `video:${id}`,
+    id, commandId, user: currentUser(), title, kind: "video", dedupeKey: `video:${id}`,
     status: "waiting_external", phase: "provider-poll",
     recovery: { mediaId: id, chapterIndex: idx, videoId: worldMedia?.videoId, session },
     deadlineAt: new Date(Date.now() + 30 * 60_000).toISOString(),
   });
-  const entry = { title, idx, id, session } as { title: string; idx: number; id: string; session?: VideoWatchSession; timer?: ReturnType<typeof setTimeout> };
+  const generation = scopeGeneration(currentUser(), title);
+  const entry = { title, idx, id, generation, session } as { title: string; idx: number; id: string; generation: string; session?: VideoWatchSession; timer?: ReturnType<typeof setTimeout> };
   videoWatchers.set(key, entry);
   const tick = async () => {
     if (!videoWatchers.has(key)) return; // 已停止（终态/删除/取消）
+    if (!isScopeGenerationCurrent(currentUser(), title, generation)) {
+      videoWatchers.delete(key);
+      updateJob(durable.job.id, { status: "cancelled", phase: "scope-replaced", error: "故事已删除或被同名新故事替换" });
+      return;
+    }
     try {
       const res = await getMediaStatus(title, idx, id);
       if (res.ok && (res.status === "ready" || res.status === "failed")) {
@@ -805,6 +845,7 @@ const VISUAL_RETRY_COOLDOWN = 60_000;
 function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter): void {
   if (c.portrait?.path && c.image) return; // 视觉已完整，跳过
   const uk = currentUser() ?? "";
+  const generation = scopeGeneration(uk, title);
   const key = `${uk}::${slug(title)}::${c.id}`;
   const durable = createJob({
     user: uk, title, kind: "visual", dedupeKey: `visual:${slug(title)}:${c.id}`,
@@ -817,7 +858,7 @@ function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter
     const t0 = Date.now();
     const failures: string[] = [];
     // 删除自查：书已被删除时停止后续生成（书目录删除后仍在锁外跑的任务在每步生成前检查，防写孤儿媒体/继续烧配额）
-    const deleted = () => isScopeDeleted(uk, title);
+    const deleted = () => !isScopeGenerationCurrent(uk, title, generation);
     try {
       // ⓪ 立即落盘 visualTriedAt（读时自愈据此冷却重试，防烧配额；每次尝试都刷新时间戳，失败也置位，手动生成不受影响）；此步失败不阻塞生成
       try {
@@ -931,11 +972,12 @@ function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter
 function ensureCover(title: string, w: WorldState): void {
   if (w.cover) return; // 已有封面跳过
   const uk = currentUser() ?? "";
+  const generation = scopeGeneration(uk, title);
   const tKey = `${uk}::${slug(title)}`;
   const durable = createJob({ user: uk, title, kind: "cover", dedupeKey: `cover:${slug(title)}`, status: "running", phase: "generating" });
   if (!durable.created || coverInFlight.has(tKey)) return;
   coverInFlight.add(tKey);
-  const deleted = () => isScopeDeleted(uk, title);
+  const deleted = () => !isScopeGenerationCurrent(uk, title, generation);
   void (async () => {
     const t0 = Date.now();
     try {
@@ -1078,7 +1120,7 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
     pathname.startsWith("/api/novel") ||
     pathname.startsWith("/api/brain") ||
     pathname.startsWith("/api/chat") ||
-    pathname === "/api/commands" ||
+    pathname.startsWith("/api/commands") ||
     pathname === "/api/search";
   if (!user && requiresAuth) {
     return json({ error: "未登录" }, 401);
@@ -1133,18 +1175,30 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
             const response = await handleNovelApi(target, forwarded);
             const result = response ? await response.clone().json().catch(() => ({})) as Record<string, unknown> : {};
             if (!response || !response.ok) throw new Error(String(result.error ?? `命令执行器返回 ${response?.status ?? 500}`));
-            updateCommand(commandId, "succeeded", result);
+            const asyncCommand = target === "/api/novel/new" || target === "/api/novel/media/plan" || target === "/api/novel/media/generate" || target === "/api/novel/auto/start" || target === "/api/novel/step";
+            if (asyncCommand) updateCommand(commandId, "running", result);
+            else updateCommand(commandId, "succeeded", result);
           } catch (error) {
             updateCommand(commandId, "failed", undefined, errorDetail(error, "命令执行失败"));
           }
         });
       }
-      return json(accepted.receipt, 202);
+      const receiptStatus = accepted.receipt.status === "queued" || accepted.receipt.status === "running"
+        ? 202 : accepted.receipt.status === "succeeded" ? 200 : 409;
+      return json(accepted.receipt, receiptStatus);
     } catch (error) {
       if (error instanceof CommandConflictError) return json({ error: error.message }, 409);
       if (error instanceof RevisionConflictError) return json({ error: error.message }, 409);
       return json({ error: errorDetail(error, "命令提交失败") }, 400);
     }
+  }
+
+  if (pathname.startsWith("/api/commands/")) {
+    if (req.method !== "GET") return json({ error: "仅支持 GET" }, 405);
+    const commandId = decodeURIComponent(pathname.slice("/api/commands/".length)).trim();
+    if (!commandId) return json({ error: "缺少 commandId" }, 400);
+    const receipt = getCommandReceipt(user!.username, commandId);
+    return receipt ? json(receipt) : json({ error: "命令不存在" }, 404);
   }
 
   if (pathname.startsWith("/api/novel/") && req.method === "POST" && req.headers.get("x-command-contract") === "v1") {
@@ -1164,7 +1218,7 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
       }
       try {
         const accepted = acceptCommandOnce(user!.username, { commandId, type: route.type, scope: { title: title || undefined }, expectedRevision, payload });
-        if (!accepted.created) return json(accepted.receipt, 202);
+        if (!accepted.created) return replayCommandReceipt(accepted.receipt);
         updateCommand(commandId, "running");
         const headers = new Headers(req.headers);
         headers.set("x-command-accepted", "1");
@@ -1175,10 +1229,13 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
         const asyncJob = pathname === "/api/novel/new" || pathname === "/api/novel/media/plan" || pathname === "/api/novel/media/generate" || pathname === "/api/novel/auto/start" || pathname === "/api/novel/step";
         if (!response.ok) {
           const result = await response.clone().json().catch(() => ({})) as Record<string, unknown>;
-          updateCommand(commandId, "failed", undefined, String(result.error ?? `命令执行器返回 ${response.status}`));
+          updateCommand(commandId, "failed", storedHttpResponse(response, result), String(result.error ?? `命令执行器返回 ${response.status}`));
         } else if (!isStream && !asyncJob) {
           const result = await response.clone().json().catch(() => ({}));
-          updateCommand(commandId, "succeeded", result);
+          updateCommand(commandId, "succeeded", storedHttpResponse(response, result));
+        } else if (!isStream && asyncJob) {
+          const result = await response.clone().json().catch(() => ({}));
+          updateCommand(commandId, "running", storedHttpResponse(response, result));
         }
         return response;
       } catch (error) {
@@ -1274,6 +1331,7 @@ async function handleApiInner(pathname: string, req: Request, user: AuthUser | n
           error: runtime.recoveryError,
           worldCommits: runtime.recoveredWorldCommits,
           interruptedJobs: runtime.interruptedJobs,
+          interruptedCommands: runtime.interruptedCommands,
         },
         agnes: mediaOk,
         text: textOk,
@@ -2837,18 +2895,20 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const sessionBase = sessionCtx && sessionCtx.sessionId && sessionCtx.messageId && Number.isInteger(sessionCtx.cardIndex)
         ? sessionCtx : undefined;
       const id = planId();
-      const controller = new AbortController();
       const count = Number(body.count) || 1;
       const user = currentUser() ?? "";
+      const generation = scopeGeneration(user, title);
       const cardId = `media-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
       const session = sessionBase ? { ...sessionBase, cardId } : undefined;
-      const task: PlanTask = { user, title, chapterIndex: idx, kind: kind as "image" | "video", count, status: "pending", at: Date.now(), controller, session };
-      createJob({
+      const durablePlan = createJob({
         id, commandId: String(body.commandId ?? "") || undefined, user, title, kind: "media-plan", dedupeKey: `media-plan:${idx}:${kind}`,
         status: "running", phase: "planning",
         recovery: { chapterIndex: idx, mediaKind: kind, count, session },
         deadlineAt: new Date(Date.now() + PLAN_TASK_TIMEOUT).toISOString(),
       });
+      if (!durablePlan.created) return json({ error: "该章分镜正在生成中", planId: durablePlan.job.id }, 409);
+      const controller = new AbortController();
+      const task: PlanTask = { user, title, chapterIndex: idx, kind: kind as "image" | "video", count, status: "pending", at: Date.now(), controller, session };
       // 真超时：180s 到点 abort 后台 LLM 并翻 failed（旧版是懒超时，不 abort，晚到结果还会覆盖回 ready）
       task.timer = setTimeout(() => failPlanTask(id, "分镜任务超时（AI 服务响应过慢），请重试", { abort: true }), PLAN_TASK_TIMEOUT);
       planTasks.set(id, task);
@@ -2876,10 +2936,14 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           // 晚到结果守卫：任务已被超时/取消翻 failed（controller 已 abort）或被删 → 不得覆盖回 ready
           const t = planTasks.get(id);
           if (!t || t.status !== "pending" || controller.signal.aborted) return;
+          if (!isScopeGenerationCurrent(user, title, generation)) {
+            failPlanTask(id, "故事已删除或被同名新故事替换", { abort: true });
+            return;
+          }
           if (t.timer) { clearTimeout(t.timer); t.timer = undefined; }
           t.status = "ready";
           t.scenes = scenes;
-          updateJob(id, { status: "succeeded", phase: "ready", result: { scenes } });
+          updateJob(id, { status: "succeeded", phase: "ready", result: { ok: true, planId: id, scenes } });
           // ① 服务端权威落盘：带会话上下文时直接把会话卡翻成「分镜完成」确认卡——
           //    刷新/重开面板读落盘卡即最新，不依赖前端消费事件（关闭面板期间 WS 事件会丢失）
           if (sess) {
@@ -2973,6 +3037,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       }
       try {
         if (kind === "video") {
+          const generation = scopeGeneration(currentUser(), title);
           // SQLite 活动任务唯一约束是并发仲裁者：跨 Tab、跨进程都只能创建一个 provider 任务。
           const videoJob = createJob({
             user: currentUser(), title, kind: "video-create",
@@ -3003,6 +3068,9 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
               }
             }
             await withTitleLock(slug(title), async () => {
+              if (!isScopeGenerationCurrent(currentUser(), title, generation)) {
+                throw new AppError("故事已删除或被同名新故事替换");
+              }
               const w = loadWorld(title);
               if (!w) throw new AppError("故事不存在: " + title);
               const ch = w.chapters.find((x) => x.index === idx);
@@ -3025,7 +3093,11 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             }
             // 视频远端任务已创建（chapter media 落盘为 pending）：启动服务端轮询，由 getMediaStatus
             // 落盘 ready/failed 并广播 task-status（前端 WS 驱动收敛，零轮询）；携带会话定位以便终态翻 brain 卡。
-            watchVideoTask(title, idx, media.id, genSession ? { sessionId: genSession.sessionId, messageId: genSession.messageId, cardIndex: genSession.cardIndex, cardId: genSession.cardId } : undefined);
+            watchVideoTask(
+              title, idx, media.id,
+              genSession ? { sessionId: genSession.sessionId, messageId: genSession.messageId, cardIndex: genSession.cardIndex, cardId: genSession.cardId } : undefined,
+              String(body.commandId ?? "") || undefined,
+            );
             updateJob(videoJob.job.id, { status: "succeeded", phase: "provider-created", result: { mediaId: media.id, videoId: media.videoId } });
             return json({ ok: true, mediaId: media.id, mediaIds: [media.id], videoId: media.videoId, mode: firstFrame ? "i2v" : "t2v" });
           } catch (error) {
@@ -3039,38 +3111,47 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         if (!w0) return json({ error: "故事不存在: " + title }, 404);
         const toAdd = valid.slice(0, 3);
         const style = styleAnchor(w0);
+        const imageBatchJob = createJob({
+          commandId: String(body.commandId ?? "") || undefined,
+          user: currentUser(), title, kind: "image-batch", dedupeKey: `image-batch:${slug(title)}:${idx}`,
+          status: "running", phase: "creating", recovery: { chapterIndex: idx },
+        });
+        if (!imageBatchJob.created) return json({ error: "该章插画正在生成中，请稍候再试" }, 409);
         // ① 锁内：创建 pending 条目并落盘（含 subject/最终 prompt 前缀；生成完成后覆盖 prompt 为最终值）
         // 插画数量上限校验放在锁内、重新 loadWorld 后对数，避免锁外读快照的 TOCTOU（两请求同时看到余量而双双超限）
-        const createRes = await withTitleLock(slug(title), async () => {
-          const w = loadWorld(title);
-          if (!w) throw new AppError("故事不存在: " + title);
-          const ch = w.chapters.find((x) => x.index === idx);
-          if (!ch) throw new AppError("章节不存在");
-          const existingImgs = (ch.media ?? []).filter(imageOccupiesQuota).length;
-          if (existingImgs + toAdd.length > MAX_IMAGES_PER_CHAPTER) {
-            return { error: `本章已有 ${existingImgs} 张插画，上限 ${MAX_IMAGES_PER_CHAPTER} 张，请先删除部分插画后再生成` };
-          }
-          const items: ChapterMedia[] = toAdd.map((s) => {
-            const sceneType = s.type === "人物" || s.type === "场景" || s.type === "事件" ? s.type : "事件";
-            return {
-              id: mediaId(),
-              kind: "image" as const,
-              anchor: s.anchor,
-              prompt: s.scene,
-              caption: s.caption || undefined,
-              sceneType,
-              subject: s.subject || undefined,
-              status: "pending" as const,
-              createdAt: Date.now(),
-            };
+        let createRes: { items: ChapterMedia[] } | { error: string };
+        try {
+          createRes = await withTitleLock(slug(title), async () => {
+            const w = loadWorld(title);
+            if (!w) throw new AppError("故事不存在: " + title);
+            const ch = w.chapters.find((x) => x.index === idx);
+            if (!ch) throw new AppError("章节不存在");
+            const existingImgs = (ch.media ?? []).filter(imageOccupiesQuota).length;
+            if (existingImgs + toAdd.length > MAX_IMAGES_PER_CHAPTER) {
+              return { error: `本章已有 ${existingImgs} 张插画，上限 ${MAX_IMAGES_PER_CHAPTER} 张，请先删除部分插画后再生成` };
+            }
+            const items: ChapterMedia[] = toAdd.map((s) => {
+              const sceneType = s.type === "人物" || s.type === "场景" || s.type === "事件" ? s.type : "事件";
+              return {
+                id: mediaId(), kind: "image" as const, anchor: s.anchor, prompt: s.scene,
+                caption: s.caption || undefined, sceneType, subject: s.subject || undefined,
+                status: "pending" as const, createdAt: Date.now(),
+              };
+            });
+            ch.media = [...(ch.media ?? []), ...items];
+            touchChapter(w, idx);
+            applyStateChange(w, { actor: "user", commandId: "CMD-M02", field: "chapters[].media", reason: `创建第 ${idx} 章插画任务（${items.length} 张）`, chapter: idx });
+            saveWorld(w);
+            return { items };
           });
-          ch.media = [...(ch.media ?? []), ...items];
-          touchChapter(w, idx);
-          applyStateChange(w, { actor: "user", commandId: "CMD-M02", field: "chapters[].media", reason: `创建第 ${idx} 章插画任务（${items.length} 张）`, chapter: idx });
-          saveWorld(w);
-          return { items };
-        });
-        if ("error" in createRes) return json({ error: createRes.error }, 400);
+        } catch (error) {
+          updateJob(imageBatchJob.job.id, { status: "failed", phase: "create-failed", error: errorDetail(error, "插画任务创建失败") });
+          throw error;
+        }
+        if ("error" in createRes) {
+          updateJob(imageBatchJob.job.id, { status: "failed", phase: "rejected", error: createRes.error });
+          return json({ error: createRes.error }, 400);
+        }
         const created = createRes.items;
         // 同步把确认卡就地换成「生成中」running 卡（已带 mediaIds 恢复锚点），经 card-replaced 广播——
         // 前端零 HTTP 回写；逐张进度由 task-status 推进，全部完成由后台 IIFE 权威翻终态卡。
@@ -3088,12 +3169,13 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
         }
         // ② 锁外并行生成（多张并发 + 429 限流重试一次；失败不阻塞其余张），完成后锁内更新
         const t0 = Date.now();
+        const generation = scopeGeneration(currentUser(), title);
         void (async () => {
           let ok = 0;
           const okIds: string[] = [];
           let failed = 0;
           // 删除自查：书在生成期间被删时短路，避免继续烧 Agnes 配额/写孤儿媒体（对照 ensureCharacterVisuals/ensureCover）
-          const deleted = () => isScopeDeleted(currentUser(), title);
+          const deleted = () => !isScopeGenerationCurrent(currentUser(), title, generation);
           await Promise.allSettled(created.map(async (item, i) => {
             const s = toAdd[i];
             // 每张图独立 controller：删除会话/卡片消失时可单独 abort 底层 fetch
@@ -3106,7 +3188,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             let mediaOk = false;
             let mediaErr = "";
             try {
-              if (deleted()) return; // 书已删：放弃本次生成（pending 条目随书一起消失，无需落盘）
+              if (deleted()) throw new DOMException("story deleted", "AbortError");
               // 参考图级联：主体角色立绘绝对优先 → 跨章角色插画（仅用已就绪图）；角色无任何图时后台补立绘，不阻塞本次插画
               const ref = findCharacterRef(w0, idx, s.anchor, s.subject || undefined);
               schedulePortraitFor(title, w0, s.anchor);
@@ -3134,6 +3216,10 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
                 }
               }
               await withTitleLock(slug(title), async () => {
+                if (deleted()) {
+                  if (media?.path) deleteMediaFile(title, media.path);
+                  throw new DOMException("story replaced", "AbortError");
+                }
                 const w = loadWorld(title);
                 const ch = w?.chapters.find((x) => x.index === idx);
                 const m = (ch?.media ?? []).find((x) => x.id === item.id);
@@ -3205,6 +3291,13 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             const replaced = replaceBrainMessageCard(title, genSession.sessionId, genSession.messageId, genSession.cardIndex, doneCard as never);
             if (replaced) publishCardReplaced(title, genSession.sessionId, genSession.messageId, genSession.cardIndex, doneCard, currentUser() ?? undefined);
           }
+          const batchResult = { ok: failed === 0, mediaIds: created.map((x) => x.id), readyMediaIds: okIds, failed };
+          updateJob(imageBatchJob.job.id, {
+            status: failed === 0 ? "succeeded" : "failed",
+            phase: failed === 0 ? "ready" : "failed",
+            result: batchResult,
+            error: failed === 0 ? null : `${failed} 张插画生成失败`,
+          });
           console.log(`[media/generate] 插画后台完成 ${ok}/${created.length}，总耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
         })();
         return json({ ok: true, mediaIds: created.map((x) => x.id) });

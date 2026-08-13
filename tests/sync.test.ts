@@ -129,6 +129,15 @@ describe("版本戳（worldVersion / notifyWorldSaved）", () => {
     flushSyncPending();
     unsub();
   });
+
+  test("同名书版本按用户隔离", () => {
+    notifyWorldSaved("同名书", "save", "alice");
+    notifyWorldSaved("同名书", "save", "alice");
+    notifyWorldSaved("同名书", "save", "bob");
+    expect(worldVersion("同名书", "alice")).toBe(2);
+    expect(worldVersion("同名书", "bob")).toBe(1);
+    expect(worldVersion("同名书")).toBe(0);
+  });
 });
 
 describe("订阅者异常隔离", () => {

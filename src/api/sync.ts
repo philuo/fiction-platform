@@ -226,9 +226,13 @@ export function resetSyncState(): void {
 /** per-title 版本戳（客户端按版本去重） */
 const worldVersions = new Map<string, number>();
 
+function worldVersionKey(title: string, user?: string): string {
+  return `${user?.trim() || "__legacy__"}\u0000${slugify(title)}`;
+}
+
 /** 读取某书当前版本（阶段 1 新连接初始同步用）；无记录返回 0 */
-export function worldVersion(title: string): number {
-  return worldVersions.get(slugify(title)) ?? 0;
+export function worldVersion(title: string, user?: string): number {
+  return worldVersions.get(worldVersionKey(title, user)) ?? 0;
 }
 
 /** A 级：saveWorld 落盘后调用（storage.ts 钩子）。无订阅者时零开销。
@@ -237,7 +241,7 @@ export function worldVersion(title: string): number {
  *  ——注意：storage.saveWorld 是通用落盘，不感知业务上下文，默认不传 regions（全量）；
  *    业务写点（routes/director 等）如需区域级刷新，可显式调用 publishSync 带 regions。 */
 export function notifyWorldSaved(title: string, reason = "save", user?: string, regions?: string[], committedRevision?: number): void {
-  const key = slugify(title);
+  const key = worldVersionKey(title, user);
   const version = committedRevision ?? (worldVersions.get(key) ?? 0) + 1;
   worldVersions.set(key, version);
   if (listeners.size === 0) return;

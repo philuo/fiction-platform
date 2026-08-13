@@ -1,8 +1,8 @@
 // 全链路 mock 长跑基建：10 本 × 10-30 章参数化（P1）+ 鲁棒性/恢复/媒体测试共用。
-// 单例模式：installFullMock 仅安装一次 mock（bun mock.module 对已缓存模块幂等），
-// 每次测试通过 setSpec/installFullMock(spec) 切换当前书参数，responder 运行时读取 activeSpec。
-// 必须在 import 任何 src/api 模块【之前】首次调用 installFullMock。
-import { mock } from "bun:test";
+// 每次测试通过 setSpec/installFullMock(spec) 切换当前书参数，responder 运行时读取 activeSpec；
+// afterAll 自动清除 override，避免影响同进程的 SSE/重试测试。
+import { afterAll } from "bun:test";
+import { setAgnesTestOverride } from "../src/api/agnes";
 
 export type BookSpec = {
   idx: number; // 第几本（生成唯一书名/角色名）
@@ -36,6 +36,8 @@ let active: BookSpec | null = null;
 let _writeCalls = 0; // 每本书重置（setSpec）
 let _settleCalls = 0;
 
+afterAll(() => setAgnesTestOverride(null));
+
 /** 切换当前书参数（responder 运行时读取） */
 export function setSpec(spec: BookSpec): void {
   active = spec;
@@ -43,14 +45,10 @@ export function setSpec(spec: BookSpec): void {
   _settleCalls = 0;
 }
 
-/** 安装全链路 mock：每个测试文件都必须调用一次（bun 的 mock.module 按测试文件独立生效，
- * 跨文件共享 installed 标志会导致后执行的文件未注册 mock 而直连真实 API）。
- * 同文件内重复调用为幂等覆盖。 */
+/** 安装全链路模型 override；解析与重试实现保持真实，避免模块 mock 跨文件泄漏。 */
 export function installFullMock(spec?: BookSpec): void {
   if (spec) active = spec;
-  mock.module("../src/api/agnes", () => {
-    class LLMError extends Error {}
-    const responder = (messages: { role: string; content: string }[]) => {
+  const responder = (messages: { role: string; content: string }[]) => {
       const spec = active ?? BOOK_SPECS[0];
       const sys = messages[0]?.content ?? "";
       const names = [`主角${spec.idx}`, `同伴${spec.idx}`, `对手${spec.idx}`, `路人${spec.idx}`].slice(0, spec.charCount);
@@ -191,16 +189,14 @@ export function installFullMock(spec?: BookSpec): void {
       }
       return "{}";
     };
-    return {
-      LLMError,
-      chat: async (messages: { role: string; content: string }[]) => responder(messages),
-      complete: async (messages: { role: string; content: string }[]) => ({ content: responder(messages) }),
-      chatStream: async (messages: { role: string; content: string }[], onChunk: (d: string) => void) => {
-        const full = responder(messages);
-        for (let i = 0; i < full.length; i += 64) onChunk(full.slice(i, i + 64));
-        return full;
-      },
-    };
+  setAgnesTestOverride({
+    chat: async (messages) => responder(messages),
+    complete: async (messages) => ({ content: responder(messages) }),
+    chatStream: async (messages, onChunk) => {
+      const full = responder(messages);
+      for (let i = 0; i < full.length; i += 64) onChunk(full.slice(i, i + 64));
+      return full;
+    },
   });
 }
 

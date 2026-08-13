@@ -54,6 +54,20 @@ export class LLMError extends Error {
   textTokens?: number;
 }
 
+type AgnesTestOverride = {
+  complete?: (messages: ChatMessage[], opts: AgnesOptions) => Promise<{ content: string; tool_calls?: ToolCall[] }>;
+  chat?: (messages: ChatMessage[], opts: AgnesOptions) => Promise<string>;
+  chatStream?: (messages: ChatMessage[], onChunk: (delta: string) => void, opts: AgnesOptions) => Promise<string>;
+};
+
+let testOverride: AgnesTestOverride | null = null;
+
+/** 测试专用依赖注入；只替换模型调用，不替换解析、错误分类或重试实现。 */
+export function setAgnesTestOverride(override: AgnesTestOverride | null): void {
+  if (process.env.NODE_ENV !== "test") throw new Error("Agnes test override 只能在 NODE_ENV=test 使用");
+  testOverride = override;
+}
+
 // —— 文本模型配置分离：TEXT_* 专用（可切换到任意 OpenAI 兼容端点，如基元 tokenrhythm），未配置时回落 AGNES_* 保持现状；
 // 插画/视频仍读 AGNES_BASE_URL/AGNES_API_KEY（images.ts/videos.ts），互不干扰 ——
 const AGNES_BASE = (process.env.AGNES_BASE_URL ?? "https://api.agnes-ai.cn/v1").replace(/\/$/, "");
@@ -264,6 +278,8 @@ async function parseResponses(res: Response, ctx?: { model?: string; msgChars?: 
 /** 完整 message 返回（含 tool_calls），供叙事引擎的工具循环使用；模型由 TEXT_MODEL/AGNES_MODEL 配置，失败重试后直接抛错。
  * 无工具调用的任务优先走官方 Responses API，失败自动降级 chat/completions 兜底（功能不中断） */
 export async function complete(messages: ChatMessage[], opts: AgnesOptions = {}): Promise<{ content: string; tool_calls?: ToolCall[] }> {
+  if (testOverride?.complete) return testOverride.complete(messages, opts);
+  if (testOverride?.chat) return { content: await testOverride.chat(messages, opts) };
   ensureTextProviderConfigured();
   const retries = opts.retries ?? 4;
   const t0 = Date.now();
@@ -304,6 +320,7 @@ export async function complete(messages: ChatMessage[], opts: AgnesOptions = {})
 
 /** 纯文本对话 */
 export async function chat(messages: ChatMessage[], opts: AgnesOptions = {}): Promise<string> {
+  if (testOverride?.chat) return testOverride.chat(messages, opts);
   const r = await complete(messages, opts);
   return r.content;
 }
@@ -360,6 +377,7 @@ export async function chatStream(
   onChunk: (delta: string) => void,
   opts: AgnesOptions = {},
 ): Promise<string> {
+  if (testOverride?.chatStream) return testOverride.chatStream(messages, onChunk, opts);
   ensureTextProviderConfigured();
   const retries = opts.retries ?? 4;
   const t0 = Date.now();

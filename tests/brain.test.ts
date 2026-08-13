@@ -1,6 +1,7 @@
 // 中枢 brain 模块测试（BRAIN.md / DEEP-DIVE.md 落地验证）
 // 覆盖：goal disposition 三态、闸门开关、闸门 LLM 审查（拒绝/放行）、失败降级放行、revise 注入 mergeTasks
-import { describe, expect, test, mock, beforeAll, afterAll } from "bun:test";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { setAgnesTestOverride } from "../src/api/agnes";
 import { emptyWorld, type WorldState } from "../src/api/world";
 import {
   brainGateEnabled, computeDisposition, gateChange, applyBrainReview, interventionMode, type BrainReviewOutput,
@@ -9,22 +10,21 @@ import { isBookComplete } from "../src/api/planner";
 
 // —— mock LLM：chat 返回可配置的 JSON ——
 let nextChatContent = "";
-mock.module("../src/api/agnes", () => ({
-  LLMError: class LLMError extends Error {},
-  isRetryableError: () => false,
-  withSmartRetry: async <T>(fn: () => Promise<T>) => fn(),
+setAgnesTestOverride({
   chat: async () => nextChatContent,
   complete: async () => ({ content: nextChatContent }),
   chatStream: async (_m: unknown, onChunk: (d: string) => void) => {
     onChunk(nextChatContent);
     return nextChatContent;
   },
-  readStream: async () => nextChatContent,
-  ChatRole: {},
-}));
+});
 
 beforeAll(() => { nextChatContent = ""; });
-afterAll(() => { delete process.env.AGNES_BRAIN_GATE; delete process.env.INTERVENTION_MODE; });
+afterAll(() => {
+  setAgnesTestOverride(null);
+  delete process.env.AGNES_BRAIN_GATE;
+  delete process.env.INTERVENTION_MODE;
+});
 
 function mkWorld(): WorldState {
   const w = emptyWorld();
