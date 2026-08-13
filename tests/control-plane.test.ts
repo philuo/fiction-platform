@@ -101,10 +101,11 @@ describe("durable jobs", () => {
   });
 
   test("启动时仅保留有安全恢复点的活动任务", () => {
-    const image = createJob({ user: "boot-user", title: "书", kind: "image", dedupeKey: "image:boot", status: "running" }).job;
+    const image = createJob({ user: "boot-user", title: "书", kind: "image", dedupeKey: "image:boot", status: "running", progress: { status: "running", phase: "provider" } }).job;
     const video = createJob({ user: "boot-user", title: "书", kind: "video", dedupeKey: "video:boot", status: "waiting_external", recovery: { videoId: "v-1" } }).job;
     expect(settleOrphanedJobs()).toBeGreaterThanOrEqual(1);
     expect(getJob(image.id)?.status).toBe("interrupted");
+    expect(getJob(image.id)?.progress).toMatchObject({ status: "interrupted", phase: "interrupted", error: expect.stringContaining("服务重启中断") });
     expect(getJob(video.id)?.status).toBe("waiting_external");
   });
 

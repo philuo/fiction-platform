@@ -1,5 +1,23 @@
 # fiction-platform 重构后缺陷审计报告
 
+## 2026-08-13 真实浏览器深度验收
+
+### BROWSER-BUG-001 [P1] 服务重启后 job 顶层终态与 progress 状态分叉
+
+- **首次发现**：2026-08-13 23:31（Asia/Shanghai）
+- **场景**：`RESTART-ADVANCE-01`，真实单章推进进入 `reviewing/delta` 后精确终止服务 PID 11336 并重启。
+- **复现**：真实 UI 点击“推进剧情 → 本章续写”，运行中刷新；SQLite 确认 `advance/running` 与 `CMD-N02/running` 后重启服务，再刷新直接故事 URL。
+- **预期**：不可续跑的单章任务统一收敛为 interrupted/failed，顶层 job、`progress_json`、receipt 和 UI 对终态的描述一致。
+- **实际**：UI 已解除只读，`jobs.status/phase=interrupted`，CMD-N02 receipt=`failed`；但同一行 `progress_json.status=running`、`phase=delta`，持久状态相互矛盾。
+- **证据**：job `6b703f0d-ccd8-4642-a77e-f440f76dcb61`；command `2b200845-d15c-437f-8730-82cfd2ab2d12`；重启前 PID 11336，重启后 PID 9528。两个浏览器 Tab 的应用 console 均无 warn/error。
+- **影响**：任何直接消费 job progress 的 UI、Brain 卡片或运维查询都可能在任务已中断后继续显示 running，形成幽灵 loading 或错误恢复判断。
+- **根因**：`settleOrphanedJobs()` 只更新 job 顶层 status/phase/error，不同步 progress；随后 `cleanupStaleAdvanceTasks()` 只处理活动任务，无法修正已经 interrupted 的行。
+- **修复**：`settleOrphanedJobs()` 在收敛不可恢复任务时保留原 progress 业务字段，同时把 `status/phase/error` 原子更新为 interrupted 语义；command receipt 继续由关联 job 的终态收敛。
+- **回归测试**：`bun test tests/control-plane.test.ts tests/advancetask.test.ts`（28 pass），`bun run typecheck`、`git diff --check` 通过。真实浏览器第二次启动单章推进后重启服务，job `d429eb21-0b33-42d8-a4ab-ee7df62ff042` 的顶层与 `progress_json` 均为 interrupted，UI 解除只读。
+- **commit / push**：本缺陷提交完成后回填 SHA；推送目标 `origin/codex/brain-reliability-ui`。
+- **状态**：已修复并复验。
+
+
 > 审计基线：分支 `codex/brain-reliability-ui`，提交 `8cbbf33`，审计日期 2026-08-13。
 >
 > 修复状态：2026-08-13 已按本报告实施修复；原始问题描述保留作为审计证据，当前状态见下节。

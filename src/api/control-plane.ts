@@ -294,6 +294,7 @@ export function settleOrphanedJobs(): number {
   let interrupted = 0;
   for (const row of rows) {
     const recovery = parseJson<Record<string, unknown>>(row.recovery_json);
+    const current = getJob(row.id);
     const resumableVideo = (row.kind === "video" || row.kind === "media-regenerate") && typeof recovery?.videoId === "string" && Boolean(recovery.videoId);
     const resumableAuto = row.kind === "auto";
     const scheduledMedia = row.kind === "media-auto-generate" && row.status === "queued";
@@ -309,6 +310,12 @@ export function settleOrphanedJobs(): number {
     updateJob(row.id, {
       status: "interrupted",
       phase: "interrupted",
+      progress: {
+        ...((current?.progress && typeof current.progress === "object") ? current.progress as Record<string, unknown> : {}),
+        status: "interrupted",
+        phase: "interrupted",
+        error: "服务重启中断了任务；已核对持久状态，无法证明任务完成",
+      },
       error: "服务重启中断了任务；已核对持久状态，无法证明任务完成",
       leaseOwner: null,
       leaseExpiresAt: null,
