@@ -347,6 +347,7 @@ describe("executeQuery（L0 查询直接执行）", () => {
 
   test("read_media → BrowseCard(media) 统计插画/视频/角色立绘", () => {
     const w = mkWorld();
+    w.cover = "images/cover.png";
     w.chapters[0].media = [
       { id: "m1", kind: "image", anchor: "夜色", status: "ready" },
       { id: "m2", kind: "video", anchor: "走入", status: "pending" },
@@ -355,7 +356,8 @@ describe("executeQuery（L0 查询直接执行）", () => {
     const card = executeQuery(w, "read_media", {});
     expect(card?.kind).toBe("browse");
     expect(card?.browseType).toBe("media");
-    const d = card!.data as { stats: { images: number; videos: number; characters: number }; list: Record<string, unknown>[] };
+    const d = card!.data as { stats: { cover: boolean; images: number; videos: number; characters: number }; list: Record<string, unknown>[] };
+    expect(d.stats.cover).toBe(true);
     expect(d.stats.images).toBe(1);
     expect(d.stats.videos).toBe(1);
     expect(d.stats.characters).toBe(1);
@@ -1069,7 +1071,7 @@ describe("isHollowReply：空话开场检测（仅「这就为您调出」式短
   });
 });
 
-describe("l0QueryReply：查询开场文本（read_chapter 模板 / read_character 按问法侧重）", () => {
+describe("l0QueryReply：查询正文只复述权威卡片事实", () => {
   test("read_chapter + browse 卡 → 模板说明已调取 + 字数", () => {
     const r = l0QueryReply("read_chapter", { kind: "browse", title: "第3章 · 风云", data: { index: 3, title: "风云", text: "一二三四五" } }, "看第三章", null);
     expect(r).toContain("第 3 章「风云」已为你调取");
@@ -1084,12 +1086,35 @@ describe("l0QueryReply：查询开场文本（read_chapter 模板 / read_charact
     expect(l0QueryReply("read_character", card, "林墨是谁", null)).toContain("主角");
   });
 
-  test("LLM 实质回复（非空话）优先保留；空话回退卡片标题", () => {
+  test("provider 回复与权威伏笔卡冲突时，以卡片事实为准", () => {
     const card = { kind: "browse", title: "伏笔账本（3 条）", data: { list: [] } };
     const good = l0QueryReply("read_foreshadow", card, "看看伏笔", "目前有 3 条伏笔，其中 1 条活跃。");
-    expect(good).toBe("目前有 3 条伏笔，其中 1 条活跃。");
+    expect(good).toBe("当前伏笔账本共 0 条。");
     const hollow = l0QueryReply("read_foreshadow", card, "看看伏笔", "这就为您调出伏笔");
-    expect(hollow).toBe("伏笔账本（3 条）");
+    expect(hollow).toBe("当前伏笔账本共 0 条。");
+  });
+
+  test("角色、世界书、媒体与规划正文不接受 provider 的冲突事实", () => {
+    expect(l0QueryReply("read_character", {
+      kind: "browse", data: { name: "林砚", role: "配角", status: "在世" },
+    }, "林砚是什么角色", "林砚是核心主角。")).toContain("林砚」：配角");
+
+    expect(l0QueryReply("read_worldbook", {
+      kind: "browse", data: { setting: { time: "当代", place: "旧城", rules: ["雨夜改写"] }, lore: [] },
+    }, "世界书有什么", "当前没有任何设定。")).toBe("当前设定：时代 当代；地点 旧城；规则 1 条；世界书条目 0 条。");
+
+    expect(l0QueryReply("read_media", {
+      kind: "browse", data: { stats: { cover: true, images: 0, videos: 0, characters: 4 } },
+    }, "封面生成了吗", "封面尚未生成。")).toContain("封面已生成");
+
+    const outline = { kind: "browse", data: { volumes: [{ title: "雨夜初变", goal: "建立异常规则" }, { title: "真相终验", goal: "追查真凶。" }], arcs: [{}, {}], done: 0, target: 20 } };
+    expect(l0QueryReply("read_outline", outline, "第一卷叫什么", "尚未规划卷章结构。")).toContain("第 1 卷「雨夜初变」");
+    expect(l0QueryReply("read_outline", outline, "第二卷目标是什么", "尚未规划卷章结构。")).toBe("第 2 卷「真相终验」：追查真凶。");
+
+    const plans = { kind: "browse", data: { volumes: [{ title: "雨夜初变" }], arcs: [{ title: "霉雨归档", estChapters: 5, goal: "发现改写" }, { title: "指纹缺口", estChapters: 4 }], total: 5, done: 0 } };
+    expect(l0QueryReply("read_plans", plans, "首弧预计几章", "尚未规划弧线。")).toContain("预计 5 章");
+    expect(l0QueryReply("read_plans", plans, "下一弧叫什么", "尚未规划弧线。")).toContain("指纹缺口");
+    expect(l0QueryReply("read_plans", { ...plans, data: { ...plans.data, volumes: outline.data.volumes } }, "第二卷目标是什么", "尚未规划卷章结构。")).toBe("第 2 卷「真相终验」：追查真凶。");
   });
 });
 

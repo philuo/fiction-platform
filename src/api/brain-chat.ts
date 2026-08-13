@@ -413,10 +413,35 @@ export function isHollowReply(text: string | undefined | null): boolean {
   return /(调出|调取|调阅|拉取|为您加载|为您展示|为您列出|为您查询)/.test(t);
 }
 
-/** L0 查询开场文本：LLM reply 若非空话直接采用；read_character 按用户问法侧重
- *  （形象/状态/关系），避免不同问法得到雷同的空话；其余空话回退为卡片标题。 */
+function queryData(card: Record<string, unknown>): Record<string, unknown> {
+  return (card.data ?? {}) as Record<string, unknown>;
+}
+
+function recordList(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value as Record<string, unknown>[] : [];
+}
+
+function requestedVolume(prompt: string, volumes: Record<string, unknown>[]): { index: number; volume: Record<string, unknown> } | null {
+  const match = prompt.match(/第\s*([一二三四五六七八九十\d]+)\s*卷/);
+  if (!match) return null;
+  const cn: Record<string, number> = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+  const index = /^\d+$/.test(match[1]) ? Number(match[1]) : cn[match[1]];
+  const volume = index ? volumes[index - 1] : undefined;
+  return volume ? { index, volume } : null;
+}
+
+function sentenceValue(value: unknown, fallback: string): string {
+  return String(value ?? fallback).replace(/[。！？!?]+$/u, "");
+}
+
+/** L0 查询开场文本只复述已构造的权威卡片事实；provider reply 只参与意图识别，
+ *  不得在同一回合覆盖 projection 数据。read_character 仍按用户问法侧重。 */
 export function l0QueryReply(intent: string, card: Record<string, unknown>, prompt: string, llmReply: string | undefined | null): string {
   const p = prompt ?? "";
+  if (card.kind === "result") {
+    const detail = String(card.detail ?? "").trim();
+    return detail || String(card.title ?? "");
+  }
   if (intent === "read_chapter" && card.kind === "browse") {
     // 正文即全部，无需 LLM 复述；模板说明已调取 + 字数 + 如何看全文（避免「重复输出标题」）
     const d = (card.data ?? {}) as Record<string, unknown>;
@@ -427,9 +452,6 @@ export function l0QueryReply(intent: string, card: Record<string, unknown>, prom
     const d = (card.data ?? {}) as Record<string, unknown>;
     const name = String(d.name ?? "该角色");
     const role = String(d.role ?? "");
-    // LLM 已给出实质回复（非空话）时优先保留，仅空话才用模板侧重（避免把好回答降级）
-    const llm = (llmReply ?? "").trim();
-    if (llm && !isHollowReply(llm)) return llm;
     // 状态正则刻意不含「现在/目前」：避免「他现在长什么样/她现在跟谁关系好」被状态分支劫持
     if (/状态|近况|最新|处境/.test(p)) {
       return `「${name}」当前状态：${String(d.status ?? "—")}`;
@@ -446,8 +468,59 @@ export function l0QueryReply(intent: string, card: Record<string, unknown>, prom
     }
     return `「${name}」：${role}。当前状态：${String(d.status ?? "—")}`;
   }
-  const t = (llmReply ?? "").trim();
-  if (t && !isHollowReply(t)) return t;
+
+  const d = queryData(card);
+  if (intent === "read_characters") {
+    const list = recordList(d.list);
+    return list.length
+      ? `当前共有 ${list.length} 位角色：${list.map((c) => `${String(c.name)}（${String(c.role ?? "未定位")}）`).join("、")}。`
+      : "当前还没有角色。";
+  }
+  if (intent === "read_outline") {
+    const volumes = recordList(d.volumes);
+    const arcs = recordList(d.arcs);
+    const requested = requestedVolume(p, volumes);
+    if (requested) return `第 ${requested.index} 卷「${String(requested.volume.title)}」：${sentenceValue(requested.volume.goal, "尚未填写目标")}。`;
+    const names = volumes.map((v) => `「${String(v.title)}」`).join("、");
+    return `当前全书已规划 ${volumes.length} 卷、${arcs.length} 条故事弧${names ? `；卷名为 ${names}` : ""}，已完成 ${String(d.done ?? 0)}/${String(d.target ?? 0)} 章。`;
+  }
+  if (intent === "read_plans") {
+    const volumes = recordList(d.volumes);
+    const arcs = recordList(d.arcs);
+    const requested = requestedVolume(p, volumes);
+    if (requested) return `第 ${requested.index} 卷「${String(requested.volume.title)}」：${sentenceValue(requested.volume.goal, "尚未填写目标")}。`;
+    if (/首弧|第一.*弧/.test(p) && arcs[0]) {
+      return `首弧「${String(arcs[0].title)}」预计 ${String(arcs[0].estChapters ?? "未定")} 章，目标：${String(arcs[0].goal ?? "尚未填写")}。`;
+    }
+    if (/下一弧/.test(p) && arcs.length) {
+      const currentIndex = arcs.findIndex((arc) => arc.status !== "done");
+      const next = arcs[Math.max(0, currentIndex + 1)] ?? arcs[0];
+      return `下一弧是「${String(next.title)}」，预计 ${String(next.estChapters ?? "未定")} 章。`;
+    }
+    const next = d.next as Record<string, unknown> | null | undefined;
+    return `当前已有 ${volumes.length} 卷、${arcs.length} 条故事弧和 ${String(d.total ?? 0)} 条章纲，已完成 ${String(d.done ?? 0)} 条${next ? `；下一条是第 ${String(next.index)} 章：${String(next.goal ?? "待规划")}` : ""}。`;
+  }
+  if (intent === "read_worldbook") {
+    const setting = (d.setting ?? {}) as Record<string, unknown>;
+    const rules = Array.isArray(setting.rules) ? setting.rules : [];
+    const lore = recordList(d.lore);
+    return `当前设定：时代 ${String(setting.time ?? "未设定")}；地点 ${String(setting.place ?? "未设定")}；规则 ${rules.length} 条；世界书条目 ${lore.length} 条。`;
+  }
+  if (intent === "read_media") {
+    const stats = (d.stats ?? {}) as Record<string, unknown>;
+    return `当前媒体：封面${stats.cover ? "已生成" : "未生成"}；章节插画 ${String(stats.images ?? 0)} 张；视频 ${String(stats.videos ?? 0)} 个；有视觉资源的角色 ${String(stats.characters ?? 0)} 位。`;
+  }
+  if (intent === "read_chapters") return `当前章节目录共 ${String(d.done ?? 0)} 章，全书目标 ${String(d.target ?? 0)} 章。`;
+  if (intent === "read_foreshadow") return `当前伏笔账本共 ${recordList(d.list).length} 条。`;
+  if (intent === "read_relationships") {
+    const list = recordList(d.list);
+    return list.length ? `当前记录了 ${list.length} 条人物关系，详情已列在下方。` : "当前没有已登记的人物关系。";
+  }
+  if (intent === "read_timeline") return `当前故事脉络含 ${recordList(d.volumes).length} 卷；下一章是第 ${String(d.next ?? 1)} 章，全书目标 ${String(d.target ?? 0)} 章。`;
+  if (intent === "read_gacha") return `当前待应用卡池有 ${recordList(d.list).length} 张卡。`;
+  if (intent === "read_proposals") return `当前有 ${recordList(d.list).length} 个待确认的新角色提案。`;
+  if (intent === "read_tasks") return `当前任务中心有 ${recordList(d.debt).length} 条质量债、${Array.isArray(d.rewriteQueue) ? d.rewriteQueue.length : 0} 个重写任务。`;
+  if (intent === "read_logs") return `当前已调取最近 ${recordList(d.list).length} 条操作日志。`;
   return String(card.title ?? "");
 }
 
@@ -729,7 +802,7 @@ export function executeQuery(w: WorldState, intent: string, params: Record<strin
     const withPortrait = w.characters.filter((c) => c.portrait?.path || c.image).length;
     return {
       kind: "browse", title: `媒体资源（插画 ${images} · 视频 ${videos}）`, browseType: "media",
-      data: { stats: { images, videos, characters: withPortrait }, list: list.slice(0, 60) },
+      data: { stats: { cover: !!w.cover, images, videos, characters: withPortrait }, list: list.slice(0, 60) },
     };
   }
   if (intent === "read_review") {
