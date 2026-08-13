@@ -4416,6 +4416,7 @@ html { scroll-behavior: smooth; }
 .bc-progress-fill { display: block; height: 100%; background: var(--seal); transition: width 0.4s ease; }
 .bc-progress-label { font-family: var(--sans); font-size: 0.66rem; color: var(--ink-soft); white-space: nowrap; }
 .bc-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(4.2rem, 1fr)); gap: 0.35rem; margin: 0.3rem 0 0.5rem; }
+.bc-stats-compact { grid-template-columns: repeat(2, minmax(0, 6.5rem)); justify-content: start; }
 .bc-stat {
   display: flex; flex-direction: column; align-items: center; gap: 0.1rem;
   border: 1px solid var(--line); border-radius: 0.3rem; padding: 0.3rem 0.2rem;
@@ -4436,6 +4437,10 @@ html { scroll-behavior: smooth; }
 .bc-browse-item-badges { display: inline-flex; gap: 0.3rem; flex-shrink: 0; }
 .bc-browse-sec { font-family: var(--sans); font-size: 0.64rem; letter-spacing: 0.12em; color: var(--ink-soft); margin-bottom: 0.15rem; }
 .bc-browse-quote { font-size: 0.74rem; color: var(--ink); font-style: italic; border-left: 3px solid var(--seal); padding-left: 0.5rem; margin: 0.3rem 0; }
+.bc-browse-quote b { display: block; margin-bottom: 0.12rem; font-size: 0.62rem; font-style: normal; color: var(--ink-soft); }
+.bc-timeline-events { margin-top: 0.55rem; }
+.bc-timeline-event { display: grid; grid-template-columns: 4rem minmax(0, 1fr); gap: 0.5rem; align-items: start; }
+.bc-timeline-event .bc-browse-text { margin: 0; }
 .bc-chip-row { display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0.2rem 0; }
 .bc-chip {
   font-family: var(--sans); font-size: 0.66rem; color: var(--ink);

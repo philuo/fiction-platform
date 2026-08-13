@@ -527,6 +527,19 @@ function WithItemActions({ item, busy, onAction, completed, children }: {
 /** 列表型浏览卡（长内容）默认折叠为标题行，点击展开——避免任务/查询消息淹没对话流 */
 const FOLD_BROWSE_TYPES = new Set(["chapters", "characters", "plans", "tasks", "logs", "worldbook", "media", "review", "gacha", "proposal"]);
 
+const STORY_STATUS_LABEL: Record<string, string> = {
+  planned: "待展开",
+  skeleton: "结构草案",
+  expanded: "章纲已展开",
+  writing: "创作中",
+  done: "已完成",
+};
+
+function storyStatusLabel(status: unknown): string {
+  const value = String(status ?? "").trim();
+  return STORY_STATUS_LABEL[value] ?? value;
+}
+
 export const BrowseCardView: React.FC<{
   card: BrowseCard;
   onAction?: (action: BrowseCardAction["action"]) => void;
@@ -643,18 +656,18 @@ export const BrowseCardView: React.FC<{
     body = (
       <>
         {d.premise ? <p className="bc-browse-text">{String(d.premise)}</p> : null}
-        <div className="bc-stats">
+        <div className="bc-stats bc-stats-compact">
           <span className="bc-stat"><b>{String(d.done ?? "")}</b>已写章</span>
           <span className="bc-stat"><b>{String(d.target ?? "")}</b>目标章</span>
-          {d.compass ? <span className="bc-stat"><b>{String(d.compass)}</b>指南针</span> : null}
         </div>
+        {d.compass ? <p className="bc-browse-quote"><b>创作方向</b>{String(d.compass)}</p> : null}
         {volumes.length > 0 && (
           <div className="bc-browse-list">
             <div className="bc-browse-sec">卷</div>
             {volumes.map((v, i) => (
               <div key={i} className="bc-browse-item">
                 <span className="bc-browse-item-title">{String(v.title ?? "")}</span>
-                <span className="bc-browse-meta">{String(v.status ?? "")}{v.range ? ` · 第 ${String((v.range as number[])[0])}-${String((v.range as number[])[1])} 章` : ""}</span>
+                <span className="bc-browse-meta">{storyStatusLabel(v.status)}{v.range ? ` · 第 ${String((v.range as number[])[0])}-${String((v.range as number[])[1])} 章` : ""}</span>
                 {v.goal ? <p className="bc-browse-text">{String(v.goal)}</p> : null}
               </div>
             ))}
@@ -666,7 +679,7 @@ export const BrowseCardView: React.FC<{
             {arcs.map((a, i) => (
               <div key={i} className="bc-browse-item">
                 <span className="bc-browse-item-title">{String(a.title ?? "")}</span>
-                <span className="bc-browse-meta">{String(a.status ?? "")}{a.estChapters ? ` · 约 ${String(a.estChapters)} 章` : ""}</span>
+                <span className="bc-browse-meta">{storyStatusLabel(a.status)}{a.estChapters ? ` · 约 ${String(a.estChapters)} 章` : ""}</span>
                 {a.goal ? <p className="bc-browse-text">{String(a.goal)}</p> : null}
               </div>
             ))}
@@ -677,6 +690,7 @@ export const BrowseCardView: React.FC<{
   } else if (card.browseType === "timeline" && d) {
     // 故事脉络：卷 → 弧 → 章 进展链
     const volumes = (Array.isArray(d.volumes) ? d.volumes : []) as Record<string, unknown>[];
+    const events = (Array.isArray(d.events) ? d.events : []) as Record<string, unknown>[];
     body = (
       <>
         <div className="bc-stats">
@@ -685,11 +699,11 @@ export const BrowseCardView: React.FC<{
         </div>
         {volumes.map((v, i) => (
           <div key={i} className="bc-browse-list">
-            <div className="bc-browse-sec">{String(v.title ?? "")} · {String(v.status ?? "")}</div>
+            <div className="bc-browse-sec">{String(v.title ?? "")} · {storyStatusLabel(v.status)}</div>
             {(Array.isArray(v.arcs) ? v.arcs : []).map((a, j) => (
               <div key={`a${j}`} className="bc-browse-item">
                 <span className="bc-browse-item-title">弧：{String((a as Record<string, unknown>).title ?? "")}</span>
-                <span className="bc-browse-meta">{String((a as Record<string, unknown>).status ?? "")}</span>
+                <span className="bc-browse-meta">{storyStatusLabel((a as Record<string, unknown>).status)}</span>
               </div>
             ))}
             {(Array.isArray(v.chapters) ? v.chapters : []).map((ch, j) => (
@@ -701,6 +715,15 @@ export const BrowseCardView: React.FC<{
             ))}
           </div>
         ))}
+        <div className="bc-browse-list bc-timeline-events">
+          <div className="bc-browse-sec">已入册事件</div>
+          {events.length === 0 ? <div className="bc-empty-state">尚无章节事件，写作并入册后会按章记录。</div> : events.map((event, index) => (
+            <div key={index} className="bc-browse-item bc-timeline-event">
+              <span className="bc-browse-item-id">第 {String(event.chapter ?? "")} 章</span>
+              <p className="bc-browse-text">{String(event.summary ?? "")}</p>
+            </div>
+          ))}
+        </div>
       </>
     );
   } else if (card.browseType === "foreshadow" && d) {
@@ -829,7 +852,7 @@ export const BrowseCardView: React.FC<{
                 item={v}
                 title={<span className="bc-browse-item-title">{String(v.title ?? "")}</span>}
                 meta={v.goal ? <>{String(v.goal)}</> : null}
-                status={v.status === "done" ? "完成" : v.status === "writing" ? "写作中" : v.status === "planned" ? "已规划" : String(v.status ?? "")}
+                status={storyStatusLabel(v.status)}
                 statusLevel={v.status === "done" ? "ok" : v.status === "writing" ? "warn" : "info"}
               />
             ))}
@@ -844,7 +867,7 @@ export const BrowseCardView: React.FC<{
                 item={a}
                 title={<span className="bc-browse-item-title">{String(a.title ?? "")}</span>}
                 meta={a.goal ? <>{String(a.goal)}｜约 {String(a.estChapters ?? "?")} 章</> : null}
-                status={a.status === "done" ? "完成" : a.status === "expanded" ? "已展开" : a.status === "skeleton" ? "骨架" : a.status === "writing" ? "写作中" : String(a.status ?? "")}
+                status={storyStatusLabel(a.status)}
                 statusLevel={a.status === "done" ? "ok" : a.status === "writing" || a.status === "expanded" ? "warn" : "info"}
               />
             ))}

@@ -1,5 +1,25 @@
 # fiction-platform 重构后缺陷审计报告
 
+## 2026-08-14 中枢问答与 UI 深度验收
+
+### BROWSER-BUG-009 [P2] 时间线/蓝图查询没有回答记录内容，并泄漏英文内部状态
+
+- **首次发现**：2026-08-14 02:11（Asia/Shanghai）
+- **场景/testId**：`BRAIN-UI-QUERY-01/02`，真实询问“时间线现在记录了什么”“查看全书蓝图结构”。
+- **复现步骤**：真实注册 `uiqa0814`；通过 provider 立项《雨夜档案》并等待蓝图任务成功；打开中枢，依次提交上述问题并等待卡片终态。
+- **预期**：正文直接回答时间线实际记录；无章节事件时明确说明。蓝图卡应以紧凑、稳定层级展示全书结构，所有业务状态使用有意义的中文。
+- **实际**：时间线正文只回答“2 卷、下一章、目标 30 章”，没有说明时间线实际没有已入册事件；卡片展示 `雨夜降临 · writing`、`expanded`、`skeleton`、`planned`。蓝图卡将长达一整句的指南针与“已写章/目标章”挤入三列统计区，随后再次原样展示 `writing/planned/expanded/skeleton`，字号、列宽和信息层级混乱。
+- **浏览器/服务/SQLite/磁盘证据**：隔离端口 `3229`；同一真实会话 DOM 同时保留用户问题、确定性正文和 BrowseCard；权威 `state.json` 有 2 卷、6 弧、0 章、空 `timeline`，证明正文没有回答可用事实而非 provider 缺数据。应用 console 无 warn/error；Browser Statsig telemetry 警告为工具噪声。
+- **影响范围**：`read_timeline`、`read_outline` 以及使用同一卷/弧状态展示的查询卡；用户无法区分“时间线没有事件”和“系统没有回答”，内部枚举降低可读性，长指南针破坏窄中枢面板布局。
+- **根因**：`executeQuery(read_timeline)` 没有把 `world.timeline` 放入卡片，`l0QueryReply` 仅统计卷数；`BrowseCardView` 的 timeline/outline 分支直接 `String(status)`，且 outline 把自由长度指南针错误复用数字统计格。
+- **修复方案**：时间线查询增加权威事件列表和空态，正文优先概括实际事件；集中映射卷/弧状态为中文业务语义；蓝图只保留两项数字进度，指南针改为独立摘要，卷/弧条目使用稳定的标题、状态和目标层级。
+- **回归测试**：`bun test tests/brain-chat.test.ts tests/brain-cards.test.ts`，113 pass / 0 fail；覆盖权威时间线事件、空时间线正文、时间线/蓝图英文枚举隔离、中文阶段、两格统计和独立指南针布局。`bun run typecheck`、`bun run build`、`git diff --check` 通过。
+- **commit / push**：本条缺陷独立提交；实际 SHA 与 push 结果见本批次最终记录。
+- **复验结果**：刷新故事页并关闭/重新打开中枢后，旧历史卡立即按新版组件重渲染，`writing/planned/expanded/skeleton` 全部中文化；新提交“时间线上现在有哪些已记录的事件？”明确回复“时间线目前还没有已入册事件”，且展示同义空态；新提交“请简要展示全书蓝图结构，并告诉我每卷和每条故事弧的当前阶段。”返回 2 卷、6 弧的权威结构和中文阶段。441px 实际中枢宽度下，卡片 `clientWidth === scrollWidth === 441`，统计区恰有两格且 `356 === scrollWidth`，独立创作方向 `353 === scrollWidth`，无横向溢出或元素重叠。两条问法各真实调用文本 provider 一次，均自然完成，未重试。应用页面无 console warn/error 或网络失败；Browser 插件 Statsig 批处理警告仅来自工具脚本，单独排除。
+- **最终状态**：已修复，真实浏览器复验通过，待本条提交推送。
+
+> `BRAIN-UI-NEW-STORY-STATE-01` 曾在立项 `ready` 阶段观察到顶层 job 仍为 running；继续等待后真实蓝图/首弧 provider 在既定时限内完成，job 收敛为 succeeded，刷新解除只读。`ready` 在现协议中明确表示“基础世界可进入、后台增强仍运行”，因此该过程归为预期运行态，不登记缺陷。
+
 ## 2026-08-13 真实浏览器深度验收
 
 ### 2026-08-14 批次收尾

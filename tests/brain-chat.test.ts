@@ -297,6 +297,18 @@ describe("executeQuery（L0 查询直接执行）", () => {
     expect(d.plans[0].hookType).toBe("悬念");
   });
 
+  test("read_timeline → 返回权威事件，正文回答记录内容而不是只报卷数", () => {
+    const w = mkWorld();
+    w.blueprint = { theme: "追凶", mainPlot: "", ending: "", compass: "查清真相", progressContract: "", volumes: [{ id: "v1", title: "第一卷", goal: "入局", status: "writing" }] };
+    w.timeline = [{ chapter: 1, summary: "主角在雨夜收到匿名卷宗" }];
+    const card = executeQuery(w, "read_timeline", {})!;
+    const data = card.data as { events: { chapter: number; summary: string }[] };
+    expect(data.events).toEqual([{ chapter: 1, summary: "主角在雨夜收到匿名卷宗" }]);
+    expect(l0QueryReply("read_timeline", card, "时间线现在记录了什么", "忽略我")).toContain("第 1 章：主角在雨夜收到匿名卷宗");
+    const empty = executeQuery({ ...w, timeline: [] }, "read_timeline", {})!;
+    expect(l0QueryReply("read_timeline", empty, "时间线现在记录了什么", "忽略我")).toContain("还没有已入册事件");
+  });
+
   test("read_tasks → BrowseCard(tasks) 质量债含 fix/ignore 操作 + 重写队列", () => {
     const w = mkWorld();
     w.qualityDebt = [{ id: "d1", chapterIndex: 2, lens: "continuity", issue: "角色状态前后矛盾", severity: "major", status: "open" }];

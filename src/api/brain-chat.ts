@@ -516,7 +516,12 @@ export function l0QueryReply(intent: string, card: Record<string, unknown>, prom
     const list = recordList(d.list);
     return list.length ? `当前记录了 ${list.length} 条人物关系，详情已列在下方。` : "当前没有已登记的人物关系。";
   }
-  if (intent === "read_timeline") return `当前故事脉络含 ${recordList(d.volumes).length} 卷；下一章是第 ${String(d.next ?? 1)} 章，全书目标 ${String(d.target ?? 0)} 章。`;
+  if (intent === "read_timeline") {
+    const events = recordList(d.events);
+    if (!events.length) return `时间线目前还没有已入册事件；故事已规划 ${recordList(d.volumes).length} 卷，下一章是第 ${String(d.next ?? 1)} 章。`;
+    const recent = events.slice(-3).map((event) => `第 ${String(event.chapter)} 章：${String(event.summary ?? "未填写摘要")}`).join("；");
+    return `时间线已记录 ${events.length} 个章节事件。最近记录：${recent}。`;
+  }
   if (intent === "read_gacha") return `当前待应用卡池有 ${recordList(d.list).length} 张卡。`;
   if (intent === "read_proposals") return `当前有 ${recordList(d.list).length} 个待确认的新角色提案。`;
   if (intent === "read_tasks") return `当前任务中心有 ${recordList(d.debt).length} 条质量债、${Array.isArray(d.rewriteQueue) ? d.rewriteQueue.length : 0} 个重写任务。`;
@@ -662,7 +667,13 @@ export function executeQuery(w: WorldState, intent: string, params: Record<strin
     }));
     return {
       kind: "browse", title: "故事脉络", browseType: "timeline",
-      data: { volumes, next: w.nextChapter ?? w.chapters.length + 1, target: targetChapterCount(w), premise: w.premise },
+      data: {
+        volumes,
+        events: w.timeline.map((event) => ({ chapter: event.chapter, summary: event.summary })),
+        next: w.nextChapter ?? w.chapters.length + 1,
+        target: targetChapterCount(w),
+        premise: w.premise,
+      },
     };
   }
   if (intent === "read_proposals") {

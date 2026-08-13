@@ -174,6 +174,35 @@ test("无 image 字段：不渲染附图容器", async () => {
   root.unmount();
 });
 
+test("时间线与蓝图卡：内部英文状态中文化，指南针不进入数字统计格", async () => {
+  const cards: BrowseCard[] = [
+    {
+      kind: "browse", title: "故事脉络", browseType: "timeline",
+      data: { next: 2, target: 30, events: [], volumes: [{ title: "雨夜卷", status: "writing", arcs: [{ title: "墨迹", status: "expanded" }], chapters: [] }] },
+    },
+    {
+      kind: "browse", title: "全书大纲", browseType: "outline",
+      data: { done: 1, target: 30, compass: "所有线索回到档案馆", volumes: [{ title: "雨夜卷", status: "planned", goal: "入局" }], arcs: [{ title: "墨迹", status: "skeleton", goal: "追查" }] },
+    },
+  ];
+  for (const card of cards) {
+    const mount = document.createElement("div");
+    document.body.appendChild(mount);
+    const root = createRoot(mount);
+    root.render(React.createElement(BrainCardView, { card }));
+    await tick();
+    const text = mount.textContent ?? "";
+    expect(text).not.toMatch(/\b(?:writing|planned|expanded|skeleton)\b/);
+    expect(text).toMatch(/创作中|待展开/);
+    if (card.browseType === "timeline") expect(text).toContain("尚无章节事件");
+    if (card.browseType === "outline") {
+      expect(mount.querySelectorAll(".bc-stat").length).toBe(2);
+      expect(mount.querySelector(".bc-browse-quote")?.textContent).toContain("所有线索回到档案馆");
+    }
+    root.unmount();
+  }
+});
+
 test("plan 卡：渲染计划选项（含动作与纯说明）", async () => {
   const calls: { option: { label: string; action?: { endpoint: string } } }[] = [];
   const mount = document.createElement("div");
