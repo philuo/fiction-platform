@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { emptyWorld, type WorldState } from "../src/api/world";
 import type { Card as WorldCard } from "../src/api/world";
-import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, explicitSettingsQuery, extractNameFromHistory, authorFromEditPrompt, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard } from "../src/api/brain-chat";
+import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, explicitSettingsQuery, extractNameFromHistory, authorFromEditPrompt, currentFromEditPrompt, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard } from "../src/api/brain-chat";
 import { getSession as sessGet, lastPendingMessage as sessLastPending } from "../src/api/brain-sessions";
 import type { ChatMessage } from "../src/api/agnes";
 
@@ -446,6 +446,16 @@ describe("buildFormCard（表单卡构建）", () => {
     expect(card?.level).toBe("L2");
     expect(card?.summary).toBe("请确认将作者署名修改为「测试作者」。");
     expect(card?.fields).toEqual([{ key: "author", label: "作者署名", type: "text", value: "测试作者", placeholder: "可留空" }]);
+  });
+
+  test("edit_world 全局当前状态问法 → 从结构化参数/明确问句预填对应字段", () => {
+    const w = mkWorld();
+    expect(currentFromEditPrompt({ current: "风暴将至" }, "忽略这里")).toBe("风暴将至");
+    expect(currentFromEditPrompt({}, "将全局当前状态设置为档案馆暂停开放")).toBe("档案馆暂停开放");
+    expect(currentFromEditPrompt({}, "把林墨的当前状态改为负伤")).toBe("");
+    const card = buildFormCard(w, "edit_world", {}, undefined, { prompt: "请把全局当前状态改为雨季档案馆开放" });
+    const field = card?.fields.find((item) => item.key === "current");
+    expect(field?.value).toBe("雨季档案馆开放");
   });
 
   test("edit_world 无 name 但对话历史提到角色 → 从历史收集角色名并预填（信息可从对话收集）", () => {

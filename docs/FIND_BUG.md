@@ -36,6 +36,22 @@
 - **复验结果**：隔离实例 PID `12684`、端口 `3229` 加载修复构建；真实新问法“请把故事作者署名改为修复后作者”只调用文本 provider 一次。浏览器卡片显示“请核对下方待修改内容；提交前不会写入故事”、标题“修改作者署名”、`CMD-W12`、`L2·回溯`，唯一字段“作者署名”预填“修复后作者”。只点击一次“保存署名”后页面显示“已保存/✓ 已执行”；磁盘 `state.json.author=修复后作者` 且 `current` 未变化，SQLite receipt `81b44fdf-9d0c-4de8-a618-ef1c96cb1050` 为 succeeded。刷新、关闭重开、继续只读聊天、新建并切换会话 Tab 后卡片仍只有完成标记，按钮没有复活。应用页面无 console/network 异常；Statsig POST 超时属于 Browser 插件工具噪声，单独排除。
 - **最终状态**：已修复，真实浏览器复验通过，待本条提交推送。
 
+### BROWSER-BUG-011 [P1] 全局当前状态表单保存成功但服务端丢弃字段
+
+- **首次发现**：2026-08-14 02:38（Asia/Shanghai）
+- **场景/testId**：`BRAIN-UI-FORM-STATE-02`，真实询问“请把全局当前状态改为雨季档案馆开放”以及“将全局当前状态设置为档案馆暂停开放”。
+- **复现步骤**：在修复后的作者场景会话中逐条提交上述当前状态问法；等待真实 provider；展开“编辑设定与全局信息”；第一次直接点击“保存设定”；第二次在标注“全局当前状态”的输入框手工填写“档案馆暂停开放”，只点击一次“保存设定”；查询服务端磁盘和 SQLite receipt。
+- **预期**：明确目标值应预填到“全局当前状态”字段；提交一次后 `state.json.current` 应保存该值，receipt result 应包含该值，刷新/重开后卡片终态保持且世界事实一致。
+- **实际**：目标问法没有预填；第一次空提交仍显示“已保存/✓ 已执行”。第二次手工填入“档案馆暂停开放”后同样显示成功，但 `state.json.current` 仍为空，receipt `915af08a-d140-4ad0-b0a5-65ad52eab105` 为 succeeded 且 result 不含目标值。卡片刷新前后完成态不复活，但权威世界没有变化。
+- **浏览器/服务/SQLite/磁盘证据**：隔离端口 `3229`、临时账号 `uiqa0814`、故事《雨夜档案》；两次提交各一次，无 provider 重试。磁盘 `state.json.author=修复后作者`、`current` 为空且无“档案馆暂停开放”；receipt status=succeeded、error=null。应用页面无 console/network 异常；Statsig 超时为 Browser 插件工具噪声。
+- **影响范围**：所有通过中枢“全局当前状态”编辑的请求；用户会得到成功假回执，状态看似完成但权威世界不变。
+- **根因**：`buildFormCard(edit_world)` 的通用设定表单没有根据 `current` 问法预填；`/api/novel/world` 路由构造 patch 时遗漏 `current`，尽管 `director.editWorld` 已支持该字段。
+- **修复方案**：增加当前状态目标值提取并只在明确“当前状态”问法中预填；路由把 `body.current` 传入导演 patch；普通设定卡摘要明确“提交前不会写入”，保持 `L0` 只读影响等级。
+- **回归测试**：`bun test tests/brain-chat.test.ts tests/command-endpoint.test.ts`，98 pass / 0 fail；覆盖结构化参数与明确中文问句的当前状态提取、角色状态误匹配隔离、表单预填，以及 `/api/novel/world` 标量白名单透传 `current`。`bun run typecheck`、`bun run check:architecture`、`bun run build`、`git diff --check` 通过。
+- **commit / push**：本条缺陷独立提交；实际 SHA 与 push 结果见本批次最终记录。
+- **复验结果**：隔离实例端口 `3229` 加载修复构建；真实新问法“请把全局当前状态改为修复验证状态”只调用文本 provider 一次。浏览器卡片以中性正文提示“提交前不会写入故事”，`CMD-W12 / L0·只读` 通用设定卡的“全局当前状态”字段准确预填“修复验证状态”。只点击一次“保存设定”后显示“已完成 / 已保存 / ✓ 已执行”；磁盘 `state.json.current=修复验证状态`，SQLite receipt `ea482183-94dc-4897-9491-ab8059eefc79` 为 `succeeded` 且 result 含该值。刷新页面、关闭后重新打开中枢、继续询问“当前状态是什么？”、切换到另一中枢会话再切回后，卡片仍保持完成终态，页面中“保存设定”按钮数量为 0，不能重复提交。应用页面无 console/network 异常；Browser 插件 Statsig telemetry 噪声单独排除。
+- **最终状态**：已修复，真实浏览器复验通过，待本条提交推送。
+
 ## 2026-08-13 真实浏览器深度验收
 
 ### 2026-08-14 批次收尾

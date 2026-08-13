@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { closeDb, getDb } from "../src/api/db";
 import { registerUser, loginUser } from "../src/api/auth";
-import { handleApi } from "../src/api/routes";
+import { handleApi, worldScalarPatchFromBody } from "../src/api/routes";
 import { syncRevision } from "../src/api/control-plane";
 
 const root = mkdtempSync(join(tmpdir(), "command-endpoint-"));
@@ -50,6 +50,13 @@ function contracted(pathname: string, commandId: string, type: string, body: Rec
 }
 
 describe("POST /api/commands", () => {
+  test("世界编辑标量白名单保留全局当前状态", () => {
+    expect(worldScalarPatchFromBody({ author: "作者", premise: "梗概", current: "档案馆暂停开放", ignored: "x" })).toEqual({
+      author: "作者", premise: "梗概", current: "档案馆暂停开放",
+    });
+    expect(worldScalarPatchFromBody({ current: 123 }).current).toBeUndefined();
+  });
+
   test("未登录拒绝，公开写指令均已迁入", async () => {
     expect((await command({ commandId: "unauth", type: "CMD-M01", scope: { title: "书" }, payload: {} }, false))?.status).toBe(401);
     const title = "command-missing-story";

@@ -1087,6 +1087,16 @@ export function authorFromEditPrompt(params: Record<string, unknown>, prompt = "
   return match?.[1]?.replace(/^(?:改为|改成|设置为|设为)/, "").trim() ?? "";
 }
 
+/** 明确的全局当前状态修改问法兜底。只接受“全局当前状态/故事当前状态”锚点，
+ * 避免把角色当前状态或普通的“现在”问法错误写入世界全局状态。 */
+export function currentFromEditPrompt(params: Record<string, unknown>, prompt = ""): string {
+  const structured = String(params.current ?? "").trim();
+  if (structured) return structured;
+  const text = prompt.replace(/\s+/g, " ").trim();
+  const match = text.match(/(?:全局|故事)(?:的)?当前状态(?:修改|改|设置|设|换)?(?:为|成|叫|是)?[：:「『“\s]*([^」』”。，,；;！!？?]{1,80})/);
+  return match?.[1]?.replace(/^(?:改为|改成|设置为|设为)/, "").trim() ?? "";
+}
+
 /** 追问选择卡（ask）构建：信息不足时给结构化候选选项（输入框上方询问面板，不混入聊天流），
  * 无法生成候选时返回 null（调用方降级为自然追问）。
  * 用户选完后把选项 label 作为新输入继续，AI 据此补全参数。 */
@@ -1178,13 +1188,14 @@ export function buildFormCard(w: WorldState, intent: string, params: Record<stri
         submitLabel: "保存署名",
       };
     }
+    const current = currentFromEditPrompt(params, opts?.prompt);
     // 设定/全局编辑（无角色语境 → 设定表单）
     return {
       kind: "form", title: "编辑设定与全局信息", commandId: "CMD-W12", level: "L0",
       summary: summary || "修改故事设定/梗概/当前状态（不回溯已写章节）",
       fields: [
         { key: "premise", label: "梗概", type: "textarea", value: w.premise, array: false },
-        { key: "current", label: "全局当前状态", type: "text", value: w.current ?? "", placeholder: "季节/天气/局势（单行）" },
+        { key: "current", label: "全局当前状态", type: "text", value: current || (w.current ?? ""), placeholder: "季节/天气/局势（单行）" },
         { key: "setting.time", label: "时代", type: "text", value: w.setting.time },
         { key: "setting.place", label: "地点", type: "text", value: w.setting.place },
         { key: "setting.tone", label: "基调", type: "text", value: w.setting.tone },

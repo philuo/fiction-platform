@@ -80,6 +80,16 @@ function sseStream(produce: (send: (obj: unknown) => void) => Promise<void>): Re
 /** 业务错误：消息可安全回显给前端（区别于内部异常） */
 export class AppError extends Error {}
 
+/** `/api/novel/world` 标量字段白名单。独立纯函数让命令路由与回归测试共享
+ * 同一转换，避免 UI 已提供字段但路由忘记透传而产生成功假回执。 */
+export function worldScalarPatchFromBody(body: Record<string, unknown>): Partial<Pick<WorldState, "author" | "premise" | "current">> {
+  return {
+    author: typeof body.author === "string" ? body.author : undefined,
+    premise: typeof body.premise === "string" ? body.premise : undefined,
+    current: typeof body.current === "string" ? body.current : undefined,
+  };
+}
+
 /** 错误信息归一（入库/回显）：取首行（剥离 stack 尾部）、截断 300 字符；
  *  非 AppError（LLMError/TypeError 等）也保留真实原因（如 ECONNRESET/超时），不笼统吞掉 */
 
@@ -2020,8 +2030,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           const w = loadWorld(title);
           if (!w) throw new AppError("故事不存在: " + title);
           const patch = {
-            author: typeof body.author === "string" ? body.author : undefined,
-            premise: typeof body.premise === "string" ? body.premise : undefined,
+            ...worldScalarPatchFromBody(body),
             setting:
               body.setting && typeof body.setting === "object"
                 ? (body.setting as Partial<WorldState["setting"]>)
