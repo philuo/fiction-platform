@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { emptyWorld, type WorldState } from "../src/api/world";
 import type { Card as WorldCard } from "../src/api/world";
-import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, extractNameFromHistory, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard } from "../src/api/brain-chat";
+import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, explicitSettingsQuery, extractNameFromHistory, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard } from "../src/api/brain-chat";
 import { getSession as sessGet, lastPendingMessage as sessLastPending } from "../src/api/brain-sessions";
 import type { ChatMessage } from "../src/api/agnes";
 
@@ -523,6 +523,19 @@ describe("buildFormCard（表单卡构建）", () => {
     const fields = card!.fields as { key: string; transform?: string }[];
     expect(fields.find((f) => f.key === "gen.autoGacha")?.transform).toBe("bool");
     expect(fields.map((f) => f.key)).toContain("gen.temperature");
+  });
+
+  test("生成参数状态查询走只读事实卡，不误判为 settings/opinion", () => {
+    const w = mkWorld();
+    w.gen = { ...w.gen, autoGacha: false, commitPolicy: "auto" };
+    expect(explicitSettingsQuery("当前是否开启自动抽卡")?.intent).toBe("read_settings");
+    expect(explicitSettingsQuery("当前是否需要人工确认入册")?.intent).toBe("read_settings");
+    expect(explicitSettingsQuery("请开启自动抽卡")).toBeNull();
+    const card = executeQuery(w, "read_settings", {});
+    expect(card?.kind).toBe("result");
+    expect(card?.detail).toContain("自动抽卡：关");
+    expect(card?.detail).toContain("人工确认入册：关");
+    expect(card?.data).toMatchObject({ autoGacha: false, commitPolicy: "auto" });
   });
 
   test("非表单意图 → null", () => {

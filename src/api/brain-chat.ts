@@ -19,7 +19,7 @@ import { loadWorld, saveWorld, slugify as slug } from "./storage";
 import { logChange } from "./steering";
 import { withTitleLock } from "./titlelock";
 import { readEvalReport } from "./eval";
-import { isPendingForeshadow, targetChapterCount } from "./world";
+import { genOf, isPendingForeshadow, targetChapterCount } from "./world";
 import { mediaDataUri, MAX_IMAGES_PER_CHAPTER } from "./media";
 import { imageOccupiesQuota } from "../shared/media-const";
 import { gachaGenerate as directorGachaGenerate } from "./director";
@@ -116,6 +116,7 @@ export const INTENTS: Record<string, IntentMeta> = {
   read_timeline: { commandId: "CMD-Q01", level: "L0", title: "查看脉络/时间线" },
   read_review: { commandId: "CMD-Q01", level: "L0", title: "查看审查报告" },
   read_gacha: { commandId: "CMD-Q01", level: "L0", title: "查看卡池（抽到的卡）" },
+  read_settings: { commandId: "CMD-Q01", level: "L0", title: "查看生成参数" },
   eval: { commandId: "CMD-S09", level: "L0", title: "整书质量评估", action: { endpoint: "/api/novel/eval", method: "POST", body: {} } },
   edit_world: { commandId: "CMD-W12", level: "L2", title: "编辑设定/角色", action: { endpoint: "/api/novel/world", method: "POST", body: {} } },
   relationship_edit: { commandId: "CMD-W12", level: "L2", title: "建立/解除人物关系" },
@@ -198,6 +199,7 @@ const INTENT_HINT: Record<string, string> = {
   read_timeline: "查看脉络/时间线/故事进展/写到哪了的发展脉络",
   read_review: "查看审查报告/评分/审查意见/这章评价",
   read_gacha: "查看抽到的卡/查看卡池/应用卡牌/抽卡结果/看看抽到了什么/卡池里有什么",
+  read_settings: "查看当前生成参数/自动抽卡是否开启/是否人工确认入册/当前字数温度视角审查严格度",
   eval: "整书质量评估",
   edit_world: "编辑设定/角色",
   relationship_edit: "建立关系/结仇/成为盟友/师徒/解除关系/给A和B建立C关系/让A和B成为C",
@@ -280,6 +282,18 @@ export function explicitMediaIntent(prompt: string): IntentResult | null {
     params,
     reply: video ? "请选择生成视频的参数。" : "请选择生成插画的参数。",
   };
+}
+
+/** 明确的参数状态查询本地确定性识别，避免“当前是否开启”被模型误判成 plan/opinion。 */
+export function explicitSettingsQuery(prompt: string): IntentResult | null {
+  const text = prompt.replace(/\s+/g, "").trim();
+  if (!text) return null;
+  const asksCurrent = /当前|现在|目前|是否|有没有|是什么|多少/.test(text);
+  const asksSetting = /自动抽卡|人工确认|确认入册|字数|温度|叙述视角|审查严格度|结尾钩子|生成参数/.test(text);
+  const mutatesSetting = /修改|调整|设置为|改成|我要开启|我要关闭|请开启|请关闭|打开设置/.test(text);
+  return asksCurrent && asksSetting && !mutatesSetting
+    ? { intent: "read_settings", params: {}, reply: "以下是当前实际生效的生成参数。" }
+    : null;
 }
 
 /** 意图识别（LLM）；失败降级为 chat。
@@ -604,6 +618,23 @@ export function executeQuery(w: WorldState, intent: string, params: Record<strin
       return { kind: "result", title: "暂无卡池", success: false, detail: "当前没有待应用的卡池，说「抽卡」先生成卡池。" };
     }
     return gachaBrowseCard(pool, w.title);
+  }
+  if (intent === "read_settings") {
+    const g = genOf(w);
+    return {
+      kind: "result", title: "当前生成参数", success: true,
+      detail: `自动抽卡：${g.autoGacha ? "开" : "关"}；人工确认入册：${g.commitPolicy === "confirm" ? "开" : "关"}；字数：${g.minWords}-${g.maxWords}；叙述视角：${g.pov}；审查严格度：${g.reviewStrictness}；章节结尾钩子：${g.forceHook ? "开" : "关"}；温度：${g.temperature}。`,
+      data: {
+        autoGacha: g.autoGacha,
+        commitPolicy: g.commitPolicy ?? "auto",
+        minWords: g.minWords,
+        maxWords: g.maxWords,
+        pov: g.pov,
+        reviewStrictness: g.reviewStrictness,
+        forceHook: g.forceHook,
+        temperature: g.temperature,
+      },
+    };
   }
   if (intent === "read_chapters") {
     // 章节目录：状态/审查分/字数/媒体数 + 章进度（done/target）
@@ -1446,6 +1477,7 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
     // —— 意图识别（注入前端选中章 + 最近会话上下文，供 LLM 自动提取工具参数，需求 2） ——
     const hist = (session?.messages ?? []).slice(-6).map((m) => `${m.role === "user" ? "用户" : "中枢"}：${(m.text ?? "").slice(0, 200)}`);
     const { intent, params, reply } = explicitMediaIntent(activePrompt)
+      ?? explicitSettingsQuery(activePrompt)
       ?? await recognizeIntent(w, activePrompt, ctx.ctx, hist);
 
     // 纯对话 / 未知意图：真流式回复（可中断、可恢复）
