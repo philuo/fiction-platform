@@ -1,0 +1,455 @@
+# fiction-platform 重构后缺陷审计报告
+
+> 审计基线：分支 `codex/brain-reliability-ui`，提交 `8cbbf33`，审计日期 2026-08-13。
+>
+> 本报告只记录问题和修复建议，未修改任何业务代码、数据库结构或公开接口。
+
+## 1. 执行摘要
+
+本轮重点审计了最近重构最集中的统一命令入口、持久任务、世界存档提交、WebSocket 投影、中枢会话、媒体生成和启动恢复链路。类型检查和生产构建均通过，但行为层存在数个会让命令永久悬挂、重复执行或让新故事被旧删除状态污染的严重问题。
+
+| 级别 | 已确认 | 高风险 | 含义 |
+| --- | ---: | ---: | --- |
+| P0 | 0 | 0 | 暂未发现可直接证明的数据灾难或越权漏洞 |
+| P1 | 6 | 0 | 核心流程失效、重复副作用或永久悬挂 |
+| P2 | 1 | 2 | 有明确规避方式的功能错误或潜伏一致性风险 |
+| P3 | 1 | 1 | 测试、文档和可维护性问题 |
+
+最优先处理的不是 UI，而是控制面协议：客户端已默认给公开写请求附加命令契约，但服务端的幂等重放、异步终态关联和任务判重尚未形成闭环。当前“请求已被接受”不等于调用方能可靠获知结果，也不保证相同业务只执行一次。
+
+## 2. 验证基线
+
+执行结果：
+
+```text
+bun run typecheck  -> 通过
+bun run build      -> 通过
+bun test           -> 654 pass / 9 fail / 663 total
+```
+
+全量测试失败项：
+
+```text
+3 个 Agnes SSE reasoning/content 解析断言失败
+5 个 Agnes 可重试错误分类/重试接线断言失败
+1 个 WebSocket 同名书用户隔离断言失败
+```
+
+对照执行：
+
+```text
+bun test tests/agnes-reasoning.test.ts tests/agnes-retry.test.ts
+-> 13 pass / 0 fail
+
+bun test tests/sync-ws.test.ts
+-> 14 pass / 0 fail
+```
+
+因此不能把上述 9 项解释为各被测函数本身的稳定回归；它们证明了全量测试存在跨文件共享状态污染。具体污染来源见 BUG-008。
+
+## 3. 已确认缺陷
+
+### BUG-001 [P1] 失败或取消的命令被伪装成 `queued`，幂等重试永远不会再次执行
+
+**位置**
+
+- `src/api/control-plane.ts:53-58`
+- `src/api/control-plane.ts:71-76`
+- `src/api/routes.ts:1166-1168`
+
+**问题**
+
+`acceptCommandOnce` 读取已有回执时只保留 `succeeded` 和 `running`，其余状态全部映射为 `queued`：
+
+```ts
+const status = existing.status === "succeeded"
+  ? "succeeded"
+  : existing.status === "running"
+    ? "running"
+    : "queued";
+```
+
+这会把数据库中的 `failed` 和 `cancelled` 错报成 `queued`。同时函数返回 `created: false`，路由在 `!accepted.created` 时直接返回，绝不会重新启动任务。
+
+**触发条件**
+
+1. 某命令第一次执行进入 `failed` 或 `cancelled`。
+2. 客户端因重试、断线恢复或重复点击，使用相同 `commandId` 和相同 payload 再次请求。
+
+**错误结果**
+
+服务端返回 `202 { accepted: true, status: "queued" }`，但没有执行者，也没有后续状态变化。调用方会永久等待一个不存在的任务。
+
+**影响**
+
+- 失败命令无法按同一幂等键恢复，也无法获得真实失败原因。
+- “durable command” 的状态事实被响应层篡改，监控和 UI 都会误判。
+- 对 `POST /api/commands` 和带 `x-command-contract: v1` 的公开写入口均有影响。
+
+**复现**
+
+1. 提交一个必然失败的命令，例如目标故事不存在的 `CMD-W12`。
+2. 等待 `command_receipts.status` 变为 `failed`。
+3. 原样重发相同 `commandId`。
+4. 响应为 `queued`；再次查询数据库仍为 `failed`，且没有新任务启动。
+
+**修复建议**
+
+回执类型和响应必须覆盖完整终态，原样返回 `failed/cancelled`、`result/error`。如果产品允许重试失败命令，应显式定义“新 commandId 重试”或原子 CAS `failed -> queued` 的协议，不能在展示层把终态改名为 `queued`。
+
+---
+
+### BUG-002 [P1] 幂等重放返回通用 202 回执，破坏原业务端点响应契约
+
+**位置**
+
+- `src/api/client.ts:60-76`
+- `src/api/routes.ts:1166-1168`
+- 典型调用方：`src/pages/Home.tsx:869-886`、`src/pages/Home.tsx:971-985`
+
+**问题**
+
+`apiFetch` 已自动为几乎所有公开 POST 写操作生成 `x-command-id`。第一次请求正常时，服务端继续执行原业务路由并返回原格式，例如 `{ ok, world }`、`{ ok, planId }`。相同命令重放时，服务端却直接返回：
+
+```json
+{ "accepted": true, "commandId": "...", "status": "succeeded" }
+```
+
+HTTP 状态还被固定为 202。原端点的状态码、响应 body、SSE 流和错误信息均无法重放。
+
+**触发条件**
+
+最典型场景是服务端第一次已完成写入，但响应在网络中丢失；客户端使用同一 `commandId` 重试。
+
+**错误结果**
+
+调用方仍按原业务响应解析。例如编辑世界会检查 `data.ok` 和 `data.world`，于是把服务端已经成功完成的命令显示为“保存失败”。对流式端点，重放甚至不再返回 SSE。
+
+**影响**
+
+- 用户看到失败并再次发起新命令，可能产生二次副作用。
+- 客户端无法区分“已成功但响应丢失”和“尚在排队”。
+- 幂等机制反而降低了网络故障时的正确性。
+
+**复现**
+
+1. 带固定 `x-command-id` 调用任一同步写接口并让其成功。
+2. 原样重发请求。
+3. 比较两次响应：第一次是业务响应，第二次是通用 202 receipt。
+
+**修复建议**
+
+持久化并重放原始 HTTP 结果，至少保存业务状态码、content-type 和 JSON result；SSE/异步命令则返回稳定的任务资源协议，并让客户端按 command receipt 明确分支，不能让同一路径在首发和重放时返回不兼容结构。
+
+---
+
+### BUG-003 [P1] `/media/generate` 顶层命令未关联实际任务，回执可永久停留在 `running`
+
+**位置**
+
+- `src/api/routes.ts:1174-1182`
+- `src/api/routes.ts:2977-3032`（视频任务）
+- `src/api/routes.ts:3102-3105`、`src/api/routes.ts:3174-3177`（图片任务）
+- `src/api/control-plane.ts:220-222`（仅关联了 `commandId` 的 job 才回写回执）
+
+**问题**
+
+命令包装层把 `/api/novel/media/generate` 标为 `asyncJob`，所以成功提交后不会直接把 receipt 置为 `succeeded`。按设计应由后台 job 到终态时经 `updateJob` 回写顶层命令。
+
+但视频 `video-create` job 和每张图片的 `image` job 创建时都没有传入 `body.commandId`。因此它们完成或失败时，`updateJob` 找不到关联命令，顶层 `command_receipts` 会一直保持 `running`。
+
+**触发条件**
+
+通过正常前端 `apiFetch` 调用 `/api/novel/media/generate`。客户端会自动附加命令契约，服务端会把 `commandId` 写入转发 body，但媒体 job 没有接住它。
+
+**错误结果**
+
+媒体本身可能已经 ready/failed，世界状态也已保存，但统一命令回执永久 `running`。
+
+**影响**
+
+- 控制面无法可靠判断媒体生成是否结束。
+- 相同命令重放只会得到 `running`，无法获得媒体 ID 或错误。
+- 回执表持续积累伪运行任务，恢复和运维判断失真。
+
+**修复建议**
+
+为一次 `/media/generate` 建立一个顶层聚合 job 并关联 commandId；图片子任务作为 children，全部结束后汇总成功/部分失败/失败结果并一次性收敛回执。视频的“provider 任务已创建”和“最终媒体 ready”也应明确哪个阶段代表命令成功。
+
+---
+
+### BUG-004 [P1] 分镜持久判重结果被忽略，重复请求仍会启动第二个 LLM 任务
+
+**位置**
+
+- `src/api/control-plane.ts:123-144`
+- `src/api/routes.ts:2839-2854`
+
+**问题**
+
+`createJob` 通过 `(user_name, dedupe_key)` 唯一索引返回 `{ created: false, job: existing }`，这是跨请求/跨进程的最终判重结果。分镜路由调用 `createJob(...)` 后丢弃返回值，随后无条件：
+
+- 创建新的本地 `AbortController` 和 `PlanTask`；
+- 设置新的 180 秒 timer；
+- 写入 `planTasks`；
+- 启动新的 `planScenes` LLM 调用；
+- 向客户端返回新的 `planId`。
+
+当数据库已有相同章节/媒体类型的活动分镜时，新的 `id` 根本没有插入数据库，却仍在内存和模型侧执行。
+
+**触发条件**
+
+同一用户、同一本书、同一章节、同一 `kind` 在首个分镜未结束时并发提交两次。跨 Tab 或网络重试均可触发。
+
+**错误结果**
+
+两个 LLM 分镜同时运行，第二个返回的 `planId` 没有对应持久 job；后续 `updateJob(id, ...)` 静默无效，取消、恢复和状态查询无法形成闭环。
+
+**影响**
+
+- 重复消耗模型配额。
+- 同一会话卡可能被两个晚到结果相互覆盖。
+- 内存状态、SQLite job 和客户端 planId 三者分叉。
+
+**修复建议**
+
+必须检查 `created`。`false` 时返回 409，或返回已有 job 的稳定 ID 并附真实状态；只有数据库成功创建者可以注册 timer、内存 task 和启动 LLM。新增跨请求并发测试，断言模型调用次数严格为 1。
+
+---
+
+### BUG-005 [P1] 删除故事的永久 tombstone 会污染后续同名新故事
+
+**位置**
+
+- `src/api/control-plane.ts:186-198`
+- `src/api/routes.ts:1740-1759`
+- `src/api/routes.ts:3095-3109`
+- 新故事首次保存：`src/api/director.ts:177-178`
+
+**问题**
+
+删除成功后以 `(user, title)` 永久保存 `scope_tombstones`，注释明确要求重启后仍保留。代码只在“删除失败且故事仍存在”时清理 tombstone，创建/保存同名新故事时没有调用 `clearScopeDeleted`。
+
+媒体后台任务用 `isScopeDeleted(currentUser(), title)` 判断是否应放弃生成。由于 tombstone 不包含故事实例 ID 或删除代次，同名新故事会继承旧故事的删除标记。
+
+**触发条件**
+
+1. 删除故事 `A`。
+2. 之后创建一个标题仍为 `A` 的新故事，或通过迁移/恢复让同名目录重新出现。
+3. 为新故事生成图片。
+
+**错误结果**
+
+图片任务在实际调用 provider 前命中 `deleted()` 并直接返回，随后 job 被记为失败或产生空错误；新故事会长期无法正常执行依赖 tombstone 守卫的后台媒体流程。
+
+**影响**
+
+- 删除行为跨越故事生命周期污染未来资源。
+- 用户无法通过重启恢复，因为 tombstone 本来就是持久化的。
+- 仅靠 title 作为 scope identity，无法区分旧故事的晚到任务和新故事的合法任务。
+
+**修复建议**
+
+给故事增加不可复用的 `storyId/generation`，tombstone 和 job 都绑定实例 ID。最低限度应在新故事首次持久化前原子清理同名墓碑，但这仍不能阻止旧 provider 结果误写新故事，因此实例 ID 才是完整修复。
+
+---
+
+### BUG-006 [P1] 非原子“回执判重 -> 业务执行”会让已接受命令永久丢失执行
+
+**位置**
+
+- `src/api/control-plane.ts:53-76`
+- `src/api/routes.ts:1166-1172`
+
+**问题**
+
+两个并发请求使用同一 commandId 时，SQLite 主键能保证只插入一个 receipt，第二个请求会得到 `created: false`。单进程路径通常正确，但 receipt 创建和业务执行之间没有持久 dispatcher/lease。若创建 receipt 的进程在启动业务前崩溃，receipt 永久停在 `queued`；其他进程重放时看到 `created: false`，也不会接管执行。
+
+同样，`POST /api/commands` 使用 fire-and-forget 进程内 Promise，服务重启后没有扫描 queued/running command receipt 并恢复或收敛的逻辑。
+
+**触发条件**
+
+进程在 `acceptCommandOnce` 成功后、业务 handler 或 durable job 建立前退出；部署重启和进程崩溃都可形成这个窗口。
+
+**错误结果**
+
+命令被持久标记为已接受，却没有任何 job 和执行者；后续同 commandId 请求不能接管，形成永久悬挂。
+
+**影响**
+
+这是 durable commands 核心承诺的断点。高风险窗口虽短，但发生后无法通过正常重试自愈。
+
+**修复建议**
+
+在同一 SQLite 事务内创建 receipt 和可 claim 的 job/outbox，由独立 dispatcher 通过租约执行。启动恢复必须扫描 `queued/running` receipt 与 job 的关联完整性：有安全恢复点则重新 claim，无恢复点则明确标记 `interrupted/failed`，不能保留假运行状态。
+
+---
+
+### BUG-007 [P2] `worldVersion` 缺少用户维度，同名书共享进程内版本号
+
+**位置**
+
+- `src/api/sync.ts:227-245`
+- `src/api/sync-server.ts:275-278`
+
+**问题**
+
+事件节流 key 已包含 user，但 `worldVersions` 只使用 `slugify(title)`：
+
+```ts
+const key = slugify(title);
+worldVersions.set(key, version);
+```
+
+WebSocket 订阅确认中的 `version: worldVersion(title)` 同样不传用户。两个用户拥有同名书时，共享同一个进程内版本计数。
+
+**触发条件**
+
+用户 A 和 B 各自拥有同名书，并在同一服务进程内交替保存或订阅。
+
+**错误结果**
+
+B 的 `subscribed.version` 可能来自 A；未传 committed revision 的遗留调用还会让 A/B 相互推进计数。实际投影 revision 已经按 user 存在 SQLite，因此这里形成两套不一致的版本事实。
+
+**影响**
+
+当前新客户端主要依赖持久 projection revision/hash，所以通常不会造成正文越权；但旧 `world-changed.version` 去重、测试断言和降级路径会出现跳号、误丢事件或错误恢复判断。
+
+**修复建议**
+
+移除这套进程内版本事实，统一使用 `sync_scopes.revision`；若暂时保留，key 必须为 `durableUser(user) + scope/title + document`，所有读写函数都必须显式接收 user。
+
+---
+
+### BUG-008 [P3] 全量测试存在模块 mock 和全局状态污染，测试结果随执行顺序变化
+
+**位置**
+
+- `tests/mocks.ts:10-27`
+- `tests/agnes-reasoning.test.ts:4`
+- `tests/agnes-retry.test.ts:6`
+- `tests/sync-ws.test.ts:153-169`
+- 其他共享项：多份测试对 `process.chdir`、`process.env.APP_DB_PATH`、`globalThis.fetch`、数据库单例和同步总线做进程级修改。
+
+**问题与证据**
+
+`installMockAgnes` 使用 `mock.module("../src/api/agnes", ...)`，其中把：
+
+```ts
+isRetryableError: () => false
+withSmartRetry: fn => fn()
+readStream: async () => ""
+```
+
+注册为全局模块 mock，未在测试结束恢复。全量执行时，真正导入 `agnes.ts` 的 reasoning/retry 测试拿到了这个 mock，精确导致 3 个空正文断言和 5 个重试断言失败。它们单独运行时 13/13 通过，说明生产实现并未在这些断言上稳定失败。
+
+WebSocket 隔离用例也表现为全量失败、单文件 14/14 通过。仓库同时存在模块级 `listeners/pendingByKey/worldVersions/allSockets`、真实 Bun server、共享 cwd 和多个全局 mock，测试文件并行运行时缺乏统一隔离。该失败目前只能归类为测试污染信号，不能据此声称生产环境已发生跨用户消息泄漏。
+
+**影响**
+
+- CI 全量测试红灯，无法作为合并门禁。
+- 真回归可能被 mock 覆盖，假回归则浪费排查时间。
+- 测试运行还触发了真实封面生成日志，说明部分测试可能读取本机 `.env` 并访问外部 provider，存在额度消耗和不可重复性。
+
+**修复建议**
+
+1. 将 Agnes 依赖改为显式注入，避免不可恢复的 `mock.module`。
+2. 需要模块 mock 的测试拆到独立 Bun 进程。
+3. 禁止并行测试直接修改进程 cwd/env/global fetch；使用每文件独立进程或统一 sandbox helper。
+4. 为数据库、sync bus、brain cache、WebSocket server 提供严格 `beforeEach/afterEach` reset。
+5. 测试环境强制清空 provider key，并让任何真实网络请求立即失败。
+
+## 4. 高风险问题（尚未证明已在生产触发）
+
+### RISK-001 [P2] `updateJob` 的普通进度更新会无条件清空租约字段
+
+**位置**：`src/api/control-plane.ts:201-218`
+
+当调用方没有传 `leaseOwner/leaseExpiresAt` 时，SQL 参数仍写入 `NULL`，而不是保留 `prev` 值。当前仓库尚未实现实际 claim/renew 流程，所以本轮不能证明已有重复消费者；但一旦启用 schema 中已经预留的租约，任意 phase/progress 更新都会释放租约，另一进程可以错误接管同一任务。
+
+建议改成动态 UPDATE、`COALESCE` 加显式清空标记，或把 lease 更新拆成独立 CAS API，并增加“持有租约时更新进度不丢 lease”的测试。
+
+### RISK-002 [P2] 图片子任务没有继承父级 commandId，聚合失败语义缺失
+
+BUG-003 已确认顶层 receipt 会悬挂；进一步的风险是当前每张图片独立成功/失败，但没有持久父子关系和明确的“部分成功”结果。进程在若干图片完成后重启时，控制面无法仅凭 command receipt 重建聚合结果。修复时不应简单把同一个 commandId 填进所有子 job，否则任一子任务先结束就会过早终结整条命令。
+
+### RISK-003 [P3] 后台异步链大量依赖 AsyncLocalStorage 隐式用户上下文
+
+图片生成、视频 watcher、自动连载和中枢任务在 fire-and-forget Promise 中多次调用 `currentUser()`。Bun 当前通常能沿 Promise 链保留 AsyncLocalStorage，但任务跨 timer、启动恢复或未来队列进程后很容易丢失上下文并落入 `__legacy__`/空用户。建议持久任务从 job 明确读取 user/title/storyId，并把它们作为函数参数传递，不能让授权边界依赖环境上下文。
+
+## 5. 架构与维护风险
+
+### 5.1 控制面存在重复事实来源
+
+目前同时存在：
+
+- `command_receipts.status`；
+- `jobs.status/progress/recovery`；
+- `world_commits` 与 `sync_scopes.revision`；
+- 进程内 `worldVersions`；
+- 进程内 `activeAuto/planTasks/imageGenTasks/videoWatchers`；
+- 世界文件中的媒体状态和中枢会话卡状态。
+
+这些事实没有统一状态转换表。例如媒体可以已经 ready，但 command receipt 仍 running；分镜可以在内存执行，但 SQLite 不存在对应 ID。建议明确单一权威：命令负责请求与结果，job 负责执行，projection 负责展示；每个状态转换必须在事务或可恢复 outbox 中连接。
+
+### 5.2 核心模块体积过大，审计边界不清
+
+当前主要文件行数：
+
+```text
+src/api/routes.ts                 3736
+src/pages/Home.tsx                3004
+src/components/BrainCabin.tsx     1809
+src/api/control-plane.ts           424
+```
+
+`routes.ts` 同时承担命令协议、鉴权后的业务分派、媒体调度、恢复、WebSocket 快照辅助和后台任务。命令是否异步通过路径字符串硬编码判断，新增端点极易漏掉 commandId 关联或终态更新。建议按 command dispatcher、story mutations、media scheduler、recovery services 拆分，并用注册表描述 route、revision policy、response mode 和 job kind，消除两份手写路由映射。
+
+### 5.3 文档已经明显漂移
+
+README 仍列出已删除的旧状态端点和不存在的文档索引，而当前实现强调状态只经 sync 投影下发。文档若继续描述 `/api/novel/state`、旧 list/status 轮询或过时目录，会误导后续重构再次引入双通道。应在控制面缺陷修复后统一更新 README、BRAIN、PLAN 和实际 API 注册表。
+
+## 6. 安全与持久化审查结论
+
+本轮没有发现可直接证明的跨用户文件读取或路径逃逸。以下实现方向是正确的：
+
+- API 入口统一通过 `userFromRequest` 和 `runAsUser` 注入账号目录上下文。
+- WebSocket 频道 key 包含 user 和 story slug。
+- 媒体读取最终经过故事目录约束，账号目录由当前用户决定。
+- `saveWorld` 已采用 prepared journal、同目录原子 rename 和启动恢复，类型检查与相关单测通过。
+- 客户端投影使用 revision/hash，并在 server instance 变化时清理旧缓存。
+
+但这些局部正确性不能抵消 BUG-001 至 BUG-006 的命令/任务状态断裂。当前最大的风险不是直接越权，而是系统告诉用户“已接受、运行中或失败”，实际执行事实却与之不同。
+
+## 7. 建议修复顺序
+
+1. **重建命令回执契约**：完整终态、原响应重放、查询接口、queued/running 启动恢复。
+2. **建立命令与聚合 job 的一对一关系**：尤其 `/media/generate`，子任务不得直接终结父命令。
+3. **修复分镜判重**：数据库 `created` 是唯一启动许可，补并发和跨进程测试。
+4. **引入 story instance ID**：job、tombstone、sync scope 和媒体晚到结果都绑定实例，解决删除后同名重建污染。
+5. **统一同步 revision**：移除无用户维度的 `worldVersions`，只使用持久 projection revision。
+6. **隔离测试运行时**：先让全量 `bun test` 稳定全绿，再继续可靠性重构。
+7. **拆分超大模块并同步文档**：使用声明式命令注册表，减少遗漏终态和 revision policy 的概率。
+
+## 8. 建议新增的验收用例
+
+1. 同 commandId 首次成功、响应丢失后重放，必须得到等价业务结果且副作用只发生一次。
+2. 同 commandId 首次失败后重放，必须返回真实 failed/error；若允许重试，要通过显式协议重新 claim。
+3. 在 receipt 插入后、业务 job 创建前模拟进程退出，重启后命令必须收敛而非永久 queued/running。
+4. 两个请求并发提交同章节分镜，模型调用次数和持久 job 数均为 1。
+5. 图片全部成功、部分失败、全部失败和进程中断时，父命令分别得到明确定义的终态。
+6. 删除故事、同名重建、旧媒体结果晚到时，旧结果不得写入新故事，新故事媒体生成正常。
+7. 两用户同名书交替保存和重连，projection revision、旧 worldVersion 降级帧和频道消息均严格隔离。
+8. 全量测试连续运行至少 10 次结果一致，且测试期间禁止任何真实外部模型请求。
+
+## 9. 未覆盖范围
+
+以下场景需要专门故障注入或真实部署环境，本轮未声称已完成验证：
+
+- 多 Bun 进程同时消费同一 SQLite job 的实际行为；
+- 在 `state.json` rename、SQLite commit、outbox 广播各精确断点强制 kill 后的恢复；
+- 真实 Agnes/兼容模型的长时间超时、429、SSE 半包和 provider 任务晚到；
+- 浏览器多 Tab 在系统休眠、网络切换和服务滚动升级期间的端到端恢复；
+- 大型真实书库下外置版本、outbox 和会话文件的性能及磁盘增长。
+
+这些项目应在上述 P1 修复后进行，否则故障注入得到的结果会被已知控制面缺陷干扰。
