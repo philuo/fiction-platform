@@ -2,6 +2,14 @@
 
 ## 2026-08-13 真实浏览器深度验收
 
+### 2026-08-14 批次收尾
+
+- 本批次使用隔离账号 `deep34506238`、故事《雨夜档案》、临时 SQLite/数据目录和端口 `3217`，累计通过真实 UI 提交超过 110 条 Brain 问法；仓库正式 `data/` 未进入测试范围。
+- 共确认并关闭 5 个浏览器缺陷。每个缺陷均先登记证据，再完成最小修复、相关自动化回归、真实浏览器复验、独立提交和立即推送。
+- 真实插画 provider 共生成 3 次：首次生成、一次重生成、删除后最终恢复；均进入明确成功终态。视频分镜和视频 provider 各提交 1 次，未重试。
+- 插画删除在 Tab B 执行后，Tab A 无刷新移除对应媒体；最终恢复生成后刷新仍显示新文件。角色/关系、伏笔账、任务中心和小说设置全部页签均完成真实 UI 覆盖，未发现新的产品缺陷。
+- Browser 工具自身 Statsig telemetry 超时/队列警告与应用页面 console 分开记录；两个应用 Tab 的实际 warning/error 均为 0。
+
 ### BROWSER-BUG-005 [P1] Brain 导出卡吞掉附件响应并把未下载误报为成功
 
 - **首次发现**：2026-08-14 00:45（Asia/Shanghai）
@@ -15,9 +23,9 @@
 - **根因**：`fetchAction()` 只区分 SSE 与 JSON；附件响应被调用 `res.json()`，解析异常被吞为 `{}`，随后 `!data.error` 被判为成功，没有消费 Blob 或触发下载。
 - **修复方案**：统一成功响应处理器识别 `Content-Disposition: attachment` 并解析 UTF-8 文件名；`/api/novel/export` 复用页面菜单已有的同源 GET 原生下载 URL，使浏览器下载管理器接管附件，避免先 fetch 再 Blob 的受限环境不可观测问题。
 - **回归测试**：新增 `tests/brain-action-response.test.ts`，覆盖 RFC 5987 文件名、附件必须被消费后才成功以及导出原生 URL；与 `tests/brain-cards.test.ts` 合计 27 项通过，`bun run typecheck`、`bun run build`、`git diff --check` 通过。
-- **commit / push**：待提交；推送目标 `origin/codex/brain-reliability-ui`。
+- **commit / push**：`02dbf5c`；已推送到 `origin/codex/brain-reliability-ui`。
 - **复验结果**：共三次导出动作且未超过上限。第一次复现旧实现假成功；第二次 Blob 实现显示开始下载但浏览器无下载事件、磁盘无文件；最终原生 URL 实现只点击一次即捕获真实 download 事件。页面保持在故事 SPA，卡片显示“已请求下载：雨夜档案.md”并进入已完成；应用 console 无 warn/error。`C:\Users\Administrator\Downloads\雨夜档案.md` 实际落盘 222 字节，UTF-8 可解码，首行为 `# 《雨夜档案》`，SHA-256 为 `16C98B8F03C2E52B441BCB5E4B611A3A1C6B97A87D58BD12D06DD1BECA5656B4`。
-- **状态**：已修复并通过真实浏览器复验，待提交推送。
+- **状态**：已修复、真实浏览器复验通过并已推送。
 
 ### BROWSER-BUG-004 [P2] 伏笔账二次删除确认态被父级点击立即清除
 
@@ -32,7 +40,7 @@
 - **根因**：删除按钮把 `confirmDelId` 设为伏笔 ID 后，点击事件继续冒泡到 `.fs-modal`；其 `onClick` 无条件执行 `setConfirmDelId(null)`，在同一交互中立即清除确认态。
 - **修复方案**：弹窗内容区只阻止冒泡，不再清除确认态；遮罩、关闭和筛选仍负责取消确认。
 - **回归测试**：新增 `tests/foreshadow-modal.test.tsx`，覆盖第一次点击只显示确认、第二次点击才发 `delete` 请求；`bun test tests/foreshadow-modal.test.tsx`、`bun run typecheck`、`bun run build`、`git diff --check` 通过。
-- **commit / push**：待提交；推送目标 `origin/codex/brain-reliability-ui`。
+- **commit / push**：`838e8bb`；已推送到 `origin/codex/brain-reliability-ui`。
 - **复验结果**：隔离生产实例加载修复构建后，真实点击第一次出现“确认删除？”，第二次删除成功；`state.json.foreshadowing=[]`，changeLog 完整记录新增、推进中、已回收、删除，Tab B 不刷新同步到活跃伏笔 0，两个应用页面无 warn/error。
 - **状态**：已修复并复验。
 
@@ -49,7 +57,7 @@
 - **根因**：L0 查询先从实时 world 构造权威卡片，但 `l0QueryReply()` 除章节和少量角色模板外仍优先保留 provider 的自由文本；provider 使用的摘要或推断可能遗漏字段，因此同一回合出现两套事实。`read_media` 卡片数据同时漏掉封面状态，使封面问法没有可用于纠偏的结构化事实；指定卷问法还可能在 `read_outline` / `read_plans` 间波动，旧逻辑没有按卡片内容统一回答。
 - **修复方案**：所有结构化 L0 查询正文改由已构造的权威卡片确定性生成；角色问法继续按状态/形象/关系侧重，媒体卡补充封面状态，指定卷/弧问法从 `read_outline` 或 `read_plans` 的同构数据统一提取。provider 只负责意图识别，不再覆盖查询事实；权威文本已有终止符时不重复追加标点。
 - **回归测试**：`bun test tests/brain-chat.test.ts tests/brain-e2e.test.ts`（114 pass）、`bun run typecheck`、`bun run build`、`git diff --check` 通过。新增冲突 provider 回复、封面状态、角色定位、指定卷目标、首弧章数和下一弧名称断言。
-- **commit / push**：待提交；推送目标 `origin/codex/brain-reliability-ui`。
+- **commit / push**：`e3034ee`；已推送到 `origin/codex/brain-reliability-ui`。
 - **复验结果**：隔离生产实例加载修复构建后真实复问“封面是否已经生成”“林砚是什么角色”“第二卷目标是什么”，分别得到“封面已生成 / 4 位角色有视觉资源”“林砚：配角”“第 2 卷『真相终验』及其真实目标”；Tab B 刷新并重开 Brain 后恢复同一会话，应用 console 无 warn/error。旧错误回合作为审计证据保留，新回合不再分叉。
 - **状态**：已修复并复验。
 
@@ -65,7 +73,7 @@
 - **根因**：意图体系只有写入型 `settings`，没有只读参数查询；这类问法完全依赖模型分类，容易落入 `opinion/plan`。
 - **修复**：新增只读 `read_settings` 意图；在调用意图 provider 前确定性识别明确的当前参数查询，直接从 `genOf(world)` 生成事实卡。修改/开启/关闭类表达仍进入原写入表单流程。
 - **回归测试**：`bun test tests/brain-chat.test.ts tests/brain-e2e.test.ts`（113 pass），`bun run typecheck`、`git diff --check` 通过。真实浏览器复问两种表达，持久卡片 detail 为“自动抽卡：关；人工确认入册：关”，未创建写命令；重复事实卡按既有去重策略不重复铺开。
-- **commit / push**：本缺陷提交完成后回填 SHA；推送目标 `origin/codex/brain-reliability-ui`。
+- **commit / push**：`caa9598`；已推送到 `origin/codex/brain-reliability-ui`。
 - **状态**：已修复并复验。
 
 ### BROWSER-BUG-001 [P1] 服务重启后 job 顶层终态与 progress 状态分叉
@@ -80,7 +88,7 @@
 - **根因**：`settleOrphanedJobs()` 只更新 job 顶层 status/phase/error，不同步 progress；随后 `cleanupStaleAdvanceTasks()` 只处理活动任务，无法修正已经 interrupted 的行。
 - **修复**：`settleOrphanedJobs()` 在收敛不可恢复任务时保留原 progress 业务字段，同时把 `status/phase/error` 原子更新为 interrupted 语义；command receipt 继续由关联 job 的终态收敛。
 - **回归测试**：`bun test tests/control-plane.test.ts tests/advancetask.test.ts`（28 pass），`bun run typecheck`、`git diff --check` 通过。真实浏览器第二次启动单章推进后重启服务，job `d429eb21-0b33-42d8-a4ab-ee7df62ff042` 的顶层与 `progress_json` 均为 interrupted，UI 解除只读。
-- **commit / push**：本缺陷提交完成后回填 SHA；推送目标 `origin/codex/brain-reliability-ui`。
+- **commit / push**：`f411664`；已推送到 `origin/codex/brain-reliability-ui`。
 - **状态**：已修复并复验。
 
 
