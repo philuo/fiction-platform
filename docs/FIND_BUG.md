@@ -87,7 +87,10 @@
 - **实际 / 证据**：展开后的回复宣称“每个账号的数据存储在独立分区，密钥分离”以及“物理上无法读取其他账号的内容”。当前代码使用登录用户上下文、账号目录和 API/WS 作用域隔离，验收基线没有“每账号独立密钥”或物理分区契约，因此“密钥分离”是无权威依据的架构事实。截图：`/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-024-boundary-claim.jpg`；应用 console 仅有 React DevTools info，warning/error 为 0；Browser 的 Statsig/telemetry 超时按计划排除。
 - **影响范围**：所有询问系统能力、安全边界、权限或数据隔离的开放聊天；可能向用户作出错误安全保证，且没有权威卡片可纠正正文。
 - **初步根因**：开放聊天正文由 provider 自由生成，系统提示未给出可证明的隔离事实与禁止推断部署/加密属性的约束，也没有对能力边界主题走确定性回复。
-- **严重度 / 状态**：P2；待修复。
+- **修复**：`3773407`（`fix: ground account isolation replies`）为账号隔离能力问法增加确定性 `read_help(topic=account_isolation)` 路由，不再调用云端分类器；回复仅陈述登录会话校验、当前用户名数据目录、中枢会话隔离及账号+故事绑定的 WebSocket 订阅，并明确这些应用层边界不代表独立密钥或物理存储分区。
+- **自动验证**：新增完整回合回归，断言原句命中本地能力路由、云端调用数为 0，且正文与权威结果卡均不出现“密钥分离”或“物理上无法读取”；定向 `tests/brain-chat.test.ts` 为 `96 pass / 0 fail / 593 assertions`。完整 `bun run check` 为 `723 pass / 0 fail / 4038 assertions`，其内客户端与 SSR 构建通过；`bun run typecheck`、`bun run check:architecture`、独立 `bun run build`、`git diff --check` 均通过。
+- **浏览器复验**：在 Tab B《雾港电台》真实中枢重新输入原句，结果卡标题为“账号数据隔离”，正文和卡片只陈述可验证的应用边界，并明确排除独立密钥/物理分区含义；页面 console warning/error 为 0。截图：`/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-024-verify.jpg`。
+- **严重度 / 状态**：P2；已修复、真实浏览器复验通过并已推送（修复 SHA：`3773407`）。
 
 ### BROWSER-BUG-023 [P3] 中枢伏笔账卡泄漏英文内部状态
 
