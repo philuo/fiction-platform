@@ -2,6 +2,22 @@
 
 ## 2026-08-14 真实浏览器深度验收（第二批）
 
+### BROWSER-BUG-013 [P2] 未执行的不可逆操作被中枢正文虚假宣称已完成
+
+- **首次发现**：2026-08-14 11:11（Asia/Shanghai）。
+- **场景 / testId / Tab**：`BRAIN-ACTION-012`，Tab B，同账号同故事《雾港电台》，当前世界尚无章节。
+- **复现步骤**：通过真实中枢输入“删除第一章”；等待意图识别与卡片持久化；不点击执行或确认，对比正文、`preview/confirm` 卡和权威 world。
+- **预期**：在用户确认和执行前，正文与预览摘要必须明确“尚未写入”，不得声称删除已完成；权威卡应保持 `CMD-N08 / L3 / 需确认`。
+- **实际**：正文和 preview summary 同时显示“已删除第一章，当前《雾港电台》共 0 章，写作进度 0/32”；同回合 confirm 卡却显示 `CMD-N08 / L3·不可逆 / 需确认`，且用户未执行任何操作。
+- **证据**：持久会话 `/tmp/moshift-realqa-Dl0cXq/data/qa814r9k2/雾港电台/brain-sessions.json` 中用户消息 `a1f0e6d4-eabd-42e4-a702-5bdf6707f1ab`、assistant 消息 `bd43b47b-c024-4b78-892a-d674f25a1658`；后者 `text` 和 preview `summary` 都是错误的已完成陈述，但 `confirmRequired=true`、action 仍为 `/api/novel/chapter/delete`。浏览器 DOM 同时显示错误正文、“删除章节 · 确认”卡和“放弃”按钮；无 command receipt，证明并未执行。
+- **影响范围**：所有使用 provider `reply` 作为待执行 preview 正文/摘要的写操作，尤其是 L2/L3 章节重写、回滚、删除和重算；用户无法判断操作是“待确认”还是“已执行”，属于明确错误事实反馈。
+- **根因**：通用 action 分支在任何业务请求发出前，直接把 provider 的自由 `reply` 同时写入 assistant 正文和 preview `summary`；代码只对 `edit_world` 表单做过中性化，没有覆盖通用 L0–L3 action。
+- **修复**：所有带 action 的待执行意图统一生成确定性中性正文，明确“当前尚未执行”；preview summary 复用同一权威文案，终态仅允许由 action/result 卡给出；同时移除忙状态拒绝分支的重复 delta。
+- **回归与门禁**：`bun test tests/brain-chat.test.ts`（91 pass / 0 fail）增强删章用例，使 provider 返回“已删除”冲突文案，断言正文、preview 摘要均为未执行语义；`bun run check`、`bun run build`、`git diff --check` 通过。
+- **commit / push**：`26fc9ed`；已推送到 `origin/codex/brain-reliability-ui`。
+- **真实浏览器复验**：重启隔离生产服务并通过真实 UI 提交“请删除第一章”；正文和 preview 均显示“已准备『删除章节』操作；请核对下方预览并确认后执行，当前尚未执行”，卡仍为 `CMD-N08 / L3 / 需确认`，无写回执。证据图 `/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-013-verify.png`；应用 console warning/error 为 0，Statsig 批队列警告为 Browser 工具噪声已排除。
+- **严重度 / 当前状态**：P2；已修复、真实浏览器复验通过并已推送。
+
 ### BROWSER-BUG-012 [P1] 立项完成后当前 Tab 永久停留在“世界构建中”
 
 - **首次发现**：2026-08-14 09:52（Asia/Shanghai）。
