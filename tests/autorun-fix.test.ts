@@ -66,6 +66,7 @@ const { saveWorld, loadWorld, readLastCheckpoint, loadPendingChapter, loadAutoSe
 const { writeOneChapter, regenerateChapter, retryChapter, ReviewFailedError, InterruptedError } = await import("../src/api/director");
 const { runAuto } = await import("../src/api/autorun");
 const { requestInterrupt } = await import("../src/api/steering");
+const { subscribeSync } = await import("../src/api/sync");
 
 let tmp: string;
 let oldCwd: string;
@@ -98,6 +99,27 @@ function makeWorld(title: string) {
 }
 
 describe("自动连载修复回归", () => {
+  test("连载开始立即广播 running session，首章期间任务中心可恢复", async () => {
+    const TITLE = "首帧同步测试";
+    makeWorld(TITLE);
+    const events: { type: string; title?: string; status?: string; written?: number }[] = [];
+    const unsubscribe = subscribeSync((event) => {
+      if (event.type === "auto-status" && event.title === TITLE) events.push(event);
+    });
+    try {
+      await runAuto(
+        TITLE,
+        { maxChapters: 1, runEvalEvery: 0 },
+        (_w, onEvent) => writeOneChapter(loadWorld(TITLE)!, "", onEvent, null),
+        () => loadWorld(TITLE),
+        () => {},
+      );
+    } finally {
+      unsubscribe();
+    }
+    expect(events[0]).toMatchObject({ type: "auto-status", title: TITLE, status: "running", written: 0 });
+  });
+
   test("429/限流错误首错即停（reason=quota，不重试不白烧额度）", async () => {
     const TITLE = "限流测试";
     makeWorld(TITLE);

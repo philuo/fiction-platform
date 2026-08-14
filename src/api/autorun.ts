@@ -11,7 +11,7 @@ import {
   clearPendingChapter, currentUser, loadAutoSession, loadPendingChapter, saveAutoSession, savePendingChapter, saveWorld,
   type AutoSession,
 } from "./storage";
-import { publishSync } from "./sync";
+import { publishSync, publishSyncImmediate } from "./sync";
 import { findLatestJob, updateJob } from "./control-plane";
 
 export type AutoOptions = {
@@ -48,6 +48,21 @@ function setControlIntent(title: string, intent?: AutoControlIntent): void {
 function controlIntent(title: string): AutoControlIntent | undefined {
   return (findLatestJob(currentUser(), "auto", title)?.recovery as { controlIntent?: AutoControlIntent } | undefined)?.controlIntent;
 }
+
+function publishSessionStatus(title: string, session: AutoSession, immediate = false): void {
+  const publish = immediate ? publishSyncImmediate : publishSync;
+  publish({
+    type: "auto-status",
+    title,
+    status: session.status,
+    phase: session.phase,
+    written: session.written,
+    updatedAt: session.updatedAt,
+    at: Date.now(),
+    user: currentUser() ?? undefined,
+  });
+}
+
 export function stopAuto(title: string): void {
   setControlIntent(title, "stop");
   // 立即持久化停止意图：防止服务在 runAuto 检测到 stopFlags 前重启 → resumeAutoSessions 误续跑
@@ -73,16 +88,7 @@ function touchSession(title: string, patch: Partial<AutoSession>): void {
   const next = { ...prev, ...patch, updatedAt: new Date().toISOString() };
   saveAutoSession(title, next);
   // C 级广播点：连载会话状态转移（开始/暂停/每章提交/终态）→ 事件总线（无订阅者零开销，节流合并）
-  publishSync({
-    type: "auto-status",
-    title,
-    status: next.status,
-    phase: next.phase,
-    written: next.written,
-    updatedAt: next.updatedAt,
-    at: Date.now(),
-    user: currentUser() ?? undefined,
-  });
+  publishSessionStatus(title, next);
 }
 
 /** 写会话终态（done/complete → done；其余人为或异常停止 → stopped） */
@@ -122,7 +128,7 @@ export async function runAuto(
 
   // 会话开始：置 running（保留历史开始时间与 lastEval，幂等恢复）
   const prev = loadAutoSession(title);
-  saveAutoSession(title, {
+  const initialSession: AutoSession = {
     status: "running",
     target: maxChapters,
     written,
@@ -133,7 +139,11 @@ export async function runAuto(
     lastEval: prev?.lastEval ?? null,
     startedAt: prev?.startedAt ?? new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-  });
+  };
+  saveAutoSession(title, initialSession);
+  // The start frame is the only state change before the first chapter commit.
+  // Publish it immediately so refresh/new tabs and the task center do not stay empty.
+  publishSessionStatus(title, initialSession, true);
 
   while (written < maxChapters) {
     // 用户停止 / 干预打断（peek 不消费，交给管线边界处理）
