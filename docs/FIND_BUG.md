@@ -33,7 +33,10 @@
 - **实际 / 证据**：面板成功打开，但默认选中“角色”页签，展示三张角色详情；“关系图”仍未激活，必须用户再次手动点击。截图：`/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-029-relation-wrong-tab.jpg`。手动点击后同一弹窗能正常显示 `img "人物关系只读图"`，证明数据与组件可用、只是 panel intent 没有携带子页签。
 - **影响范围**：中枢“打开关系图/查看关系网”等面板意图；用户意图只完成一半，自动化等待还会因聊天舱关闭而误判为流式回复超时。
 - **初步根因**：`open_relationships` panel intent 只映射到角色关系总弹窗，未向弹窗状态传递 `tab=graph`；弹窗始终使用默认 `characters` 页签。
-- **严重度 / 状态**：P2；待修复。
+- **修复**：`faa518e`（`fix: open relationship graph tab`）让 `open_relationships` 的权威 panel intent 固定携带 `{ tab: "关系图" }`，页面 modal reducer 与 `Home` 完整透传该页签，`RelationshipModal` 支持显式初始页签；底栏人工“角色与关系”入口不传该参数，继续默认“角色”。
+- **自动验证**：新增 panel intent、modal reducer、只读关系图组件与人工入口默认页签回归测试；定向测试为 `109 pass / 0 fail / 685 assertions`；完整 `bun run check` 为 `733 pass / 0 fail / 4078 assertions`，架构检查、类型检查、客户端与 SSR 构建全部通过；`git diff --check` 通过。
+- **浏览器复验**：隔离生产服务重启并刷新客户端后重放原句，弹窗直接激活“关系图”，存在唯一 `img "人物关系只读图"`，新增/删除/保存编辑控件数为 0；关闭后从底栏打开相邻控制场景仍默认“角色”。应用 console warning/error 为 0。截图：`/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-029-verify.jpg`，SHA-256：`3b8f0eccd9664d45ad6bda3c063c227b397f2e7a56623cb641c8691c9aa694b1`。
+- **严重度 / 状态**：P2；已修复并推送（修复 SHA：`faa518e`）。
 
 ### BROWSER-BUG-028 [P2] 一致性巡检完成后无检查结论且卡片仍称“尚未执行”
 
