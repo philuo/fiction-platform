@@ -2,6 +2,22 @@
 
 ## 2026-08-14 真实浏览器深度验收（第二批）
 
+### BROWSER-BUG-022 [P2] 分镜在刷新窗口完成后丢失待确认入口
+
+- **首次发现**：2026-08-14 17:45（Asia/Shanghai）。
+- **场景 / testId / Tab**：`ASYNC-MEDIA-PLAN-REFRESH-02`，Tab B，同账号故事《雾港电台》第 1 章，通过真实“更多 → 生成插画 → 1张”提交分镜后立即刷新页面。
+- **前置与复现**：章节正文已存在且没有活动媒体任务；真实 UI 提交一次插画分镜，页面出现“AI 分镜中”后刷新；provider 在刷新窗口内完成；重新进入同一 URL 并等待完整 sync snapshot。
+- **预期**：页面应从服务端持久 job 恢复待确认分镜，显示场景、可编辑提示词以及“确认生成/取消”；确认或取消后持久标记已消费，后续刷新不得重复弹出历史计划。
+- **实际**：刷新后页面直接恢复空闲，没有“分镜完成”“确认生成”或其他恢复入口，并允许再次提交分镜。job `plan-mssrhdb5nn8yu` 已为 `succeeded/ready`，command `8ec8119b-4710-4bf4-aba0-52f3df5cb6d2` 也为 succeeded，`result_json` 含完整 1 个 scene；服务端完成事实与页面可操作状态分叉。
+- **证据**：SQLite job rowid `78`，`recovery_json={"chapterIndex":1,"mediaKind":"image","count":1}`，完成时间 `2026-08-14T09:45:34.227Z`；刷新后 DOM 仅有空闲的“推进剧情”和可再次打开的章节“更多”菜单，无媒体确认模态框；应用页面未观察到 console warning/error。
+- **影响范围**：从章节菜单直接发起且没有 Brain session 卡作为替代入口的 image/video 分镜；刷新、关闭 Tab、浏览器休眠或短暂断线刚好跨过任务终态时，用户会永久丢失已付出 provider 调用的结果并可能重复调用。
+- **根因**：`Home.consumeHomeMediaPlanStatus()` 只接受当前 Tab 内存 `pendingMediaPlanRef` 中匹配的 planId；刷新必然丢失该 ref。`listMediaTaskStates()` 虽返回历史 ready job 和 scenes，却不含 `chapterIndex/mediaKind`，也没有未消费标记；客户端既无法重建计划，又不能安全恢复全部历史 ready job。
+- **修复**：direct-Home 分镜 job 在 recovery 持久保存 `chapterIndex/mediaKind/awaitingConfirmation`；sync 的活动/未消费计划投影携带完整恢复上下文和 scenes。Home 从完整快照恢复 running 锁或 ready 确认窗；确认生成携带 planId，确认、取消、关闭、Esc 和遮罩退出统一持久标记 `awaitingConfirmation=false`。消费后立即发布完整 brain snapshot，使其他 Tab 关闭同一确认窗；旧版无显式标记和 Brain session 自有倒计时卡不会被误弹。
+- **回归与门禁**：`tests/home-media-plan.test.ts` 覆盖刷新后 running/ready 恢复以及 consumed/legacy/session/malformed 隔离；`tests/media-plan-task.test.ts` 覆盖 sync 元数据、Brain session 不进入 Home 恢复、ready 取消消费、确认消费幂等及账号/故事边界。定向测试 17 pass / 0 fail；最终 `bun run check` 为 720 pass / 0 fail（4017 assertions），49 个公开命令架构检查、typecheck、client/SSR build 和 `git diff --check` 均通过。
+- **真实浏览器复验**：修复构建中重新通过“更多 → 生成插画 → 1张”提交 job `plan-msss08295itz9`（command `824deb39-3e85-4012-ba62-fd633bf2b8a3`），看到“AI 分镜中”后立即刷新；页面从 sync 恢复运行锁，provider 完成后自动显示 1 个可编辑场景和“确认生成/取消”。点击确认并再次刷新，计划持久变为 `awaitingConfirmation=false, consumedBy=generate`，旧确认窗未重弹；image-batch `ad47cdf2-737c-4b3c-a1f7-b00117cc96f1` 和子 job `136a8694-d556-4c91-9c8f-b629ae75b49a` 从 running 恢复进度并最终 succeeded/ready，文件 `images/ill-msss1d83krn.jpg` 的 SHA-256 为 `232d1e71bee2fa4f38424f1ef04dc58fd3052903517bffd2893e2065fbd5896d`。第三次 control job `plan-msss44tahm677`（command `f0d6757b-f68b-4256-aacb-60fb4f599cfa`）显示确认窗后点击取消，持久记录 `consumedBy=cancel`，刷新同样不重弹。截图 `/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-022-verify-ready.jpg`（SHA-256 `3b684bc12fa4178275384ebb2466d9ffe5b4be59d88e2b6915de927e83cdfcb2`）和 `BROWSER-BUG-022-verify-final.jpg`（SHA-256 `d9f4294efa61f932161a3f95ba2222e7b2321192d0f61e900aa7321c228a95dc`）；应用 console warning/error 为 0，Browser Statsig telemetry 超时单独排除。
+- **commit / push**：`8eb7e35`；已推送到 `origin/codex/brain-reliability-ui`。
+- **严重度 / 状态**：P2；已修复、真实浏览器复验通过并已推送。
+
 ### BROWSER-BUG-021 [P1] 已停止连载的晚到 session 被误建为匿名新 job
 
 - **首次发现**：2026-08-14 17:24（Asia/Shanghai）。
