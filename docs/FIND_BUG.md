@@ -13,9 +13,9 @@
 - **根因**：`Home` 在消费 `ready` 帧并自动导航时清空 `lastTaskIdRef`；后续 library `done` 帧只通过该 ref 查任务，未使用仍保存于页面的 `currentTaskId`，因此永远跳过清锁分支。
 - **修复**：新增 `trackedNewStoryTask`，以“本次提交 id → 页面当前任务 id”为追踪优先级；完整 library snapshot 中任务终态或任务已被清理时统一清除 `currentTaskId/buildingStage`。
 - **回归测试**：`bun test tests/home-story-open.test.ts`（3 pass / 0 fail）覆盖 ready 导航清空提交 ref 后仍按页面 task id 消费 done；`bun run check`（700 pass / 0 fail，3931 assertions）、`bun run build`、`git diff --check` 通过。
-- **commit / push**：待修复提交完成后回填。
+- **commit / push**：`7cb2274`；已推送到 `origin/codex/brain-reliability-ui`。
 - **复验结果**：用同一隔离数据第二次真实立项《纸月邮局》，在 `running` 阶段刷新并从书架重新进入；页面恢复构建锁。job `5621facb-e990-451a-aef2-514c273c0baf` 进入 `succeeded/done` 后，当前 Tab 未刷新即自动移除构建横幅，抽卡和推进按钮恢复可用。一个角色视觉因 provider 内容拒绝明确进入 failed，不影响 new-story 终态，未伪装为成功。
-- **状态**：已修复并通过真实浏览器复验，待提交推送。
+- **状态**：已修复、真实浏览器复验通过并已推送。
 
 ## 2026-08-14 中枢问答与 UI 深度验收
 
