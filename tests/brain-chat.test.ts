@@ -7,8 +7,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { emptyWorld, type WorldState } from "../src/api/world";
 import type { Card as WorldCard } from "../src/api/world";
-import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, explicitSettingsQuery, explicitCapabilityQuery, explicitActionIntent, extractNameFromHistory, authorFromEditPrompt, currentFromEditPrompt, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard } from "../src/api/brain-chat";
-import { getSession as sessGet, lastPendingMessage as sessLastPending } from "../src/api/brain-sessions";
+import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, explicitSettingsQuery, explicitCapabilityQuery, explicitActionIntent, extractNameFromHistory, authorFromEditPrompt, currentFromEditPrompt, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard, recentMediaReferenceReply } from "../src/api/brain-chat";
+import { appendMessage as sessAppendMessage, createSession as sessCreateSession, getSession as sessGet, lastPendingMessage as sessLastPending } from "../src/api/brain-sessions";
 import type { ChatMessage } from "../src/api/agnes";
 
 // —— 注入替身（替代 mock.module）：chatJson 返回 nextChatContent（JSON 字符串）；chatStream 逐字符真流式 + abort 检查 ——
@@ -620,6 +620,60 @@ describe("buildFormCard（表单卡构建）", () => {
     } finally {
       brainChatDeps.chatJson = original;
     }
+  });
+
+  test("刚才那个分镜优先关联当前会话权威场景，不调用 provider 补写", async () => {
+    mockWorld = mkWorld();
+    mockWorld.chapters[0].title = "潮信";
+    const sessionId = "recent-media-reference";
+    sessCreateSession(mockWorld.title, "生成第一章插画", sessionId);
+    sessAppendMessage(mockWorld.title, sessionId, { id: "media-user", role: "user", text: "生成第一章插画", at: Date.now() });
+    sessAppendMessage(mockWorld.title, sessionId, {
+      id: "media-card", role: "assistant", text: "", at: Date.now(), cards: [{
+        kind: "preview", title: "生成第 1 章插画（1 张）", chapterIndex: 1, mediaKind: "image",
+        scenes: [{
+          caption: "林渡将录音增益推至极限，水下声呐脉冲从噪底浮现",
+          anchor: "增益推到极限，低通滤波降到最弱，水下声波脉冲从噪底浮起来",
+          scene: "authoritative scene prompt",
+        }],
+      }],
+    });
+
+    let classifierCalls = 0;
+    let streamCalls = 0;
+    const originalJson = brainChatDeps.chatJson;
+    const originalStream = brainChatDeps.chatStream;
+    brainChatDeps.chatJson = (async () => { classifierCalls += 1; throw new Error("classifier should not run"); }) as typeof brainChatDeps.chatJson;
+    brainChatDeps.chatStream = (async () => { streamCalls += 1; throw new Error("stream should not run"); }) as typeof brainChatDeps.chatStream;
+    try {
+      const events = await runTurn("刚才那个分镜为什么选这段？", { sessionId });
+      const text = events.filter((event) => event.type === "delta").map((event) => String(event.text ?? "")).join("\n");
+      expect(classifierCalls).toBe(0);
+      expect(streamCalls).toBe(0);
+      expect(text).toContain("第 1 章「潮信」");
+      expect(text).toContain("林渡将录音增益推至极限，水下声呐脉冲从噪底浮现");
+      expect(text).toContain("增益推到极限，低通滤波降到最弱");
+      expect(text).not.toContain("来自明天的录音");
+      expect(events.at(-1)?.type).toBe("done");
+    } finally {
+      brainChatDeps.chatJson = originalJson;
+      brainChatDeps.chatStream = originalStream;
+    }
+  });
+
+  test("上一张图按权威时间解析；没有记录时明确追问", () => {
+    const world = mkWorld();
+    world.chapters[0].media = [
+      { id: "m1", kind: "image", anchor: "锚点一", caption: "场景一", status: "ready", createdAt: 2 },
+      { id: "m2", kind: "image", anchor: "锚点二", caption: "场景二", status: "ready", createdAt: 3 },
+    ];
+    const latest = recentMediaReferenceReply(world, "上一张图为什么选这里？");
+    expect(latest).toContain("场景二");
+    expect(latest).not.toContain("场景一");
+
+    world.chapters[0].media = [];
+    expect(recentMediaReferenceReply(world, "刚才的分镜讲什么？")).toContain("没有找到可确认的近期分镜");
+    expect(recentMediaReferenceReply(world, "聊聊这一章的节奏")).toBeNull();
   });
 
   test("非表单意图 → null", () => {

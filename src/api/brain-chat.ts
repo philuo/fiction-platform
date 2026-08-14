@@ -39,6 +39,7 @@ import {
   updateMessageText,
   updateMessageThinking,
   type BrainChatCard,
+  type BrainSession,
 } from "./brain-sessions";
 
 const uid = () => uuid();
@@ -172,6 +173,79 @@ function worldSummary(w: WorldState): string {
   if (revise.length) lines.push(`需修订章节 ${revise.length} 章：第 ${revise.map((c) => c.index).join("、")} 章`);
   lines.push(`梗概：${w.premise.slice(0, 80)}`);
   return lines.join("\n");
+}
+
+type RecentMediaReference = {
+  chapterIndex: number;
+  chapterTitle?: string;
+  kind: "image" | "video";
+  caption: string;
+  anchor: string;
+};
+
+function mediaReferencePrompt(prompt: string): boolean {
+  const text = prompt.replace(/\s+/g, "");
+  return /(?:刚才|刚刚|方才|这个|那个|上一个|上一张|前一张).*(?:分镜|插画|图片|图像|视频)|(?:刚才|刚刚|方才|这个|那个|上一个|上一张|前一张)(?:的)?图/.test(text);
+}
+
+function cardMediaReferences(w: WorldState, session?: BrainSession): RecentMediaReference[] {
+  if (!session) return [];
+  for (let mi = session.messages.length - 1; mi >= 0; mi--) {
+    const cards = session.messages[mi].cards ?? [];
+    for (let ci = cards.length - 1; ci >= 0; ci--) {
+      const card = cards[ci] as { chapterIndex?: unknown; mediaKind?: unknown; scenes?: unknown };
+      if (!Array.isArray(card.scenes) || card.scenes.length === 0) continue;
+      const chapterIndex = Number(card.chapterIndex);
+      if (!Number.isInteger(chapterIndex) || chapterIndex <= 0) continue;
+      const chapterTitle = w.chapters.find((chapter) => chapter.index === chapterIndex)?.title;
+      const kind = card.mediaKind === "video" ? "video" : "image";
+      const refs = card.scenes.flatMap((scene): RecentMediaReference[] => {
+        if (!scene || typeof scene !== "object") return [];
+        const item = scene as { anchor?: unknown; caption?: unknown };
+        const anchor = String(item.anchor ?? "").trim();
+        const caption = String(item.caption ?? "").trim();
+        if (!anchor || !caption) return [];
+        return [{ chapterIndex, chapterTitle, kind, caption, anchor }];
+      });
+      if (refs.length) return refs;
+    }
+  }
+  return [];
+}
+
+function worldMediaReferences(w: WorldState): RecentMediaReference[] {
+  return w.chapters
+    .flatMap((chapter, chapterOrder) => (chapter.media ?? []).map((media, mediaOrder) => ({
+      chapter,
+      media,
+      order: chapterOrder * 10_000 + mediaOrder,
+    })))
+    .filter(({ media }) => !!media.anchor?.trim() && !!media.caption?.trim() && media.status !== "failed")
+    .sort((a, b) => (b.media.createdAt ?? 0) - (a.media.createdAt ?? 0) || b.order - a.order)
+    .map(({ chapter, media }) => ({
+      chapterIndex: chapter.index,
+      chapterTitle: chapter.title,
+      kind: media.kind,
+      caption: media.caption!.trim(),
+      anchor: media.anchor.trim(),
+    }));
+}
+
+/** 近期分镜/媒体指代必须落到权威卡片或 world；无法唯一解析时追问，不交给 provider 补写。 */
+export function recentMediaReferenceReply(w: WorldState, prompt: string, session?: BrainSession): string | null {
+  if (!mediaReferencePrompt(prompt)) return null;
+  const cardRefs = cardMediaReferences(w, session);
+  const candidates = cardRefs.length ? cardRefs : worldMediaReferences(w).slice(0, 1);
+  if (!candidates.length) {
+    return "我在当前故事和本会话里没有找到可确认的近期分镜或媒体记录。请告诉我章节或图注，我再针对对应内容回答。";
+  }
+  if (cardRefs.length > 1) {
+    const choices = candidates.slice(0, 3).map((item, index) => `${index + 1}. 第 ${item.chapterIndex} 章「${item.chapterTitle ?? "未命名"}」：${item.caption}`);
+    return `最近一次记录里有多个分镜，我不能仅凭当前指代确定你指哪一个：\n${choices.join("\n")}\n请回复序号或图注。`;
+  }
+  const item = candidates[0];
+  const noun = item.kind === "video" ? "视频分镜" : "插画分镜";
+  return `你指的是第 ${item.chapterIndex} 章「${item.chapterTitle ?? "未命名"}」的${noun}“${item.caption}”，对应原文锚点是“${item.anchor}”。选择这段，是因为权威分镜记录把这里确定为可视化场景：图注给出了明确的画面主体和动作，原文锚点也提供了可核对的落点。我的判断只基于这两项已记录事实；如果你想换成另一段，我可以按你指定的原文重新比较。`;
 }
 
 /** 意图 → 中文语义提示（供意图识别参考，提升中文口语命中率） */
@@ -1680,6 +1754,15 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
 
   try {
     send({ type: "intent" });
+
+    const mediaReferenceReply = recentMediaReferenceReply(w, activePrompt, session);
+    if (mediaReferenceReply) {
+      updateMessageText(title, sessionId, messageId, mediaReferenceReply, true);
+      send({ type: "delta", messageId, text: mediaReferenceReply });
+      markMessageDone(title, sessionId, messageId);
+      send({ type: "done", messageId });
+      return;
+    }
 
     // —— 意图识别（注入前端选中章 + 最近会话上下文，供 LLM 自动提取工具参数，需求 2） ——
     const hist = (session?.messages ?? []).slice(-6).map((m) => `${m.role === "user" ? "用户" : "中枢"}：${(m.text ?? "").slice(0, 200)}`);
