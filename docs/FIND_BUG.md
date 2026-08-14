@@ -77,7 +77,10 @@
 - **相邻控制复现**：`CHAT-110`“这段开篇对白是否太少”没有关联上一轮刚提出的第 2 章开篇方案，而是擅自切换到第 1 章；未追问指代对象。
 - **影响范围**：依赖“刚才那个/这个分镜/上一张图”等指代的媒体追问，以及所有缺少权威卡片约束的开放剧情解释；会让用户基于不存在的内容继续创作。
 - **初步根因**：开放聊天上下文没有注入或确定性解析最近媒体 plan/result，provider 只依据概括性故事上下文补全对象；正文也未经过 world/media 权威事实校验。
-- **严重度 / 状态**：P2；待修复。
+- **修复**：`63a8fd2`（`fix: ground recent media references`）新增近期媒体指代的确定性解析：优先读取当前 Brain session 最近权威分镜卡的 `chapterIndex/mediaKind/scenes.caption/scenes.anchor`，回退到 world 中按 `createdAt`（缺失时按章节媒体顺序）选出的最近媒体。唯一对象直接基于图注和原文锚点回答；同一卡含多个分镜或找不到记录时明确列项/追问，不再调用意图分类器或流式 provider 补写事实。普通不含近期媒体指代的聊天保持原路径。
+- **自动验证**：新增完整回合回归，模拟持久会话分镜卡并断言原句精确引用第 1 章「潮信」、真实图注和锚点，云端分类与流式调用数均为 0；另覆盖“上一张图”按权威时间选取、无记录追问及普通聊天不误拦截。定向 `tests/brain-chat.test.ts` 为 `98 pass / 0 fail / 604 assertions`；完整 `bun run check` 为 `725 pass / 0 fail / 4049 assertions`，其内客户端与 SSR 构建通过；`bun run typecheck`、`bun run check:architecture`、独立 `bun run build`、`git diff --check` 均通过。
+- **浏览器复验**：重启隔离生产服务后，在 Tab B《雾港电台》真实中枢重新输入原句。回复精确定位第 1 章「潮信」的插画分镜“林渡将录音增益推至极限，水下声呐脉冲从噪底浮现”及原文锚点“增益推到极限，低通滤波降到最弱，水下声波脉冲从噪底浮起来”，未再出现“来自明天的录音”等虚构剧情；页面 console warning/error 为 0。截图：`/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-025-verify.jpg`（SHA-256 `73a5c4e836b61623b6a55e77193f2b5fa47f93944213070702ff31c5ae368662`）。
+- **严重度 / 状态**：P2；已修复、真实浏览器复验通过并已推送（修复 SHA：`63a8fd2`）。
 
 ### BROWSER-BUG-024 [P2] 中枢把未实现的“密钥分离”宣称为账号隔离事实
 
