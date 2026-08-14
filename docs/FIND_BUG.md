@@ -10,7 +10,10 @@
 - **实际 / 证据**：权威 BrowseCard 正确列出 4 条伏笔，但每条元信息均显示“状态：planted｜埋于第 1/2 章”。同页伏笔管理组件已经使用“已埋设”，说明不是数据缺失而是该卡片分支遗漏映射；应用 console warning/error 为 0。
 - **影响范围**：中枢 `read_foreshadow` 的所有伏笔列表；`active/resolved` 也会原样暴露，破坏中文界面一致性但不改变数据。
 - **根因**：`src/components/brain-cards.tsx` 的 foreshadow browse 分支直接 `String(f.status)`，未复用仓库已有的伏笔状态中文映射。
-- **严重度 / 状态**：P3；待修复。
+- **修复**：`1fee85b`（`fix: localize foreshadow statuses`）新增伏笔状态显示映射，将 `planted/active/resolved` 分别呈现为“已埋设/推进中/已回收”，未知非空枚举统一显示“未知状态”，不再暴露内部值；新增 BrowseCard 四分支回归测试。
+- **自动验证**：定向 `tests/brain-cards.test.ts` 为 `26 pass / 0 fail`；完整 `bun run check` 为 `721 pass / 0 fail / 4022 assertions`，其内客户端与 SSR 构建通过；`bun run typecheck`、`bun run check:architecture`、独立 `bun run build`、`git diff --check` 均通过。
+- **浏览器复验**：刷新 Tab B 的旧历史卡后，原 4 条伏笔均显示“状态：已埋设”，页面不再包含 `planted`；应用 console warning/error 为 0。该复验直接覆盖既有持久会话的刷新恢复，而非只验证新消息。
+- **严重度 / 状态**：P3；已修复并推送（修复 SHA：`1fee85b`）。
 
 ### BROWSER-BUG-022 [P2] 分镜在刷新窗口完成后丢失待确认入口
 
