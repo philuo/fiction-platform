@@ -23,7 +23,7 @@ export type Character = {
   portrait?: { mediaId: string; path: string; prompt: string; looks?: string };
   exit?: { chapter: number; reason: string }; // 离场/死亡记录
   image?: string; // 角色图像（相对 data/<story>/ 的路径）
-  /** 上次自动视觉生成尝试的时间戳（无论成败；读时自愈据此做冷却重试：未尝试过或失败超过冷却期才补，避免反复烧配额；手动生成不受影响） */
+  /** 上次自动视觉尝试时间；与持久 visual job 失败史共同决定有界退避，永久 4xx 不自动重试，手动生成不受影响。 */
   visualTriedAt?: number;
   introducedAt: number;
 };

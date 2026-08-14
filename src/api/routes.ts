@@ -753,10 +753,7 @@ export function getSystemSyncSnapshot(title: string, heal = false): Omit<Extract
   if (!w) return null;
   if (heal) {
     scheduleReadSelfHeal(title);
-    const needy = w.characters.filter((c) => {
-      if (c.portrait?.path && c.image) return false;
-      return !c.visualTriedAt || Date.now() - c.visualTriedAt > VISUAL_RETRY_COOLDOWN;
-    });
+    const needy = w.characters.filter((c) => shouldAutoGenerateVisual(title, c));
     for (const c of needy) ensureCharacterVisuals(w.title, w, c);
     if (!w.cover && (!w.coverTriedAt || Date.now() - w.coverTriedAt > VISUAL_RETRY_COOLDOWN)) ensureCover(w.title, w);
   }
@@ -784,8 +781,43 @@ export function getSystemSyncSnapshot(title: string, heal = false): Omit<Extract
 const visualInFlight = runtimeSet<string>("visual-character");
 /** 小说封面生成中集合（进程级去重：同一本书同时只允许一个自动封面任务） */
 const coverInFlight = runtimeSet<string>("visual-cover");
-/** 视觉自动重试冷却：失败/尝试后 1 分钟内不再自动触发（防高频烧配额；手动生成不受影响）。入口触发与中枢巡检共用 */
+/** 首次尝试的最小冷却；失败后还会叠加持久 job 退避和最大次数。 */
 const VISUAL_RETRY_COOLDOWN = 60_000;
+const VISUAL_TRANSIENT_RETRY_DELAYS = [5 * 60_000, 30 * 60_000] as const;
+const VISUAL_MAX_AUTO_ATTEMPTS = 1 + VISUAL_TRANSIENT_RETRY_DELAYS.length;
+
+/** 4xx（除明确可重试状态）与内容拒绝不会因重放相同 prompt 自愈。 */
+function isPermanentVisualFailure(error: string | undefined): boolean {
+  if (!error) return false;
+  const status = /HTTP\s+(\d{3})/i.exec(error)?.[1];
+  if (status) {
+    const code = Number(status);
+    if (code >= 400 && code < 500 && ![408, 409, 425, 429].includes(code)) return true;
+  }
+  return /unable to generate this content|content\s*(?:policy|moderation)|内容安全|违规|图像过大/i.test(error);
+}
+
+/**
+ * 自动视觉只对瞬时失败做有界、持久化退避重试。手动生成端点不经过此门禁。
+ * job 是重启后的权威尝试史；不能只用 1 分钟 visualTriedAt，否则巡检会无界消耗 provider。
+ */
+function shouldAutoGenerateVisual(title: string, c: WorldCharacter): boolean {
+  if (c.portrait?.path && c.image) return false;
+  const jobs = listJobs(currentUser(), title).filter((job) =>
+    job.kind === "visual"
+    && (job.recovery as { characterId?: string } | undefined)?.characterId === c.id,
+  );
+  if (jobs.some((job) => ["queued", "running", "waiting_external", "paused"].includes(job.status))) return false;
+  const failures = jobs.filter((job) => job.status === "failed");
+  const latestFailure = failures[0];
+  if (latestFailure) {
+    if (isPermanentVisualFailure(latestFailure.error) || failures.length >= VISUAL_MAX_AUTO_ATTEMPTS) return false;
+    const delay = VISUAL_TRANSIENT_RETRY_DELAYS[Math.min(failures.length - 1, VISUAL_TRANSIENT_RETRY_DELAYS.length - 1)];
+    const lastAttemptAt = Math.max(Date.parse(latestFailure.updatedAt) || 0, c.visualTriedAt ?? 0);
+    return Date.now() - lastAttemptAt >= delay;
+  }
+  return !c.visualTriedAt || Date.now() - c.visualTriedAt >= VISUAL_RETRY_COOLDOWN;
+}
 
 /** 角色视觉自动补全（fire-and-forget）：角色创建（立项 / 确认入册 / 手动新增 / 读时自愈 / 中枢巡检）后自动生成头像 + 立绘。
  * 生成顺序：先头像（纯文生，仅角色自身字段属性）→ 再以头像为参考图生成立绘（立绘必须参考头像，渠道单一；头像缺失时立绘不生成，随头像失败一并留痕）；
@@ -794,7 +826,7 @@ const VISUAL_RETRY_COOLDOWN = 60_000;
  * 已有完整视觉（portrait+image）的角色跳过（幂等），只缺其一则只补缺的；失败不抛错。
  * 注意：内部自带短事务落盘，调用方勿持锁（锁可重入，锁内启动亦安全）。 */
 function ensureCharacterVisuals(title: string, w0: WorldState, c: WorldCharacter): void {
-  if (c.portrait?.path && c.image) return; // 视觉已完整，跳过
+  if (!shouldAutoGenerateVisual(title, c)) return;
   const uk = currentUser() ?? "";
   const generation = scopeGeneration(uk, title);
   const key = `${uk}::${slug(title)}::${c.id}`;
@@ -1024,16 +1056,12 @@ function sweepVisualGapsFor(_username: string): void {
   for (const d of listStories()) {
     const w = loadWorldBySlug(d);
     if (!w) continue;
-    const needy = w.characters.filter((c) => {
-      if (c.portrait?.path && c.image) return false;
-      if (!c.visualTriedAt) return true;
-      return Date.now() - c.visualTriedAt > VISUAL_RETRY_COOLDOWN;
-    });
+    const needy = w.characters.filter((c) => shouldAutoGenerateVisual(w.title, c));
     for (const c of needy) ensureCharacterVisuals(w.title, w, c);
   }
 }
 
-/** 中枢巡检周期：每 60s 扫一遍（视觉生成低频，冷却 1 分钟兜底防烧配额） */
+/** 中枢巡检周期：每 60s 扫一遍（实际重试由持久 job 的失败分类、退避和次数上限决定）。 */
 const VISUAL_SWEEP_INTERVAL = 60_000;
 let visualSweepTimer: ReturnType<typeof setInterval> | null = null;
 

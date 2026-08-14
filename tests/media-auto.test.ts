@@ -397,4 +397,38 @@ describe("P5 角色媒体自动生成", () => {
     const c2b = after2.characters.find((c) => c.id === "c2")!;
     expect(c2b.image).toBeFalsy();
   });
+
+  test("永久 HTTP 400 视觉失败不被读时自愈/巡检无界重试", async () => {
+    await runAsUser(TEST_USER, async () => {
+      const { emptyWorld } = await import("../src/api/world");
+      const { saveWorld } = await import("../src/api/storage");
+      const { createJob, listJobs, updateJob } = await import("../src/api/control-plane");
+      const { getSystemSyncSnapshot } = await import("../src/api/routes");
+      const w = emptyWorld();
+      w.title = "永久拒绝书";
+      w.setting = { time: "架空", place: "边城", rules: [], tone: "" };
+      w.cover = "images/existing-cover.jpg";
+      w.characters.push({
+        id: "c400", name: "永久拒绝角色", role: "配角", traits: [], motivation: "", status: "",
+        relations: {}, introducedAt: 0, visualTriedAt: Date.now() - 10 * 60_000,
+      });
+      saveWorld(w);
+      const failed = createJob({
+        user: TEST_USER, title: w.title, kind: "visual", dedupeKey: `visual:${w.title}:c400`,
+        status: "running", phase: "generating", recovery: { characterId: "c400" },
+      });
+      updateJob(failed.job.id, {
+        status: "failed", phase: "failed",
+        error: "头像：Agnes 生图失败 HTTP 400: Unable to generate this content. Please modify your prompt and try again.",
+      });
+
+      const beforeJobs = listJobs(TEST_USER, w.title).filter((job) => job.kind === "visual").length;
+      const beforeCalls = genPrompts.length;
+      const snapshot = getSystemSyncSnapshot(w.title, true)!;
+      expect(snapshot.visual.running).toBe(false);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(listJobs(TEST_USER, w.title).filter((job) => job.kind === "visual").length).toBe(beforeJobs);
+      expect(genPrompts.length).toBe(beforeCalls);
+    });
+  });
 });

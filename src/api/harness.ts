@@ -140,7 +140,7 @@ export const COMMANDS: HarnessCommand[] = [
   C("CMD-S08", "sync 订阅自愈钩子", "System", "system", "sync system-snapshot", "连接后后台重算登场+媒体迁移+autoRepair", "appearedIn/ch.media（dirty 时 saveWorld）", "none", "L1", "—", ["audit"], ["U03", "U05", "U08"]),
   C("CMD-S09", "整书评估 evaluateBook", "System", "user", "/api/novel/eval → eval.ts:49", "8 维 LLM 评估（缓存指纹）", "只读（写 eval.json）", "brain", "L0", "缓存兜底", ["none"], ["U15"]),
   C("CMD-S10", "限流排队 limiter", "System", "system", "limiter.ts", "text 5/40、image 5/40、video 1/2 并发限流", "影响所有 LLM/媒体行为", "none", "L0", "排队不 429", ["schedule"], []),
-  C("CMD-S11", "中枢视觉巡检 sweepVisualGaps", "System", "system", "routes.ts:236（dev.ts/prod.ts 启动触发，每 60s）", "扫描所有故事角色，头像/立绘缺失自动补全（1 分钟冷却）", "characters[].portrait/image", "image", "L1", "冷却兜底防烧配额", ["schedule", "audit"], ["U13"]),
+  C("CMD-S11", "中枢视觉巡检 sweepVisualGaps", "System", "system", "routes.ts:236（dev.ts/prod.ts 启动触发，每 60s）", "扫描所有故事角色，头像/立绘缺失时按持久 job 分类做有界退避补全", "characters[].portrait/image", "image", "L1", "永久 4xx 停止自动重试；瞬时失败最多 3 次，5/30 分钟退避", ["schedule", "audit"], ["U13"]),
   C("CMD-S12", "删除整本故事 deleteStory", "System", "user", "/api/novel/delete", "持久墓碑、取消活动任务并删除故事目录", "story scope/jobs/sessions/media", "none", "L3", "失败时仍存在故事则撤销墓碑", ["control", "audit"], ["U01"]),
   C("CMD-S13", "关闭提案提示 proposal-closed", "System", "user", "/api/novel/proposal-closed", "持久化用户级提案提示偏好", "proposal_closed", "none", "L0", "失败不得本地假关闭", ["audit"], ["U09"]),
 
