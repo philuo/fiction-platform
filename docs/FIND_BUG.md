@@ -66,7 +66,10 @@
 - **实际 / 证据**：系统确实没有创建写命令，但回复从结论到表格均分析“第 2 章”，称“如果第 2 章继续……”“建议让他主动重放录音”，完全忽略已经存在的第 2 章正文及页面“第 3 章待写作”。截图：`/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-026-next-chapter-resolution.jpg`。
 - **影响范围**：开放聊天里的“下一章/当前章/上一章”等相对章节表达；可能让建议、审查或后续动作基于错误章节，虽本例因否定约束未产生写副作用。
 - **初步根因**：相对章节解析只覆盖确定性查询/动作路径，开放聊天仍由 provider 从摘要猜测；提示上下文未以不可覆盖的形式标明 `chapters.length=2` 与 `nextChapter=3`。
-- **严重度 / 状态**：P2；待修复。
+- **修复**：`fecd183`（`fix: ground relative next chapter context`）在中枢权威世界摘要中加入按章号排序的已写章节目录及 `nextChapter` 对应的“下一待写章（尚未写作）”，并在纯聊天系统约束中规定“下一章”必须绑定该字段，不得把已写章节当成待写章节。创作分析仍可流式生成，但相对章号不再由 provider 猜测。
+- **自动验证**：新增完整聊天回归，构造已写第 1/2 章且 `nextChapter=3` 的 world，捕获实际发给流式 provider 的 system/user 消息，断言包含第 1 章「第一章」、第 2 章「覆水」及“下一待写章：第 3 章（尚未写作）”；同时断言回复为第 3 章且没有 action/card。定向 `tests/brain-chat.test.ts` 为 `99 pass / 0 fail / 610 assertions`；完整 `bun run check` 为 `726 pass / 0 fail / 4055 assertions`，其内客户端与 SSR 构建通过；`bun run typecheck`、`bun run check:architecture`、独立 `bun run build`、`git diff --check` 均通过。
+- **浏览器复验**：重启隔离生产服务后在 Tab B《雾港电台》真实输入原句。完整回复标题和正文均分析“第 3 章”，并把「潮信 / 覆水」明确列为前两章；页面没有执行卡、写作运行态或命令副作用，console warning/error 为 0。回复中更广泛的未入册剧情推断仍按 `BROWSER-BUG-027` 单独处理，不计为本缺陷通过范围。截图：`/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-026-verify.jpg`（SHA-256 `953cd87c2118f8480ceac6fd8f15278879bd953f1b1c187bfd476969165189b5`）。
+- **严重度 / 状态**：P2；已修复、真实浏览器复验通过并已推送（修复 SHA：`fecd183`）。
 
 ### BROWSER-BUG-025 [P2] “刚才那个分镜”未关联权威媒体记录并虚构剧情事实
 
