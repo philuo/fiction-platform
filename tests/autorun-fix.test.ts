@@ -64,10 +64,10 @@ installMockAgnes((messages) => {
 const { emptyWorld, DEFAULT_GEN } = await import("../src/api/world");
 const { saveWorld, loadWorld, readLastCheckpoint, loadPendingChapter, loadAutoSession, saveAutoSession } = await import("../src/api/storage");
 const { writeOneChapter, regenerateChapter, retryChapter, ReviewFailedError, InterruptedError } = await import("../src/api/director");
-const { autoReportJobOutcome, runAuto } = await import("../src/api/autorun");
+const { autoReportJobOutcome, runAuto, stopAuto } = await import("../src/api/autorun");
 const { requestInterrupt } = await import("../src/api/steering");
 const { subscribeSync } = await import("../src/api/sync");
-const { findLatestJob, listJobs, updateJob } = await import("../src/api/control-plane");
+const { createJob, findLatestJob, listJobs, updateJob } = await import("../src/api/control-plane");
 
 let tmp: string;
 let oldCwd: string;
@@ -324,6 +324,62 @@ describe("自动连载修复回归", () => {
     updateJob(job.id, { status: "cancelled", phase: "cancelled" });
     expect(job.progress).toMatchObject({ status: "running", phase: "写作中" });
     expect(loadAutoSession(TITLE)).toMatchObject({ status: "stopped", phase: "cancelled" });
+  });
+
+  test("停止后的晚到章节阶段不创建匿名 running job", async () => {
+    const TITLE = "停止晚到隔离";
+    makeWorld(TITLE);
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const entered = new Promise<void>((resolve) => { started = resolve; });
+    const running = runAuto(
+      TITLE,
+      { maxChapters: 2, runEvalEvery: 0 },
+      async (_w, onEvent) => {
+        started();
+        await gate;
+        return writeOneChapter(loadWorld(TITLE)!, "", onEvent, null, { requirePass: true });
+      },
+      () => loadWorld(TITLE),
+      () => {},
+    );
+    await entered;
+    stopAuto(TITLE);
+    release();
+    expect((await running).reason).toBe("stopped");
+    const jobs = listJobs(null, TITLE).filter((job) => job.kind === "auto");
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({ status: "cancelled" });
+    expect(loadAutoSession(TITLE)?.status).toBe("stopped");
+  });
+
+  test("绑定 job 在 provider 开始前已取消时不创建新轮次", async () => {
+    const TITLE = "启动前取消";
+    makeWorld(TITLE);
+    const job = createJob({
+      user: null,
+      title: TITLE,
+      kind: "auto",
+      dedupeKey: `auto:${TITLE}`,
+      status: "cancelled",
+      phase: "stopping",
+    }).job;
+    let calls = 0;
+    const report = await runAuto(
+      TITLE,
+      { maxChapters: 1, runEvalEvery: 0, jobId: job.id },
+      async (_w, onEvent) => {
+        calls++;
+        return writeOneChapter(loadWorld(TITLE)!, "", onEvent, null, { requirePass: true });
+      },
+      () => loadWorld(TITLE),
+      () => {},
+    );
+    expect(report.reason).toBe("stopped");
+    expect(calls).toBe(0);
+    expect(listJobs(null, TITLE).filter((item) => item.kind === "auto")).toHaveLength(1);
+    expect(findLatestJob(null, "auto", TITLE)?.status).toBe("cancelled");
   });
 
   test("resumeAutoSessions：running 会话自动恢复续跑，paused 不恢复", async () => {

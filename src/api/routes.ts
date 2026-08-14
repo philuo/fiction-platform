@@ -2382,7 +2382,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           }
           const report = await runAuto(
             title,
-            { maxChapters, stopAvgScore, autoGacha, runEvalEvery, execRetry: buildAutoExecRetry(lockKey, title) },
+            { maxChapters, stopAvgScore, autoGacha, runEvalEvery, jobId: durableAuto.job.id, execRetry: buildAutoExecRetry(lockKey, title) },
             // 每章在锁内重新加载最新世界（杜绝旧快照覆盖）；autoGacha 临时覆盖仅作用本章；requirePass：审查不通过不 commit
             (_w, onEvent) => withTitleLock(lockKey, async () => {
               const fresh = loadWorld(title);
@@ -3568,13 +3568,13 @@ function loadWorldBySlug(slugName: string): WorldState | null {
 }
 
 /** 后台续跑（服务重启恢复）：无 SSE 消费者，进度仅写入 autorun-session.json */
-async function runAutoInBackground(title: string, target: number, written: number): Promise<void> {
+async function runAutoInBackground(title: string, target: number, written: number, jobId: string): Promise<void> {
   const lockKey = slug(title);
   const autoKey = `${currentUser() ?? ""}::${slug(title)}`;
   try {
     const report = await runAuto(
       title,
-      { maxChapters: target, runEvalEvery: 10, execRetry: buildAutoExecRetry(lockKey, title) },
+      { maxChapters: target, runEvalEvery: 10, jobId, execRetry: buildAutoExecRetry(lockKey, title) },
       (_w, onEvent) => withTitleLock(lockKey, async () => {
         const fresh = loadWorld(title);
         if (!fresh) throw new AppError("故事不存在: " + title);
@@ -3637,7 +3637,7 @@ function resumeAutoForDir(username: string): void {
       activeAuto.add(autoKey);
       const target = Math.max(1, Math.min(Number(s.target) || 3, 30));
       const written = Math.max(0, Number(s.written) || 0);
-      void runAutoInBackground(w.title, target, written);
+      void runAutoInBackground(w.title, target, written, job.id);
       console.log(`[auto] 服务重启恢复连载：${w.title}（目标 ${target} 章，已写 ${written} 章）`);
     } catch (e) {
       console.warn("[auto] 会话恢复跳过:", job.title ?? job.id, (e as Error).message);

@@ -12,13 +12,14 @@ import {
   type AutoSession,
 } from "./storage";
 import { publishSync, publishSyncImmediate } from "./sync";
-import { findLatestJob, updateJob } from "./control-plane";
+import { findLatestJob, getJob, updateJob } from "./control-plane";
 
 export type AutoOptions = {
   maxChapters: number; // 硬上限（≤30，防失控烧额度；绝对目标，含恢复的初始 written）
   stopAvgScore?: number; // 评分熔断线（章节均分低于该值即停）
   autoGacha?: boolean; // 临时覆盖自动抽卡开关
   runEvalEvery?: number; // 每 N 章跑一次整书评估（默认 10，0=关闭）
+  jobId?: string; // 路由/恢复绑定的 durable job；启动前若已终态则不得再调用 provider
   /** 暂存区草稿重试执行器（存在 pending 且与 nextChapter 匹配时使用）；不提供则跳过重试语义 */
   execRetry?: (w: WorldState, pending: PendingChapter, onEvent: (e: StepEvent) => void) => Promise<StepResult>;
 };
@@ -110,7 +111,7 @@ function isPausedByUser(title: string): boolean {
 // —— 会话状态辅助：合并更新 autorun-session.json（不存在则忽略） ——
 function touchSession(title: string, patch: Partial<AutoSession>): void {
   const prev = loadAutoSession(title);
-  if (!prev) return;
+  if (!prev || prev.status === "stopped" || prev.status === "done") return;
   const next = { ...prev, ...patch, updatedAt: new Date().toISOString() };
   saveAutoSession(title, next);
   // C 级广播点：连载会话状态转移（开始/暂停/每章提交/终态）→ 事件总线（无订阅者零开销，节流合并）
@@ -149,6 +150,14 @@ export async function runAuto(
   let scoreSum = 0;
   let scoreCount = 0;
   let lastEval: EvalReport | undefined;
+
+  if (opts.jobId) {
+    const job = getJob(opts.jobId);
+    if (!job || ["succeeded", "failed", "interrupted", "cancelled"].includes(job.status)) {
+      const reason = job?.status === "cancelled" ? "stopped" : job?.status === "succeeded" ? "done" : "interrupted";
+      return { written, reason, avgScore: null };
+    }
+  }
 
   clearAutoStop(title);
 
