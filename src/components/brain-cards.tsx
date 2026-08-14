@@ -540,6 +540,17 @@ function storyStatusLabel(status: unknown): string {
   return STORY_STATUS_LABEL[value] ?? value;
 }
 
+const FORESHADOW_STATUS_LABEL: Record<string, string> = {
+  planted: "已埋设",
+  active: "推进中",
+  resolved: "已回收",
+};
+
+function foreshadowStatusLabel(status: unknown): string {
+  const value = String(status ?? "").trim();
+  return FORESHADOW_STATUS_LABEL[value] ?? (value ? "未知状态" : "未标记");
+}
+
 export const BrowseCardView: React.FC<{
   card: BrowseCard;
   onAction?: (action: BrowseCardAction["action"]) => void;
@@ -734,7 +745,7 @@ export const BrowseCardView: React.FC<{
           <div key={i} className="bc-browse-item">
             <span className="bc-browse-item-id">伏笔 · {String(f.id ?? "")}</span>
             <p className="bc-browse-text">{String(f.text ?? "")}</p>
-            <span className="bc-browse-meta">状态：{String(f.status ?? "")}｜埋于第 {String(f.plantedAt ?? "")} 章</span>
+            <span className="bc-browse-meta">状态：{foreshadowStatusLabel(f.status)}｜埋于第 {String(f.plantedAt ?? "")} 章</span>
           </div>
         ))}
       </div>

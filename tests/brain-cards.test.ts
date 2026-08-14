@@ -203,6 +203,31 @@ test("时间线与蓝图卡：内部英文状态中文化，指南针不进入�
   }
 });
 
+test("伏笔账卡：planted/active/resolved 状态中文化，未知值不泄漏", async () => {
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root = createRoot(mount);
+  root.render(React.createElement(BrainCardView, {
+    card: {
+      kind: "browse", title: "伏笔账本（4 条）", browseType: "foreshadow",
+      data: { list: [
+        { id: "f1", text: "纸条", status: "planted", plantedAt: 1 },
+        { id: "f2", text: "录音", status: "active", plantedAt: 2 },
+        { id: "f3", text: "旧案", status: "resolved", plantedAt: 3 },
+        { id: "f4", text: "异常", status: "internal-new-state", plantedAt: 4 },
+      ] },
+    },
+  }));
+  await tick();
+  const text = mount.textContent ?? "";
+  expect(text).toContain("状态：已埋设");
+  expect(text).toContain("状态：推进中");
+  expect(text).toContain("状态：已回收");
+  expect(text).toContain("状态：未知状态");
+  expect(text).not.toMatch(/\b(?:planted|active|resolved|internal-new-state)\b/);
+  root.unmount();
+});
+
 test("plan 卡：渲染计划选项（含动作与纯说明）", async () => {
   const calls: { option: { label: string; action?: { endpoint: string } } }[] = [];
   const mount = document.createElement("div");
