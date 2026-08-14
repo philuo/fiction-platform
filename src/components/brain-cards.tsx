@@ -743,7 +743,7 @@ export const BrowseCardView: React.FC<{
       <div className="bc-browse-list">
         {list.map((f, i) => (
           <div key={i} className="bc-browse-item">
-            <span className="bc-browse-item-id">伏笔 · {String(f.id ?? "")}</span>
+            <span className="bc-browse-item-id">伏笔 · 第 {i + 1} 条</span>
             <p className="bc-browse-text">{String(f.text ?? "")}</p>
             <span className="bc-browse-meta">状态：{foreshadowStatusLabel(f.status)}｜埋于第 {String(f.plantedAt ?? "")} 章</span>
           </div>

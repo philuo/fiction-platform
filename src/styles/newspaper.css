@@ -2141,7 +2141,7 @@ input[type="checkbox"], input[type="radio"] {
   padding: 0.6rem 1.4rem;
   border-radius: var(--radius);
   box-shadow: var(--shadow-md);
-  z-index: 200;
+  z-index: 1300; /* 最顶层提示：高于中枢对话舱（850）与所有弹窗（900），任何场景下都可见 */
   max-width: 90vw;
   text-align: center;
   pointer-events: none;
@@ -3836,7 +3836,7 @@ html { scroll-behavior: smooth; }
 /* ============ 中枢对话舱（BrainCabin） ============ */
 .brain-cabin-mask {
   position: fixed; inset: 0; background: rgba(25, 24, 23, 0.35);
-  z-index: 1000; display: flex; justify-content: flex-end;
+  z-index: 850; display: flex; justify-content: flex-end; /* 低于弹层（modal-mask/modal-overlay 900）：角色与关系/伏笔账/设置/记忆审计/二次确认等均覆盖在中枢之上 */
   animation: bcFadeIn 0.2s ease;
 }
 @keyframes bcFadeIn { from { opacity: 0; } to { opacity: 1; } }
