@@ -297,6 +297,73 @@ export function explicitSettingsQuery(prompt: string): IntentResult | null {
     : null;
 }
 
+/**
+ * 明确写入句式的本地确定性识别。这些句式若交给带历史的模型分类，
+ * 容易被上一回合的写操作串话，进而执行无关副作用。只接管语义强、参数可确定的指令；
+ * 含糊请求和指代仍由模型结合上下文处理。
+ */
+export function explicitActionIntent(prompt: string): IntentResult | null {
+  const raw = prompt.trim();
+  const text = raw.replace(/\s+/g, "");
+  if (!text) return null;
+  if (/(?:为什么|怎么|如何|失败|报错|是否|能否|可以吗|是什么|说明|介绍)/.test(text)) return null;
+  const chapter = chapterIndexFromPrompt(text);
+
+  if (/导出.*(?:全书|小说|Markdown|MD)|(?:全书|小说).*导出/i.test(text)) {
+    return { intent: "export", params: {}, reply: "已准备导出全书。" };
+  }
+  if (/(?:展开|生成|补全).*(?:故事弧|弧).*(?:章纲|章节计划)|(?:展开|生成).*章纲/.test(text)) {
+    return { intent: "expand_arc", params: {}, reply: "请核对待展开的故事弧章纲。" };
+  }
+  if (/(?:暂停|pause).*(?:连载|自动)|(?:连载|自动).*(?:暂停|pause)/i.test(text)) {
+    return { intent: "autopause", params: {}, reply: "已准备暂停自动连载。" };
+  }
+  if (/(?:停止|停下|终止|别跑).*(?:连载|自动)|(?:连载|自动).*(?:停止|停下|终止|别跑)/.test(text)) {
+    return { intent: "autostop", params: {}, reply: "已准备停止自动连载。" };
+  }
+  if (/(?:开始)?(?:自动连载|自动更|自动写)/.test(text)) {
+    const count = /(?:一|1)章/.test(text) ? 1 : undefined;
+    return { intent: "autostart", params: count ? { count } : {}, reply: "已准备开始自动连载。" };
+  }
+  if (/(?:抽|来|给我).{0,8}(?:一|二|三|[1-6])?(?:张|个)?.{0,4}(?:事件卡|卡牌|卡)(?:试试|看看)?$/.test(text)) {
+    const countMatch = text.match(/([1-6])(?:张|个)/) ?? text.match(/([一二三四五六])(?:张|个)/);
+    const count = countMatch ? (/^[1-6]$/.test(countMatch[1]) ? Number(countMatch[1]) : CN_NUM[countMatch[1]]) : 1;
+    const types = /事件卡/.test(text) ? ["发展方向"] : undefined;
+    return { intent: "gacha", params: { count, ...(types ? { types } : {}) }, reply: `将为你抽取 ${count} 张卡。` };
+  }
+  if (chapter != null && /(?:重算.*账本|账(?:本)?(?:重新)?算|账.*重新算)/.test(text)) {
+    return { intent: "resettle", params: { index: chapter }, reply: `已准备重算第 ${chapter} 章账本。` };
+  }
+  if (chapter != null && /(?:AI)?重写|重新写(?:一遍|过)/i.test(text)) {
+    return { intent: "regenerate", params: { index: chapter }, reply: `已准备重写第 ${chapter} 章。` };
+  }
+  if (chapter != null && /(?:删除|删掉|删了|删掉)/.test(text)) {
+    return { intent: "delete_chapter", params: { index: chapter }, reply: `已准备删除第 ${chapter} 章。` };
+  }
+  if (/重写队列/.test(text)) return { intent: "rewrite", params: {}, reply: "已准备处理回溯重写队列。" };
+  if (/(?:运行|开始|执行)?.*一致性巡检/.test(text)) return { intent: "integrity", params: {}, reply: "已准备运行一致性巡检。" };
+
+  const relation = raw.match(/解除\s*(.+?)\s*(?:和|与)\s*(.+?)\s*的关系/);
+  if (relation) {
+    return { intent: "relationship_edit", params: { nameA: relation[1].trim(), nameB: relation[2].trim(), remove: true }, reply: "已识别关系解除请求。" };
+  }
+  const create = raw.match(/(?:新建|新增|添加|加)(?:一|一个|个)?(?:角色|人物)(?:叫|名为)?\s*([^\s，,。；;]+?)(?=，|,|。|；|;|定位为|作为|$)/);
+  if (create) {
+    const role = raw.match(/(?:定位为|作为)(主角|反派|配角|关键人物)/)?.[1];
+    return { intent: "create_character", params: { name: create[1], ...(role ? { role } : {}) }, reply: `已识别新建角色「${create[1]}」。` };
+  }
+  const statusEdit = raw.match(/(?:把)?\s*(.+?)的状态(?:改成|改为|设为)\s*(.+)$/);
+  if (statusEdit) return { intent: "edit_character", params: { name: statusEdit[1].trim(), status: statusEdit[2].trim() }, reply: `已识别角色「${statusEdit[1].trim()}」的状态修改。` };
+  const roleEdit = raw.match(/^\s*(.+?)(?:的定位)?(?:改成|改为|设为)\s*(主角|反派|配角|关键人物)\s*$/);
+  if (roleEdit) return { intent: "edit_character", params: { name: roleEdit[1].trim(), role: roleEdit[2] }, reply: `已识别角色「${roleEdit[1].trim()}」的定位修改。` };
+  if (/(?:角色|人物)/.test(text) && /^(?:请)?(?:删除|移除|不要)/.test(text)) {
+    const name = raw.replace(/^\s*(?:请)?(?:删除|移除|不要)\s*(?:角色|人物)?\s*/, "")
+      .replace(/(?:这个)?(?:角色|人物)(?:了)?[\s。！!]*$/, "").trim();
+    if (name) return { intent: "delete_character", params: { name }, reply: `已识别删除角色「${name}」的请求。` };
+  }
+  return null;
+}
+
 /** 意图识别（LLM）；失败降级为 chat。
  *  ctx：前端上下文（选中章）——用户未指定章节时作为参数兜底（需求 1/2）；
  *  history：最近会话文本（支持「上一章/刚说的那个」类指代）。 */
@@ -1595,6 +1662,7 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
     const hist = (session?.messages ?? []).slice(-6).map((m) => `${m.role === "user" ? "用户" : "中枢"}：${(m.text ?? "").slice(0, 200)}`);
     const { intent, params, reply } = explicitMediaIntent(activePrompt)
       ?? explicitSettingsQuery(activePrompt)
+      ?? explicitActionIntent(activePrompt)
       ?? await recognizeIntent(w, activePrompt, ctx.ctx, hist);
 
     // 纯对话 / 未知意图：真流式回复（可中断、可恢复）

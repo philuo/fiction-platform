@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { emptyWorld, type WorldState } from "../src/api/world";
 import type { Card as WorldCard } from "../src/api/world";
-import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, explicitSettingsQuery, extractNameFromHistory, authorFromEditPrompt, currentFromEditPrompt, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard } from "../src/api/brain-chat";
+import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, explicitSettingsQuery, explicitActionIntent, extractNameFromHistory, authorFromEditPrompt, currentFromEditPrompt, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard } from "../src/api/brain-chat";
 import { getSession as sessGet, lastPendingMessage as sessLastPending } from "../src/api/brain-sessions";
 import type { ChatMessage } from "../src/api/agnes";
 
@@ -988,6 +988,48 @@ describe("显式媒体指令本地快路径", () => {
       expect(cloudCalls).toBe(0);
       expect(events.some((e) => e.type === "card" && (e.card as { kind?: string })?.kind === "form")).toBe(true);
       expect(events.some((e) => e.type === "done")).toBe(true);
+    } finally {
+      brainChatDeps.chatJson = original;
+    }
+  });
+});
+
+describe("明确写入指令本地快路径", () => {
+  test("不受上一回合影响，稳定识别真实浏览器错分的强指令", () => {
+    const cases: [string, string][] = [
+      ["导出全书为Markdown", "export"],
+      ["展开首个故事弧的章纲", "expand_arc"],
+      ["自动更一章，别多写", "autostart"],
+      ["先停下连载任务", "autostop"],
+      ["连载先别跑了，暂停", "autopause"],
+      ["来一张事件卡试试", "gacha"],
+      ["加个人物叫许舟", "create_character"],
+      ["不要许舟这个角色了", "delete_character"],
+      ["把第一章重新写一遍", "regenerate"],
+      ["第一章的账重新算一下", "resettle"],
+    ];
+    for (const [prompt, intent] of cases) expect(explicitActionIntent(prompt)?.intent).toBe(intent);
+  });
+
+  test("提取角色、章节、抽卡与连载参数，故障询问不误触发", () => {
+    expect(explicitActionIntent("新建角色顾南，定位为配角")).toMatchObject({ intent: "create_character", params: { name: "顾南", role: "配角" } });
+    expect(explicitActionIntent("把顾南的状态改成负伤")).toMatchObject({ intent: "edit_character", params: { name: "顾南", status: "负伤" } });
+    expect(explicitActionIntent("许舟改成关键人物")).toMatchObject({ intent: "edit_character", params: { name: "许舟", role: "关键人物" } });
+    expect(explicitActionIntent("解除林渡和唐哲的关系")).toMatchObject({ intent: "relationship_edit", params: { nameA: "林渡", nameB: "唐哲", remove: true } });
+    expect(explicitActionIntent("来一张事件卡试试")).toMatchObject({ intent: "gacha", params: { count: 1, types: ["发展方向"] } });
+    expect(explicitActionIntent("为什么导出全书失败了")).toBeNull();
+  });
+
+  test("强指令在流程中不调用云端意图分类器", async () => {
+    mockWorld = mkWorld();
+    let cloudCalls = 0;
+    const original = brainChatDeps.chatJson;
+    brainChatDeps.chatJson = (async () => { cloudCalls += 1; throw new Error("cloud should not run"); }) as typeof brainChatDeps.chatJson;
+    try {
+      const events = await runTurn("导出全书为Markdown", { sessionId: "local-action-fast-path" });
+      expect(cloudCalls).toBe(0);
+      const card = events.find((event) => event.type === "card")?.card as { title?: string; kind?: string } | undefined;
+      expect(card).toMatchObject({ title: "导出全书", kind: "preview" });
     } finally {
       brainChatDeps.chatJson = original;
     }
