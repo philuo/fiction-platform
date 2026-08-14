@@ -2,6 +2,34 @@
 
 ## 2026-08-14 真实浏览器深度验收（第二批）
 
+### BROWSER-BUG-037 [P1] 视频重生成复用 mediaId 建 watcher 导致主键冲突并遗失 provider 任务
+
+- **首次发现**：2026-08-14 21:29（Asia/Shanghai）。
+- **场景 / testId / Tab**：`ASYNC-VIDEO-REGENERATE-01`；《雾港电台》第 2 章已有 ready 视频 `m_6374e762-7b5d-48bb-8e57-cc2231c28818`，真实 UI 点击该视频“重新生成”并只确认一次。
+- **预期**：旧 MP4 在新视频 ready 前继续可播放；新的 provider `videoId` 由同一 `media-regenerate` job 持久 watcher 接管，成功后原子替换，失败/重启则保留或回滚旧视频；不得创建第二次 provider 副作用。
+- **实际 / 证据**：provider 已成功返回新 `videoId=...2825bf0f6e9f4420b835bcba5d74ab37`，world 也已写成 `pending` 且保留旧 path，但 `watchVideoTask()` 再以原 mediaId 作为 `jobs.id` 插入 `video` job，撞上首次视频 watcher 的同名终态行，抛出 `UNIQUE constraint failed: jobs.id`。顶层 `media-regenerate` job `e789b9f6-c586-4e5b-aa80-b25685886c1f` 和 receipt `f214991f-9b7c-4166-b5cc-f48d3861c774` 因此 failed，新 provider 任务没有活动 watcher；应用 console warning/error 为 0。截图 `/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-037-video-regenerate-job-id-conflict.jpg`，SHA-256：`8912ecc582bddf6d45027d5eb7cdbdd837cb8ec0a26aeda2d22a7763cf5fff54`。
+- **影响范围**：任何已经完成过一次视频生成、随后对同一媒体原地重生成的用户；每次都会在 provider 创建成功后因 SQLite 主键冲突失败，产生付费副作用却无法继续轮询，属于核心媒体流程失败和孤儿 provider 任务。
+- **根因**：首次视频 watcher 固定使用 `jobs.id=mediaId`；重生成保持 mediaId 不变，路由虽已创建并更新 `media-regenerate` job，却又调用通用 watcher 创建第二条固定主键 job，没有复用重生成 job，也没有处理“provider 已创建但 watcher 登记失败”的启动恢复。第一阶段修复后又确认启动恢复会把保留的 rollback 旧 path 误认作新 `videoId` 的完成文件，从而直接标记 ready，仍不会恢复 watcher。
+- **修复**：`2c1942b`（`fix: reuse regeneration video watchers`）让 watcher 复用活动 `media-regenerate` job；旧版本已在 provider 创建后失败时，按相同 `mediaId + videoId + rollback` 创建 recovery job 接管，禁止再次调用 provider。`cb6a7c8`（`fix: resume orphaned video replacements`）让启动恢复识别“新 `videoId` + rollback 旧 path”，即使旧版本已经误标 ready 也先还原 pending，再交给 watcher；只有非重生成视频的既有 path 才能直接作为 ready 证据。
+- **自动验证**：新增活动 regen job 复用、失败 regen recovery 接管同一 `videoId`、rollback 旧 path 不得冒充新文件三组回归；定向媒体测试为 24 pass / 0 fail（112 assertions），完整 `bun run check` 为 750 pass / 0 fail（4174 assertions），typecheck、架构检查、client/SSR build 与 `git diff --check` 均通过。
+- **commit / push**：`2c1942b`、`cb6a7c8`；均已推送到 `origin/codex/brain-reliability-ui`。
+- **真实浏览器与重启复验**：部署 `cb6a7c8` 后重启隔离生产服务，启动恢复保留 1 个 pending 视频并创建 recovery job `017c02ed-f53e-4e24-a758-660d7aed474a`，复用原 provider `videoId=...2825bf0f6e9f4420b835bcba5d74ab37` 后收敛为 `succeeded/ready`；数据库仍只有首次生成的 1 条 `video-create`，没有第二次 provider 副作用。world 从 rollback 旧路径 `...msszbpif.mp4` 原子切换为新路径 `...msszze2y.mp4`，新 MP4 SHA-256 为 `4d3761754bef3558bb82158bc2b114383b15b3427e6a6f0cbba581661fdd3aad`。真实页面刷新后视频 `readyState=4`、`1280x704`、时长 `11.041667s`、无媒体错误；无幽灵 loading，提案区保持关闭，未新增 `CMD-S13 closed:false`，应用 console warning/error 为 0。复验证据图 `/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-037-video-regenerate-recovered.jpg`，SHA-256：`0bd2b972a39249e06fb09192713db0babddd538356a597dd3490f447d8bbd986`。
+- **严重度 / 当前状态**：P1；已修复，原 provider 任务经服务重启恢复完成，真实浏览器刷新与播放复验通过并已推送。
+
+### BROWSER-BUG-036 [P2] 视频分镜完成时无新增提案却重新打开已关闭的提案区
+
+- **首次发现**：2026-08-14 21:22（Asia/Shanghai）。
+- **场景 / testId / Tab**：`ASYNC-VIDEO-PLAN-CONCURRENT-PROPOSAL-PREF-01`；同账号《雾港电台》，提案关闭状态为 true，中枢真实提交“为第二章生成一段视频”，视频分镜与 3 秒自动生成倒计时完成期间观察页面和 SQLite。
+- **复现步骤**：1）确认 receipt `91167a2a-f9bc-4a31-9e92-0462e5fc4ec3` 已写入 `closed:true`，刷新并打开完整 Brain 历史后提案区保持关闭；2）在中枢提交视频生成表单并点击“挑选场景并生成”；3）等待 `media-plan` `plan-mssz8mit41fhh` 成功并进入 `media-auto-generate`；4）观察底部提案区和 `CMD-S13` receipt。
+- **预期**：媒体分镜、卡片 patch/replace、自动生成倒计时和视频 provider 提交都不应改变角色提案偏好；没有新增 proposal 时不得自动打开提案区。
+- **实际 / 证据**：视频计划完成时页面重新显示两项旧提案，并自动创建 receipt `87751de7-26d5-4f8c-86d9-c86f9f011d35` 写入 `closed:false`。`brain-sessions.json` 中两个 proposal `panelIntent` 均已有 `consumedAt`，本轮输入也不是打开面板意图；视频 watcher 为独立 job `m_6374e762-7b5d-48bb-8e57-cc2231c28818`。截图 `/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-036-proposal-reopens-on-media.jpg`，SHA-256：`3f8f4dfda7d233a59c0bb91e357eb2da88b5be2e918199587609c97958add081`。
+- **影响范围**：异步任务的 world/sync/card 更新可能覆盖用户提案偏好并产生无关写命令；BUG-035 已排除历史 browse 卡误开，此路径表明仍存在另一处基于 proposal 数量或投影瞬态的自动重开来源。
+- **根因 / 修复**：`Home` 的“新提案到达”effect 只比较 `pendingProposals.length` 与 `lastPropCountRef`；异步完整投影曾瞬时令列表变空，原有两项恢复时便被误判为新增。`3d238f5`（`fix: track proposal arrivals by identity`）改为按故事累计已见 proposal ID，只对真正首次出现的新 ID 自动打开；故事切换仍隔离各自 ID 集合。
+- **自动验证**：新增“2 项 -> 瞬时 0 项 -> 恢复原 2 项”回归，断言旧 ID 恢复不打开、真正新 ID 到达才打开；完整 `bun run check` 为 748 pass / 0 fail（4165 assertions），typecheck、架构检查、client/SSR build 与 `git diff --check` 均通过。
+- **commit / push**：`3d238f5`；已推送到 `origin/codex/brain-reliability-ui`。
+- **真实浏览器复验**：修复后真实 UI 关闭提案，receipt `abc6b724-c933-40e5-a5b4-b0c88237efb9` 写入 `closed:true`；随后视频 provider 完成、服务重启恢复重生成 watcher并刷新第 2 章，底部提案区始终不再出现，`CMD-S13` 最新记录仍为该 `closed:true` 回执，没有新增 `closed:false`。应用 console warning/error 为 0；BUG-037 复验证据图同时覆盖本相邻场景。
+- **严重度 / 当前状态**：P2；已修复，媒体异步投影、服务重启和浏览器刷新相邻场景复验通过并已推送。
+
 ### BROWSER-BUG-035 [P2] 历史提案查询卡在每次刷新时覆盖用户关闭偏好
 
 - **首次发现**：2026-08-14 21:03（Asia/Shanghai）。
