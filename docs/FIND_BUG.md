@@ -2,6 +2,20 @@
 
 ## 2026-08-14 真实浏览器深度验收（第二批）
 
+### BROWSER-BUG-032 [P1] 同一 Brain session 双 Tab 并发提问时后到消息被静默吞掉
+
+- **首次发现**：2026-08-14 20:23（Asia/Shanghai）。
+- **场景 / testId / Tab**：`MULTITAB-SAME-SESSION-001`，Tab A/B，同账号、同一本《雾港电台》、同一 Brain session；A/B 同时分别提交“当前世界书设定是什么？只查询。”和“当前时间线记录了什么？只查询。”。
+- **复现步骤**：A/B 打开同一 URL 与同一会话；同时按 Enter 提交两条不同只读查询；观察两个页面与 `brain-sessions.json`。两个页面最初均接受各自输入，随后 B 被替换为 A 的世界书回答；等待超过 10 秒后，服务端会话只保存 A 的 user/assistant 回合，B 的时间线 user/assistant 均不存在。
+- **预期**：普通新 prompt 即使撞上同 session 的运行回合，也应按顺序执行或给出可恢复的明确冲突结果；只有明确 `attach=true` 的断线重连请求才能附着已有回合。任何已接受的用户消息都不能被另一 Tab 的回复静默覆盖。
+- **实际 / 证据**：`/api/brain/chat` 在发现 session 已有运行任务时无条件 attach，忽略第二个普通请求的 prompt；A/B 最终都只显示 A 的世界书结果，服务端会话尾部也只有该回合，应用 console warning/error 为 0。截图：`/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-032-concurrent-message-lost.jpg`，SHA-256：`741b5d419ce64fd55f6ee082878945bf66caa1ac4e36ff11119c6326d110fc2e`。
+- **影响范围**：同账号或多个设备对同一 Brain session 的并发输入；后到请求无错误、无审计记录且无法恢复，用户会误以为系统已处理，属于核心聊天数据丢失。
+- **根因**：`src/api/routes.ts` 的 Brain SSE 路由先调用 `attachSessionTask()`，只要 session 正在运行就进入 attach 分支，没有区分普通新回合与客户端断线重连的 `bcAttach` 标志；因此后到普通请求从未进入 `brainChatStream()`，prompt 也没有落盘。
+- **修复**：`1e02453`（`fix: queue concurrent brain turns`）新增按“账号 + 故事 + sessionId”隔离的 `withSessionTurn()` 回合队列；普通新请求在同 session 内串行执行，不同 session/故事/账号互不阻塞；只有明确 `attach=true` 才调用 `attachSessionTask()` 并重放当前回合。原 attach 端到端测试同步改为显式协议，避免继续把错误行为固化成测试预期。
+- **自动验证**：新增真实 HTTP/SSE 并发回归，两个普通请求并发时各自连接收到自己的完整 `delta/done`，服务端按 `user/assistant/user/assistant` 顺序保存两回合且无 pending；断线 attach 终态补发仍通过。定向 `tests/brain-e2e.test.ts` + `tests/brain-sessions.test.ts` 为 `49 pass / 0 fail / 205 assertions`；完整 `bun run check`、生产构建、类型检查、架构检查与 `git diff --check` 全部通过，架构仍为 49 个公开命令、0 循环依赖。
+- **浏览器复验**：隔离生产服务重启后，Tab A/B 同时提交“大纲有几卷”和“章节目录有几章”；两端最终均按同一顺序显示两组 user/assistant 回合，分别回答 2 卷与 2 章，卡片类型分别为 `outline`、`chapters`。`brain-sessions.json` 精确保存 4 条独立消息，两个 assistant 均 `pending=false`，无丢失、串回复或重复；应用 console warning/error 为 0。截图：`/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-032-verify-A.jpg`（SHA-256：`5472d6e47343ea8a9c7a5c9c2e85d951426c894b81634f137e68c7fe3af81904`）和 `BROWSER-BUG-032-verify-B.jpg`（SHA-256：`469eeb76e173c716c5527ce63f3fd3fa410b1a347908b61513863a4f92587307`）。
+- **严重度 / 状态**：P1；已修复并推送（修复 SHA：`1e02453`）。
+
 ### BROWSER-BUG-031 [P2] “第二章章纲与正文偏差”被降级成全书计划进度查询
 
 - **首次发现**：2026-08-14 18:46（Asia/Shanghai）。
