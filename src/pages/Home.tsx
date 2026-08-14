@@ -57,16 +57,39 @@ type Phase = "landing" | "playing";
 type StoryMeta = { slug: string; title: string; genre: string; chapters: number; updatedAt: string; cover?: string };
 
 export type ScenePlan = { anchor: string; scene: string; caption?: string; type?: string; subject?: string; extraChars?: string[] };
-export type MediaPlan = { kind: "image" | "video"; chapterIndex: number; scenes: ScenePlan[] };
+export type MediaPlan = { id?: string; kind: "image" | "video"; chapterIndex: number; scenes: ScenePlan[] };
 export type PendingMediaPlan = Omit<MediaPlan, "scenes"> & { id: string };
+export type MediaPlanTask = {
+  id?: string;
+  status: string;
+  scenes?: ScenePlan[];
+  error?: string;
+  chapterIndex?: number;
+  mediaKind?: "image" | "video";
+  awaitingConfirmation?: boolean;
+};
 
 /** Match an async media-plan sync terminal frame to the request that originated in this tab. */
 export function mediaPlanFromTask(
   pending: PendingMediaPlan | null,
-  task: { id?: string; status: string; scenes?: ScenePlan[] },
+  task: MediaPlanTask,
 ): MediaPlan | null {
-  if (!pending || task.id !== pending.id || task.status !== "ready" || !task.scenes?.length) return null;
-  return { kind: pending.kind, chapterIndex: pending.chapterIndex, scenes: task.scenes };
+  if (!task.id || task.status !== "ready" || !task.scenes?.length) return null;
+  if (pending) {
+    if (task.id !== pending.id) return null;
+    return { id: task.id, kind: pending.kind, chapterIndex: pending.chapterIndex, scenes: task.scenes };
+  }
+  if (task.awaitingConfirmation !== true || !Number.isInteger(task.chapterIndex) || Number(task.chapterIndex) < 1
+    || (task.mediaKind !== "image" && task.mediaKind !== "video")) return null;
+  return { id: task.id, kind: task.mediaKind, chapterIndex: Number(task.chapterIndex), scenes: task.scenes };
+}
+
+/** Rebuild the in-flight Home request anchor from a full authoritative snapshot after refresh. */
+export function pendingMediaPlanFromTask(task: MediaPlanTask): PendingMediaPlan | null {
+  if (!task.id || task.awaitingConfirmation !== true || !["queued", "running", "waiting_external", "paused"].includes(task.status)
+    || !Number.isInteger(task.chapterIndex) || Number(task.chapterIndex) < 1
+    || (task.mediaKind !== "image" && task.mediaKind !== "video")) return null;
+  return { id: task.id, kind: task.mediaKind, chapterIndex: Number(task.chapterIndex) };
 }
 
 /** Decide whether navigation may subscribe to a story before its system snapshot arrives.
@@ -660,6 +683,15 @@ const Home: React.FC<HomeProps> = (props) => {
       const snapshot = e.sessions as BrainSyncSession[];
       lastBrainStatusRef.current = { title: e.title, sessions: snapshot };
       brainStatusRef.current?.(snapshot);
+      const projectedPlanIds = new Set(e.tasks.filter((task) => task.sub === "plan").map((task) => task.id));
+      const shownPlan = mediaPlanRef.current;
+      if (shownPlan?.id && !projectedPlanIds.has(shownPlan.id)) setMediaPlan(null);
+      const pendingPlan = pendingMediaPlanRef.current;
+      if (pendingPlan && !projectedPlanIds.has(pendingPlan.id)) {
+        pendingMediaPlanRef.current = null;
+        setBusy(false);
+        setBusyPhase("");
+      }
       let hasTerminalMedia = false;
       for (const task of e.tasks) {
         if (task.sub === "plan") {
@@ -1170,6 +1202,8 @@ const Home: React.FC<HomeProps> = (props) => {
 
   // 段落锚定媒体生成（plan → 确认选中段落 → generate；异步任务 + 轮询，不阻塞页面，刷新可恢复）
   const [mediaPlan, setMediaPlan] = useState<MediaPlan | null>(null);
+  const mediaPlanRef = useRef<MediaPlan | null>(mediaPlan);
+  mediaPlanRef.current = mediaPlan;
   type MediaGen = { chapterIndex: number; mediaIds: string[]; progress: number };
   const [mediaGen, setMediaGen] = useState<MediaGen | null>(null);
   // 改词重生成：编辑弹窗状态（预填 prompt，风格后缀服务端自动保留）
@@ -1349,9 +1383,18 @@ const Home: React.FC<HomeProps> = (props) => {
   }
 
   /** The plan endpoint accepts a durable job; only sync may deliver its authoritative terminal result. */
-  function consumeHomeMediaPlanStatus(task: { id?: string; status: string; scenes?: ScenePlan[]; error?: string }): boolean {
-    const pending = pendingMediaPlanRef.current;
-    if (!pending || task.id !== pending.id) return false;
+  function consumeHomeMediaPlanStatus(task: MediaPlanTask): boolean {
+    let pending = pendingMediaPlanRef.current;
+    if (!pending) {
+      pending = pendingMediaPlanFromTask(task);
+      if (pending) {
+        pendingMediaPlanRef.current = pending;
+        setBusy(true);
+        setBusyPhase("AI 分镜中（挑选关键场景）…");
+        return true;
+      }
+    }
+    if (pending && task.id !== pending.id) return false;
     if (task.status === "ready") {
       const plan = mediaPlanFromTask(pending, task);
       pendingMediaPlanRef.current = null;
@@ -1361,7 +1404,7 @@ const Home: React.FC<HomeProps> = (props) => {
       else showToast("场景规划失败: 服务端未返回分镜场景");
       return true;
     }
-    if (["failed", "interrupted", "cancelled"].includes(task.status)) {
+    if (pending && ["failed", "interrupted", "cancelled"].includes(task.status)) {
       pendingMediaPlanRef.current = null;
       setBusy(false);
       setBusyPhase("");
@@ -1417,11 +1460,11 @@ const Home: React.FC<HomeProps> = (props) => {
   async function confirmMediaGen() {
     if (!world || !mediaPlan) return;
     const plan = mediaPlan;
-    setMediaPlan(null);
     try {
-      const res = await mediaCommands.generate({ title: world.title, chapterIndex: plan.chapterIndex, kind: plan.kind, scenes: plan.scenes });
+      const res = await mediaCommands.generate({ title: world.title, chapterIndex: plan.chapterIndex, kind: plan.kind, scenes: plan.scenes, planId: plan.id });
       const data = (await res.json()) as { ok?: boolean; mediaId?: string; mediaIds?: string[]; error?: string };
       if (!data.ok) throw new Error(data.error ?? "创建生成任务失败");
+      setMediaPlan(null);
       if (plan.kind === "image") {
         const ids = data.mediaIds ?? [];
         if (!ids.length) throw new Error("服务端未返回生成任务");
@@ -1435,6 +1478,24 @@ const Home: React.FC<HomeProps> = (props) => {
     } catch (e) {
       setMediaGen(null);
       showToast("生成任务创建失败: " + (e as Error).message);
+    }
+  }
+
+  async function discardMediaPlan() {
+    const plan = mediaPlanRef.current;
+    if (!plan) return;
+    const title = worldTitleRef.current;
+    if (!plan.id || !title) {
+      setMediaPlan(null);
+      return;
+    }
+    try {
+      const res = await mediaCommands.cancel({ title, planId: plan.id, reason: "用户取消待确认分镜" });
+      const data = (await res.json()) as { ok?: boolean; error?: string };
+      if (!res.ok || !data.ok) throw new Error(data.error ?? "取消分镜失败");
+      setMediaPlan(null);
+    } catch (error) {
+      showToast("取消分镜失败: " + (error as Error).message);
     }
   }
 
@@ -2061,7 +2122,7 @@ const Home: React.FC<HomeProps> = (props) => {
         else if (deletePreview) setDeletePreview(null);
         else if (integrityView) setIntegrityView(null);
         else if (regenMedia) setRegenMedia(null);
-        else if (mediaPlan) setMediaPlan(null);
+        else if (mediaPlan) void discardMediaPlan();
         else if (showNewStory) setShowNewStory(false);
         else if (showGacha || showSettings || showMemoryAudit || showBrainCabin || showTaskCenter || showForeshadow || relModal) dispatchModal({ type: "close" });
         else if (showAutoStart) setShowAutoStart(false);
@@ -2799,13 +2860,13 @@ const Home: React.FC<HomeProps> = (props) => {
 
       {/* 媒体生成确认：告知 LLM 选中的关键段落（场景），确认后生成并锚定到对应段落前方 */}
       {mediaPlan && (
-        <div className="modal-mask" onClick={() => setMediaPlan(null)}>
+        <div className="modal-mask" onClick={() => void discardMediaPlan()}>
           <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: "560px" }}>
             <div className="modal-head">
               <b style={{ fontFamily: "var(--sans)", letterSpacing: "0.25em" }}>
                 {mediaPlan.kind === "video" ? "生成关键情节视频" : `生成插画（${mediaPlan.scenes.length} 张）`}
               </b>
-              <button className="modal-close" onClick={() => setMediaPlan(null)}><X size={16} /></button>
+              <button className="modal-close" onClick={() => void discardMediaPlan()}><X size={16} /></button>
             </div>
             <div className="modal-body">
               <p style={{ fontSize: "0.8rem", color: "var(--ink-soft)", marginBottom: "0.7rem" }}>
@@ -2845,7 +2906,7 @@ const Home: React.FC<HomeProps> = (props) => {
                 })}
               </div>
               <div style={{ display: "flex", gap: "0.8rem", justifyContent: "flex-end", marginTop: "1rem" }}>
-                <button className="btn" onClick={() => setMediaPlan(null)}>取消</button>
+                <button className="btn" onClick={() => void discardMediaPlan()}>取消</button>
                 <button className="btn btn-primary" disabled={mediaPlan.scenes.some((s) => !s.scene.trim())} onClick={() => void confirmMediaGen()}>确认生成</button>
               </div>
             </div>

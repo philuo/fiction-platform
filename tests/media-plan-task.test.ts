@@ -134,6 +134,7 @@ describe("media/plan 分镜任务化（异步 + sync 权威恢复）", () => {
     expect(got).not.toBeNull();
     expect(got!.status).toBe("succeeded");
     expect(got!.phase).toBe("ready");
+    expect((got!.recovery as { awaitingConfirmation?: boolean }).awaitingConfirmation).toBe(true);
     const scenes = (got!.result as { scenes: { anchor: string; scene: string }[] }).scenes;
     expect(Array.isArray(scenes)).toBe(true);
     expect(scenes.length).toBe(2);
@@ -210,13 +211,16 @@ describe("分镜任务完成事件广播（sync websocket 事件驱动，免轮�
       // 等广播（mock LLM 立即完成）
       for (let i = 0; i < 40 && got.length === 0; i++) await Bun.sleep(25);
       expect(got.length).toBe(1);
-      const evt = got[0] as { kind: string; sub?: string; status: string; id?: string; scenes?: unknown[] };
+      const evt = got[0] as { kind: string; sub?: string; status: string; id?: string; scenes?: unknown[]; chapterIndex?: number; mediaKind?: string; awaitingConfirmation?: boolean };
       expect(evt.kind).toBe("media");
       expect(evt.sub).toBe("plan");
       expect(evt.status).toBe("ready");
       expect(evt.id).toBe(planId);
       expect(Array.isArray(evt.scenes)).toBe(true);
       expect((evt.scenes as unknown[]).length).toBe(2);
+      expect(evt.chapterIndex).toBe(1);
+      expect(evt.mediaKind).toBe("image");
+      expect(evt.awaitingConfirmation).toBe(true);
     } finally {
       unsub();
       resetSyncState();
@@ -329,6 +333,7 @@ describe("分镜完成服务端落盘翻卡（带会话上下文，刷新/重开
     expect((flipped!.scenes ?? []).length).toBe(2);
     expect(typeof flipped!.countdownAt).toBe("number");
     expect(flipped!.action?.endpoint).toBe("/api/novel/media/generate");
+    expect((getJob(String(p.data.planId))?.recovery as { awaitingConfirmation?: boolean }).awaitingConfirmation).toBe(false);
     const { getActiveJob } = await import("../src/api/control-plane");
     const scheduled = getActiveJob(USER, `media-auto:${flipped!.cardId}`);
     expect(scheduled?.kind).toBe("media-auto-generate");
@@ -391,7 +396,8 @@ describe("/api/novel/media/cancel 幂等取消", () => {
     }
   });
 
-  test("对已终态（ready）的 planId 取消为 no-op，不翻回 failed", async () => {
+  test("取消已 ready 的 direct-Home plan 会持久消费且不翻回 failed", async () => {
+    const { listMediaTaskStates } = await import("../src/api/routes");
     const p = await runAsUser(USER, () => api("/api/novel/media/plan", { title: TITLE, chapterIndex: 1, kind: "image", count: 1 }));
     const planId = String(p.data.planId ?? "");
     // 等持久 job ready
@@ -402,8 +408,29 @@ describe("/api/novel/media/cancel 幂等取消", () => {
       await Bun.sleep(25);
     }
     expect(ready).toBe(true);
+    expect(runAsUser(USER, () => listMediaTaskStates(USER, TITLE)).some((task) => task.id === planId && task.awaitingConfirmation)).toBe(true);
     const c = await runAsUser(USER, () => api("/api/novel/media/cancel", { title: TITLE, planId }));
     expect(c.status).toBe(200);
     expect(getJob(planId)?.status).toBe("succeeded");
+    expect((getJob(planId)?.recovery as { awaitingConfirmation?: boolean; consumedBy?: string }).awaitingConfirmation).toBe(false);
+    expect((getJob(planId)?.recovery as { consumedBy?: string }).consumedBy).toBe("cancel");
+    expect(runAsUser(USER, () => listMediaTaskStates(USER, TITLE)).some((task) => task.id === planId)).toBe(false);
+  });
+
+  test("确认生成消费使用同一持久标记，且账号/故事边界不能消费", async () => {
+    const { markMediaPlanConsumed } = await import("../src/api/routes");
+    const id = `plan-confirm-${Date.now()}`;
+    createJob({
+      id, user: USER, title: TITLE, kind: "media-plan", dedupeKey: `confirm:${id}`,
+      status: "succeeded", phase: "ready",
+      recovery: { chapterIndex: 1, mediaKind: "image", awaitingConfirmation: true },
+    });
+    expect(runAsUser("other-user", () => markMediaPlanConsumed(TITLE, id, "generate"))).toBe(false);
+    expect(runAsUser(USER, () => markMediaPlanConsumed("other-title", id, "generate"))).toBe(false);
+    expect(runAsUser(USER, () => markMediaPlanConsumed(TITLE, id, "generate"))).toBe(true);
+    expect(runAsUser(USER, () => markMediaPlanConsumed(TITLE, id, "generate"))).toBe(false);
+    expect(getJob(id)?.status).toBe("succeeded");
+    expect((getJob(id)?.recovery as { awaitingConfirmation?: boolean; consumedBy?: string }).awaitingConfirmation).toBe(false);
+    expect((getJob(id)?.recovery as { consumedBy?: string }).consumedBy).toBe("generate");
   });
 });

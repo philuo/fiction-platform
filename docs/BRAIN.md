@@ -90,7 +90,7 @@ idle -> submitting -> running -> succeeded|failed|interrupted|cancelled
 | brain task emitter/AbortController、前端 abort/cache/展开集合 | 流式执行和 UI 缓存 | 可留内存；会话检查点/job 才能决定用户可见终态 |
 | `panelConsumingRef`、Canvas 布局/缩放/拖拽状态 | 一次请求防抖和纯 UI 状态 | 可留内存；权威消费时间及关系数据均已持久化 |
 | `activeAuto` | 连载循环执行镜像 | 可留内存；会话、checkpoint、暂停/停止意图和终态均由 auto job 持久化 |
-| `planTasks`、`imageGenTasks` | 分镜/生图执行句柄和流内即时结果 | 可留内存；job/world 保存恢复依据与用户可见终态，重启恢复不依赖 Map |
+| `planTasks`、`imageGenTasks` | 分镜/生图执行句柄和流内即时结果 | 可留内存；job/world 保存恢复依据与用户可见终态，重启恢复不依赖 Map。直接从 Home 发起的分镜以 job recovery 的 `awaitingConfirmation` 持久化一次性待确认状态，sync 携带 `chapterIndex/mediaKind/scenes`；确认生成或取消后标记 consumed，旧计划不再投影。 |
 | `visualInFlight`、`coverInFlight` | 单进程并发优化 | 可留内存；SQLite 活动 job 唯一约束负责权威仲裁，视觉终态缓存已移除 |
 | 视频重生成 recovery job | 视频回滚上下文、重生成互斥 | 已迁入 SQLite；watcher 重启后按 dedupeKey 读取旧 id/path，成功/失败/超时收敛 job |
 | `scope_tombstones`、读自愈 Set | 持久删除墓碑/短期去重 | 墓碑已迁入 SQLite；纯自愈执行锁可留内存 |

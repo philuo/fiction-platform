@@ -62,7 +62,7 @@
 
 | 指令 | 持久任务 | 恢复策略 |
 |---|---|---|
-| M01 分镜规划 | `jobs(media-plan)`，场景结果写 job result | 重启后无结果则 interrupted，不自动重跑 LLM |
+| M01 分镜规划 | `jobs(media-plan)`，场景结果写 job result；Home 待确认状态写 recovery 并由 sync 恢复 | 重启后无结果则 interrupted，不自动重跑 LLM；ready 计划确认/取消后必须持久消费，刷新不得重复弹出 |
 | M02 插画生成 | 每个 mediaId 一个 `jobs(image)`；章节 media 先写 pending | 有有效文件则补成功，否则失败 |
 | M03 视频生成 | `jobs(video)` 保存 provider `videoId` | 有 videoId 则服务端恢复查询；客户端不轮询 provider |
 | M04 视频状态回写 | 服务端 watcher 内部指令 | 终态写世界+job+outbox；无公开 status API |

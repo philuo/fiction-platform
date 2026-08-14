@@ -48,7 +48,7 @@ export type SyncEvent = {
   | ({ type: "system-snapshot"; at: number } & StorySystemProjection)
   | { type: "world-changed"; title: string; version: number; reason?: string; regions?: string[]; at: number }
   | { type: "auto-status"; title: string; status: string; phase?: string; written?: number; updatedAt?: string; at: number }
-  | { type: "task-status"; title: string; kind: "build" | "advance" | "media" | "visual"; id?: string; sub?: "plan"; scenes?: { anchor: string; scene: string; caption?: string }[]; status: string; error?: string; at: number }
+  | { type: "task-status"; title: string; kind: "build" | "advance" | "media" | "visual"; id?: string; sub?: "plan"; scenes?: { anchor: string; scene: string; caption?: string }[]; chapterIndex?: number; mediaKind?: "image" | "video"; awaitingConfirmation?: boolean; status: string; error?: string; at: number }
   | { type: "brain-note"; title: string; eventId: string; text: string; at: number }
   | { type: "card-update"; title: string; sessionId: string; messageId: string; cardId: string; patch: Record<string, unknown>; at: number }
   | { type: "card-replaced"; title: string; sessionId: string; messageId: string; cardIndex: number; card: Record<string, unknown>; at: number }
@@ -67,7 +67,7 @@ export type SyncEvent = {
         messageCount?: number;
         completed?: string[];
       }[];
-      tasks: { id: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[] }[];
+      tasks: { id: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[]; chapterIndex?: number; mediaKind?: "image" | "video"; awaitingConfirmation?: boolean }[];
       at: number;
     }
 );

@@ -16,12 +16,12 @@ export type SyncChannelEvent =
   | { type: "system-invalidated"; title: string; at: number }
   | { type: "world-changed"; title: string; version: number; reason?: string; regions?: string[]; at: number }
   | { type: "auto-status"; title: string; status: string; phase?: string; written?: number; updatedAt?: string; at: number }
-  | { type: "task-status"; title: string; kind: "build" | "advance" | "media" | "visual"; id?: string; sub?: "plan"; scenes?: { anchor: string; scene: string; caption?: string }[]; status: string; error?: string; at: number }
+  | { type: "task-status"; title: string; kind: "build" | "advance" | "media" | "visual"; id?: string; sub?: "plan"; scenes?: { anchor: string; scene: string; caption?: string }[]; chapterIndex?: number; mediaKind?: "image" | "video"; awaitingConfirmation?: boolean; status: string; error?: string; at: number }
   | { type: "brain-note"; title: string; eventId: string; text: string; at: number }
   | { type: "card-update"; title: string; sessionId: string; messageId: string; cardId: string; patch: Record<string, unknown>; at: number }
   | { type: "card-replaced"; title: string; sessionId: string; messageId: string; cardIndex: number; card: Record<string, unknown>; at: number }
   | { type: "brain-append"; title: string; sessionId: string; messageId: string; at: number }
-  | { type: "brain-status"; title: string; full?: boolean; sessions: { id: string; sessionTitle: string; createdAt: number; streaming: boolean; updatedAt: number; messages?: Record<string, unknown>[]; messageStates?: Record<string, unknown>[]; messageCount?: number; completed?: string[] }[]; tasks: { id: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[] }[]; at: number; revision?: number; hash?: string; cursor?: number }
+  | { type: "brain-status"; title: string; full?: boolean; sessions: { id: string; sessionTitle: string; createdAt: number; streaming: boolean; updatedAt: number; messages?: Record<string, unknown>[]; messageStates?: Record<string, unknown>[]; messageCount?: number; completed?: string[] }[]; tasks: { id: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[]; chapterIndex?: number; mediaKind?: "image" | "video"; awaitingConfirmation?: boolean }[]; at: number; revision?: number; hash?: string; cursor?: number }
   | { type: "subscribed"; title: string; version: number }
   | { type: "pong" }
   | { type: "document-changed"; scope: string; document: string; baseRevision: number; revision: number; hash: string; cursor: number }

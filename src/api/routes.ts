@@ -54,7 +54,7 @@ import type { CardType } from "./cards";
 import { renameSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { runtimeReadiness } from "./runtime-readiness";
-import { clearScopeDeleted, createJob, getActiveJob, isScopeGenerationCurrent, listJobs, listScheduledJobs, markScopeDeleted, scopeGeneration, transitionJob, updateJob, type DurableJob } from "./control-plane";
+import { clearScopeDeleted, createJob, durableUser, getActiveJob, getJob, isScopeGenerationCurrent, listJobs, listScheduledJobs, markScopeDeleted, scopeGeneration, transitionJob, updateJob, type DurableJob } from "./control-plane";
 import { runtimeMap, runtimeSet } from "../application/runtime/job-runner-registry";
 import { CommandBus } from "../transport/http/command-bus";
 import { errorDetail, jsonResponse as json, readJsonBody as readBody } from "../transport/http/responses";
@@ -185,6 +185,34 @@ const PLAN_TASK_MAX = 200; // 防膨胀上限：超出只清最旧终态
 const PLAN_TASK_TIMEOUT = 180_000; // pending 真超时：180s（与 media.ts PLAN_SCENE_TIMEOUT_MS 对齐），到点 abort
 function planId(): string { return `plan-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`; }
 
+type MediaPlanRecovery = {
+  chapterIndex?: number;
+  mediaKind?: "image" | "video";
+  count?: number;
+  session?: PlanTask["session"];
+  awaitingConfirmation?: boolean;
+  consumedAt?: string;
+  consumedBy?: string;
+};
+
+function mediaPlanRecovery(job: DurableJob): MediaPlanRecovery {
+  return (job.recovery && typeof job.recovery === "object" ? job.recovery : {}) as MediaPlanRecovery;
+}
+
+/** A ready direct-Home plan is a one-shot handoff. Keep the succeeded job for audit, but remove it
+ * from subsequent projections once the user confirms or dismisses it. */
+export function markMediaPlanConsumed(title: string, id: string, consumedBy: "generate" | "cancel"): boolean {
+  const job = getJob(id);
+  if (!job || job.kind !== "media-plan" || job.title !== title || job.user !== durableUser(currentUser())) return false;
+  const recovery = mediaPlanRecovery(job);
+  if (job.status !== "succeeded" || recovery.awaitingConfirmation !== true) return false;
+  updateJob(id, {
+    status: "succeeded",
+    recovery: { ...recovery, awaitingConfirmation: false, consumedAt: new Date().toISOString(), consumedBy },
+  });
+  return true;
+}
+
 /** WS 订阅快照：返回该用户该书所有「进行中」媒体任务（分镜 pending + 插画/视频生成中），
  *  供 sync-server 在订阅成功后推送——刷新/重开后前端据此恢复 loading 卡（免 HTTP 轮询）。
  *  除内存 Map 外补扫 state.json 的 ChapterMedia.status==="pending"：服务重启后内存清空，
@@ -200,7 +228,12 @@ export function listPendingMediaTasks(username: string, title: string): SyncEven
   };
   for (const job of listJobs(username, title, true)) {
     if (job.kind === "media-plan") {
-      out.push({ type: "task-status", title, kind: "media", sub: "plan", id: job.id, status: job.status, at: now, user: username });
+      const recovery = mediaPlanRecovery(job);
+      out.push({
+        type: "task-status", title, kind: "media", sub: "plan", id: job.id, status: job.status,
+        chapterIndex: recovery.chapterIndex, mediaKind: recovery.mediaKind,
+        awaitingConfirmation: recovery.awaitingConfirmation, at: now, user: username,
+      });
       seen.add(`plan::${job.id}`);
     } else if (job.kind === "image" || job.kind === "video") {
       pushMedia(String((job.recovery as { mediaId?: string } | undefined)?.mediaId ?? job.id));
@@ -226,24 +259,33 @@ export function listPendingMediaTasks(username: string, title: string): SyncEven
   return out;
 }
 
-/** sync WS 权威媒体状态快照：分镜内存任务 + state.json 全部章节媒体状态。
- *  周期快照在 pending 刚结束时仍携带 ready/failed，弥补浏览器休眠期间可能错过的单次终态事件。 */
+/** sync WS 权威媒体状态快照：活动分镜、尚未消费的 Home ready 分镜和章节媒体状态。
+ *  ready 分镜携带恢复确认窗所需上下文；确认/取消后不再投影，避免刷新反复弹历史计划。 */
 export function listMediaTaskStates(username: string, title: string): {
   id: string;
   status: string;
   sub?: "plan";
   error?: string;
   scenes?: { anchor: string; scene: string; caption?: string }[];
+  chapterIndex?: number;
+  mediaKind?: "image" | "video";
+  awaitingConfirmation?: boolean;
 }[] {
-  const out: { id: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[] }[] = [];
+  const out: { id: string; status: string; sub?: "plan"; error?: string; scenes?: { anchor: string; scene: string; caption?: string }[]; chapterIndex?: number; mediaKind?: "image" | "video"; awaitingConfirmation?: boolean }[] = [];
   for (const job of listJobs(username, title)) {
     if (job.kind !== "media-plan") continue;
+    const recovery = mediaPlanRecovery(job);
+    const active = ["queued", "running", "waiting_external", "paused"].includes(job.status);
+    if (!active && !(job.status === "succeeded" && recovery.awaitingConfirmation === true)) continue;
     out.push({
       id: job.id,
       status: job.status === "succeeded" ? "ready" : job.status,
       sub: "plan",
       error: job.error,
       scenes: (job.result as { scenes?: ScenePlan[] } | undefined)?.scenes,
+      chapterIndex: recovery.chapterIndex,
+      mediaKind: recovery.mediaKind,
+      awaitingConfirmation: recovery.awaitingConfirmation,
     });
   }
   const w = loadWorld(title);
@@ -625,6 +667,9 @@ async function cancelMediaTargets(target: CancelTarget): Promise<CancelResult> {
     if (t && t.title === target.title && t.status === "pending") {
       failPlanTask(target.planId, reason, { abort: true });
       result.planIds.push(target.planId);
+    } else if (markMediaPlanConsumed(target.title, target.planId, "cancel")) {
+      result.planIds.push(target.planId);
+      publishBrainStatusSnapshot(target.title);
     }
   }
 
@@ -2729,7 +2774,7 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
       const durablePlan = createJob({
         id, commandId: String(body.commandId ?? "") || undefined, user, title, kind: "media-plan", dedupeKey: `media-plan:${idx}:${kind}`,
         status: "running", phase: "planning",
-        recovery: { chapterIndex: idx, mediaKind: kind, count, session },
+        recovery: { chapterIndex: idx, mediaKind: kind, count, session, awaitingConfirmation: !session },
         deadlineAt: new Date(Date.now() + PLAN_TASK_TIMEOUT).toISOString(),
       });
       if (!durablePlan.created) return json({ error: "该章分镜正在生成中", planId: durablePlan.job.id }, 409);
@@ -2803,7 +2848,11 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             }
           }
           // ② WS 广播（面板打开时实时就地翻卡，免轮询）
-          publishSync({ type: "task-status", title, kind: "media", sub: "plan", id, status: "ready", scenes, at: Date.now(), user: user || undefined });
+          publishSync({
+            type: "task-status", title, kind: "media", sub: "plan", id, status: "ready", scenes,
+            chapterIndex: idx, mediaKind: kind as "image" | "video", awaitingConfirmation: !sess,
+            at: Date.now(), user: user || undefined,
+          });
           planTasks.delete(id);
         } catch (e) {
           if (e instanceof DOMException && e.name === "AbortError") {
@@ -2871,6 +2920,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             status: "running", phase: "provider-create", recovery: { chapterIndex: idx },
           });
           if (!videoJob.created) return json({ error: "该章视频正在生成中，请稍候再试" }, 409);
+          const consumedPlan = String(body.planId ?? "").trim();
+          if (consumedPlan && markMediaPlanConsumed(title, consumedPlan, "generate")) publishBrainStatusSnapshot(title);
           try {
             const scene = valid[0];
             const sceneType = scene.type === "人物" || scene.type === "场景" || scene.type === "事件" ? scene.type : "事件";
@@ -2979,6 +3030,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
           return json({ error: createRes.error }, 400);
         }
         const created = createRes.items;
+        const consumedPlan = String(body.planId ?? "").trim();
+        if (consumedPlan && markMediaPlanConsumed(title, consumedPlan, "generate")) publishBrainStatusSnapshot(title);
         // 同步把确认卡就地换成「生成中」running 卡（已带 mediaIds 恢复锚点），经 card-replaced 广播——
         // 前端零 HTTP 回写；逐张进度由 task-status 推进，全部完成由后台 IIFE 权威翻终态卡。
         if (genSession) {

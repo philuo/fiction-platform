@@ -7,6 +7,9 @@ export type MediaTaskState = {
   sub?: "plan";
   error?: string;
   scenes?: { anchor: string; scene: string; caption?: string }[];
+  chapterIndex?: number;
+  mediaKind?: "image" | "video";
+  awaitingConfirmation?: boolean;
 };
 
 export interface ProjectionSnapshotPort {
