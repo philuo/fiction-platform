@@ -2,6 +2,22 @@
 
 ## 2026-08-14 真实浏览器深度验收（第二批）
 
+### BROWSER-BUG-016 [P2] 刷新重进后任务中心把正在运行的单章推进显示为空闲
+
+- **首次发现**：2026-08-14 12:14（Asia/Shanghai）。
+- **场景 / testId / Tab**：`ASYNC-ADVANCE-02` + `MULTITAB-CONCURRENT-UI-01`，Tab A 通过真实 UI 发起第二次单章推进并刷新，Tab B 同书重新进入后打开任务中心。
+- **预期**：任务中心从权威 system snapshot 恢复单章 job 的阶段与进度，至少应与底部“进行中…”锁、SQLite job/progress 一致，不得提示用户再次开始。
+- **实际 / 证据**：Tab B 底部按钮为 disabled 的“进行中…”；SQLite job `011ef487-f857-4b03-a19c-069543ccfafd`、command `edbbcfe4-2efd-49e5-8539-a41addd438df` 为 `running/reviewing`。同一页面的任务中心却显示“推进剧情（单章）—空闲 · 在底部控制条点『推进剧情』开始单章写作任务”。
+- **影响范围**：所有在单章推进运行期间刷新、关闭或从另一 Tab 重进的用户；任务中心与页面锁自相矛盾，会导致错误恢复判断与重复操作。
+- **根因**：`system-snapshot` 已把运行中的 `advanceTask` 恢复为页面 `advancePhase`，底部运行锁也使用该状态；但 `TaskCenterModal.advanceBusy` 仍只读取当前 Tab 发起 SSE 时设置的本地 `busy`。刷新或新 Tab 的 `busy=false`，因此同一页面出现“进行中”与“空闲”两套结论。
+- **修复**：新增 `advanceTaskIsBusy`，任务中心统一以“本地 in-flight 或权威 snapshot phase”判定单章任务；自动连载期间仍保持互斥隔离。
+- **回归与门禁**：`tests/home-task-center.test.ts` 覆盖刷新后仅有快照阶段、首个快照前仅有本地 busy、自动连载互斥三条路径；`bun run check` 707 pass / 0 fail（3958 assertions），架构检查确认 49 个公开命令、typecheck、client/SSR build 和 `git diff --check` 均通过。
+- **commit / push**：`77565a1`；已推送到 `origin/codex/brain-reliability-ui`。
+- **真实浏览器复验**：修复后的生产 bundle 中，在《纸月邮局》真实发起单章推进，运行中刷新并重新打开任务中心；底部保持 disabled 的“进行中…”，任务中心同步显示准备/考据/本章计划/写作/审查/修补/结算/存档步骤、当前 `delta` 阶段和“取消推进”，不再出现空闲提示。应用 console warning/error 为 0。
+- **严重度 / 状态**：P2；已修复、真实浏览器复验通过并已推送。
+
+> `ASYNC-ADVANCE-RESTART-01`：为精确覆盖服务重启，在《纸月邮局》通过真实 UI 发起独立推进 job `deddc496-f65d-49a0-847a-f406ae91a92d`（command `1eadf24f-6838-45c5-86c7-bb69a5dccb8a`），确认其处于 `running/writing` 后停止服务。重启时 job 单调收敛为 `interrupted/interrupted`，receipt 收敛为 `failed`，错误均为“服务重启中断了任务；已核对持久状态，无法证明任务完成”；权威 `state.json` 仍为 0 章。重新进入真实页面后底部为“待机/推进剧情”，无半章、幽灵 loading 或应用 console 异常。此前用于 BUG-016 相邻复验的同书推进因 provider 失败明确收敛为 failed，未计作重启通过。
+
 ### BROWSER-BUG-015 [P1] 明确写入指令被上下文串话误分类
 
 - **首次发现**：2026-08-14 11:42（Asia/Shanghai）。
