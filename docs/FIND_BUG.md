@@ -2,6 +2,20 @@
 
 ## 2026-08-14 真实浏览器深度验收（第二批）
 
+### BROWSER-BUG-020 [P1] 已取消 auto job 被晚到审查帧回滚为 paused
+
+- **首次发现**：2026-08-14 13:31（Asia/Shanghai）。
+- **场景 / testId / Tab**：`ASYNC-AUTO-RESTART-CANCEL-LATE-01`，服务重启恢复 auto 后，在真实连载控制台点击“停止连载”，继续等待当时已在 provider 内的章节流程完全退出。
+- **预期**：`cancelled` 是不可回滚终态；任何晚到 saveSession、审查或路由收尾只能被丢弃，job/receipt/UI 必须保持取消且解除锁定。
+- **实际 / 证据**：job `cdf070bd-0e1f-4883-ad53-43c8b7fd7301` 与 receipt 先一致进入 cancelled；约 9 分钟后 provider 返回 review-failed，`saveAutoSession` 通过通用 `updateJob` 把 job 改为 `paused/第 1 章审查未通过，等待处理`，receipt 因自身终态保护仍为 cancelled。权威章节仍为 0，但 job/receipt 分叉且页面会重新视为任务活动。
+- **影响范围**：所有 cancelled/failed/interrupted/succeeded job 的晚到异步回调；当前 `updateJob` 没有终态单调保护，可能复活任务、重锁 UI 或覆盖审计结论。
+- **根因**：`updateCommand` 已有终态保护，`updateJob` 却允许任意新状态覆盖；`saveAutoSession` 还会把新一轮 running 会话写回上一轮终态 job，同毫秒 job 仅按 `updated_at` 排序时也可能读到旧轮次。启动恢复只扫描 queued/running/waiting_external，无法修复已经回滚为 paused 的历史分叉；会话读取又优先信任旧 `progress_json`，即使顶层 job 已收敛仍可能显示幽灵运行态。
+- **修复**：job 的 succeeded/failed/interrupted/cancelled 终态只允许同终态补充结果，不接受另一终态或非终态晚到帧；新一轮 running 会话在上一轮终态后创建独立 job，并以 `updated_at/created_at/rowid` 稳定选择最新轮次。启动恢复扫描 paused 并以终态 command receipt 收敛顶层 job、progress 和 recovery；`loadAutoSession` 再以顶层 job 终态规范化旧进度，覆盖历史及部分迁移数据。
+- **回归与门禁**：`tests/control-plane.test.ts` 覆盖四类 job 终态、同终态结果补写、跨终态拒绝和 paused 幽灵任务启动收敛；`tests/autorun-fix.test.ts` 覆盖新连载轮次隔离及旧 progress 规范化；`tests/resume.test.ts` 的 stop/pause/断点续跑控制场景保持通过。最终 `bun run check` 为 715 pass / 0 fail（3987 assertions），49 个公开命令架构检查、typecheck、client/SSR build、额外 `bun run build` 与 `git diff --check` 全部通过。
+- **真实浏览器复验**：修复构建首次启动即把历史分叉 job `cdf070bd…` 从 `paused/审查未通过` 收敛为 cancelled，与 receipt 一致；刷新《纸月邮局》后底部恢复“推进剧情”，任务中心显示“已停止”，无幽灵 loading。随后真实 UI 启动 1 章连载并点击“停止连载”，新 job `57423728-03d0-4604-a437-99d53e4427d9`、command `a7a14645-bb50-4ddf-8328-28ec6e877346` 进入 cancelled；在该真实 job 上注入等价晚到 `paused/late-review` 更新后，SQLite 仍保持 `cancelled/stopping`、错误“用户请求停止”，刷新页面仍空闲且权威章节为 0。应用 console warning/error 为 0。
+- **commit / push**：`5edd1b7`；已推送到 `origin/codex/brain-reliability-ui`。
+- **严重度 / 状态**：P1；已修复、真实浏览器复验通过并已推送。
+
 ### BROWSER-BUG-019 [P2] 刷新或后台恢复的自动连载没有暂停/取消控制
 
 - **首次发现**：2026-08-14 13:16（Asia/Shanghai）。
@@ -22,7 +36,7 @@
 - **修复**：新增 `autoReportJobOutcome`，按 `done/complete、review/paused、score、stopped、interrupted、quota、error` 分别映射 job 的终态与 phase；晚到的循环收尾不会把已取消 job 改写成成功。
 - **回归与门禁**：`tests/autorun-fix.test.ts` 覆盖 5 类退出原因映射；定向 18 pass / 0 fail，typecheck、架构检查、client/SSR build 和 `git diff --check` 通过。此前完整门禁基线为 708 pass / 0 fail（3959 assertions）。
 - **commit / push**：`248b7f8`；已推送到 `origin/codex/brain-reliability-ui`。
-- **真实浏览器复验**：服务重启恢复 auto job `cdf070bd-0e1f-4883-ad53-43c8b7fd7301` 后，通过真实“连载控制台 → 停止连载”发出持久停止命令；job 与 receipt 立即为 `cancelled/用户手动停止`，等待 provider 晚到数分钟后仍未被覆盖为 succeeded/done，页面解除运行锁，权威章节数保持 0。审查暂停样本 `e4fc94df…` 的 `result.reason=review` 与 progress paused 证据保留在本条复现记录中。
+- **真实浏览器复验**：服务重启恢复 auto job `cdf070bd-0e1f-4883-ad53-43c8b7fd7301` 后，通过真实“连载控制台 → 停止连载”发出持久停止命令；修复后的退出映射没有再把 review/stopped 写成 succeeded/done，权威章节数保持 0。继续等待完整 provider 晚到后发现 job 由 cancelled 回滚 paused，而 receipt 仍 cancelled；该通用终态单调性问题另立 `BROWSER-BUG-020`，不把异常计作本条通过项。审查暂停样本 `e4fc94df…` 的 `result.reason=review` 与 progress paused 证据保留在本条复现记录中。
 - **严重度 / 状态**：P2；已修复、真实浏览器复验通过并已推送。
 
 ### BROWSER-BUG-017 [P2] 自动连载首章运行期间任务中心显示“暂无连载任务”
