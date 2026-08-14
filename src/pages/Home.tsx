@@ -264,7 +264,12 @@ const Home: React.FC<HomeProps> = (props) => {
         dispatchModal({ type: "open", modal: "settings", settingsTab: String(opts?.tab ?? "") });
         break;
       case "relationships":
-        dispatchModal({ type: "open-relationship", editable: false, charId: null });
+        dispatchModal({
+          type: "open-relationship",
+          editable: false,
+          charId: null,
+          tab: opts?.tab === "关系图" ? "关系图" : undefined,
+        });
         break;
       case "taskcenter": dispatchModal({ type: "open", modal: "tasks" }); break;
       case "foreshadow": dispatchModal({ type: "open", modal: "foreshadow" }); break;
@@ -310,9 +315,10 @@ const Home: React.FC<HomeProps> = (props) => {
   }
   /** 角色与关系弹窗（底部按钮=可编辑模式；脉络/审查面板角色点击=只读模式，顶层共享同一实例渲染，避免弹窗被困在区域内部） */
   const relModal = modalState.open === "relationship" ? modalState.relationship ?? null : null;
-  const setRelModal = (value: { editable: boolean; charId: string | null } | null | ((current: { editable: boolean; charId: string | null } | null) => { editable: boolean; charId: string | null } | null)) => {
+  type RelationshipModalState = { editable: boolean; charId: string | null; tab?: "角色" | "关系图" };
+  const setRelModal = (value: RelationshipModalState | null | ((current: RelationshipModalState | null) => RelationshipModalState | null)) => {
     const next = typeof value === "function" ? value(relModal) : value;
-    if (next) dispatchModal({ type: "open-relationship", editable: next.editable, charId: next.charId });
+    if (next) dispatchModal({ type: "open-relationship", editable: next.editable, charId: next.charId, tab: next.tab });
     else dispatchModal({ type: "close" });
   };
   const [toast, setToast] = useState("");
@@ -2706,6 +2712,7 @@ const Home: React.FC<HomeProps> = (props) => {
         <RelationshipModal
           world={world}
           readOnly={!relModal.editable}
+          initialTab={relModal.tab}
           selectedCharId={relModal.editable ? undefined : relModal.charId}
           onSelectCharacter={relModal.editable ? undefined : (id) => setRelModal((m) => (m ? { ...m, charId: id } : m))}
           onSaveRelations={relModal.editable ? (chars) => saveWorld({ characters: chars }) : undefined}

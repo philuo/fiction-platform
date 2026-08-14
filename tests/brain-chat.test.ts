@@ -880,6 +880,16 @@ describe("brainChatStream（SSE 编排，事件协议 v2）", () => {
     expect(events[events.length - 1].type).toBe("done");
   });
 
+  test("意图 open_relationships → panel intent 固定打开只读关系图页签", async () => {
+    mockWorld = mkWorld();
+    nextChatContent = JSON.stringify({ intent: "open_relationships", params: {}, reply: "已打开关系图" });
+    const events = await runTurn("打开关系图，不要编辑。");
+    const card = events.find((event) => event.type === "card")?.card as Record<string, unknown>;
+    expect(card.kind).toBe("result");
+    expect(card.open).toEqual({ target: "relationships", opts: { tab: "关系图" } });
+    expect(card.panelIntent).toMatchObject({ target: "relationships", opts: { tab: "关系图" } });
+  });
+
   test("意图 advance（L2）→ delta + card(preview/confirmRequired) + card(confirm)", async () => {
     mockWorld = mkWorld();
     nextChatContent = JSON.stringify({ intent: "advance", params: {}, reply: "好的，推进剧情" });

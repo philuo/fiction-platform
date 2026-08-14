@@ -1655,6 +1655,7 @@ const OPEN_PANELS: Record<
   open_relationships: {
     title: "打开关系图", target: "relationships",
     detail: "已为你打开人物关系图，可查看各角色间的关联；点击角色可查看详情。",
+    opts: () => ({ tab: "关系图" }),
   },
   open_taskcenter: {
     title: "打开任务中心", target: "taskcenter",

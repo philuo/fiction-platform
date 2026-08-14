@@ -72,6 +72,8 @@ export const RelationshipModal: React.FC<{
   onViewPortrait?: (c: Character) => void;
   /** 只读模式：角色与关系图均不可编辑（审查面板复用）；缺省 false */
   readOnly?: boolean;
+  /** 首次打开时选中的页签；人工入口缺省为角色，中枢关系图入口显式指定关系图。 */
+  initialTab?: "角色" | "关系图";
   /** 受控选中角色 id（高亮列表项与关系图节点）；点击角色项时通过 onSelectCharacter 通知外部 */
   selectedCharId?: string | null;
   onSelectCharacter?: (id: string) => void;
@@ -101,7 +103,7 @@ export const RelationshipModal: React.FC<{
   }).current;
 
   // === UI 状态 ===
-  const [tab, setTab] = useState<"角色" | "关系图">("角色");
+  const [tab, setTab] = useState<"角色" | "关系图">(p.initialTab ?? "角色");
   const [uiSelEdge, setUiSelEdge] = useState<number | null>(null);
   const [editLabel, setEditLabel] = useState("");
   const [showAddEdge, setShowAddEdge] = useState(false);

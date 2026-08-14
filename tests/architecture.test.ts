@@ -62,4 +62,19 @@ describe("module contracts", () => {
     expect(modalReducer(open, { type: "open", modal: "brain" })).toEqual({ open: "brain" });
     expect(modalReducer(open, { type: "close" })).toEqual(initialModalState);
   });
+
+  test("relationship modal state preserves the requested initial tab", () => {
+    expect(modalReducer(initialModalState, {
+      type: "open-relationship", editable: false, charId: null, tab: "关系图",
+    })).toEqual({
+      open: "relationship",
+      relationship: { editable: false, charId: null, tab: "关系图" },
+    });
+    expect(modalReducer(initialModalState, {
+      type: "open-relationship", editable: true, charId: null,
+    })).toEqual({
+      open: "relationship",
+      relationship: { editable: true, charId: null },
+    });
+  });
 });
