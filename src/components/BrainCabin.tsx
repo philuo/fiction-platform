@@ -210,7 +210,6 @@ function fmtTime(ts: number): string {
   return `${d.getMonth() + 1}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-/** 检测 messages 中第一条含「新角色提案」浏览卡的消息 id（供 onProposalTalk 触发；纯函数便于单测） */
 /** 从 completedCards 提取某卡已完成的 itemId 集合（key 形如 "msgId:cardIndex:itemId"） */
 export function completedItemIdsOf(completed: ReadonlySet<string>, msgId: string, cardIndex: number): ReadonlySet<string> {
   const prefix = `${msgId}:${cardIndex}:`;
@@ -270,14 +269,6 @@ export function guardAction(
     if (!d || d.status !== "open") return did ? "该质量债已处理或不存在" : "缺少质量债标识";
   }
   return null;
-}
-
-export function findProposalCardMessageId(messages: ChatMessage[]): string | undefined {
-  return messages.find((m) =>
-    (m.cards ?? []).some((c) =>
-      c.kind === "browse" && c.browseType === "proposal", // 提案浏览卡（read_proposals 查询）
-    ),
-  )?.id;
 }
 
 /** 追问选择面板恢复：返回最后一条含未答 ask 卡的中枢消息（ask 卡不渲染进聊天流，显示在输入框上方；
@@ -411,8 +402,6 @@ export const BrainCabin: React.FC<{
   world: WorldState;
   brainState: BrainState | null;
   onWorldUpdate?: () => void;
-  /** 用户与中枢沟通「新角色提案」相关话题（返回提案浏览卡）→ 通知 Home 恢复底部提案区显示 */
-  onProposalTalk?: () => void;
   /** 中枢打开系统面板/弹窗（open_* 意图 result 卡带 open 字段）：target 为面板键，opts 为定位参数（如 settings tab / 角色 id） */
   onOpenPanel?: (target: string, opts?: Record<string, unknown>) => void;
   /** 左侧栏当前选中章节详情（未指定章的操作（如生成插画）默认用此章；供中枢感知选中章上下文） */
@@ -451,7 +440,7 @@ export const BrainCabin: React.FC<{
   registerIsStreaming?: (fn: (sessionId: string) => boolean) => void;
   /** 媒体参数选择经 sync WS 上行并由服务端持久化/广播到其它 Tab。 */
   syncMediaFormValues?: (payload: { sessionId: string; messageId: string; cardIndex: number; values: Record<string, unknown> }) => boolean;
-}> = ({ open, onClose, world, brainState, onWorldUpdate, onProposalTalk, onOpenPanel, currentChapter, autoRunning, buildingStage, sysTick = 0, registerCardPatch, registerCardReplace, registerBrainStatus, registerTaskStatus, onGoToMedia, registerWsStatus, registerIsStreaming, syncMediaFormValues }) => {
+}> = ({ open, onClose, world, brainState, onWorldUpdate, onOpenPanel, currentChapter, autoRunning, buildingStage, sysTick = 0, registerCardPatch, registerCardReplace, registerBrainStatus, registerTaskStatus, onGoToMedia, registerWsStatus, registerIsStreaming, syncMediaFormValues }) => {
   const storedBrainState = useBrainSyncState(world.title);
   const {
     sessions, activeId, messages, streaming, thinking, reconnecting,
@@ -641,11 +630,10 @@ export const BrainCabin: React.FC<{
   }
 
   // 打开面板卡（open_* 显式协议）→ onOpenPanel 统一分发触发对应弹窗；
-  // 用户与中枢聊「新角色提案」话题（返回提案浏览卡）→ 通知 Home 恢复底部提案区显示（无 onOpenPanel 时兼容旧回调）；
-  // 同一消息只通知一次（历史会话加载旧卡片也视为已浏览，可接受）
+  // 只有显式 open_* panelIntent 可以打开系统面板；browse 查询卡纯只读，不改变页面偏好。
   const panelConsumingRef = useRef(new Set<string>());
   useEffect(() => {
-    if (!onOpenPanel && !onProposalTalk) return;
+    if (!onOpenPanel) return;
     const open = findOpenPanelCard(messages);
     if (open && activeId && !panelConsumingRef.current.has(open.panelIntent.intentId)) {
       panelConsumingRef.current.add(open.panelIntent.intentId);
@@ -658,20 +646,10 @@ export const BrainCabin: React.FC<{
       }).then(async (response) => {
         const data = await response.json().catch(() => ({})) as { consumed?: boolean };
         if (!response.ok || !data.consumed) return;
-        if (onOpenPanel) onOpenPanel(open.panelIntent.target, open.panelIntent.opts);
-        else if (open.panelIntent.target === "proposals" && onProposalTalk) onProposalTalk();
+        onOpenPanel(open.panelIntent.target, open.panelIntent.opts);
       }).finally(() => panelConsumingRef.current.delete(open.panelIntent.intentId));
-      return;
     }
-    // 提案浏览卡属于会话内容提示，不是弹窗命令；仅恢复底部提案区。
-    if (!open && onProposalTalk) {
-      const id = findProposalCardMessageId(messages);
-      if (id && !panelConsumingRef.current.has(id)) {
-        panelConsumingRef.current.add(id);
-        onProposalTalk();
-      }
-    }
-  }, [messages, onOpenPanel, onProposalTalk]);
+  }, [messages, onOpenPanel, world.title, activeId]);
 
   // 智能滚动：仅当用户停留在底部时才跟随新内容（上翻查看历史不被打断）；发送/切换会话强制回到底部
   const stickToBottom = () => {

@@ -6,7 +6,7 @@ import React from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { act } from "react";
 import Home from "../src/pages/Home";
-import { findProposalCardMessageId } from "../src/components/BrainCabin";
+import { findOpenPanelCard } from "../src/components/BrainCabin";
 import type { BrainCard } from "../src/components/brain-cards";
 import { emptyWorld, type WorldState, type CharacterProposal } from "../src/api/world";
 import { resetSyncStores, setSystemSyncState } from "../src/components/syncStateStore";
@@ -209,36 +209,43 @@ test("抽屉内「确认入册」触发 POST /api/novel/proposal", async () => {
   await tick();
 });
 
-describe("中枢话题恢复（findProposalCardMessageId）", () => {
+describe("中枢提案查询与打开意图区分", () => {
   const proposalCard: BrainCard = {
     kind: "browse", title: "新角色提案（1 项）", browseType: "proposal", data: { list: [] },
   };
   const otherCard: BrainCard = {
     kind: "browse", title: "第3章", browseType: "chapter", data: { index: 3 },
   };
-  test("含提案浏览卡的消息被识别（用户与中枢聊「新角色提案」→ 通知 Home 恢复显示）", () => {
+  test("提案浏览卡是纯查询，不会被识别为打开面板意图", () => {
     const msgs = [
       { id: "m1", role: "user", text: "有哪些角色推荐", at: "" },
       { id: "m2", role: "brain", cards: [proposalCard], at: "" },
     ] as unknown as { id: string; cards?: BrainCard[] }[];
-    expect(findProposalCardMessageId(msgs as never)).toBe("m2");
+    expect(findOpenPanelCard(msgs as never)).toBeNull();
   });
-  test("无提案卡 → undefined（不误触发恢复）", () => {
-    const msgs = [
-      { id: "m1", role: "brain", cards: [otherCard], at: "" },
-      { id: "m2", role: "brain", cards: [], at: "" },
-      { id: "m3", role: "user", text: "再写一章", at: "" },
-    ] as unknown as { id: string; cards?: BrainCard[] }[];
-    expect(findProposalCardMessageId(msgs as never)).toBeUndefined();
-  });
-  test("旧的打开结果卡不再走本地标题兜底（由服务端迁移为可持久消费 panelIntent）", () => {
+
+  test("旧标题结果卡和普通浏览卡都不能替代持久 panelIntent", () => {
     const resultCard: BrainCard = {
       kind: "result", title: "新角色提案", success: true, detail: "已为你打开底部新角色提案面板",
     };
     const msgs = [
       { id: "m1", role: "user", text: "打开新角色提案", at: "" },
-      { id: "m2", role: "brain", cards: [resultCard], at: "" },
+      { id: "m2", role: "brain", cards: [resultCard, otherCard], at: "" },
     ] as unknown as { id: string; cards?: BrainCard[] }[];
-    expect(findProposalCardMessageId(msgs as never)).toBeUndefined();
+    expect(findOpenPanelCard(msgs as never)).toBeNull();
+  });
+
+  test("未消费的显式 panelIntent 才会打开提案面板", () => {
+    const msgs = [{
+      id: "m1", role: "brain", at: "", cards: [{
+        kind: "result", title: "打开新角色提案", success: true, detail: "已打开",
+        cardId: "card-1", panelIntent: { intentId: "panel-1", target: "proposals" },
+      }],
+    }] as unknown as { id: string; cards?: BrainCard[] }[];
+    expect(findOpenPanelCard(msgs as never)).toEqual({
+      messageId: "m1",
+      cardId: "card-1",
+      panelIntent: { intentId: "panel-1", target: "proposals" },
+    });
   });
 });

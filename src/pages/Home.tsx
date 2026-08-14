@@ -2598,7 +2598,6 @@ const Home: React.FC<HomeProps> = (props) => {
           world={world}
           brainState={brainState}
           onWorldUpdate={() => { void refreshAllStates(); }}
-          onProposalTalk={() => savePropClosed(false)}
           onOpenPanel={handleOpenPanel}
           currentChapter={shownChapter ? {
             index: shownChapter.index,
