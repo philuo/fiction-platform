@@ -41,7 +41,6 @@ type Props = {
   advanceBusy: boolean;
   /** 世界构建中阶段文案（壳就绪后后台增强蓝图/章节；非空时任务中心显示构建进度） */
   buildingStage?: string | null;
-  autoRunning: boolean; // 本页正在跑 auto SSE（运行中才可暂停）
   pendingCommitIdx: number | null; // 推进剧情待人工确认入册的章节号（SSE pending-commit 事件）
   onClose: () => void;
   onPause: () => void;
@@ -82,10 +81,10 @@ export const TaskCenterModal: React.FC<Props> = (p) => {
                 <span className="mem-char-status">{s.phase}</span>
               </div>
               <div className="task-progress"><div className="task-progress-bar" style={{ width: `${pct}%` }} /></div>
-              {(running || paused) && <StepBar phase={p.autoRunning ? (s.phase || "准备") : "已暂停"} failed={paused && !!s.failedChapter} />}
+              {(running || paused) && <StepBar phase={s.phase || (paused ? "已暂停" : "准备")} failed={paused && !!s.failedChapter} />}
               {paused && s.pauseReason && <div className="task-note task-note-warn"><AlertTriangle size={12} /> {s.pauseReason}</div>}
               <div className="task-actions">
-                {running && p.autoRunning && (
+                {running && (
                   <>
                     <button className="btn btn-ghost" onClick={p.onPause} title="章边界停下，保持会话可恢复"><Pause size={14} /> 暂停</button>
                     <button className="btn btn-danger-sm" onClick={p.onRemove} title="取消任务：立即打断并清理会话与暂存区，回到空闲状态后才可手动操作"><X size={14} /> 取消任务</button>

@@ -2549,7 +2549,6 @@ const Home: React.FC<HomeProps> = (props) => {
           advancePhase={busyPhase || advancePhase}
           advanceBusy={advanceTaskIsBusy(busy, autoRunning, advancePhase)}
           buildingStage={buildingStage}
-          autoRunning={autoRunning}
           pendingCommitIdx={pendingCommitIdx}
           onClose={() => setShowTaskCenter(false)}
           onPause={pauseAutoRun}
