@@ -12,6 +12,8 @@ import {
   recoverRunningMediaCards,
   registerSessionTask,
 } from "../src/api/brain-sessions";
+import { videoRegenerationNeedsResume } from "../src/api/media-recovery";
+import type { DurableJob } from "../src/api/control-plane";
 
 const TITLE = "media-recovery-test";
 let dataDir = "";
@@ -148,6 +150,21 @@ describe("recoverRunningMediaCards — 重启后 running 卡收敛", () => {
     expect(r2.planFailed).toBe(0);
     expect(r2.mediaFailed).toBe(0);
     expect(r2.stuckFailed).toBe(0);
+  });
+});
+
+describe("视频重生成启动恢复", () => {
+  test("旧 path 仅作 rollback：匹配新 videoId 的失败 watcher 仍需恢复轮询", () => {
+    const media = { id: "m1", videoId: "provider-new", path: "videos/old.mp4" };
+    const failed = {
+      id: "regen-1", user: "tester", title: TITLE, kind: "media-regenerate",
+      dedupeKey: "media-regenerate:m1", status: "failed", phase: "failed", updatedAt: new Date().toISOString(),
+      recovery: { mediaId: "m1", chapterIndex: 1, videoId: "provider-new", rollback: { oldVideoId: "provider-old", oldPath: "videos/old.mp4" } },
+    } as DurableJob;
+    expect(videoRegenerationNeedsResume(media, [failed])).toBe(true);
+    expect(videoRegenerationNeedsResume({ ...media, path: "videos/new.mp4" }, [failed])).toBe(false);
+    expect(videoRegenerationNeedsResume(media, [{ ...failed, status: "succeeded" }])).toBe(false);
+    expect(videoRegenerationNeedsResume(media, [{ ...failed, recovery: { ...(failed.recovery as object), videoId: "other" } }])).toBe(false);
   });
 });
 

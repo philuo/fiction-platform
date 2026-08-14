@@ -15,6 +15,7 @@ import { withTitleLock } from "./titlelock";
 import { touchChapter, type WorldState } from "./world";
 import { applyStateChange } from "./statechange";
 import { recoverRunningMediaCards } from "./brain-sessions";
+import { listJobs, type DurableJob } from "./control-plane";
 
 const VIDEO_STALE_MS = 30 * 60_000;
 
@@ -23,11 +24,30 @@ type RecoverTally = {
   cards: ReturnType<typeof recoverRunningMediaCards>;
 };
 
+type RecoverableVideo = { id?: string; videoId?: string; path?: string };
+
+/** A regeneration keeps the old path playable while a different videoId is pending.
+ * That rollback path is not proof that the replacement finished. */
+export function videoRegenerationNeedsResume(media: RecoverableVideo, jobs: DurableJob[]): boolean {
+  if (!media.id || !media.videoId || !media.path) return false;
+  return jobs.some((job) => {
+    if (job.kind !== "media-regenerate" || ["succeeded", "cancelled"].includes(job.status)) return false;
+    const recovery = job.recovery && typeof job.recovery === "object"
+      ? job.recovery as { mediaId?: string; videoId?: string; rollback?: { oldPath?: string } }
+      : null;
+    if (!recovery) return false;
+    return recovery.mediaId === media.id
+      && recovery.videoId === media.videoId
+      && recovery.rollback?.oldPath === media.path;
+  });
+}
+
 /** 收敛单本书：返回翻转数量（供日志） */
 async function recoverStory(title: string, resumePendingVideos: (title: string) => void): Promise<RecoverTally> {
   const tally = { imgReady: 0, imgFailed: 0, vidFailed: 0, vidKept: 0 };
   const mediaStatusById = new Map<string, string>();
   const now = Date.now();
+  const jobs = listJobs(currentUser(), title);
 
   await withTitleLock(slug(title), async () => {
     const w = loadWorld(title);
@@ -35,7 +55,17 @@ async function recoverStory(title: string, resumePendingVideos: (title: string) 
     let dirty = false;
     for (const ch of w.chapters) {
       for (const m of ch.media ?? []) {
-        if (m.status !== "pending" || !m.id) continue;
+        if (!m.id) continue;
+        const regeneratingVideo = m.kind === "video" && videoRegenerationNeedsResume(m, jobs);
+        if (m.status === "ready" && regeneratingVideo) {
+          // Older builds could fail after swapping the new provider videoId, then a restart
+          // mistook the retained rollback file for the new result. Restore the safe watcher state.
+          m.status = "pending";
+          dirty = true;
+          touchChapter(w, ch.index);
+          applyStateChange(w, { actor: "system", commandId: "CMD-M04", field: "chapters[].media", reason: `启动恢复：第 ${ch.index} 章视频重生成继续轮询（${m.id}）`, chapter: ch.index });
+        }
+        if (m.status !== "pending") continue;
         if (m.kind === "image") {
           if (m.path) {
             m.status = "ready";
@@ -57,7 +87,7 @@ async function recoverStory(title: string, resumePendingVideos: (title: string) 
             dirty = true;
             touchChapter(w, ch.index);
             applyStateChange(w, { actor: "system", commandId: "CMD-M04", field: "chapters[].media", reason: `启动恢复：第 ${ch.index} 章视频任务收敛（${m.id}）`, chapter: ch.index });
-          } else if (m.path) {
+          } else if (m.path && !regeneratingVideo) {
             m.status = "ready";
             m.error = undefined;
             tally.imgReady++;
