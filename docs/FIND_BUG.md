@@ -23,7 +23,11 @@
 - **预期**：只要权威 auto session 为 running，任务中心就应提供暂停和取消任务；这些控制是服务端持久命令，不应依赖当前 Tab 是否持有原 SSE reader。
 - **实际 / 证据**：任务中心已正确显示“连载中 · 0/1 章 · 第 1 章重试中”，SQLite job `cdf070bd-0e1f-4883-ad53-43c8b7fd7301` 为 running；但任务中心没有“暂停/取消任务”，只剩“处理暂存章节”。
 - **影响范围**：刷新、关闭重开、服务重启恢复以及由非消费式恢复请求启动的自动连载；用户无法从任务中心停止后台任务。
-- **严重度 / 状态**：P2；待修复。
+- **根因 / 修复**：任务中心把权威 `session.status=running` 与当前 Tab 的本地 `autoRunning`（仅原 SSE reader 存活时为 true）共同作为控制按钮条件，刷新或恢复后因此隐藏控制。移除该本地 prop 依赖：running session 始终提供暂停/取消，步骤阶段直接使用权威 session phase；Home 不再向任务中心传递连接局部状态。
+- **回归与门禁**：新增 `tests/task-center-modal.test.tsx`，直接渲染“只有恢复 session、没有本地 SSE reader”的任务中心并断言暂停/取消与真实阶段均可见。最终 `bun run check` 为 715 pass / 0 fail（3987 assertions），49 个公开命令架构检查、typecheck、client/SSR build、额外 `bun run build` 与 `git diff --check` 全部通过。
+- **真实浏览器复验**：在《纸月邮局》通过真实“推进剧情 → 章节连载”启动目标 1 章，运行中刷新页面以丢弃原 Tab SSE reader；刷新后的底栏从权威 snapshot 恢复“连载·第 1 章重试中”，打开任务中心显示 `连载中 · 0/1 章`、真实阶段以及“暂停”“取消任务”两个可用按钮。随后真实点击“取消任务”，页面立即解除只读锁并回到“推进剧情”；应用 console warning/error 为 0。
+- **commit / push**：`4faff2b`；已推送到 `origin/codex/brain-reliability-ui`。
+- **严重度 / 状态**：P2；已修复、真实浏览器复验通过并已推送。
 
 ### BROWSER-BUG-018 [P2] 自动连载审查暂停被顶层 job 覆盖成 done
 
