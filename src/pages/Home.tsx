@@ -224,12 +224,12 @@ const Home: React.FC<HomeProps> = (props) => {
   const syncedLibrary = useLibrarySyncState();
   const [busy, setBusy] = useState(false);
   const [busyPhase, setBusyPhase] = useState("");
-  // 初始选中章节：SSR 预载时按 URL chapter（服务端）恢复 → localStorage 上次选中 → 第一章。
-  // localStorage 仅增强阅读位置恢复；服务端 chapter 缺失自动忽略（resolveInitialChapter 兜底）
+  // Hydration 首帧只能使用 SSR 已知数据；localStorage 阅读位置在挂载后的 effect 中恢复。
+  // 否则服务端默认第一章、客户端首帧读取缓存章节，会让 Masthead 发生 hydration mismatch。
   const [activeIdx, setActiveIdx] = useState(() => {
     if (!props.initialData?.world) return -1;
     const w = props.initialData.world;
-    return resolveInitialChapter(w, props.initialData?.chapter ?? loadReadingPref(w.title));
+    return resolveInitialChapter(w, props.initialData?.chapter);
   }); // -1 = 无章节
   const [modalState, dispatchModal] = useReducer(modalReducer, initialModalState);
   const showGacha = modalState.open === "gacha";
@@ -489,6 +489,20 @@ const Home: React.FC<HomeProps> = (props) => {
     else u.searchParams.delete("chapter");
     window.history.replaceState(null, "", u.pathname + u.search);
   }
+
+  // 客户端挂载后再恢复本地阅读位置，保持 SSR 与 hydrate 首帧完全一致。
+  // URL chapter 由 SSR 注入且始终优先；只有 URL 未指定章节时才应用本地偏好。
+  useEffect(() => {
+    const initialWorld = props.initialData?.world;
+    if (!initialWorld || props.initialData?.chapter != null) return;
+    const preferred = loadReadingPref(initialWorld.title);
+    if (preferred == null) return;
+    const resolved = resolveInitialChapter(initialWorld, preferred);
+    setActiveIdx(resolved);
+    setStoryUrl(initialWorld.title, resolved > 0 ? resolved : undefined);
+    // initialData 是服务端启动快照，只需在首次 hydration 后恢复一次。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // 打开已有小说
   async function openStory(title: string, triggeringLibrary?: { stories: { title: string }[] }) {

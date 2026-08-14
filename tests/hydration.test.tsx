@@ -62,9 +62,10 @@ const homeProps = (world: WorldState) => ({
 const tick = () => new Promise<void>((r) => setTimeout(r, 50));
 
 /** 在 happy-dom 中把 SSR HTML 写进 #root，再 hydrateRoot，捕获 hydration mismatch 警告 */
-async function captureHydrationWarnings(html: string, clientWorld: WorldState): Promise<string[]> {
+async function captureHydration(html: string, clientWorld: WorldState): Promise<{ warnings: string[]; issue: string }> {
   win.document.body.innerHTML = `<div id="root">${html}</div>`;
   const warnings: string[] = [];
+  let issue = "";
   const origError = console.error;
   const record = (s: string) => {
     if (/hydrat|did not match|mismatch/i.test(s)) warnings.push(s);
@@ -82,6 +83,7 @@ async function captureHydrationWarnings(html: string, clientWorld: WorldState): 
     );
     try {
       await tick(); // 等 hydrate 完成（React 19 hydrate 是异步的；过早操作会触发 early-update 降级）
+      issue = win.document.querySelector(".issue")?.textContent ?? "";
     } finally {
       root.unmount();
     }
@@ -91,23 +93,23 @@ async function captureHydrationWarnings(html: string, clientWorld: WorldState): 
   } finally {
     console.error = origError;
   }
-  return warnings;
+  return { warnings, issue };
 }
 
 describe("SSR ↔ hydrate 一致性（hydration mismatch 防护）", () => {
   test("weary presence（≥8 条 open 质量债）：SSR 与 client 首帧一致，无 mismatch", async () => {
     const html = renderToString(React.createElement(Home, homeProps(mkWorld(23))));
     expect(html).toContain('stroke="#7a6f5e"'); // weary 色
-    const warnings = await captureHydrationWarnings(html, mkWorld(23));
-    expect(warnings).toEqual([]);
+    const result = await captureHydration(html, mkWorld(23));
+    expect(result.warnings).toEqual([]);
   });
 
   test("standby presence（2 条 open 质量债）：SSR 与 client 首帧一致，无 mismatch", async () => {
     const html = renderToString(React.createElement(Home, homeProps(mkWorld(2))));
     expect(html).toContain('data-presence="standby"');
     expect(html).toContain('stroke="#7a6f5e"'); // 深色控制条上的可见色
-    const warnings = await captureHydrationWarnings(html, mkWorld(2));
-    expect(warnings).toEqual([]);
+    const result = await captureHydration(html, mkWorld(2));
+    expect(result.warnings).toEqual([]);
   });
 
   test("自检：SSR 与 client 输入不一致（weary ↔ standby 漂移）时渲染输出可检测出差异", () => {
@@ -122,5 +124,24 @@ describe("SSR ↔ hydrate 一致性（hydration mismatch 防护）", () => {
     expect(clientHtml).toContain('data-presence="standby"');
     expect(clientHtml).toContain('stroke="#7a6f5e"');
     expect(serverHtml).not.toBe(clientHtml); // presence 与文案仍可检测出输入漂移
+  });
+
+  test("localStorage 保存第 2 章时首帧仍与 SSR 一致，挂载后再恢复阅读位置", async () => {
+    const world = mkWorld(2);
+    world.chapters.push({ index: 2, title: "第二章", text: "第二章正文", review: null });
+    win.localStorage.setItem("fp_reading_prefs", JSON.stringify({
+      [world.title]: { chapter: 2, updatedAt: Date.now() },
+    }));
+    try {
+      const html = renderToString(React.createElement(Home, homeProps(world)));
+      win.document.body.innerHTML = `<div id="server-root">${html}</div>`;
+      expect(win.document.querySelector(".issue")?.textContent).toContain("1");
+
+      const result = await captureHydration(html, world);
+      expect(result.warnings).toEqual([]);
+      expect(result.issue).toContain("2");
+    } finally {
+      win.localStorage.removeItem("fp_reading_prefs");
+    }
   });
 });
