@@ -4,7 +4,7 @@ import * as anysearch from "./anysearch";
 import * as director from "./director";
 import { buildBlueprint, confirmBlueprint, expandArc, type BlueprintOption } from "./planner";
 import * as steering from "./steering";
-import { runAuto, stopAuto, pauseAuto } from "./autorun";
+import { autoReportJobOutcome, runAuto, stopAuto, pauseAuto } from "./autorun";
 import { evaluateBookCached } from "./eval";
 import { extractFingerprint } from "./style";
 import { loadWorld, listStories, deleteStory, exportMarkdown, exportEpub, slugify as slug, saveWorld, storyDir, storyExists, loadAutoSession, saveAutoSession, clearAutoSession, loadPendingChapter, clearPendingChapter, currentUser, migrateLegacyStoriesTo, runAsUser, userDir } from "./storage";
@@ -2394,7 +2394,8 @@ export async function handleNovelApi(pathname: string, req: Request): Promise<Re
             (e) => send(e),
             initialWritten,
           );
-          updateJob(durableAuto.job.id, { status: "succeeded", phase: "done", result: report });
+          const outcome = autoReportJobOutcome(report);
+          updateJob(durableAuto.job.id, { ...outcome, result: report, error: outcome.error ?? null });
           send({ phase: "auto-done", report });
         } catch (error) {
           updateJob(durableAuto.job.id, { status: "failed", phase: "failed", error: errorDetail(error, "自动连载失败") });

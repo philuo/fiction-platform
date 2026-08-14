@@ -36,6 +36,32 @@ export type AutoReport = {
   failedChapter?: number;
 };
 
+/** Map the loop exit reason to the durable invocation terminal state. */
+export function autoReportJobOutcome(report: AutoReport): {
+  status: "succeeded" | "failed" | "interrupted" | "cancelled";
+  phase: "done" | "paused" | "stopped" | "failed" | "interrupted" | "cancelled";
+  error?: string;
+} {
+  switch (report.reason) {
+    case "done":
+    case "complete":
+      return { status: "succeeded", phase: "done" };
+    case "review":
+    case "paused":
+      return { status: "succeeded", phase: "paused" };
+    case "score":
+      return { status: "succeeded", phase: "stopped" };
+    case "stopped":
+      return { status: "cancelled", phase: "cancelled", error: "自动连载已停止" };
+    case "interrupted":
+      return { status: "interrupted", phase: "interrupted", error: "自动连载被中断" };
+    case "quota":
+      return { status: "failed", phase: "failed", error: "自动连载因额度或限流停止" };
+    case "error":
+      return { status: "failed", phase: "failed", error: "自动连载连续失败" };
+  }
+}
+
 type AutoControlIntent = "stop" | "pause";
 function setControlIntent(title: string, intent?: AutoControlIntent): void {
   const job = findLatestJob(currentUser(), "auto", title);

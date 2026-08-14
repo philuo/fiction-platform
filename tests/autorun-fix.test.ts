@@ -64,7 +64,7 @@ installMockAgnes((messages) => {
 const { emptyWorld, DEFAULT_GEN } = await import("../src/api/world");
 const { saveWorld, loadWorld, readLastCheckpoint, loadPendingChapter, loadAutoSession, saveAutoSession } = await import("../src/api/storage");
 const { writeOneChapter, regenerateChapter, retryChapter, ReviewFailedError, InterruptedError } = await import("../src/api/director");
-const { runAuto } = await import("../src/api/autorun");
+const { autoReportJobOutcome, runAuto } = await import("../src/api/autorun");
 const { requestInterrupt } = await import("../src/api/steering");
 const { subscribeSync } = await import("../src/api/sync");
 
@@ -99,6 +99,14 @@ function makeWorld(title: string) {
 }
 
 describe("自动连载修复回归", () => {
+  test("连载退出原因映射到真实 job 终态，不把暂停/失败写成 done", () => {
+    expect(autoReportJobOutcome({ written: 0, reason: "review", avgScore: null })).toEqual({ status: "succeeded", phase: "paused" });
+    expect(autoReportJobOutcome({ written: 0, reason: "quota", avgScore: null })).toEqual({ status: "failed", phase: "failed", error: "自动连载因额度或限流停止" });
+    expect(autoReportJobOutcome({ written: 0, reason: "interrupted", avgScore: null })).toEqual({ status: "interrupted", phase: "interrupted", error: "自动连载被中断" });
+    expect(autoReportJobOutcome({ written: 0, reason: "stopped", avgScore: null })).toEqual({ status: "cancelled", phase: "cancelled", error: "自动连载已停止" });
+    expect(autoReportJobOutcome({ written: 1, reason: "done", avgScore: 8 })).toEqual({ status: "succeeded", phase: "done" });
+  });
+
   test("连载开始立即广播 running session，首章期间任务中心可恢复", async () => {
     const TITLE = "首帧同步测试";
     makeWorld(TITLE);
