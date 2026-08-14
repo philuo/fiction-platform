@@ -2,6 +2,20 @@
 
 ## 2026-08-14 真实浏览器深度验收（第二批）
 
+### BROWSER-BUG-021 [P1] 已停止连载的晚到 session 被误建为匿名新 job
+
+- **首次发现**：2026-08-14 17:24（Asia/Shanghai）。
+- **场景 / testId / Tab**：`ASYNC-AUTO-CANCEL-LATE-NEW-JOB-01`，真实 UI 启动目标 1 章后点击“停止连载”，原 job/receipt 已 cancelled，继续等待真实 provider 返回。
+- **预期**：同一运行轮次的晚到 `touchSession` 必须被终态会话丢弃；只有新的用户启动命令才能创建下一轮 auto job，且新 job 必须关联该命令。
+- **实际 / 证据**：原 job `57423728-03d0-4604-a437-99d53e4427d9`（command `a7a14645-bb50-4ddf-8328-28ec6e877346`）保持 cancelled；真实 provider 晚到后，`saveAutoSession` 在 1ms 后创建匿名 running job `fe934776-d669-4ae9-a396-ee06b610f53b`，`command_id` 为空、phase=`连载开始`。权威章节仍为 0，但刷新会重新出现运行锁。
+- **影响范围**：所有停止/取消后的连载晚到阶段更新；会产生无命令来源的幽灵任务、重复恢复和 UI 永久锁定，且绕过原 job 的终态单调保护。
+- **后续真实结果**：继续等待 provider 后，匿名 job 最终变成 `succeeded/连载结束（done）` 并写入第 1 章；原 cancelled command 没有任何 receipt 能关联这次成功副作用，证明问题不只是短暂 UI 状态，而是命令审计和执行归属断裂。
+- **根因 / 修复**：`saveAutoSession` 为支持“上一轮终态后重新开始”会在看到 terminal latest job 时创建新 job，但 `runAuto` 没有绑定路由已创建的 durable job，也没有区分“新用户命令”与“同一轮次晚到阶段”。新增 `AutoOptions.jobId`，真实路由和服务重启恢复都把 durable jobId 传入；provider 开始前若该 job 已 succeeded/failed/interrupted/cancelled，直接返回相应报告且 provider 调用数为 0。`touchSession` 同时拒绝 stopped/done 会话的晚到合并，封住执行中停止后的第二条复活路径。
+- **回归与门禁**：`tests/autorun-fix.test.ts` 新增两条完整流程回归：执行器已进入后 stop，释放晚到章节阶段仍只有一条 cancelled job；绑定 job 在 provider 开始前已 cancelled 时执行器调用数为 0、不得创建新轮次。`tests/resume.test.ts` 的断点续跑、pause 和 stop 语义保持通过。最终 `bun run check` 为 717 pass / 0 fail（3995 assertions），49 个公开命令架构检查、typecheck、client/SSR build、额外 `bun run build` 与 `git diff --check` 全部通过。
+- **真实浏览器复验**：修复构建中，《纸月邮局》已有 1 章，真实 UI 以绝对目标 2 章启动连载并在第 2 章 provider 阶段立即点击“停止连载”。唯一新 job `fc40b06e-df4f-4c8c-a863-ad0f56d2d71a` 始终关联 command `d19bda4e-f7ad-44b9-abc3-6a02ec820f62` 并为 cancelled；精确停止服务再重启后，auto job 最大 rowid 仍为 77，没有匿名新行，权威章节仍为 1，页面空闲且 console warning/error 为 0。
+- **commit / push**：`8008c93`；已推送到 `origin/codex/brain-reliability-ui`。
+- **严重度 / 状态**：P1；已修复、真实浏览器复验通过并已推送。
+
 ### BROWSER-BUG-020 [P1] 已取消 auto job 被晚到审查帧回滚为 paused
 
 - **首次发现**：2026-08-14 13:31（Asia/Shanghai）。
