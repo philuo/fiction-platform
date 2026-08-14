@@ -2,6 +2,24 @@
 
 ## 2026-08-14 真实浏览器深度验收（第二批）
 
+### BROWSER-BUG-019 [P2] 刷新或后台恢复的自动连载没有暂停/取消控制
+
+- **首次发现**：2026-08-14 13:16（Asia/Shanghai）。
+- **场景 / testId / Tab**：`ASYNC-AUTO-REFRESH-CONTROL-01`，重启隔离服务后从持久 paused session 恢复自动连载，并立即打开任务中心。
+- **预期**：只要权威 auto session 为 running，任务中心就应提供暂停和取消任务；这些控制是服务端持久命令，不应依赖当前 Tab 是否持有原 SSE reader。
+- **实际 / 证据**：任务中心已正确显示“连载中 · 0/1 章 · 第 1 章重试中”，SQLite job `cdf070bd-0e1f-4883-ad53-43c8b7fd7301` 为 running；但任务中心没有“暂停/取消任务”，只剩“处理暂存章节”。
+- **影响范围**：刷新、关闭重开、服务重启恢复以及由非消费式恢复请求启动的自动连载；用户无法从任务中心停止后台任务。
+- **严重度 / 状态**：P2；待修复。
+
+### BROWSER-BUG-018 [P2] 自动连载审查暂停被顶层 job 覆盖成 done
+
+- **首次发现**：2026-08-14 13:15（Asia/Shanghai）。
+- **场景 / testId**：`ASYNC-AUTO-01`，目标 1 章的真实自动连载经过 provider 重试后审查未通过，草稿进入暂存区。
+- **预期**：顶层 job 的 phase/result 应明确表达策略暂停，不得显示目标完成；额度、错误、取消、中断也必须映射到各自终态，receipt 不得虚假成功。
+- **实际 / 证据**：job `e4fc94df-6a13-44de-aee1-6654e08ee68e` 的 `progress_json.status=paused`、`phase=第 1 章审查未通过，等待处理`、`result.reason=review`、章节仍为 0；路由随后无条件把顶层 job 覆盖成 `succeeded/done`，command receipt `39fcea23-757d-4f02-bfc2-055f743c8d12` 也为 succeeded。
+- **影响范围**：所有 auto 的 review/paused/quota/error/interrupted/stopped 终止原因；任务中心、审计和命令回执可能把未完成或失败误报为 done。
+- **严重度 / 状态**：P2；待修复。
+
 ### BROWSER-BUG-017 [P2] 自动连载首章运行期间任务中心显示“暂无连载任务”
 
 - **首次发现**：2026-08-14 12:59（Asia/Shanghai）。
