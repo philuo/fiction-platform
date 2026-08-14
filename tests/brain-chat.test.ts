@@ -598,6 +598,30 @@ describe("buildFormCard（表单卡构建）", () => {
     }
   });
 
+  test("账号隔离说明只陈述可证明的应用边界", async () => {
+    expect(explicitCapabilityQuery("解释你为什么不能直接访问其他账号的数据。"))
+      .toMatchObject({ intent: "read_help", params: { topic: "account_isolation" } });
+
+    mockWorld = mkWorld();
+    let cloudCalls = 0;
+    const original = brainChatDeps.chatJson;
+    brainChatDeps.chatJson = (async () => { cloudCalls += 1; throw new Error("cloud should not run"); }) as typeof brainChatDeps.chatJson;
+    try {
+      const events = await runTurn("解释你为什么不能直接访问其他账号的数据。", { sessionId: "account-isolation-fast-path" });
+      expect(cloudCalls).toBe(0);
+      const text = events.filter((event) => event.type === "delta").map((event) => String(event.text ?? "")).join("\n");
+      const card = events.find((event) => event.type === "card")?.card as { title?: string; detail?: string } | undefined;
+      expect(card?.title).toBe("账号数据隔离");
+      expect(card?.detail).toContain("登录会话");
+      expect(card?.detail).toContain("数据目录");
+      expect(card?.detail).toContain("WebSocket");
+      expect(`${text}\n${card?.detail ?? ""}`).not.toContain("密钥分离");
+      expect(`${text}\n${card?.detail ?? ""}`).not.toContain("物理上无法读取");
+    } finally {
+      brainChatDeps.chatJson = original;
+    }
+  });
+
   test("非表单意图 → null", () => {
     const w = mkWorld();
     expect(buildFormCard(w, "advance", {})).toBeNull();
