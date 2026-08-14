@@ -813,6 +813,32 @@ describe("brainChatStream（SSE 编排，事件协议 v2）", () => {
     }
   });
 
+  test("开放聊天把下一章绑定到权威 nextChapter，不把已写第 2 章当待写章", async () => {
+    mockWorld = mkWorld();
+    mockWorld.chapters.push({ index: 2, title: "覆水", text: "第二章正文", review: null });
+    mockWorld.nextChapter = 3;
+    let sentMessages: ChatMessage[] = [];
+    const original = brainChatDeps.chatStream;
+    brainChatDeps.chatStream = (async (messages: ChatMessage[], onChunk: (d: string) => void) => {
+      sentMessages = messages;
+      onChunk("第 3 章应先收紧调查节奏。");
+      return "第 3 章应先收紧调查节奏。";
+    }) as typeof brainChatDeps.chatStream;
+    nextChatContent = JSON.stringify({ intent: "chat", params: {}, reply: "" });
+    try {
+      const events = await runTurn("不要推进剧情，我只想听你分析下一章的节奏。", { sessionId: "next-chapter-grounding" });
+      expect(sentMessages[0]?.content).toContain("下一章");
+      expect(sentMessages[0]?.content).toContain("下一待写章");
+      expect(sentMessages[1]?.content).toContain("第 1 章「第一章」、第 2 章「覆水」");
+      expect(sentMessages[1]?.content).toContain("下一待写章：第 3 章（尚未写作）");
+      expect(events.filter((event) => event.type === "card")).toHaveLength(0);
+      expect(events.filter((event) => event.type === "delta").map((event) => String(event.text ?? "")).join(""))
+        .toContain("第 3 章");
+    } finally {
+      brainChatDeps.chatStream = original;
+    }
+  });
+
   test("意图 read_chapter → delta(reply) + card(browse) + done", async () => {
     mockWorld = mkWorld();
     nextChatContent = JSON.stringify({ intent: "read_chapter", params: { index: 1 }, reply: "为你打开第一章" });

@@ -159,6 +159,8 @@ const INTENT_ENUM = Object.keys(INTENTS);
 function worldSummary(w: WorldState): string {
   const lines = [
     `《${w.title}》(${w.genre})，已写 ${w.chapters.length} 章`,
+    `已写章节：${w.chapters.length ? [...w.chapters].sort((a, b) => a.index - b.index).map((chapter) => `第 ${chapter.index} 章「${chapter.title}」`).join("、") : "无"}`,
+    `下一待写章：第 ${w.nextChapter} 章（尚未写作）`,
     `角色 ${w.characters.length} 个：${w.characters.slice(0, 6).map((c) => c.name).join("、")}`,
     `伏笔 ${w.foreshadowing.length} 条（活跃 ${w.foreshadowing.filter((f) => f.status !== "resolved").length}）`,
   ];
@@ -1036,7 +1038,8 @@ const CHAT_SYSTEM = `你是小说创作引擎「墨枢」的中枢（brain），
 回答要求：
 - 自然、简洁、有判断力；创作建议给出具体可行的方案
 - 可使用 Markdown 组织内容（标题/列表/表格/引用/代码块/图片 ![]()），便于前端渲染
-- 涉及多方案取舍时先给出推荐并简述理由`;
+- 涉及多方案取舍时先给出推荐并简述理由
+- “下一章”必须解析为权威上下文标注的“下一待写章”；不得把已写章节当成待写章节，也不得分析尚不存在的旧章内容`;
 
 /**
  * LLM/存储依赖注入点（测试替身用）：生产默认走真实实现；
