@@ -20,7 +20,10 @@
 - **实际 / 证据**：回复称支持 Markdown、EPUB、PDF、TXT 四种格式，还宣称存在“导出含批注版”和“分卷导出”选项。代码核对显示 `src/api/routes.ts` 的 `/api/novel/export` 仅对 `format=epub` 输出 EPUB，其余输出 Markdown；`src/pages/Home.tsx` 与 `SettingsModal.tsx` 的 UI 也只提供这两种。截图：`/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-030-export-capability-hallucination.jpg`。本例没有触发下载，否定约束通过。
 - **影响范围**：中枢帮助、能力清单、导出说明及其他产品能力问答；用户会寻找不存在的功能，甚至基于错误格式承诺安排交付流程。
 - **初步根因**：能力问答走开放聊天而非仓库定义的 command/capability registry；provider 根据通用写作产品惯例补全了不存在的功能。
-- **严重度 / 状态**：P2；待修复。
+- **修复**：`6080a0c`（`fix: ground export capability replies`）新增本地产品能力查询快路径，将导出格式问法固定路由到 `read_help(topic=export_formats)`；权威结果只列 Markdown/EPUB，并明确排除 PDF、TXT、批注版与分卷导出，且不携带下载 action。
+- **自动验证**：新增快路径识别与完整回合测试，验证不调用云端分类器、不产生 action；定向 `tests/brain-chat.test.ts` 为 `95 pass / 0 fail`；完整 `bun run check` 为 `722 pass / 0 fail / 4030 assertions`，架构检查、类型检查、客户端与 SSR 构建全部通过；`git diff --check` 通过。
+- **浏览器复验**：隔离生产服务重启后重放原句，正文显示“当前支持 Markdown（.md）和 EPUB（.epub）两种导出格式；这次只说明能力，不会开始下载”，权威结果卡同步说明不支持其余虚构选项；未触发下载，应用 console warning/error 为 0。截图：`/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-030-verify.jpg`。
+- **严重度 / 状态**：P2；已修复并推送（修复 SHA：`6080a0c`）。
 
 ### BROWSER-BUG-029 [P2] “打开关系图”只打开角色弹窗且停在错误页签
 
