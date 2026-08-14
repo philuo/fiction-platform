@@ -2,6 +2,21 @@
 
 ## 2026-08-14 真实浏览器深度验收（第二批）
 
+### BROWSER-BUG-033 [P2] 阅读位置缓存导致刷新时 React hydration mismatch
+
+- **首次发现**：2026-08-14 12:38（Asia/Shanghai）。
+- **场景 / testId**：`ASYNC-MEDIA-REGENERATE-REFRESH-02`、`ASYNC-MEDIA-REGENERATE-RESTART-03`；Tab A，同账号《雾港电台》，先在真实页面选择第 2 章，再于不含 `chapter` 参数的故事 URL 刷新。
+- **复现步骤**：1）在左侧目录选择第 2 章，使 `fp_reading_prefs` 保存阅读位置；2）保持 URL 仅含 `title=雾港电台`；3）刷新页面；4）检查首屏刊头与应用 console；服务重启后再次刷新可稳定复现。
+- **预期**：服务端 HTML 与客户端 hydrate 首帧使用同一章节，hydrate 完成后再恢复本地阅读偏好；应用 console warning/error 为 0。
+- **实际 / 证据**：服务端 `Masthead > .issue` 渲染“第 1 章”，客户端首次 render 直接读取 `localStorage` 并渲染“第 2 章”，React 两次报告 hydration mismatch（约 12:38:40、12:42:31，差异为 `+ 2 / - 1`）。重启恢复截图 `/tmp/moshift-realqa-Dl0cXq/evidence/ASYNC-media-regenerate-restart.jpg`；该错误是应用 console，不属于已排除的 Statsig telemetry 噪声。
+- **影响范围**：任何保存过非首章阅读位置、随后通过不带 `chapter` 的故事 URL 刷新或重新进入的用户；React 会丢弃服务端树并在客户端重建，造成首屏闪动、额外渲染及事件绑定失效风险。
+- **根因**：`Home` 的 `activeIdx` initializer 在 SSR 无法访问 `localStorage`，客户端 hydrate 时却调用 `loadReadingPref`；同一 `initialData` 因运行环境不同产生不同首帧。
+- **修复**：首次 state initializer 仅使用 SSR 注入的 URL chapter（缺省回退第一章），把 `localStorage` 阅读位置恢复移到挂载后的 effect；effect 不覆盖显式 URL chapter，并把恢复后的章节规范化回 URL。
+- **回归与门禁**：`tests/hydration.test.tsx` 新增两章世界与第 2 章本地偏好，断言 SSR 首帧为第 1 章、hydrate 无 mismatch、effect 后切到第 2 章；定向测试 4 pass / 0 fail，`bun run check` 746 pass / 0 fail（4153 assertions），49 个公开命令架构检查、typecheck、client/SSR build 与 `git diff --check` 均通过。
+- **commit / push**：`d131df7`；已推送到 `origin/codex/brain-reliability-ui`。
+- **真实浏览器复验**：新生产 bundle 中通过同一浏览器已保存的第 2 章偏好打开仅含 `title=雾港电台` 的 URL，页面在 hydrate 后稳定显示第 2 章并规范化为 `chapter=2`；新开干净标签页的应用 console warning/error 为 0。相邻控制场景显式打开 `chapter=1` 后仍保持第 1 章，URL 优先级通过。证据图 `/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-033-verify-clean.jpg`；原 Tab 仅保留 12:38/12:42 两条旧 bundle 历史错误，复验后计数未增加。
+- **严重度 / 当前状态**：P2；已修复、真实浏览器复验通过并已推送。
+
 ### BROWSER-BUG-032 [P1] 同一 Brain session 双 Tab 并发提问时后到消息被静默吞掉
 
 - **首次发现**：2026-08-14 20:23（Asia/Shanghai）。
