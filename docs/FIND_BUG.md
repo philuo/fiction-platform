@@ -43,7 +43,10 @@
 - **实际 / 证据**：命令立即显示“已完成 / 执行成功”，但没有任何巡检结果、冲突列表或“未发现冲突”结论；同一卡片完成后仍保留两处“已准备……当前尚未执行”，与“已完成”终态直接矛盾。截图：`/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-028-readonly-result-missing.jpg`。
 - **影响范围**：一致性巡检及可能复用通用 preview/confirm/result 卡的其他只读 AI 长操作；用户无法判断命令真正检查了什么，也无法凭终态卡确认结果。
 - **初步根因**：通用 Brain action 完成处理只把 HTTP 成功映射为“执行成功”，未把命令业务响应渲染为 result/browse 卡；完成态沿用 preview 阶段静态正文，没有随状态替换。
-- **严重度 / 状态**：P2；待修复。
+- **修复**：`b3e775e`（`fix: show consistency scan results`）让 Brain 动作响应识别 `/api/novel/integrity` 的结构化 `report`：无发现时显示“未发现问题”，有发现时显示 finding、自动修复和孤儿媒体数量以及前 3 条 issue。Preview 成功态以终态 `detail` 替换预览 `summary`；刷新恢复时，如果消息正文与已成功 Preview 的旧摘要重复，则隐藏该正文，避免“已完成”和“尚未执行”并存。失败态和含额外说明的正文保持可见。
+- **自动验证**：`tests/brain-action-response.test.ts` 覆盖无问题、有 finding 的 JSON 摘要及成功/失败/额外说明三种消息正文抑制边界；`tests/brain-cards.test.ts` 覆盖成功 Preview 只显示一次终态结论。两文件定向为 `32 pass / 0 fail / 142 assertions`；完整 `bun run check` 为 `729 pass / 0 fail / 4067 assertions`，其内客户端与 SSR 构建通过；`bun run typecheck`、`bun run check:architecture`、独立 `bun run build`、`git diff --check` 均通过。
+- **浏览器复验**：载入新客户端后重新通过真实中枢创建并执行 `CMD-S01`；实际结果显示“发现 2 个问题；自动修复 0 项；孤儿媒体 0 项”，并列出第 1 章摘要含未入册“黑伞陌生人”、第 2 章摘要含未入册“台长”两条 info finding。再次精确重启服务并刷新页面，持久完成卡仍只显示该终态结论，“当前尚未执行”和通用“执行成功”均不再出现；console warning/error 为 0。截图：`/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-028-verify.jpg`（SHA-256 `c7ce721bd18cd9b9c7c3afdd06003ca3620e4cb20e467b46f8c81a874d6f56d1`）。
+- **严重度 / 状态**：P2；已修复、真实浏览器执行与重启/刷新恢复复验通过并已推送（修复 SHA：`b3e775e`）。
 
 ### BROWSER-BUG-027 [P2] 视角分析使用虚构伏笔和章节内容而非权威 world
 
