@@ -2,6 +2,18 @@
 
 ## 2026-08-14 真实浏览器深度验收（第二批）
 
+### BROWSER-BUG-014 [P1] 角色视觉的永久 provider 失败被巡检每分钟无界重试
+
+- **首次发现 / 场景**：2026-08-14 11:15（Asia/Shanghai）；`ASYNC-VISUAL-FAIL-RECOVERY-01`，隔离实例 `127.0.0.1:32741`，账号 `qa814r9k2`，《纸月邮局》角色“纸月”（`c3`）。
+- **复现与实际**：真实 UI 立项后，头像 provider 稳定返回 HTTP 400 `Unable to generate this content`。同一 `dedupeKey=visual:纸月邮局:c3` 终态 failed 后可再创建新 job；60 秒巡检与 60 秒 `visualTriedAt` 冷却叠加，每轮都再调 provider。SQLite `/tmp/moshift-realqa-Dl0cXq/data/app.db` 累计 **53 条**同角色 failed visual job；最新为 `b518b95a-4b6b-4186-b772-61a700055ba2`（2026-08-14T03:17:08.216Z），相邻 job 以约 60–120 秒间隔出现，服务日志每轮均为实际 provider 失败。
+- **预期 / 影响**：永久 4xx/内容拒绝必须停止自动重试但保留可见 failed；瞬时失败应有持久退避与最大尝试数，手动重试不受限制。旧行为会无界消耗 provider 额度、污染 job/操作日志，属于重复 provider 副作用。
+- **根因**：`ensureCharacterVisuals` 只依赖进程内 in-flight 去重和 1 分钟内存时间戳；任务结束后唯一活跃 job 约束释放，巡检无法根据持久 failed job 区分永久失败与瞬时故障。
+- **修复**：以持久 `visual` job 作为权威尝试史：4xx（除 408/409/425/429）和内容拒绝直接停止自动重试；瞬时失败仅按 5/30 分钟退避自动尝试，总上限 3 次。读时自愈、定时巡检和所有自动入口共用此门禁，用户手动生成不受影响；同步修订 `WorldCharacter` 契约、`CMD-S11` harness 和 `docs/HARNESS.md`。
+- **回归与门禁**：`bun test tests/media-auto.test.ts` 新增永久 HTTP 400 用例（读时自愈后 visual job 数和图片调用数均不增），9 pass / 0 fail；`bun run check`、`bun run build`、`git diff --check` 通过。
+- **commit / push**：`8f0b9c1`；已推送到 `origin/codex/brain-reliability-ui`。
+- **真实浏览器 / 重启复验**：修复构建启动后运行超过 4 个巡检周期，SQLite 仍为 53 条，最新时间仍停在修复前 `03:17:08.405Z`；日志无新“纸月”图片调用。故障已在服务重启后持续收敛，不再产生重复 provider 副作用。
+- **严重度 / 状态**：P1；已修复、真实浏览器复验通过并已推送。
+
 ### BROWSER-BUG-013 [P2] 未执行的不可逆操作被中枢正文虚假宣称已完成
 
 - **首次发现**：2026-08-14 11:11（Asia/Shanghai）。
