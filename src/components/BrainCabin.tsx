@@ -46,6 +46,14 @@ export function mediaGuideText(card: FormCard, values?: Record<string, unknown>)
     : `为「${chapterLabel}」生成 ${count} 张插画，确认后开始生成。`;
 }
 
+/** Preview 成功后终态结论由卡片 detail 承载；隐藏与 preview summary 重复的旧消息正文，避免仍称“尚未执行”。 */
+export function shouldHideSettledPreviewText(msg: ChatMessage, text: string): boolean {
+  const preview = msg.cards?.find((card): card is PreviewCard => card.kind === "preview");
+  if (!preview || (preview.executionState !== "succeeded" && preview.status !== "done")) return false;
+  const normalize = (value: string) => value.replace(/\s+/g, "").trim();
+  return !!text && normalize(text) === normalize(preview.summary ?? "");
+}
+
 /** 表单值扁平化（与后端 brain-chat.ts flattenFormValues 一致：点路径 + array 拆分 + number/bool 转换） */
 function flattenFormValues(fields: FormField[], values: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -110,6 +118,26 @@ export async function consumeActionSuccess(
     return { success: true, detail: `已开始下载：${filename}` };
   }
   const data = await res.json().catch(() => ({})) as Record<string, unknown>;
+  const report = data.report;
+  if (report && typeof report === "object") {
+    const integrity = report as { findings?: unknown; autoFixed?: unknown; orphanMedia?: unknown };
+    if (Array.isArray(integrity.findings) && Array.isArray(integrity.autoFixed) && Array.isArray(integrity.orphanMedia)) {
+      const findings = integrity.findings as Array<{ issue?: unknown; level?: unknown }>;
+      if (!findings.length && !integrity.autoFixed.length && !integrity.orphanMedia.length) {
+        return { success: true, detail: "一致性巡检完成：未发现问题。" };
+      }
+      const parts = [
+        `一致性巡检完成：发现 ${findings.length} 个问题`,
+        `自动修复 ${integrity.autoFixed.length} 项`,
+        `孤儿媒体 ${integrity.orphanMedia.length} 项。`,
+      ];
+      const issues = findings.slice(0, 3).map((item, index) => {
+        const level = String(item.level ?? "").trim();
+        return `${index + 1}. ${level ? `[${level}] ` : ""}${String(item.issue ?? "未提供问题说明")}`;
+      });
+      return { success: true, detail: `${parts.join("；")}${issues.length ? `\n${issues.join("\n")}` : ""}` };
+    }
+  }
   return { success: !data.error, detail: data.error ? String(data.error) : "执行成功" };
 }
 
@@ -1036,7 +1064,9 @@ export const BrainCabin: React.FC<{
             const shownText = msg.pending ? (msg.text ?? "").slice(0, reveal[msg.id] ?? 0) : (msg.text ?? "");
             // 媒体生成 form 卡消息：正文跟随卡片当前选择的章节/张数动态生成（去「正在…生成」的误导）
             const mediaCard = mediaCardOf(msg);
-            const displayText = mediaCard ? mediaGuideText(mediaCard, mediaFormValues[msg.id]) : shownText;
+            const displayText = mediaCard
+              ? mediaGuideText(mediaCard, mediaFormValues[msg.id])
+              : shouldHideSettledPreviewText(msg, shownText) ? "" : shownText;
             // 滚动吸附：每条用户提问 sticky 吸顶（CSS 处理），当前视口内 AI 回复对应的提问自然吸附在顶部
             const isSysNote = msg.kind === "system";
             return (

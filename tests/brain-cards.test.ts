@@ -586,6 +586,30 @@ test("preview 卡：异步任务状态（生成中/失败/完成）就地呈现"
   r3.unmount();
 });
 
+test("preview 卡成功态只显示终态结论，不保留尚未执行的预览摘要", async () => {
+  const mount = document.createElement("div");
+  document.body.appendChild(mount);
+  const root: Root = createRoot(mount);
+  root.render(React.createElement(BrainCardView, {
+    card: {
+      kind: "preview" as const,
+      title: "一致性巡检",
+      commandId: "CMD-S01",
+      level: "L0" as const,
+      summary: "已准备一致性巡检，当前尚未执行。",
+      executionState: "succeeded" as const,
+      detail: "一致性巡检完成：未发现问题。",
+    },
+    onExecute: () => {},
+  }));
+  await tick();
+  const text = mount.textContent ?? "";
+  expect(text).toContain("一致性巡检完成：未发现问题。");
+  expect(text).not.toContain("当前尚未执行");
+  expect(text.match(/一致性巡检完成：未发现问题。/g)).toHaveLength(1);
+  root.unmount();
+});
+
 test("form 卡 onValuesChange：初始上报默认值，切换 select 后上报新值（驱动消息正文跟随选项）", async () => {
   const mount = document.createElement("div");
   document.body.appendChild(mount);

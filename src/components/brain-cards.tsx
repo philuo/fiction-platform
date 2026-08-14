@@ -277,7 +277,7 @@ export const PreviewCardView: React.FC<{
         <ExecutionBadge state={card.executionState} />
         {card.confirmRequired && !done && <span className="bc-confirm-tag">需确认</span>}
       </div>
-      <p className="brain-card-body">{card.summary}</p>
+      <p className="brain-card-body">{done && card.detail ? card.detail : card.summary}</p>
       {card.scenes?.length ? (
         <div className="bc-scenes">
           {card.scenes.map((sc, i) => (
@@ -303,7 +303,7 @@ export const PreviewCardView: React.FC<{
           {card.detail ? `：${card.detail}` : ""}
         </p>
       )}
-      {!running && !failed && card.detail && <p className="bc-task-status">{card.detail}</p>}
+      {!running && !failed && !done && card.detail && <p className="bc-task-status">{card.detail}</p>}
       {awaitingAuto && (
         <p className="bc-task-status bc-task-countdown">
           <span className="bc-progress-pill bc-progress-pill-running">倒计时 {left}s</span>
