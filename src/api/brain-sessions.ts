@@ -574,11 +574,32 @@ export type SessionTask = {
 };
 
 const tasks = new Map<string, SessionTask>();
+const turnTails = new Map<string, Promise<void>>();
 
 /** 任务表 key：用户 + 书名 + sessionId——sessionId 可由调用方指定（brain-chat 传请求 body 的 id），
  * 不同账号 / 不同书 / 同 sessionId 均不可互串（否则同用户跨书同 id 会 attach 到错误任务收错 delta） */
 function taskKey(title: string, sessionId: string): string {
   return `${currentUser() ?? ""}::${slugify(title)}::${sessionId}`;
+}
+
+/**
+ * 同一会话的新回合必须串行。多 Tab 同时提交时，后到请求等待前一回合完成，
+ * 而不是被误当成断线重连连接；不同账号、故事或 session 互不阻塞。
+ */
+export async function withSessionTurn<T>(title: string, sessionId: string, fn: () => Promise<T>): Promise<T> {
+  const key = taskKey(title, sessionId);
+  const previous = turnTails.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.then(() => current);
+  turnTails.set(key, tail);
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (turnTails.get(key) === tail) turnTails.delete(key);
+  }
 }
 
 /** 若会话已有进行中任务则注册 emitter 并返回任务；没有返回 null（调用方自行开新回合） */

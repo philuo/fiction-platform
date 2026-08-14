@@ -44,6 +44,7 @@ import {
   listSyncSessionSnapshots,
   settleCardsAfterMutation,
   isCardExecutionTransition,
+  withSessionTurn,
   type BrainMutationImpact,
 } from "./brain-sessions";
 import { startAdvanceTask, updateAdvanceTaskPhase, completeAdvanceTask, failAdvanceTask, getAdvanceTaskForClient, clearAdvanceTask } from "./advancetask";
@@ -1552,12 +1553,11 @@ async function handleGeneralApi(pathname: string, req: Request): Promise<Respons
       if (!bcResume && !bcChatPrompt) return json({ error: "缺少 prompt" }, 400);
       if (!bcSessionId) return json({ error: "缺少 sessionId" }, 400);
       return sseStream(async (send) => {
-        // 已有运行中任务（其他连接在流式）→ attach：先重放当前已生成文本，再收广播直到任务结束；
-        // 结束后补发最终状态（done/interrupted）——任务收尾期 attach 的新连接可能错过已广播的 done，
-        // 否则前端消息永久 pending（一直 loading），需刷新才能看到最新状态（需求 3 修复）
-        const attached = attachSessionTask(bcChatTitle, bcSessionId, send);
-        if (bcAttach && !attached) return; // attach-only 且任务已结束：直接收尾（前端查 detail 同步最终状态）
-        if (attached) {
+        if (bcAttach) {
+          // 只有断线重连才能 attach 已有回合。普通新 prompt 必须进入下方会话队列，
+          // 否则多 Tab 同时输入时后到 prompt 会被静默吞掉，只收到先到回合的广播。
+          const attached = attachSessionTask(bcChatTitle, bcSessionId, send);
+          if (!attached) return; // attach-only 且任务已结束：直接收尾（前端查 detail 同步最终状态）
           const sess = getBrainSession(bcChatTitle, bcSessionId);
           const pending = sess ? lastPendingMessage(sess) : null;
           if (pending) send({ type: "reset", messageId: pending.id, text: pending.text, thinking: pending.thinking ?? "" });
@@ -1572,16 +1572,18 @@ async function handleGeneralApi(pathname: string, req: Request): Promise<Respons
           }
           return;
         }
-        // 新回合：注册任务（req.signal 取消时 abort 任务），回合内 send 一律广播给会话全部连接
-        const task = registerSessionTask(bcChatTitle, bcSessionId, send, req.signal);
-        task.running = true;
-        const broadcast = (obj: unknown) => broadcastToSession(bcChatTitle, bcSessionId, obj);
-        try {
-          await brainChatStream({ title: bcChatTitle, prompt: bcChatPrompt, sessionId: bcSessionId, send: broadcast, signal: req.signal, resume: bcResume, thinking: bcThinking, ctx: bcCtx ?? undefined });
-        } finally {
-          task.running = false;
-          finishSessionTask(bcChatTitle, bcSessionId);
-        }
+        await withSessionTurn(bcChatTitle, bcSessionId, async () => {
+          // 新回合：注册任务（req.signal 取消时 abort 任务），回合内 send 一律广播给当前回合连接。
+          const task = registerSessionTask(bcChatTitle, bcSessionId, send, req.signal);
+          task.running = true;
+          const broadcast = (obj: unknown) => broadcastToSession(bcChatTitle, bcSessionId, obj);
+          try {
+            await brainChatStream({ title: bcChatTitle, prompt: bcChatPrompt, sessionId: bcSessionId, send: broadcast, signal: req.signal, resume: bcResume, thinking: bcThinking, ctx: bcCtx ?? undefined });
+          } finally {
+            task.running = false;
+            finishSessionTask(bcChatTitle, bcSessionId);
+          }
+        });
       });
     }
 

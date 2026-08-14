@@ -418,7 +418,7 @@ describe("中枢聊天 e2e：极端场景", () => {
       // 等待任务开始（注册 running）后再 attach
       await new Promise((r) => setTimeout(r, 80));
       // 第二个连接：attach 到同一任务（refetch 需要新请求）
-      const second = api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "慢速生成", sessionId: sid, resume: false }, cookieA);
+      const second = api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "慢速生成", sessionId: sid, resume: false, attach: true }, cookieA);
       const res2 = await second;
       const events2 = await readSSE(res2.body as unknown as ReadableStream<Uint8Array>);
       // attach 连接：先重放（reset）或直接等到任务结束，最终必须收到 done（补发）——不永久挂起
@@ -433,6 +433,52 @@ describe("中枢聊天 e2e：极端场景", () => {
       expect(detail.session.messages.filter((m) => m.role === "assistant")).toHaveLength(1);
     } finally {
       brainChatDeps.chatStream = origStream;
+    }
+  });
+
+  test("同 session 两个普通请求并发时逐回合执行，不把后到 prompt 当 attach 吞掉", async () => {
+    const sid = "e2e-concurrent-turns";
+    await api("/api/brain/sessions", "POST", { title: "e2e-book", id: sid, prompt: "并发回合" }, cookieA);
+    const originalStream = brainChatDeps.chatStream;
+    brainChatDeps.chatStream = (async (messages: ChatMessage[], onChunk: (d: string) => void) => {
+      const prompt = String(messages.at(-1)?.content ?? "");
+      const reply = prompt.endsWith("用户问题：查询世界书") ? "世界书回答" : "时间线回答";
+      let acc = "";
+      for (const ch of reply) {
+        acc += ch;
+        onChunk(ch);
+        await new Promise((resolve) => setTimeout(resolve, 8));
+      }
+      return acc;
+    }) as typeof brainChatDeps.chatStream;
+    nextChatContent = '{"intent":"chat","params":{},"reply":""}';
+
+    try {
+      const first = api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "查询世界书", sessionId: sid, resume: false }, cookieA);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      const second = api("/api/brain/chat", "POST", { title: "e2e-book", prompt: "查询时间线", sessionId: sid, resume: false }, cookieA);
+      const [firstResponse, secondResponse] = await Promise.all([first, second]);
+      const [firstEvents, secondEvents] = await Promise.all([
+        readSSE(firstResponse.body as unknown as ReadableStream<Uint8Array>),
+        readSSE(secondResponse.body as unknown as ReadableStream<Uint8Array>),
+      ]);
+      expect(firstEvents.some((event) => event.type === "done")).toBe(true);
+      expect(secondEvents.some((event) => event.type === "done")).toBe(true);
+      expect(firstEvents.filter((event) => event.type === "delta").map((event) => String(event.text ?? "")).join(""))
+        .toBe("世界书回答");
+      expect(secondEvents.filter((event) => event.type === "delta").map((event) => String(event.text ?? "")).join(""))
+        .toBe("时间线回答");
+
+      const detail = (await (await api("/api/brain/sessions/detail", "POST", { title: "e2e-book", id: sid }, cookieA)).json()) as { session: { messages: { role: string; text: string; pending?: boolean }[] } };
+      expect(detail.session.messages.map((message) => [message.role, message.text])).toEqual([
+        ["user", "查询世界书"],
+        ["assistant", "世界书回答"],
+        ["user", "查询时间线"],
+        ["assistant", "时间线回答"],
+      ]);
+      expect(detail.session.messages.some((message) => message.pending)).toBe(false);
+    } finally {
+      brainChatDeps.chatStream = originalStream;
     }
   });
 });
