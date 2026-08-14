@@ -570,12 +570,20 @@ const Home: React.FC<HomeProps> = (props) => {
   const pendingProposals = useMemo(() => {
     return (world?.characterProposals ?? []).filter((p) => p.status === "pending");
   }, [world]);
-  // 新提案到达时自动恢复底部提案区显示（用户 ✕ 关闭后，有新增提案仍提示，避免错过）
-  const lastPropCountRef = useRef(pendingProposals.length);
+  // 新提案到达时自动恢复底部提案区显示。按故事累计已见 ID，避免异步完整投影
+  // 短暂缺少 proposals 后恢复同一批旧数据时，被数量比较误判为新增。
+  const seenProposalIdsRef = useRef(new Map<string, Set<string>>());
   useEffect(() => {
-    if (pendingProposals.length > lastPropCountRef.current) savePropClosed(false);
-    lastPropCountRef.current = pendingProposals.length;
-  }, [pendingProposals.length]);
+    if (!world) return;
+    const ids = pendingProposals.map((proposal) => proposal.id);
+    const seen = seenProposalIdsRef.current.get(world.title);
+    if (!seen) {
+      seenProposalIdsRef.current.set(world.title, new Set(ids));
+      return;
+    }
+    if (ids.some((id) => !seen.has(id))) savePropClosed(false);
+    for (const id of ids) seen.add(id);
+  }, [world?.title, pendingProposals]);
   const shownChapter = useMemo(() => {
     if (!world) return null;
     if (activeIdx === -1) return lastChapter;

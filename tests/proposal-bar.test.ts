@@ -174,6 +174,35 @@ test("关闭状态服务端持久化：SSR 注入 closed（刷新直达）→ �
   await tick();
 });
 
+test("异步投影短暂丢失后恢复同一批提案，不误判为新增并重开关闭偏好", async () => {
+  const initial = mkWorld();
+  const { mount, root } = await mountHome(initial, { propClosed: true, serverClosed: true });
+  const withoutProposals = structuredClone(initial);
+  withoutProposals.characterProposals = [];
+  await act(async () => {
+    setSystemSyncState({
+      title: initial.title, world: withoutProposals,
+      visual: { running: false, pending: [], failed: [] },
+      autoSession: null, autoPending: null, advanceTask: null,
+      proposalClosed: true, at: Date.now(), revision: 2, hash: `proposal-empty-${Date.now()}`,
+    });
+    await tick();
+  });
+  await act(async () => {
+    setSystemSyncState({
+      title: initial.title, world: structuredClone(initial),
+      visual: { running: false, pending: [], failed: [] },
+      autoSession: null, autoPending: null, advanceTask: null,
+      proposalClosed: true, at: Date.now(), revision: 3, hash: `proposal-restored-${Date.now()}`,
+    });
+    await tick();
+  });
+  expect(propClosedCalls.filter((call) => call.body.closed === false)).toHaveLength(0);
+  expect(mount.querySelector(".proposal-bar")).toBeNull();
+  root.unmount();
+  await tick();
+});
+
 test("未登录（initialData 无 user）→ 渲染登录页（AuthPage），不渲染提案区", async () => {
   const mount = document.createElement("div");
   document.body.appendChild(mount);
