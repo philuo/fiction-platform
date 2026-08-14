@@ -568,6 +568,15 @@ export function explicitSettingsQuery(prompt: string): IntentResult | null {
 export function explicitCapabilityQuery(prompt: string): IntentResult | null {
   const text = prompt.replace(/\s+/g, "").trim();
   if (!text) return null;
+  const asksTaskRecovery = /(?:刷新|重新进入|关闭(?:浏览器|页面|标签页)|服务(?:端)?重启|重启服务|断线)/.test(text)
+    && /(?:任务|状态|恢复|继续|续跑|中断|丢失)/.test(text);
+  if (asksTaskRecovery) {
+    return {
+      intent: "read_help",
+      params: { topic: "task_recovery" },
+      reply: "浏览器刷新与服务重启的恢复语义不同；我会按当前持久任务协议说明，不会发起任何操作。",
+    };
+  }
   const asksAccountIsolation = /(?:其他|别的|另一)(?:账号|账户|用户).*(?:数据|内容)|(?:账号|账户|用户).*(?:隔离|互相访问|跨账号)/.test(text);
   if (asksAccountIsolation) {
     return {
@@ -2459,12 +2468,15 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
     if (intent === "read_help") {
       const exportFormats = params.topic === "export_formats";
       const accountIsolation = params.topic === "account_isolation";
+      const taskRecovery = params.topic === "task_recovery";
       const card: BrainChatCard = {
-        kind: "result", title: exportFormats ? "支持的导出格式" : accountIsolation ? "账号数据隔离" : "中枢能力清单", success: true,
+        kind: "result", title: exportFormats ? "支持的导出格式" : accountIsolation ? "账号数据隔离" : taskRecovery ? "任务恢复边界" : "中枢能力清单", success: true,
         detail: exportFormats
           ? "Markdown（.md）：保留标题与章节结构，适合继续编辑。\nEPUB（.epub）：生成带目录的电子书文件。\n当前不支持 PDF、TXT、批注版或分卷导出。"
           : accountIsolation
             ? "每个请求先校验登录会话，并在当前用户名对应的数据目录中读取故事与中枢会话；WebSocket 订阅也同时绑定账号和故事。这里描述的是应用层访问控制与目录/频道隔离，不代表每账号独立加密密钥或物理存储分区。"
+            : taskRecovery
+              ? "浏览器刷新、关闭标签页或重新进入：不会停止服务端任务。页面通过持久 job、world 投影、Brain session 与同步快照恢复状态；同一服务进程内仍在运行的 Brain 流可重新附着，已落盘消息与任务卡不会因刷新丢失。\n服务重启后可安全续跑：自动连载从章节 checkpoint 继续；尚未到期的媒体自动生成按持久 deadline 重新调度；已经取得 videoId 的视频生成或视频重生成恢复 watcher 轮询。\n服务重启后明确中断：尚未取得 videoId 的视频创建，以及运行中的立项、单章推进、分镜、图片/批量图片、角色视觉、封面和无安全 checkpoint 的 AI 调用会收敛为 interrupted/failed，不会保留幽灵 loading。\n媒体产物保护：已生成并落盘的文件识别为 ready；图片无文件则失败；重生成失败或中断时保留旧媒体。"
           : "数据询问：章节目录/角色（立绘·关系·出场·后续安排）/某章出场角色/人物关系/大纲/脉络时间线/伏笔/新角色提案/卡池/计划进度/任务（质量债与重写队列）/台账日志/审查报告/媒体资源/整书评估/设定世界书\n写作治理：推进剧情写一章/AI 重写章节/回溯重写/自动连载（开始·暂停·停止·跳过·确认草稿）/生成插画与视频/抽卡/设定一致性巡检/导出全书\n编辑计划：编辑设定与角色/新建·修改·删除角色/建立人物关系（如「给张三和李四建立仇人关系」）/伏笔增删改/展开弧章纲/调整生成参数/制定方案/征求意见\n打开面板：设置（含角色页）/关系图/任务中心/伏笔账/审查面板/卡池/整书评估/记忆·台账/自动连载/新角色提案区",
       };
       markMessageDone(title, sessionId, messageId, [card]);

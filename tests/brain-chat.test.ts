@@ -801,6 +801,35 @@ describe("buildFormCard（表单卡构建）", () => {
     }
   });
 
+  test("刷新与服务重启恢复能力走持久任务协议，不交给 provider 猜测", async () => {
+    const prompt = "页面刷新或服务重启时，哪些任务能继续，哪些会明确中断？只解释现有能力，不执行。";
+    expect(explicitCapabilityQuery(prompt))
+      .toMatchObject({ intent: "read_help", params: { topic: "task_recovery" } });
+
+    mockWorld = mkWorld();
+    let cloudCalls = 0;
+    const originalJson = brainChatDeps.chatJson;
+    const originalStream = brainChatDeps.chatStream;
+    brainChatDeps.chatJson = (async () => { cloudCalls += 1; throw new Error("cloud should not run"); }) as typeof brainChatDeps.chatJson;
+    brainChatDeps.chatStream = (async () => { cloudCalls += 1; throw new Error("cloud should not run"); }) as typeof brainChatDeps.chatStream;
+    try {
+      const events = await runTurn(prompt, { sessionId: "task-recovery-capability-fast-path" });
+      expect(cloudCalls).toBe(0);
+      const card = events.find((event) => event.type === "card")?.card as { title?: string; detail?: string; action?: unknown } | undefined;
+      expect(card?.title).toBe("任务恢复边界");
+      expect(card?.detail).toContain("浏览器刷新、关闭标签页或重新进入：不会停止服务端任务");
+      expect(card?.detail).toContain("自动连载从章节 checkpoint 继续");
+      expect(card?.detail).toContain("已经取得 videoId 的视频生成或视频重生成恢复 watcher 轮询");
+      expect(card?.detail).toContain("无安全 checkpoint 的 AI 调用会收敛为 interrupted/failed");
+      expect(card?.detail).toContain("重生成失败或中断时保留旧媒体");
+      expect(card?.action).toBeUndefined();
+      expect(events.at(-1)?.type).toBe("done");
+    } finally {
+      brainChatDeps.chatJson = originalJson;
+      brainChatDeps.chatStream = originalStream;
+    }
+  });
+
   test("刚才那个分镜优先关联当前会话权威场景，不调用 provider 补写", async () => {
     mockWorld = mkWorld();
     mockWorld.chapters[0].title = "潮信";
