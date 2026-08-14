@@ -2,6 +2,20 @@
 
 ## 2026-08-14 真实浏览器深度验收（第二批）
 
+### BROWSER-BUG-017 [P2] 自动连载首章运行期间任务中心显示“暂无连载任务”
+
+- **首次发现**：2026-08-14 12:59（Asia/Shanghai）。
+- **场景 / testId / Tab**：`ASYNC-AUTO-01` + `ASYNC-CONCURRENT-UI-01`，真实 UI 在《纸月邮局》启动目标 1 章的自动连载后立即打开任务中心。
+- **预期**：任务中心立即显示 auto session 的目标、已写章数、当前阶段和可用控制；底部状态、任务中心与持久 job 必须一致。
+- **实际 / 证据**：页面正文区与底部均显示“自动连载：第 1 章写作中（第 1 稿）…”，SQLite auto job `e4fc94df-6a13-44de-aee1-6654e08ee68e`、command `39fcea23-757d-4f02-bfc2-055f743c8d12` 为 `running/连载开始`；同一 Tab 的任务中心却显示“暂无连载任务 · 在底部『推进剧情』下拉选『章节连载』开始”。
+- **影响范围**：每次新启动自动连载的首章运行窗口；用户无法从任务中心核对目标和进度，也无法使用其中的暂停/取消控制，且与底部运行锁互相矛盾。
+- **根因**：`startAutoRun` 在提交请求前发出的 snapshot 请求早于服务端创建 auto session；`runAuto` 随后只调用 `saveAutoSession`，没有发布初始 `auto-status`。第一次 `touchSession` 要等到整章提交或暂停，导致首章运行期间所有订阅 Tab 都收不到包含 session 的新 system snapshot。
+- **修复**：集中 `publishSessionStatus`，auto session 初次持久化后立即发布不可合并丢失的 `auto-status`；后续阶段仍走 1 秒节流。WS 随事件紧跟权威 system snapshot，任务中心和新 Tab 可立即恢复 `running/target/written/phase`。
+- **回归与门禁**：`tests/autorun-fix.test.ts` 新增真实 `runAuto` 首帧广播断言；定向 13 pass / 0 fail。`bun run check` 708 pass / 0 fail（3959 assertions），架构检查确认 49 个公开命令，typecheck、client/SSR build、`git diff --check` 均通过。
+- **commit / push**：`33e59e8`；已推送到 `origin/codex/brain-reliability-ui`。
+- **真实浏览器复验**：重启隔离生产服务后从持久 paused session 点击“恢复”；350ms 内重新打开任务中心，页面立即显示“连载中 · 0/1 章（0%）· 第 1 章重试中（上一稿审查未过）”，与新 auto job `cdf070bd-0e1f-4883-ad53-43c8b7fd7301` 的 `running` session 一致，不再出现“暂无连载任务”。
+- **严重度 / 状态**：P2；已修复、真实浏览器复验通过并已推送。
+
 ### BROWSER-BUG-016 [P2] 刷新重进后任务中心把正在运行的单章推进显示为空闲
 
 - **首次发现**：2026-08-14 12:14（Asia/Shanghai）。
