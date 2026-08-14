@@ -2,6 +2,21 @@
 
 ## 2026-08-14 真实浏览器深度验收（第二批）
 
+### BROWSER-BUG-035 [P2] 历史提案查询卡在每次刷新时覆盖用户关闭偏好
+
+- **首次发现**：2026-08-14 21:03（Asia/Shanghai）。
+- **场景 / testId**：`MULTITAB-REOPEN-PROPOSAL-PREF-01`；同账号《雾港电台》，会话历史中曾查询过提案列表，真实 UI 关闭底部“新角色提案”提示后刷新页面。
+- **复现步骤**：1）点击“关闭新角色提案提示”，确认页面不再显示提案区；2）SQLite receipt `50397d12-b2d3-4a20-b0c4-962beeb5c8b5` 成功写入 `closed:true`；3）刷新同一故事 URL；4）等待 Brain session 历史载入。
+- **预期**：查询提案列表只在聊天中展示 browse 卡，不修改面板偏好；关闭状态跨刷新保持。只有显式“打开提案”产生的持久 `panelIntent` 可以重新打开，且只能消费一次。
+- **实际 / 证据**：刷新后提案提示和展开抽屉重新出现，并自动创建 receipt `06acebaa-eb7d-43ac-8096-32b4161261c9` 写入 `closed:false`。修复前提交 `52c1a86` 的独立数据副本重放再次生成 receipt `d0a7ff34-f4e9-4f3e-beed-7a5b26b12f4c`（`closed:false`）；截图 `/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-035-proposal-reopens.jpg`，SHA-256：`6763e33f5e1e5c54c50a6deb240e6ef2a563c57b8c0834876535a2a47ef69c51`。应用 console warning/error 为 0。
+- **影响范围**：任何历史会话曾查询提案列表的故事；用户关闭偏好无法持久保持，每次新 Tab/刷新还会产生无关写命令，违反“查询不创建写命令”和“打开提案与查询提案列表不混淆”的验收要求。
+- **根因**：`BrainCabin` 的消息 effect 扫描任意历史 `browseType=proposal` 卡并调用 `onProposalTalk -> savePropClosed(false)`；组件每次挂载都会把旧查询误当作新的面板打开意图。该支路绕过了已有的持久 `panelIntent` 一次性消费协议。
+- **修复**：`764f48d`（`fix: keep proposal queries read only`）删除 `findProposalCardMessageId` 和 `onProposalTalk` 写偏好通路；`BrainCabin` 只允许服务端持久、尚未消费且带 `cardId` 的 `panelIntent` 打开面板。提案 browse 卡及旧标题 result 卡都保持只读，显式 `open_proposals` 仍经 `/api/brain/sessions/consume-panel` 一次性消费。
+- **自动验证**：`tests/proposal-bar.test.ts` 新增三条协议边界回归，分别断言 browse 查询卡、旧标题 result 卡不会被当作打开意图，未消费的显式 `panelIntent` 仍可打开；定向 `tests/proposal-bar.test.ts tests/brain-fold.test.tsx tests/brain-e2e.test.ts` 为 48 pass / 0 fail（198 assertions）。完整 `bun run check` 为 747 pass / 0 fail（4163 assertions），架构检查、typecheck、client/SSR build 与 `git diff --check` 均通过。
+- **commit / push**：`764f48d`；已推送到 `origin/codex/brain-reliability-ui`。
+- **真实浏览器复验**：在新生产 bundle 中通过真实 UI 关闭提案提示，receipt `248ecd88-826e-4e51-bcf7-0230743443de` 成功写入 `closed:true`；刷新并打开中枢后，两张历史“新角色提案（2 项）”browse 卡仍存在，但底部提案区不再出现，也没有新增 `closed:false` 回执。相邻控制场景输入“请把新角色提案面板打开”后面板正常出现；关闭中枢后再由页面关闭提案，receipt `91167a2a-f9bc-4a31-9e92-0462e5fc4ec3` 写入 `closed:true`，随后刷新、新开同 URL Tab、重新载入完整会话历史均未重复打开，证明显式 intent 已消费。干净 Tab 应用 console warning/error 为 0；证据图 `/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-035-verify-clean.jpg`，SHA-256：`bdeb0af1f8e3e809908202cf151fae119ce8580f7ea053b132b18d346dd1a983`。
+- **严重度 / 当前状态**：P2；已修复、真实浏览器刷新/重进及显式打开控制场景复验通过并已推送。
+
 ### BROWSER-BUG-034 [P2] 恢复能力问答把刷新与重启混淆并给出错误事实
 
 - **首次发现**：2026-08-14 20:54（Asia/Shanghai）。
