@@ -587,6 +587,21 @@ export function explicitCapabilityQuery(prompt: string): IntentResult | null {
   return null;
 }
 
+/** 指定章节的章纲兑现检查走本地只读查询，保留“章节 + 对比正文”操作符。 */
+export function explicitPlanComparisonQuery(prompt: string): IntentResult | null {
+  const text = prompt.replace(/\s+/g, "").trim();
+  const chapterIndex = chapterIndexFromPrompt(text);
+  if (chapterIndex == null || !/(?:章纲|章节计划)/.test(text)) return null;
+  const asksComparison = /(?:偏差|差异|对比|比较|兑现|一致|吻合|按.*(?:章纲|计划))/.test(text);
+  const mentionsActual = /(?:正文|实际|成稿|写成|写得)/.test(text);
+  if (!asksComparison || (!mentionsActual && !/按.*(?:章纲|计划)/.test(text))) return null;
+  return {
+    intent: "read_plans",
+    params: { chapterIndex, compareActual: true },
+    reply: `我会按结算摘要核对第 ${chapterIndex} 章的章纲兑现情况。`,
+  };
+}
+
 /**
  * 明确写入句式的本地确定性识别。这些句式若交给带历史的模型分类，
  * 容易被上一回合的写操作串话，进而执行无关副作用。只接管语义强、参数可确定的指令；
@@ -843,6 +858,13 @@ export function l0QueryReply(intent: string, card: Record<string, unknown>, prom
     return `当前全书已规划 ${volumes.length} 卷、${arcs.length} 条故事弧${names ? `；卷名为 ${names}` : ""}，已完成 ${String(d.done ?? 0)}/${String(d.target ?? 0)} 章。`;
   }
   if (intent === "read_plans") {
+    if (card.browseType === "plan-comparison") {
+      const matched = Number(d.matchedCount ?? 0);
+      const total = Number(d.totalBeats ?? 0);
+      const additions = recordList(d.additions).length;
+      const unconfirmed = Math.max(0, total - matched);
+      return `第 ${String(d.index ?? "?")} 章「${String(d.title ?? "")}」共 ${total} 项章纲，结算摘要确认 ${matched} 项已兑现${unconfirmed ? `、${unconfirmed} 项未能确认` : ""}；正文另有 ${additions} 项章纲外展开。`;
+    }
     const volumes = recordList(d.volumes);
     const arcs = recordList(d.arcs);
     const requested = requestedVolume(p, volumes);
@@ -898,6 +920,74 @@ export function isAmbiguousChapterPrompt(prompt: string | undefined | null): boo
   // 明确查看/获取内容/评价的动作词 → 视为有明确意图，不追问
   const actionWords = /查看|看|看看|浏览|读|阅读|打开|展示|调出|调取|给我|发|输出|全文|内容|正文|讲|说|写|概况|梗概|大概|什么|如何|怎么样|评价|评论|评估|生成|配图|插图|画/;
   return !actionWords.test(p);
+}
+
+function comparisonBigrams(value: string): Set<string> {
+  const normalized = value.replace(/[\s，。、“”‘’「」『』：；？！,.:'";!?（）()《》【】\-—]/gu, "");
+  const grams = new Set<string>();
+  for (let i = 0; i < normalized.length - 1; i += 1) grams.add(normalized.slice(i, i + 2));
+  return grams;
+}
+
+/**
+ * 将章纲 beat 与已落盘的结算事件做保守匹配。输出只复用原始字符串；
+ * 未达到阈值的内容标记为“未确认”，不把语义猜测写成已发生事实。
+ */
+export function buildChapterPlanComparison(w: WorldState, chapterIndex: number): Record<string, unknown> {
+  const chapter = w.chapters.find((item) => item.index === chapterIndex);
+  if (!chapter) {
+    return { kind: "result", title: `第 ${chapterIndex} 章章纲对比失败`, success: false, detail: `未找到第 ${chapterIndex} 章正文，无法核对章纲。` };
+  }
+  const plan = (w.chapterPlans ?? []).find((item) => item.index === chapterIndex);
+  if (!plan) {
+    return { kind: "result", title: `第 ${chapterIndex} 章「${chapter.title}」章纲对比失败`, success: false, detail: `第 ${chapterIndex} 章「${chapter.title}」没有已保存章纲，无法与正文核对。` };
+  }
+  const summary = (w.chapterSummaries ?? []).find((item) => item.index === chapterIndex);
+  if (!summary) {
+    return { kind: "result", title: `第 ${chapterIndex} 章「${chapter.title}」章纲对比失败`, success: false, detail: `第 ${chapterIndex} 章「${chapter.title}」没有结算摘要，无法确认正文是否兑现章纲。` };
+  }
+
+  const availableEvents = new Set(summary.events.map((_, index) => index));
+  const beats = plan.beats.map((beat) => {
+    const source = comparisonBigrams(beat);
+    let bestIndex = -1;
+    let bestScore = 0;
+    for (const eventIndex of availableEvents) {
+      const target = comparisonBigrams(summary.events[eventIndex]);
+      let shared = 0;
+      for (const gram of source) if (target.has(gram)) shared += 1;
+      const score = source.size + target.size > 0 ? (2 * shared) / (source.size + target.size) : 0;
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = eventIndex;
+      }
+    }
+    const matched = bestIndex >= 0 && bestScore >= 0.2;
+    if (matched) availableEvents.delete(bestIndex);
+    return {
+      beat,
+      status: matched ? "fulfilled" : "unconfirmed",
+      matchedEvents: matched ? [summary.events[bestIndex]] : [],
+    };
+  });
+  const additions = summary.events.filter((_, index) => availableEvents.has(index));
+  const matchedCount = beats.filter((item) => item.status === "fulfilled").length;
+  return {
+    kind: "browse",
+    title: `第 ${chapterIndex} 章「${chapter.title}」· 章纲兑现对比`,
+    browseType: "plan-comparison",
+    data: {
+      index: chapterIndex,
+      title: chapter.title,
+      goal: plan.goal,
+      summary: summary.summary,
+      beats,
+      additions,
+      matchedCount,
+      totalBeats: beats.length,
+      actualEventCount: summary.events.length,
+    },
+  };
 }
 
 /** read_chapter 含糊提及时的追问卡：让用户明确要做什么（查看正文/生成插画/审查/聊聊）。
@@ -1103,6 +1193,9 @@ export function executeQuery(w: WorldState, intent: string, params: Record<strin
     };
   }
   if (intent === "read_plans") {
+    if (params.compareActual === true && typeof params.chapterIndex === "number") {
+      return buildChapterPlanComparison(w, params.chapterIndex);
+    }
     // 计划/章纲进度：指南针 + 卷 + 弧 + 章纲（done/total）
     const volumes = (w.blueprint?.volumes ?? []).map((v) => ({ title: v.title, status: v.status, goal: v.goal, range: v.chapterRange ?? null }));
     const arcs = (w.storyArcs ?? []).map((a) => ({ title: a.title, status: a.status, estChapters: a.estChapters, goal: a.goal }));
@@ -1996,6 +2089,7 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
     const { intent, params, reply } = explicitMediaIntent(activePrompt)
       ?? explicitSettingsQuery(activePrompt)
       ?? explicitCapabilityQuery(activePrompt)
+      ?? explicitPlanComparisonQuery(activePrompt)
       ?? explicitActionIntent(activePrompt)
       ?? await recognizeIntent(w, activePrompt, ctx.ctx, hist);
 

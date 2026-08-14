@@ -102,7 +102,7 @@ export type BrowseCard = BrainCardBase & {
     | "chapter" | "character" | "foreshadow" | "review" | "eval" | "proposal" | "gacha"
     // —— 查询扩展（Phase 1）：列表/进度/统计可视化 ——
     | "chapters" | "characters" | "plans" | "tasks" | "logs" | "worldbook" | "media"
-    | "appearances" | "relationships" | "outline" | "timeline";
+    | "appearances" | "relationships" | "outline" | "timeline" | "plan-comparison";
   data: unknown;
   /** 列表级可选操作（proposal 列表项内嵌 actions 由渲染层读取，此字段暂为列表级扩展） */
   actions?: BrowseCardAction[];
@@ -895,6 +895,42 @@ export const BrowseCardView: React.FC<{
             ))}
           </div>
         )}
+      </>
+    );
+  } else if (card.browseType === "plan-comparison" && d) {
+    const beats = (Array.isArray(d.beats) ? d.beats : []) as Record<string, unknown>[];
+    const additions = (Array.isArray(d.additions) ? d.additions : []) as string[];
+    body = (
+      <>
+        <div className="bc-stats bc-stats-compact">
+          <span className="bc-stat"><b>{String(d.matchedCount ?? 0)}/{String(d.totalBeats ?? 0)}</b>章纲已兑现</span>
+          <span className="bc-stat"><b>{additions.length}</b>章纲外展开</span>
+        </div>
+        {d.goal ? <p className="bc-browse-quote"><b>本章目标</b>{String(d.goal)}</p> : null}
+        <div className="bc-browse-list">
+          <div className="bc-browse-sec">逐项核对</div>
+          {beats.map((item, index) => {
+            const fulfilled = item.status === "fulfilled";
+            const matchedEvents = (Array.isArray(item.matchedEvents) ? item.matchedEvents : []) as string[];
+            return (
+              <div className="bc-browse-item" key={index}>
+                <div className="bc-browse-item-head">
+                  <span className="bc-browse-item-title">章纲 {index + 1}</span>
+                  <CardStatusBadge status={fulfilled ? "已兑现" : "未从结算摘要确认"} level={fulfilled ? "ok" : "warn"} />
+                </div>
+                <p className="bc-browse-text">{String(item.beat ?? "")}</p>
+                {matchedEvents.map((event, eventIndex) => <p className="bc-browse-meta" key={eventIndex}>正文事件：{event}</p>)}
+              </div>
+            );
+          })}
+        </div>
+        <div className="bc-browse-list">
+          <div className="bc-browse-sec">正文新增 / 章纲外展开</div>
+          {additions.length
+            ? additions.map((event, index) => <p className="bc-browse-text" key={index}>· {event}</p>)
+            : <p className="bc-browse-meta">结算摘要中没有未匹配事件。</p>}
+        </div>
+        {d.summary ? <p className="bc-browse-quote"><b>实际正文摘要</b>{String(d.summary)}</p> : null}
       </>
     );
   } else if (card.browseType === "tasks" && d) {

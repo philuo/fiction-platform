@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { emptyWorld, type WorldState } from "../src/api/world";
 import type { Card as WorldCard } from "../src/api/world";
-import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, explicitSettingsQuery, explicitCapabilityQuery, explicitActionIntent, extractNameFromHistory, authorFromEditPrompt, currentFromEditPrompt, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard, recentMediaReferenceReply, groundedChatContext, perspectiveForeshadowReply, urgentIssuesReply } from "../src/api/brain-chat";
+import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, explicitSettingsQuery, explicitCapabilityQuery, explicitPlanComparisonQuery, explicitActionIntent, buildChapterPlanComparison, extractNameFromHistory, authorFromEditPrompt, currentFromEditPrompt, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard, recentMediaReferenceReply, groundedChatContext, perspectiveForeshadowReply, urgentIssuesReply } from "../src/api/brain-chat";
 import { appendMessage as sessAppendMessage, createSession as sessCreateSession, getSession as sessGet, lastPendingMessage as sessLastPending } from "../src/api/brain-sessions";
 import type { ChatMessage } from "../src/api/agnes";
 
@@ -384,6 +384,96 @@ describe("executeQuery（L0 查询直接执行）", () => {
     expect(d.done).toBe(0);
     expect(d.next?.index).toBe(3);
     expect(d.plans[0].hookType).toBe("悬念");
+  });
+
+  test("章纲与正文对比问法保留中文/阿拉伯章号和 compareActual 操作符", () => {
+    expect(explicitPlanComparisonQuery("把第二章的章纲和实际正文偏差告诉我。"))
+      .toMatchObject({ intent: "read_plans", params: { chapterIndex: 2, compareActual: true } });
+    expect(explicitPlanComparisonQuery("第 12 章是否按章纲写的？"))
+      .toMatchObject({ intent: "read_plans", params: { chapterIndex: 12, compareActual: true } });
+    expect(explicitPlanComparisonQuery("看看全书章纲进度")).toBeNull();
+  });
+
+  test("章纲兑现对比逐项引用权威事件，并将未匹配事件列为正文新增", () => {
+    const w = mkWorld();
+    w.chapters.push({ index: 2, title: "覆水", text: "正文", review: null });
+    w.chapterPlans = [{
+      index: 2, arcId: "a1", goal: "林渡前往大桥调查并被台长阻挠。", hookType: "反转", status: "done",
+      beats: [
+        "林渡在桥墩启动灵噪接收器，听到苏遥求救。",
+        "桥墩新漆下藏着旧电话号码，拨打后听见苏遥呼吸。",
+        "台长勒令林渡停职一周，并提起三年前失踪主播。",
+        "林渡在档案室找到入职表，签名字迹与苏遥相似。",
+      ],
+    }];
+    w.chapterSummaries = [{
+      index: 2, summary: "林渡调查大桥后被停职，并在档案室遭遇异常。", appeared: ["林渡", "苏遥"], stateChanges: [],
+      events: [
+        "林渡在跨江大桥桥墩启动灵噪接收器，听到苏遥从水下求救",
+        "刮开桥墩新漆后露出旧电话号码，拨打为空号但传来苏遥呼吸",
+        "台长勒令林渡停职一周，暗示三年前有主播失踪",
+        "林渡潜入档案室找到入职表，签名字迹与苏遥相似",
+        "手机收到来自苏遥的异常短信",
+        "广播模仿林渡的声音，并警告他只剩三天",
+      ],
+    }];
+
+    const card = buildChapterPlanComparison(w, 2);
+    expect(card).toMatchObject({ kind: "browse", browseType: "plan-comparison", title: "第 2 章「覆水」· 章纲兑现对比" });
+    const data = card.data as { matchedCount: number; totalBeats: number; beats: { status: string; beat: string; matchedEvents: string[] }[]; additions: string[]; summary: string };
+    expect(data.matchedCount).toBe(4);
+    expect(data.totalBeats).toBe(4);
+    expect(data.beats.every((item) => item.status === "fulfilled")).toBe(true);
+    expect(data.beats[0].beat).toBe(w.chapterPlans[0].beats[0]);
+    expect(data.beats[0].matchedEvents[0]).toBe(w.chapterSummaries[0].events[0]);
+    expect(data.additions).toEqual([
+      "手机收到来自苏遥的异常短信",
+      "广播模仿林渡的声音，并警告他只剩三天",
+    ]);
+    expect(l0QueryReply("read_plans", card, "第二章章纲和正文有什么偏差", "全局有四条章纲"))
+      .toBe("第 2 章「覆水」共 4 项章纲，结算摘要确认 4 项已兑现；正文另有 2 项章纲外展开。");
+  });
+
+  test("章纲兑现对比缺少正文、章纲或结算摘要时明确失败", () => {
+    const w = mkWorld();
+    expect(buildChapterPlanComparison(w, 2)).toMatchObject({ kind: "result", success: false, detail: "未找到第 2 章正文，无法核对章纲。" });
+    w.chapters.push({ index: 2, title: "覆水", text: "正文", review: null });
+    expect(buildChapterPlanComparison(w, 2)).toMatchObject({ kind: "result", success: false, detail: expect.stringContaining("没有已保存章纲") });
+    w.chapterPlans = [{ index: 2, arcId: "a1", goal: "调查", beats: [], hookType: "无", status: "done" }];
+    expect(buildChapterPlanComparison(w, 2)).toMatchObject({ kind: "result", success: false, detail: expect.stringContaining("没有结算摘要") });
+  });
+
+  test("章纲正文对比完整回合不调用 provider，也不产生写操作", async () => {
+    mockWorld = mkWorld();
+    mockWorld.chapters.push({ index: 2, title: "覆水", text: "正文", review: null });
+    mockWorld.chapterPlans = [{
+      index: 2, arcId: "a1", goal: "前往大桥调查。", hookType: "反转", status: "done",
+      beats: ["林渡在桥墩启动接收器并听见苏遥求救。"],
+    }];
+    mockWorld.chapterSummaries = [{
+      index: 2, summary: "林渡在桥墩收到苏遥求救。", appeared: ["林渡", "苏遥"], stateChanges: [],
+      events: ["林渡在桥墩启动接收器，听见苏遥求救", "手机收到苏遥发来的异常短信"],
+    }];
+    const originalJson = brainChatDeps.chatJson;
+    const originalStream = brainChatDeps.chatStream;
+    let providerCalls = 0;
+    brainChatDeps.chatJson = (async () => { providerCalls += 1; throw new Error("provider should not run"); }) as typeof brainChatDeps.chatJson;
+    brainChatDeps.chatStream = (async () => { providerCalls += 1; throw new Error("provider should not run"); }) as typeof brainChatDeps.chatStream;
+    try {
+      const events = await runTurn("把第二章的章纲和实际正文偏差告诉我。", { sessionId: "chapter-plan-comparison" });
+      const text = events.filter((event) => event.type === "delta").map((event) => String(event.text ?? "")).join("");
+      const card = events.find((event) => event.type === "card")?.card as Record<string, unknown> | undefined;
+      expect(providerCalls).toBe(0);
+      expect(text).toContain("第 2 章「覆水」");
+      expect(text).toContain("1 项章纲外展开");
+      expect(card).toMatchObject({ kind: "browse", browseType: "plan-comparison" });
+      expect(card?.action).toBeUndefined();
+      expect(events.filter((event) => ["preview", "confirm", "progress"].includes(String((event.card as Record<string, unknown> | undefined)?.kind ?? "")))).toHaveLength(0);
+      expect(events.at(-1)?.type).toBe("done");
+    } finally {
+      brainChatDeps.chatJson = originalJson;
+      brainChatDeps.chatStream = originalStream;
+    }
   });
 
   test("read_timeline → 返回权威事件，正文回答记录内容而不是只报卷数", () => {
