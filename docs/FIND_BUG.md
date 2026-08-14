@@ -1,5 +1,22 @@
 # fiction-platform 重构后缺陷审计报告
 
+## 2026-08-14 真实浏览器深度验收（第二批）
+
+### BROWSER-BUG-012 [P1] 立项完成后当前 Tab 永久停留在“世界构建中”
+
+- **首次发现**：2026-08-14 09:52（Asia/Shanghai）。
+- **场景**：`ASYNC-NEW-STORY-01`，隔离生产实例 `127.0.0.1:32741`，账号 `qa814r9k2`，通过真实 UI 立项《雾港电台》。
+- **复现步骤**：从空书架点击“+ 新建”，提交近未来悬疑灵感；等待 `ready` 后页面自动打开故事；继续等待后台蓝图增强、封面和角色视觉全部结束，不刷新当前 Tab。
+- **预期**：`new-story` 进入 `succeeded/done` 后，页面自动清除世界构建横幅和运行锁，推进、抽卡、评估及编辑操作恢复可用。
+- **实际**：SQLite job `e0f98d26-b589-466f-b945-dbccd79aea51` 已于 `2026-08-14T01:52:00.458Z` 进入 `succeeded/done`，封面及 3 个 visual job 也全部 succeeded；当前 Tab 超过十秒仍显示“世界构建中：世界已就绪，正在生成故事蓝图…”，创作按钮持续 disabled。
+- **影响范围**：所有从书架提交立项并在 `ready` 帧自动进入故事的用户；必须刷新页面才能解除假运行锁，属于核心首用流程失效。
+- **根因**：`Home` 在消费 `ready` 帧并自动导航时清空 `lastTaskIdRef`；后续 library `done` 帧只通过该 ref 查任务，未使用仍保存于页面的 `currentTaskId`，因此永远跳过清锁分支。
+- **修复**：新增 `trackedNewStoryTask`，以“本次提交 id → 页面当前任务 id”为追踪优先级；完整 library snapshot 中任务终态或任务已被清理时统一清除 `currentTaskId/buildingStage`。
+- **回归测试**：`bun test tests/home-story-open.test.ts`（3 pass / 0 fail）覆盖 ready 导航清空提交 ref 后仍按页面 task id 消费 done；`bun run check`（700 pass / 0 fail，3931 assertions）、`bun run build`、`git diff --check` 通过。
+- **commit / push**：待修复提交完成后回填。
+- **复验结果**：用同一隔离数据第二次真实立项《纸月邮局》，在 `running` 阶段刷新并从书架重新进入；页面恢复构建锁。job `5621facb-e990-451a-aef2-514c273c0baf` 进入 `succeeded/done` 后，当前 Tab 未刷新即自动移除构建横幅，抽卡和推进按钮恢复可用。一个角色视觉因 provider 内容拒绝明确进入 failed，不影响 new-story 终态，未伪装为成功。
+- **状态**：已修复并通过真实浏览器复验，待提交推送。
+
 ## 2026-08-14 中枢问答与 UI 深度验收
 
 ### BROWSER-BUG-009 [P2] 时间线/蓝图查询没有回答记录内容，并泄漏英文内部状态

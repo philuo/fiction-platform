@@ -83,6 +83,25 @@ export function storyExistsForOpen(
     ?? fallbackStories.some((story) => story.title === title);
 }
 
+type NewStoryTaskView = {
+  id: string;
+  status: string;
+  title?: string;
+  stage?: string;
+  error?: string;
+};
+
+/** Keep tracking a ready new-story task after navigation clears the submission ref.
+ * The page-owned task id is the recovery anchor for the later done/failed library frame. */
+export function trackedNewStoryTask<T extends NewStoryTaskView>(
+  tasks: readonly T[],
+  submittedTaskId: string | null,
+  currentTaskId: string | null,
+): T | undefined {
+  const id = submittedTaskId ?? currentTaskId;
+  return id ? tasks.find((task) => task.id === id) : undefined;
+}
+
 // —— 新角色提案区关闭状态（服务端权威：bun:sqlite 按用户 + 书名存储）——
 // SSR 时服务端读会话 cookie → 查库 → 注入 initialData.propClosed，首帧 HTML 即正确（不渲染提案区），
 // 客户端与 SSR 快照一致、无修正 re-render —— 根治「刷新闪现后自动关」。
@@ -355,9 +374,17 @@ const Home: React.FC<HomeProps> = (props) => {
     const active = syncedLibrary.tasks.filter((t) => t.status === "running" || t.status === "ready");
     setCreating(active);
     const mine = lastTaskIdRef.current;
-    if (!mine) return;
-    const task = syncedLibrary.tasks.find((t) => t.id === mine);
-    if (!task) return;
+    const trackedId = mine ?? currentTaskId;
+    if (!trackedId) return;
+    const task = trackedNewStoryTask(syncedLibrary.tasks, mine, currentTaskId);
+    if (!task) {
+      // A complete library snapshot is authoritative: a task removed by cleanup must not
+      // leave the story page permanently locked in its local building state.
+      lastTaskIdRef.current = null;
+      setCurrentTaskId(null);
+      setBuildingStage(null);
+      return;
+    }
     if (task.status === "ready" && task.title && phase !== "playing") {
       lastTaskIdRef.current = null;
       setCurrentTaskId(task.id);
@@ -374,7 +401,7 @@ const Home: React.FC<HomeProps> = (props) => {
       setBuildingStage(null);
       showToast("立项失败: " + (task.error ?? "未知错误"));
     }
-  }, [syncedLibrary, phase]);
+  }, [syncedLibrary, phase, currentTaskId]);
 
   /** 删除图书二次确认（与中枢历史会话删除同款交互）：首次点击进入确认态（3s 未确认自动恢复），再点才真正删除 */
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
