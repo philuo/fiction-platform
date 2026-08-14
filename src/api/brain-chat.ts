@@ -27,6 +27,7 @@ import { uuid } from '../shared/uuid';
 import type { CardType } from "./cards";
 import type { Card as WorldCard, WorldState } from "./world";
 import { extractRelationshipSubgraph } from "../shared/relationships";
+import type { EvalReport } from "../contracts/evaluation";
 import {
   appendMessage,
   createSession,
@@ -173,7 +174,197 @@ function worldSummary(w: WorldState): string {
   if (debt.length) lines.push(`未处理质量债 ${debt.length} 项`);
   const revise = w.chapters.filter((c) => c.review?.verdict === "revise");
   if (revise.length) lines.push(`需修订章节 ${revise.length} 章：第 ${revise.map((c) => c.index).join("、")} 章`);
-  lines.push(`梗概：${w.premise.slice(0, 80)}`);
+  lines.push(`长期创作前提（包含未来方向，不等于已发生）：${w.premise.slice(0, 160)}`);
+  return lines.join("\n");
+}
+
+function clipped(value: string | undefined | null, max: number): string {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+/** Open-ended analysis needs more than counts: facts and future plans must be visibly separated.
+ * The bounds keep long books from consuming the whole model context; omitted facts must be queried,
+ * never reconstructed from provider memory. */
+export function groundedChatContext(
+  w: WorldState,
+  prompt: string,
+  selectedChapterIndex?: number | null,
+  evalReport: EvalReport | null = null,
+): string {
+  const lines = [
+    worldSummary(w),
+    "【事实边界】只有下方‘已写事实/角色名册/伏笔账/质量记录’可作为当前既有事实；长期前提、章纲、蓝图和提案都不是已发生事实。未列出的内容必须明确说无法从当前记录确认，或用‘假设/可以考虑’标为新建议。",
+  ];
+  const explicitIndexes = [...prompt.matchAll(/第\s*(\d+)\s*章/g)].map((match) => Number(match[1]));
+  const inferredIndex = chapterIndexFromPrompt(prompt);
+  const preferred = new Set<number>([
+    ...explicitIndexes,
+    ...(inferredIndex != null ? [inferredIndex] : []),
+    ...(Number.isInteger(selectedChapterIndex) ? [Number(selectedChapterIndex)] : []),
+  ]);
+  const sortedChapters = [...w.chapters].sort((a, b) => a.index - b.index);
+  const selectedChapters = sortedChapters.length <= 8
+    ? sortedChapters
+    : sortedChapters.filter((chapter) => preferred.has(chapter.index)).concat(sortedChapters.slice(-4))
+      .filter((chapter, index, all) => all.findIndex((candidate) => candidate.index === chapter.index) === index)
+      .slice(0, 8);
+  const summaries = new Map((w.chapterSummaries ?? []).map((summary) => [summary.index, summary]));
+  lines.push("【已写章节事实】");
+  for (const chapter of selectedChapters) {
+    const summary = summaries.get(chapter.index);
+    lines.push(`- 第 ${chapter.index} 章「${chapter.title}」：${clipped(summary?.summary, 700) || "暂无权威摘要"}`);
+    if (summary?.events?.length) lines.push(`  已发生事件：${summary.events.slice(0, 8).map((event) => clipped(event, 220)).join("；")}`);
+    if (preferred.has(chapter.index) || selectedChapters.length <= 3) {
+      lines.push(`  正文开头（原文）：${clipped(chapter.text, 1400) || "（空）"}`);
+    }
+  }
+  if (selectedChapters.length < sortedChapters.length) {
+    lines.push(`- 另有 ${sortedChapters.length - selectedChapters.length} 个已写章节未展开；需要精确分析时应先查询对应章节，不得猜测。`);
+  }
+
+  lines.push("【当前角色名册】");
+  for (const character of w.characters.slice(0, 16)) {
+    const relations = Object.entries(character.relations ?? {}).slice(0, 8).map(([name, relation]) => `${name}=${relation}`).join("；");
+    lines.push(`- ${character.name}（${character.role}${character.identity ? `；身份：${character.identity}` : ""}）：状态=${clipped(character.status, 260) || "未记录"}${relations ? `；关系=${relations}` : ""}`);
+  }
+  if (w.characters.length > 16) lines.push(`- 另有 ${w.characters.length - 16} 个角色未展开；不得自行补写其身份或状态。`);
+
+  lines.push("【权威伏笔账】");
+  if (w.foreshadowing.length === 0) lines.push("- 无");
+  for (const item of w.foreshadowing.slice(0, 30)) {
+    lines.push(`- [${item.status}] 第 ${item.plantedAt} 章：${clipped(item.text, 260)}${item.note ? `；备注=${clipped(item.note, 220)}` : ""}`);
+  }
+  if (w.foreshadowing.length > 30) lines.push(`- 另有 ${w.foreshadowing.length - 30} 条伏笔未展开；不得用章节人物或提案替代。`);
+
+  const proposals = (w.characterProposals ?? []).filter((proposal) => proposal.status === "pending");
+  lines.push("【未入册角色提案（不是角色名册，也不是伏笔）】");
+  lines.push(proposals.length
+    ? proposals.slice(0, 12).map((proposal) => `- ${proposal.name}：${clipped(proposal.reason, 220)}`).join("\n")
+    : "- 无");
+
+  const debt = (w.qualityDebt ?? []).filter((item) => item.status === "open");
+  lines.push("【现有质量记录】");
+  if (debt.length === 0) lines.push("- 未记录开放质量债");
+  for (const item of debt.slice(0, 16)) lines.push(`- 第 ${item.chapterIndex} 章 / ${item.lens} / ${item.severity}：${clipped(item.issue, 280)}`);
+  if (evalReport) {
+    lines.push(`- 最近整书评估：${evalReport.chaptersEvaluated} 章，综合 ${evalReport.overall}`);
+    for (const dimension of evalReport.dimensions) {
+      lines.push(`  ${dimension.name} ${dimension.score}：${clipped(dimension.evidence, 320)}`);
+    }
+    for (const suggestion of evalReport.suggestions.slice(0, 6)) lines.push(`  评估建议：${clipped(suggestion, 320)}`);
+  } else {
+    lines.push("- 暂无已落盘整书评估");
+  }
+
+  const planned = (w.chapterPlans ?? []).filter((plan) => plan.status === "planned").slice(0, 8);
+  lines.push("【未来计划层（尚未发生，仅可称计划/设想）】");
+  if (planned.length === 0) lines.push("- 无已登记未来章纲");
+  for (const plan of planned) lines.push(`- 第 ${plan.index} 章计划：${clipped(plan.goal, 280)}；节拍=${plan.beats.slice(0, 6).map((beat) => clipped(beat, 180)).join("；")}`);
+  return lines.join("\n");
+}
+
+function questionGroundingRules(w: WorldState, prompt: string): string[] {
+  const rules: string[] = [];
+  if (/伏笔/.test(prompt)) {
+    rules.push("本轮涉及伏笔：任何被称为‘伏笔’或计入伏笔数量的条目，都必须逐条对应【权威伏笔账】中的原文条目。章节事件、声纹比对、人物、关系和未入册提案一律不得混算为伏笔；影响数量必须由实际引用的权威条目数计算。");
+  }
+  const numericIndexes = [...prompt.matchAll(/第\s*(\d+)\s*章/g)].map((match) => Number(match[1]));
+  const inferredIndex = chapterIndexFromPrompt(prompt);
+  const chapterIndexes = [...new Set([...numericIndexes, ...(inferredIndex != null ? [inferredIndex] : [])])];
+  const chapters = chapterIndexes.flatMap((index) => {
+    const chapter = w.chapters.find((item) => item.index === index);
+    return chapter ? [`第 ${chapter.index} 章的唯一权威标题是「${chapter.title}」；不得改称其他标题。`] : [];
+  });
+  rules.push(...chapters);
+  if (chapters.length && /对比|比较|方案/.test(prompt)) {
+    rules.push("本轮比较已写章节的方案：回答开头必须先依据【已写章节事实】说明当前正文实际采用的顺序，再把用户给出的选项明确称为‘假设改写方案’；不得把建议写成现有正文。");
+  }
+  if (/评估|最紧迫|问题|批评|连续性|逻辑|文笔|破坏/.test(prompt)) {
+    rules.push("本轮涉及质量判断：优先引用【现有质量记录】中的具体证据；没有记录支持的判断必须标为新建议，不得冒充已有审查或评估结论。");
+  }
+  return rules;
+}
+
+function shouldGroundPlanAsAnalysis(prompt: string): boolean {
+  const compact = prompt.replace(/\s+/g, "");
+  return /(?:对比|比较|分析|批评|总结|评估|优缺点|利弊|是否太|问题|读者预期)/.test(compact)
+    || /(?:不要|别|无需|只)(?:.{0,8})(?:执行|修改|推进|分析|说明|评价)/.test(compact);
+}
+
+/** Perspective-change questions about existing foreshadows use the ledger directly.
+ * A free-form model repeatedly promoted ordinary chapter events into new foreshadows, so the
+ * authoritative item set and counts are deterministic while the impact wording stays advisory. */
+export function perspectiveForeshadowReply(w: WorldState, prompt: string): string | null {
+  const compact = prompt.replace(/\s+/g, "");
+  if (!/视角/.test(compact) || !/伏笔/.test(compact) || !/(?:改成|换成|改为|换为)/.test(compact)) return null;
+  const chapterIndex = chapterIndexFromPrompt(compact);
+  if (chapterIndex == null) return "请先指定要改视角的章节，我会只按权威伏笔账逐条评估，不会把普通事件或角色提案混算成伏笔。";
+  const chapter = w.chapters.find((item) => item.index === chapterIndex);
+  if (!chapter) return `第 ${chapterIndex} 章尚未写入，当前没有可核对的正文与伏笔记录。`;
+  const viewpoint = compact.match(/(?:改成|换成|改为|换为)([^，。！？?,]{1,12})视角/)?.[1] ?? "新人物";
+  const unresolved = w.foreshadowing.filter((item) => item.status !== "resolved");
+  const direct = unresolved.filter((item) => item.plantedAt === chapterIndex);
+  const other = unresolved.filter((item) => item.plantedAt !== chapterIndex);
+  const lines = [
+    `按当前权威伏笔账，把第 ${chapter.index} 章「${chapter.title}」改成${viewpoint}视角，会直接影响本章埋设的 ${direct.length} 条伏笔；不能把声纹比对、人物或未入册提案另算成伏笔。`,
+  ];
+  if (direct.length === 0) {
+    lines.push("本章没有登记未回收伏笔，因此不能断言会直接破坏某条现有伏笔。");
+  } else {
+    lines.push("\n### 直接受影响的权威伏笔");
+    for (const item of direct) {
+      let impact = `这是视角改写风险判断：需要重新安排${viewpoint}能感知的信息，并避免提前解释该线索。`;
+      if (/敲击|SOS|求救|录音/.test(item.text) && /苏遥/.test(viewpoint)) {
+        impact = "这是视角改写风险判断：从苏遥视角呈现会更容易暴露求救者的主动行为，需要保留信息差，否则会削弱林渡逐步确认信号来源的悬念。";
+      } else if (/纸条|黑伞|桥不是塌了/.test(item.text)) {
+        impact = "这是视角改写风险判断：该线索目前落在林渡所在的外部场景；若坚持苏遥单一视角，需要保留一个可核对的林渡场景或另设交接方式，不能让苏遥无来源地知道纸条内容。";
+      }
+      lines.push(`- **${item.text}**（第 ${item.plantedAt} 章，${item.status}）\n  ${impact}`);
+    }
+  }
+  if (other.length) {
+    lines.push(`\n### 不应算作“直接被破坏”\n其余 ${other.length} 条未回收伏笔埋在其他章节；只改第 ${chapterIndex} 章不会让它们自动消失：`);
+    for (const item of other) lines.push(`- ${item.text}（第 ${item.plantedAt} 章）`);
+  }
+  lines.push(`\n结论：若目标只是增加${viewpoint}的主观感受，优先考虑短暂、明确标记的视角片段；不要在未重排上述 ${direct.length} 条线索的信息揭示顺序前，整体替换第 ${chapterIndex} 章视角。以上只是分析，没有执行任何修改。`);
+  return lines.join("\n");
+}
+
+/** The "most urgent issues" answer is an audit report, not a brainstorming turn.
+ * Render persisted evaluation evidence verbatim so planned arcs cannot leak in as fake findings. */
+export function urgentIssuesReply(w: WorldState, prompt: string, report: EvalReport | null): string | null {
+  const compact = prompt.replace(/\s+/g, "");
+  if (!/(?:最紧迫|最严重|最优先).*(?:三|3)个?(?:问题|缺陷)|(?:三|3)个?(?:最紧迫|最严重|最优先).*(?:问题|缺陷)/.test(compact)) return null;
+  if (!report) return "当前没有已落盘的整书评估，无法给出有证据的‘最紧迫三个问题’排序。可以先执行只读整书评估；这次没有执行任何操作。";
+  const dimensions = [...report.dimensions].sort((a, b) => a.score - b.score).slice(0, 3);
+  const debtByDimension: Record<string, Set<string>> = {
+    剧情逻辑: new Set(["logic"]),
+    设定一致: new Set(["continuity"]),
+    人物塑造: new Set(["character"]),
+    节奏张力: new Set(["pacing"]),
+    文笔风格: new Set(["prose"]),
+    伏笔管理: new Set(["foreshadow"]),
+  };
+  const openDebt = (w.qualityDebt ?? []).filter((item) => item.status === "open");
+  const lines = [`按最近一次已落盘整书评估（${report.chaptersEvaluated} 章，综合 ${report.overall}），分数最低的三个维度是：`];
+  dimensions.forEach((dimension, index) => {
+    lines.push(`\n${index + 1}. **${dimension.name}（${dimension.score} 分）**\n   评估证据：${dimension.evidence}`);
+    const lenses = debtByDimension[dimension.name];
+    const matchingDebt = lenses ? openDebt.filter((item) => lenses.has(item.lens)) : [];
+    const matching = matchingDebt.slice(0, 4);
+    if (matching.length) {
+      lines.push(`   对应开放质量债（${matching.length} 条${matchingDebt.length > matching.length ? "，仅列前 4 条" : ""}）：`);
+      for (const item of matching) lines.push(`   - 第 ${item.chapterIndex} 章：${item.issue}`);
+    } else {
+      lines.push("   当前没有与该维度直接匹配的开放质量债；不额外补造原因。");
+    }
+  });
+  if (report.suggestions.length) {
+    lines.push("\n评估已记录的处理建议：");
+    for (const suggestion of report.suggestions.slice(0, 3)) lines.push(`- ${suggestion}`);
+  }
+  lines.push("\n以上只复述已落盘评估与质量债，没有执行任何操作，也没有把未来章纲当成现有问题证据。");
   return lines.join("\n");
 }
 
@@ -1039,7 +1230,11 @@ const CHAT_SYSTEM = `你是小说创作引擎「墨枢」的中枢（brain），
 - 自然、简洁、有判断力；创作建议给出具体可行的方案
 - 可使用 Markdown 组织内容（标题/列表/表格/引用/代码块/图片 ![]()），便于前端渲染
 - 涉及多方案取舍时先给出推荐并简述理由
-- “下一章”必须解析为权威上下文标注的“下一待写章”；不得把已写章节当成待写章节，也不得分析尚不存在的旧章内容`;
+- “下一章”必须解析为权威上下文标注的“下一待写章”；不得把已写章节当成待写章节，也不得分析尚不存在的旧章内容
+- 只能把上下文中明确标为“已写章节事实、当前角色名册、权威伏笔账、质量记录”的内容陈述为现有事实；长期创作前提、未来计划层和未入册提案不得冒充已发生剧情、已入册角色或伏笔
+- 不得新增上下文中没有的专名、章节标题、角色身份、场景、关系、伏笔或评估结论；提出新创意时必须显式使用“假设”“建议”“可以考虑”等措辞
+- 最近对话只用于解析“刚才那个/这段”等指代，历史中的中枢回复不是权威事实；与权威上下文冲突时必须以权威上下文为准
+- 用户要求基于原文分析而上下文没有相应原文时，明确说明无法核对并请其指定/打开章节，禁止自行编造原文`;
 
 /**
  * LLM/存储依赖注入点（测试替身用）：生产默认走真实实现；
@@ -1107,7 +1302,7 @@ async function streamChatReply(ctx: BrainChatContext, messageId: string): Promis
   try {
     const w = brainChatDeps.loadWorld(title);
     if (w) {
-      const lines = [worldSummary(w)];
+      const lines = [groundedChatContext(w, prompt, snap?.chapterIndex, readEvalReport(w.title))];
       if (typeof snap?.chapterIndex === "number" && Number.isInteger(snap.chapterIndex)) {
         const ch = w.chapters.find((c) => c.index === snap.chapterIndex);
         if (ch) lines.push(`用户当前选中章节：第 ${ch.index} 章「${ch.title}」${ch.review?.verdict === "revise" ? "（需修订）" : ""}`);
@@ -1117,6 +1312,16 @@ async function streamChatReply(ctx: BrainChatContext, messageId: string): Promis
       if (snap?.writingRunning) sys.push("写作任务进行中");
       if (snap?.systemStatus) sys.push(snap.systemStatus);
       if (sys.length) lines.push(`系统状态：${sys.join("；")}`);
+      const questionRules = questionGroundingRules(w, prompt);
+      if (questionRules.length) lines.push(`【本轮硬约束】\n${questionRules.map((rule) => `- ${rule}`).join("\n")}`);
+      const session = getSession(title, sessionId);
+      const recent = (session?.messages ?? [])
+        .filter((message) => (message.text ?? "").trim())
+        .slice(-8)
+        .map((message) => `${message.role === "user" ? "用户" : "中枢"}：${clipped(message.text, 600)}`);
+      if (recent.length) {
+        lines.push(`最近对话（只用于指代解析，不是事实来源）：\n${recent.join("\n")}`);
+      }
       worldCtx = lines.join("\n");
     }
   } catch { /* 世界读取失败：仅用 prompt 兜底 */ }
@@ -1144,7 +1349,7 @@ async function streamChatReply(ctx: BrainChatContext, messageId: string): Promis
     {
       ...taskOpts("brainGate"),
       signal,
-      temperature: 0.7,
+      temperature: 0.4,
       maxTokens: 20000,
       retries: 2,
       // 思考模式开关（默认关）：thinking={type:"disabled"} 关闭思维链（首字节提速 90%+，tokenrhythm 实测生效）
@@ -1768,6 +1973,24 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
       return;
     }
 
+    const foreshadowReply = perspectiveForeshadowReply(w, activePrompt);
+    if (foreshadowReply) {
+      updateMessageText(title, sessionId, messageId, foreshadowReply, true);
+      send({ type: "delta", messageId, text: foreshadowReply });
+      markMessageDone(title, sessionId, messageId);
+      send({ type: "done", messageId });
+      return;
+    }
+
+    const issueReply = urgentIssuesReply(w, activePrompt, readEvalReport(w.title));
+    if (issueReply) {
+      updateMessageText(title, sessionId, messageId, issueReply, true);
+      send({ type: "delta", messageId, text: issueReply });
+      markMessageDone(title, sessionId, messageId);
+      send({ type: "done", messageId });
+      return;
+    }
+
     // —— 意图识别（注入前端选中章 + 最近会话上下文，供 LLM 自动提取工具参数，需求 2） ——
     const hist = (session?.messages ?? []).slice(-6).map((m) => `${m.role === "user" ? "用户" : "中枢"}：${(m.text ?? "").slice(0, 200)}`);
     const { intent, params, reply } = explicitMediaIntent(activePrompt)
@@ -1779,6 +2002,13 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
     // 纯对话 / 未知意图：真流式回复（可中断、可恢复）
     const meta = INTENTS[intent];
     if (intent === "chat" || !meta) {
+      await streamChatReply({ ...ctx, prompt: activePrompt }, messageId);
+      markMessageDone(title, sessionId, messageId);
+      send({ type: "done", messageId });
+      return;
+    }
+
+    if ((intent === "plan" || intent === "opinion") && shouldGroundPlanAsAnalysis(activePrompt)) {
       await streamChatReply({ ...ctx, prompt: activePrompt }, messageId);
       markMessageDone(title, sessionId, messageId);
       send({ type: "done", messageId });

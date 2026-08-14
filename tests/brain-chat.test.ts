@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { emptyWorld, type WorldState } from "../src/api/world";
 import type { Card as WorldCard } from "../src/api/world";
-import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, explicitSettingsQuery, explicitCapabilityQuery, explicitActionIntent, extractNameFromHistory, authorFromEditPrompt, currentFromEditPrompt, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard, recentMediaReferenceReply } from "../src/api/brain-chat";
+import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, explicitSettingsQuery, explicitCapabilityQuery, explicitActionIntent, extractNameFromHistory, authorFromEditPrompt, currentFromEditPrompt, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard, recentMediaReferenceReply, groundedChatContext, perspectiveForeshadowReply, urgentIssuesReply } from "../src/api/brain-chat";
 import { appendMessage as sessAppendMessage, createSession as sessCreateSession, getSession as sessGet, lastPendingMessage as sessLastPending } from "../src/api/brain-sessions";
 import type { ChatMessage } from "../src/api/agnes";
 
@@ -135,6 +135,95 @@ describe("INTENTS 意图映射", () => {
     expect(INTENTS.autoskip.level).toBe("L1");
     expect(INTENTS.autoskip.commandId).toBe("CMD-N14");
     expect(INTENTS.autoskip.action?.endpoint).toBe("/api/novel/auto/skip");
+  });
+});
+
+describe("groundedChatContext（开放分析权威事实边界）", () => {
+  test("分区注入章节、角色、伏笔、提案、质量债和最近评估", () => {
+    const world = mkWorld();
+    world.premise = "最终林墨会发现自己是信号源";
+    world.chapters[0].text = "凌晨，林墨在电台听到苏遥的求救。";
+    world.chapterSummaries = [{
+      index: 1,
+      summary: "林墨在电台收到苏遥求救。",
+      events: ["林墨确认信号来自桥下"],
+      appeared: ["林墨", "苏遥"],
+      stateChanges: [],
+    }];
+    world.characters[0].identity = "午夜电台主持人";
+    world.characters[0].status = "被停职";
+    world.characters[0].relations = { 苏遥: "旧识" };
+    world.characterProposals = [{
+      id: "p1", name: "黑伞陌生人", role: "神秘人", traits: [], motivation: "阻止调查",
+      reason: "章节中短暂出现，等待确认入册", source: "writer", status: "pending",
+    }];
+    world.qualityDebt = [{ id: "q1", chapterIndex: 1, lens: "logic", issue: "纸条出现缺少动作铺垫", severity: "minor", status: "open" }];
+    const context = groundedChatContext(world, "如果把第一章改成苏遥视角，会破坏哪些伏笔？", 1, {
+      at: "2026-08-14T00:00:00.000Z",
+      chaptersEvaluated: 1,
+      overall: 6.5,
+      dimensions: [{ name: "剧情逻辑", score: 5, evidence: "纸条来路未交代" }],
+      suggestions: ["补足纸条落点动作"],
+    });
+
+    expect(context).toContain("第 1 章「第一章」：林墨在电台收到苏遥求救");
+    expect(context).toContain("正文开头（原文）：凌晨，林墨在电台听到苏遥的求救");
+    expect(context).toContain("身份：午夜电台主持人");
+    expect(context).toContain("状态=被停职");
+    expect(context).toContain("神秘玉佩");
+    expect(context).toContain("未入册角色提案（不是角色名册，也不是伏笔）");
+    expect(context).toContain("黑伞陌生人：章节中短暂出现，等待确认入册");
+    expect(context).toContain("纸条出现缺少动作铺垫");
+    expect(context).toContain("最近整书评估：1 章，综合 6.5");
+    expect(context).toContain("长期创作前提（包含未来方向，不等于已发生）");
+  });
+
+  test("视角改写只把伏笔账条目计入影响，不把普通事件混算", () => {
+    const world = mkWorld();
+    world.chapters[0].title = "潮信";
+    world.foreshadowing = [
+      { id: "f1", text: "录音末尾出现三短三长三短的SOS敲击", plantedAt: 1, status: "planted" },
+      { id: "f2", text: "纸条写着桥不是塌了，是被封着的", plantedAt: 1, status: "planted" },
+      { id: "f3", text: "档案签名是林渡笔迹", plantedAt: 2, status: "planted" },
+    ];
+    const reply = perspectiveForeshadowReply(world, "如果把第一章改成苏遥视角，会破坏哪些伏笔？")!;
+    expect(reply).toContain("直接影响本章埋设的 2 条伏笔");
+    expect(reply).toContain("录音末尾出现三短三长三短的SOS敲击");
+    expect(reply).toContain("纸条写着桥不是塌了，是被封着的");
+    expect(reply).toContain("其余 1 条未回收伏笔埋在其他章节");
+    expect(reply).toContain("档案签名是林渡笔迹（第 2 章）");
+    expect(reply).toContain("不能把声纹比对、人物或未入册提案另算成伏笔");
+    expect(perspectiveForeshadowReply(world, "第一章有哪些伏笔？")).toBeNull();
+  });
+
+  test("最紧迫三个问题只复述评估证据与匹配质量债", () => {
+    const world = mkWorld();
+    world.qualityDebt = [
+      { id: "q1", chapterIndex: 1, lens: "logic", issue: "坐标来源未交代", severity: "minor", status: "open" },
+      { id: "q2", chapterIndex: 1, lens: "prose", issue: "短信画面抽象", severity: "minor", status: "open" },
+    ];
+    const reply = urgentIssuesReply(world, "总结最紧迫的三个问题，别执行", {
+      at: "2026-08-14T00:00:00.000Z", chaptersEvaluated: 2, overall: 6.3,
+      dimensions: [
+        { name: "剧情逻辑", score: 5, evidence: "逻辑证据原文" },
+        { name: "人物塑造", score: 6, evidence: "人物证据原文" },
+        { name: "节奏张力", score: 7, evidence: "节奏证据原文" },
+        { name: "文笔风格", score: 7, evidence: "文笔证据原文" },
+        { name: "爽点钩子", score: 7, evidence: "钩子证据原文" },
+        { name: "伏笔管理", score: 7, evidence: "伏笔证据原文" },
+        { name: "设定一致", score: 5, evidence: "一致性证据原文" },
+        { name: "主题立意", score: 6, evidence: "主题证据原文" },
+      ],
+      suggestions: ["统一时间线"],
+    })!;
+    expect(reply).toContain("剧情逻辑（5 分）");
+    expect(reply).toContain("设定一致（5 分）");
+    expect(reply).toContain("人物塑造（6 分）");
+    expect(reply).toContain("评估证据：逻辑证据原文");
+    expect(reply).toContain("第 1 章：坐标来源未交代");
+    expect(reply).not.toContain("短信画面抽象");
+    expect(reply).toContain("没有把未来章纲当成现有问题证据");
+    expect(urgentIssuesReply(world, "总结最紧迫的三个问题", null)).toContain("没有已落盘的整书评估");
   });
 });
 
@@ -839,6 +928,88 @@ describe("brainChatStream（SSE 编排，事件协议 v2）", () => {
     }
   });
 
+  test("开放聊天把最近对话仅标作指代参考，并注入权威事实边界", async () => {
+    mockWorld = mkWorld();
+    mockWorld.chapterSummaries = [{
+      index: 1,
+      summary: "林墨在夜色中调查。",
+      events: ["林墨独自离开电台"],
+      appeared: ["林墨"],
+      stateChanges: [],
+    }];
+    nextChatContent = JSON.stringify({ intent: "chat", params: {}, reply: "" });
+    const original = brainChatDeps.chatStream;
+    let call = 0;
+    let secondMessages: ChatMessage[] = [];
+    brainChatDeps.chatStream = (async (messages: ChatMessage[], onChunk: (d: string) => void) => {
+      call += 1;
+      if (call === 1) onChunk("旧回复曾误称唐哲是电台技术员。");
+      else {
+        secondMessages = messages;
+        onChunk("我会以权威章节记录为准。\n");
+      }
+      return "ok";
+    }) as typeof brainChatDeps.chatStream;
+    try {
+      await runTurn("先谈谈人物", { sessionId: "grounded-history" });
+      await runTurn("这段分析可靠吗？", { sessionId: "grounded-history" });
+      expect(secondMessages[0]?.content).toContain("历史中的中枢回复不是权威事实");
+      expect(secondMessages[1]?.content).toContain("【已写章节事实】");
+      expect(secondMessages[1]?.content).toContain("【权威伏笔账】");
+      expect(secondMessages[1]?.content).toContain("最近对话（只用于指代解析，不是事实来源）");
+      expect(secondMessages[1]?.content).toContain("旧回复曾误称唐哲是电台技术员");
+    } finally {
+      brainChatDeps.chatStream = original;
+    }
+  });
+
+  test("伏笔与章节分析收到问题级硬约束，禁止把事件或提案混算", async () => {
+    mockWorld = mkWorld();
+    let sentMessages: ChatMessage[] = [];
+    const original = brainChatDeps.chatStream;
+    brainChatDeps.chatStream = (async (messages: ChatMessage[], onChunk: (d: string) => void) => {
+      sentMessages = messages;
+      onChunk("只分析权威伏笔。\n");
+      return "只分析权威伏笔。";
+    }) as typeof brainChatDeps.chatStream;
+    nextChatContent = JSON.stringify({ intent: "chat", params: {}, reply: "" });
+    try {
+      await runTurn("第一章这些伏笔的逻辑有什么问题？", { sessionId: "foreshadow-grounding" });
+      expect(sentMessages[1]?.content).toContain("章节事件、声纹比对、人物、关系和未入册提案一律不得混算为伏笔");
+      expect(sentMessages[1]?.content).toContain("影响数量必须由实际引用的权威条目数计算");
+      expect(sentMessages[1]?.content).toContain("第 1 章的唯一权威标题是「第一章」");
+      expect(sentMessages[1]?.content).toContain("优先引用【现有质量记录】中的具体证据");
+    } finally {
+      brainChatDeps.chatStream = original;
+    }
+  });
+
+  test("视角伏笔分析走确定性回复，不调用 provider 且不产生动作卡", async () => {
+    mockWorld = mkWorld();
+    mockWorld.chapters[0].title = "潮信";
+    mockWorld.foreshadowing = [
+      { id: "f1", text: "SOS敲击", plantedAt: 1, status: "planted" },
+      { id: "f2", text: "鱼尾纸条", plantedAt: 1, status: "planted" },
+      { id: "f3", text: "档案签名", plantedAt: 2, status: "planted" },
+    ];
+    const originalJson = brainChatDeps.chatJson;
+    const originalStream = brainChatDeps.chatStream;
+    let providerCalls = 0;
+    brainChatDeps.chatJson = (async () => { providerCalls += 1; throw new Error("should not call"); }) as typeof brainChatDeps.chatJson;
+    brainChatDeps.chatStream = (async () => { providerCalls += 1; throw new Error("should not call"); }) as typeof brainChatDeps.chatStream;
+    try {
+      const events = await runTurn("如果把第一章改成苏遥视角，会破坏哪些伏笔？", { sessionId: "perspective-ledger" });
+      const text = events.filter((event) => event.type === "delta").map((event) => String(event.text ?? "")).join("");
+      expect(text).toContain("直接影响本章埋设的 2 条伏笔");
+      expect(text).toContain("其余 1 条未回收伏笔埋在其他章节");
+      expect(events.filter((event) => event.type === "card")).toHaveLength(0);
+      expect(providerCalls).toBe(0);
+    } finally {
+      brainChatDeps.chatJson = originalJson;
+      brainChatDeps.chatStream = originalStream;
+    }
+  });
+
   test("意图 read_chapter → delta(reply) + card(browse) + done", async () => {
     mockWorld = mkWorld();
     nextChatContent = JSON.stringify({ intent: "read_chapter", params: { index: 1 }, reply: "为你打开第一章" });
@@ -888,6 +1059,33 @@ describe("brainChatStream（SSE 编排，事件协议 v2）", () => {
     expect(card.kind).toBe("result");
     expect(card.open).toEqual({ target: "relationships", opts: { tab: "关系图" } });
     expect(card.panelIntent).toMatchObject({ target: "relationships", opts: { tab: "关系图" } });
+  });
+
+  test("章节方案对比即使识别为 opinion 也走权威分析，不生成动作卡", async () => {
+    mockWorld = mkWorld();
+    mockWorld.chapters.push({ index: 2, title: "覆水", text: "白天，林墨先到桥下调查，之后回电台查旧档。", review: null });
+    mockWorld.chapterSummaries = [{ index: 2, summary: "林墨先调查桥墩，随后查阅旧档。", events: ["林墨在桥下调查", "林墨回台查旧档"], appeared: ["林墨"], stateChanges: [] }];
+    nextChatContent = JSON.stringify({ intent: "opinion", params: {}, reply: "第 2 章「回声」应该先查不存在的旧档记录" });
+    const original = brainChatDeps.chatStream;
+    let sentMessages: ChatMessage[] = [];
+    brainChatDeps.chatStream = (async (messages: ChatMessage[], onChunk: (d: string) => void) => {
+      sentMessages = messages;
+      onChunk("当前第 2 章「覆水」实际先写桥下调查，再写旧档；以下只比较改写方案。");
+      return "ok";
+    }) as typeof brainChatDeps.chatStream;
+    try {
+      const events = await runTurn("对比两种第二章开头方案：直接下水调查，或先查电台旧档。", { sessionId: "grounded-comparison" });
+      const text = events.filter((event) => event.type === "delta").map((event) => String(event.text ?? "")).join("");
+      expect(text).toContain("第 2 章「覆水」实际先写桥下调查");
+      expect(text).not.toContain("回声");
+      expect(events.filter((event) => event.type === "card")).toHaveLength(0);
+      expect(sentMessages[1]?.content).toContain("第 2 章「覆水」");
+      expect(sentMessages[1]?.content).toContain("林墨先调查桥墩，随后查阅旧档");
+      expect(sentMessages[1]?.content).toContain("回答开头必须先依据【已写章节事实】说明当前正文实际采用的顺序");
+      expect(sentMessages[1]?.content).toContain("假设改写方案");
+    } finally {
+      brainChatDeps.chatStream = original;
+    }
   });
 
   test("意图 advance（L2）→ delta + card(preview/confirmRequired) + card(confirm)", async () => {
