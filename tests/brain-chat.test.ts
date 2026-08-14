@@ -767,9 +767,15 @@ describe("brainChatStream（SSE 编排，事件协议 v2）", () => {
 
   test("意图 delete_chapter（L3）→ confirm 仅 abort 选项", async () => {
     mockWorld = mkWorld();
-    nextChatContent = JSON.stringify({ intent: "delete_chapter", params: { index: 1 }, reply: "删除第一章" });
+    nextChatContent = JSON.stringify({ intent: "delete_chapter", params: { index: 1 }, reply: "已删除第一章，当前共 0 章" });
     const events = await runTurn("删掉第一章");
-    const confirmCard = events.filter((e) => e.type === "card").map((e) => e.card as Record<string, unknown>).find((c) => c?.kind === "confirm");
+    const delta = events.find((e) => e.type === "delta") as { text?: string } | undefined;
+    expect(delta?.text).toBe("已准备「删除章节」操作；请核对下方预览并确认后执行，当前尚未执行。");
+    expect(delta?.text).not.toContain("已删除");
+    const cards = events.filter((e) => e.type === "card").map((e) => e.card as Record<string, unknown>);
+    const previewCard = cards.find((c) => c?.kind === "preview");
+    const confirmCard = cards.find((c) => c?.kind === "confirm");
+    expect(previewCard?.summary).toBe(delta?.text);
     expect(confirmCard).toBeTruthy();
     expect(confirmCard!.options).toEqual(["abort"]);
   });

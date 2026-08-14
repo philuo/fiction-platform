@@ -1897,8 +1897,12 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
       return;
     }
 
-    // 操作意图：reply 作为开场回复（一次性 delta，前端打字机动画）
-    const text = reply || meta.title;
+    // 操作意图：reply 作为开场回复（一次性 delta，前端打字机动画）。
+    // 带 action 的意图在此时只生成待执行预览；provider 可能返回“已删除/已重写”等
+    // 完成态文案，不得用它伪造业务回执。真实终态只能由后续 action/result 卡给出。
+    const text = meta.action
+      ? `已准备「${meta.title}」操作；请核对下方预览${meta.level === "L2" || meta.level === "L3" ? "并确认后执行" : "后执行"}，当前尚未执行。`
+      : (reply || meta.title);
     if (text) {
       updateMessageText(title, sessionId, messageId, text, true);
       send({ type: "delta", messageId, text });
@@ -2011,11 +2015,6 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
       if (sv2?.advanceTaskRunning) busyReasons.push("推进任务进行中");
       if (sv2?.mediaGenerating) busyReasons.push("插画/视频生成中");
       if (busyReasons.length) {
-        const text = reply || meta.title;
-        if (text) {
-          updateMessageText(title, sessionId, messageId, text, true);
-          send({ type: "delta", messageId, text });
-        }
         const busyCard: BrainChatCard = {
           kind: "result", title: meta.title, success: false,
           detail: `当前${busyReasons.join("、")}，为避免与运行中任务冲突暂不执行「${meta.title}」。可先等待完成或中断后再试。`,
@@ -2033,7 +2032,7 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
         title: meta.title,
         commandId: meta.commandId,
         level: meta.level,
-        summary: reply || meta.title,
+        summary: text,
         confirmRequired: needConfirm,
         action: meta.action ? { ...meta.action, body } : undefined,
       };
