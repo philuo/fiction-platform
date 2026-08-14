@@ -9,8 +9,11 @@
 - **预期**：解析 `chapterIndex=2`，读取第 2 章权威 chapter plan 与正文/结算摘要，逐项说明已兑现、偏离和新增内容；无章纲时应明确说明。
 - **实际 / 证据**：正文只回答“2 卷、6 条故事弧、4 条章纲、已完成 2 条；下一条是第 3 章……”，卡片也是全局“计划与章纲进度（2/4）”，完全没有第 2 章章纲、正文或偏差。截图：`/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-031-outline-body-diff-misroute.jpg`。
 - **影响范围**：包含“偏差/对比/是否按章纲写”等语义的章节计划查询；用户无法用中枢检查章节执行度，且泛化回复容易被误认为已完成比较。
-- **初步根因**：`read_plan` 意图只支持全局 plan browse，未保留“章节 + 比较正文”的操作符；`chapterIndex` 即使提取也没有专用响应构建器消费。
-- **严重度 / 状态**：P2；待修复。
+- **根因**：`read_plans` 只支持全局 plan browse，意图识别没有保留“指定章节 + 比较实际正文”的操作符；`executeQuery()` 即使收到 `chapterIndex` 也不会消费它，只能返回卷、弧和全局章纲进度。
+- **修复**：`c7ce293`（`fix: compare chapter plan with actual`）增加本地确定性 `explicitPlanComparisonQuery()`，中文/阿拉伯章号的明确对比问法固定映射为 `read_plans({ chapterIndex, compareActual:true })`，不调用 provider；新增 `buildChapterPlanComparison()`，将保存的章纲 beat 与权威结算事件做一对一保守匹配，只输出原始章纲/事件文本，低置信项标记“未从结算摘要确认”，未匹配事件标记“正文新增 / 章纲外展开”；前端增加专用只读对比卡，正文摘要由同一结构化结果确定性生成。缺少正文、章纲或结算摘要时返回明确失败结果，不伪造比较。
+- **自动验证**：新增中文/阿拉伯章号快路径、4 条章纲兑现、2 条正文新增、缺数据失败和完整 Brain 回合测试；完整回合验证 provider 调用为 0、无 `preview/confirm/progress` 写卡。定向 `tests/brain-chat.test.ts` 为 `111 pass / 0 fail / 679 assertions`；完整 `bun run check`、`bun run build`、`bun run typecheck`、`bun run check:architecture` 与 `git diff --check` 均通过，架构仍为 49 个公开命令、0 循环依赖。
+- **浏览器复验**：隔离生产服务重启后在 Tab B 重放原句，正文与专用卡均显示第 2 章「覆水」、`4/4` 章纲已兑现和 `2` 项章纲外展开；四组原始章纲/结算事件逐项对应，新增项准确列出铅笔字/异常短信及湿工作服/异常广播/三天警告；旧的全局“2 卷 / 6 条故事弧 / 下一条第 3 章”均未出现。消息内执行、确认、进度卡和写操作按钮均为 0，应用 console warning/error 为 0。截图：`/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-031-verify.jpg`，SHA-256：`8f7c29a2cbfa9184f840654971ed0915dda26b50bcf6321dfbb9609cb855255e`。
+- **严重度 / 状态**：P2；已修复并推送（修复 SHA：`c7ce293`）。
 
 ### BROWSER-BUG-030 [P2] 导出能力问答虚构 PDF/TXT 与批注/分卷选项
 
