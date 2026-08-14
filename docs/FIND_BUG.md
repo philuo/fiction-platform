@@ -18,7 +18,12 @@
 - **预期**：顶层 job 的 phase/result 应明确表达策略暂停，不得显示目标完成；额度、错误、取消、中断也必须映射到各自终态，receipt 不得虚假成功。
 - **实际 / 证据**：job `e4fc94df-6a13-44de-aee1-6654e08ee68e` 的 `progress_json.status=paused`、`phase=第 1 章审查未通过，等待处理`、`result.reason=review`、章节仍为 0；路由随后无条件把顶层 job 覆盖成 `succeeded/done`，command receipt `39fcea23-757d-4f02-bfc2-055f743c8d12` 也为 succeeded。
 - **影响范围**：所有 auto 的 review/paused/quota/error/interrupted/stopped 终止原因；任务中心、审计和命令回执可能把未完成或失败误报为 done。
-- **严重度 / 状态**：P2；待修复。
+- **根因**：`/api/novel/auto/start` 在 `runAuto` 返回后无条件 `updateJob(...succeeded, done)`，覆盖了 `saveAutoSession` 已持久化的 paused/stopped/interrupted/failed 阶段；同一 job 绑定的 command receipt 也因此收到错误终态。
+- **修复**：新增 `autoReportJobOutcome`，按 `done/complete、review/paused、score、stopped、interrupted、quota、error` 分别映射 job 的终态与 phase；晚到的循环收尾不会把已取消 job 改写成成功。
+- **回归与门禁**：`tests/autorun-fix.test.ts` 覆盖 5 类退出原因映射；定向 18 pass / 0 fail，typecheck、架构检查、client/SSR build 和 `git diff --check` 通过。此前完整门禁基线为 708 pass / 0 fail（3959 assertions）。
+- **commit / push**：`248b7f8`；已推送到 `origin/codex/brain-reliability-ui`。
+- **真实浏览器复验**：服务重启恢复 auto job `cdf070bd-0e1f-4883-ad53-43c8b7fd7301` 后，通过真实“连载控制台 → 停止连载”发出持久停止命令；job 与 receipt 立即为 `cancelled/用户手动停止`，等待 provider 晚到数分钟后仍未被覆盖为 succeeded/done，页面解除运行锁，权威章节数保持 0。审查暂停样本 `e4fc94df…` 的 `result.reason=review` 与 progress paused 证据保留在本条复现记录中。
+- **严重度 / 状态**：P2；已修复、真实浏览器复验通过并已推送。
 
 ### BROWSER-BUG-017 [P2] 自动连载首章运行期间任务中心显示“暂无连载任务”
 
