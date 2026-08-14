@@ -2,6 +2,20 @@
 
 ## 2026-08-14 真实浏览器深度验收（第二批）
 
+### BROWSER-BUG-034 [P2] 恢复能力问答把刷新与重启混淆并给出错误事实
+
+- **首次发现**：2026-08-14 20:54（Asia/Shanghai）。
+- **场景 / testId**：`CHAT-RECOVERY-BOUNDARY-121`；Tab A，同账号《雾港电台》，真实中枢 UI 输入“页面刷新或服务重启时，哪些任务能继续，哪些会明确中断？只解释现有能力，不执行。”
+- **预期**：能力边界回答必须来自系统恢复契约，区分浏览器刷新与服务进程重启；不得靠模型猜测。刷新后后端任务继续且前端从 sync/job/session 恢复；服务重启时安全恢复点任务续跑，其余明确收敛为 interrupted/failed。
+- **实际 / 证据**：回答声称“插画/封面生成刷新或重启后进程中断，需重新发起”“视频生成同上”“正在进行的对话上下文刷新后最近对话可能丢失”，并自称无法确认任务队列持久化机制。实际系统已有持久 job、safe-recovery 分类、视频 watcher 和 Brain session 落盘；本轮及此前真实刷新/重启已证明会话不丢、刷新不会停止服务端任务。截图 `/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-034-capability-recovery-claim.jpg`；本回合没有动作卡，也没有新增 command receipt。
+- **影响范围**：用户询问刷新、关闭页面、服务重启、异步任务恢复或会话恢复时，会收到与产品真实行为冲突的操作建议，可能导致重复提交 provider 任务或误判数据丢失。
+- **根因**：能力边界问题仍走开放 provider 回答；grounded context 只注入故事事实，没有注入系统恢复协议，也没有确定性能力查询分支。
+- **修复**：`explicitCapabilityQuery` 新增 `task_recovery` 权威主题，区分浏览器刷新/关闭与服务重启；固定结果卡按当前状态机列明 auto checkpoint、media deadline、videoId watcher 的安全续跑，以及其余无 checkpoint 任务的 interrupted/failed 收敛与旧媒体保护，不再调用 provider 猜测。
+- **回归与门禁**：`tests/brain-chat.test.ts` 断言原始问法命中本地能力分支、分类和流式 provider 调用均为 0，并校验刷新、auto、video watcher、无 checkpoint 与媒体回滚事实；定向测试 112 pass / 0 fail，`bun run check` 747 pass / 0 fail（4163 assertions），49 个公开命令架构检查、typecheck、client/SSR build 和 `git diff --check` 均通过。
+- **commit / push**：`51ab53a`；已推送到 `origin/codex/brain-reliability-ui`。
+- **真实浏览器复验**：新生产 bundle 中在干净 Tab 逐字重放原问法，立即得到“任务恢复边界”权威卡，明确“刷新不会停止服务端任务”“已取得 videoId 的 watcher 续跑”“无 checkpoint 任务明确 interrupted/failed”“重生成中断保留旧媒体”；无动作按钮、无 provider 等待，应用 console warning/error 为 0。证据图 `/tmp/moshift-realqa-Dl0cXq/evidence/BROWSER-BUG-034-verify.jpg`。问法审计文件现为 121 次真实提交、120 条唯一问法，达到唯一问法门槛。
+- **严重度 / 当前状态**：P2；已修复、真实浏览器复验通过并已推送。
+
 ### BROWSER-BUG-033 [P2] 阅读位置缓存导致刷新时 React hydration mismatch
 
 - **首次发现**：2026-08-14 12:38（Asia/Shanghai）。
