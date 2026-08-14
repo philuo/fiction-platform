@@ -102,6 +102,11 @@ export function trackedNewStoryTask<T extends NewStoryTaskView>(
   return id ? tasks.find((task) => task.id === id) : undefined;
 }
 
+/** Whether the task center should show the restored single-chapter task. */
+export function advanceTaskIsBusy(localBusy: boolean, autoRunning: boolean, syncedPhase: string): boolean {
+  return !autoRunning && (localBusy || Boolean(syncedPhase));
+}
+
 // —— 新角色提案区关闭状态（服务端权威：bun:sqlite 按用户 + 书名存储）——
 // SSR 时服务端读会话 cookie → 查库 → 注入 initialData.propClosed，首帧 HTML 即正确（不渲染提案区），
 // 客户端与 SSR 快照一致、无修正 re-render —— 根治「刷新闪现后自动关」。
@@ -2542,7 +2547,7 @@ const Home: React.FC<HomeProps> = (props) => {
           session={autoSession}
           pending={autoPending}
           advancePhase={busyPhase || advancePhase}
-          advanceBusy={busy && !autoRunning}
+          advanceBusy={advanceTaskIsBusy(busy, autoRunning, advancePhase)}
           buildingStage={buildingStage}
           autoRunning={autoRunning}
           pendingCommitIdx={pendingCommitIdx}
