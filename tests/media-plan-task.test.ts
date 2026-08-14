@@ -196,6 +196,51 @@ describe("media/generate video 同书同章并发防护", () => {
     expect(afterTerminal.created).toBe(true);
     updateJob(afterTerminal.job.id, { status: "cancelled", phase: "test-cleanup" });
   });
+
+  test("视频重生成复用 regen job；旧构建在 provider 后失败时由新 job 接管同一 videoId", async () => {
+    const mediaId = `video-stable-${Date.now()}`;
+    const videoId = `provider-${Date.now()}`;
+    const { loadWorld, saveWorld } = await import("../src/api/storage");
+    const { ensureVideoWatcherJob } = await import("../src/api/routes");
+    await runAsUser(USER, () => {
+      const world = loadWorld(TITLE)!;
+      world.chapters[0].media = [...(world.chapters[0].media ?? []), {
+        id: mediaId, kind: "video", anchor: "沈夜负剑立于城楼", prompt: "月色城楼",
+        status: "pending", videoId, path: "videos/old.mp4", createdAt: Date.now(),
+      }];
+      saveWorld(world);
+    });
+    const original = await runAsUser(USER, () => createJob({
+      id: mediaId, user: USER, title: TITLE, kind: "video", dedupeKey: `video:${mediaId}`,
+      status: "waiting_external", recovery: { mediaId, chapterIndex: 1, videoId: "provider-old" },
+    }));
+    updateJob(original.job.id, { status: "succeeded", phase: "ready" });
+    const rollback = { oldVideoId: "provider-old", oldPath: "videos/old.mp4" };
+    const regen = await runAsUser(USER, () => createJob({
+      user: USER, title: TITLE, kind: "media-regenerate", dedupeKey: `media-regenerate:${mediaId}`,
+      status: "waiting_external", phase: "provider-poll",
+      recovery: { mediaId, chapterIndex: 1, videoId, rollback },
+    }));
+    const reused = await runAsUser(USER, () => ensureVideoWatcherJob(TITLE, 1, mediaId));
+    expect(reused.id).toBe(regen.job.id);
+    expect(listJobs(USER, TITLE).filter((job) => job.kind === "video" && job.dedupeKey === `video:${mediaId}`)).toHaveLength(1);
+
+    // 模拟旧构建：provider 已创建并写入 world，但 watcher 主键冲突令 regen job 失败。
+    updateJob(regen.job.id, { status: "failed", phase: "failed", error: "UNIQUE constraint failed: jobs.id" });
+    const recovered = await runAsUser(USER, () => ensureVideoWatcherJob(TITLE, 1, mediaId));
+    expect(recovered.id).not.toBe(mediaId);
+    expect(recovered.id).not.toBe(regen.job.id);
+    expect(recovered).toMatchObject({
+      kind: "media-regenerate", status: "waiting_external", phase: "provider-poll",
+      recovery: { mediaId, chapterIndex: 1, videoId, rollback },
+    });
+    updateJob(recovered.id, { status: "cancelled", phase: "test-cleanup" });
+    await runAsUser(USER, () => {
+      const world = loadWorld(TITLE)!;
+      world.chapters[0].media = (world.chapters[0].media ?? []).filter((media) => media.id !== mediaId);
+      saveWorld(world);
+    });
+  });
 });
 
 describe("分镜任务完成事件广播（sync websocket 事件驱动，免轮询）", () => {

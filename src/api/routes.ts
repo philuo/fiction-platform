@@ -545,6 +545,48 @@ const VIDEO_WATCH_INTERVAL_MS = 15_000; // provider 查询间歇（视频 RPM=2�
 type VideoWatchSession = { sessionId: string; messageId: string; cardIndex: number; cardId: string };
 const videoWatchers = runtimeMap<{ title: string; idx: number; id: string; generation: string; session?: VideoWatchSession; timer?: ReturnType<typeof setTimeout> }>("media-video-watch");
 
+function videoRegenRecovery(job: DurableJob | null): { mediaId?: string; chapterIndex?: number; videoId?: string; rollback?: { oldVideoId?: string; oldPath?: string } } | null {
+  return job?.recovery && typeof job.recovery === "object"
+    ? job.recovery as { mediaId?: string; chapterIndex?: number; videoId?: string; rollback?: { oldVideoId?: string; oldPath?: string } }
+    : null;
+}
+
+/** Return the durable row owned by a video watcher.
+ * Regeneration already owns a media-regenerate row; reusing it preserves rollback state and
+ * avoids colliding with the terminal watcher from the original generation. */
+export function ensureVideoWatcherJob(title: string, idx: number, id: string, session?: VideoWatchSession, commandId?: string): DurableJob {
+  const user = currentUser();
+  const worldMedia = loadWorld(title)?.chapters.find((chapter) => chapter.index === idx)?.media?.find((media) => media.id === id);
+  const activeRegen = getActiveJob(user, `media-regenerate:${id}`);
+  const activeRecovery = videoRegenRecovery(activeRegen);
+  if (activeRegen && activeRecovery?.videoId && activeRecovery.videoId === worldMedia?.videoId) return activeRegen;
+
+  // A provider task may have been created and swapped into world before an older build failed
+  // to register its watcher. Recover that exact videoId without issuing another provider call.
+  if (worldMedia?.status === "pending" && worldMedia.videoId) {
+    const orphaned = listJobs(user, title).find((job) => {
+      if (job.kind !== "media-regenerate" || !["failed", "interrupted"].includes(job.status)) return false;
+      const recovery = videoRegenRecovery(job);
+      return recovery?.mediaId === id && recovery.videoId === worldMedia.videoId && Boolean(recovery.rollback);
+    });
+    const recovery = videoRegenRecovery(orphaned ?? null);
+    if (recovery) {
+      return createJob({
+        user, title, kind: "media-regenerate", dedupeKey: `media-regenerate:${id}`,
+        status: "waiting_external", phase: "provider-poll", recovery,
+        deadlineAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+      }).job;
+    }
+  }
+
+  return createJob({
+    commandId, user, title, kind: "video", dedupeKey: `video:${id}`,
+    status: "waiting_external", phase: "provider-poll",
+    recovery: { mediaId: id, chapterIndex: idx, videoId: worldMedia?.videoId, session },
+    deadlineAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+  }).job;
+}
+
 /** 开始（或复用）一个视频 pending 任务的服务端轮询；幂等。reconcileMediaProviderStatus 负责落盘 + 广播终态。
  *  传入 session 时，终态（ready/failed）由服务端权威翻 brain 卡并推 card-replaced（刷新/重启后仍能收敛）。
  *  插画不进此表（后台 Promise 完成时直接落盘广播），视频拿 videoId 后才需要持续查询远端。 */
@@ -556,13 +598,7 @@ export function watchVideoTask(title: string, idx: number, id: string, session?:
     if (session && !existing.session) existing.session = session;
     return;
   }
-  const worldMedia = loadWorld(title)?.chapters.find((c) => c.index === idx)?.media?.find((m) => m.id === id);
-  const durable = createJob({
-    id, commandId, user: currentUser(), title, kind: "video", dedupeKey: `video:${id}`,
-    status: "waiting_external", phase: "provider-poll",
-    recovery: { mediaId: id, chapterIndex: idx, videoId: worldMedia?.videoId, session },
-    deadlineAt: new Date(Date.now() + 30 * 60_000).toISOString(),
-  });
+  const durable = ensureVideoWatcherJob(title, idx, id, session, commandId);
   const generation = scopeGeneration(currentUser(), title);
   const entry = { title, idx, id, generation, session } as { title: string; idx: number; id: string; generation: string; session?: VideoWatchSession; timer?: ReturnType<typeof setTimeout> };
   videoWatchers.set(key, entry);
@@ -570,14 +606,14 @@ export function watchVideoTask(title: string, idx: number, id: string, session?:
     if (!videoWatchers.has(key)) return; // 已停止（终态/删除/取消）
     if (!isScopeGenerationCurrent(currentUser(), title, generation)) {
       videoWatchers.delete(key);
-      updateJob(durable.job.id, { status: "cancelled", phase: "scope-replaced", error: "故事已删除或被同名新故事替换" });
+      updateJob(durable.id, { status: "cancelled", phase: "scope-replaced", error: "故事已删除或被同名新故事替换" });
       return;
     }
     try {
       const res = await reconcileMediaProviderStatus(title, idx, id);
       if (res.ok && (res.status === "ready" || res.status === "failed")) {
         videoWatchers.delete(key); // 终态：停止 provider watcher（reconciler 已落盘章节媒体 + 广播 task-status）
-        updateJob(durable.job.id, { status: res.status === "ready" ? "succeeded" : "failed", phase: res.status, error: res.status === "failed" ? res.error : null });
+        updateJob(durable.id, { status: res.status === "ready" ? "succeeded" : "failed", phase: res.status, error: res.status === "failed" ? res.error : null });
         // 服务端权威翻 brain 卡为终态（card-replaced），不依赖前端回写
         const sess = entry.session;
         if (sess) {
