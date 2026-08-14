@@ -205,7 +205,7 @@ export function findLatestJob(user: string | null, kind: string, title?: string)
   const args: string[] = [durableUser(user), kind];
   let sql = "SELECT * FROM jobs WHERE user_name=? AND kind=?";
   if (title !== undefined) { sql += " AND scope_title=?"; args.push(title); }
-  sql += " ORDER BY updated_at DESC LIMIT 1";
+  sql += " ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT 1";
   const row = getDb().query(sql).get(...args) as Record<string, unknown> | null;
   return row ? rowToJob(row) : null;
 }
@@ -254,6 +254,10 @@ export function updateJob(id: string, patch: {
   const prev = getJob(id);
   if (!prev) return null;
   const status = patch.status ?? prev.status;
+  const terminalStatuses = ["succeeded", "failed", "interrupted", "cancelled"] as const;
+  if (terminalStatuses.includes(prev.status as typeof terminalStatuses[number]) && status !== prev.status) {
+    return prev;
+  }
   getDb().query(`UPDATE jobs SET status=?, phase=?, progress_json=COALESCE(?,progress_json),
     recovery_json=COALESCE(?,recovery_json), result_json=COALESCE(?,result_json), error=?,
     lease_owner=?, lease_expires_at=?, updated_at=? WHERE id=?`).run(
@@ -288,13 +292,38 @@ export function listScheduledJobs(kind: string): DurableJob[] {
 /** 收敛重启后已失去进程执行句柄的任务；仅保留有安全恢复点的任务。 */
 export function settleOrphanedJobs(): number {
   const rows = getDb().query(`SELECT id,kind,status,recovery_json FROM jobs
-    WHERE status IN ('queued','running','waiting_external')`).all() as {
+    WHERE status IN ('queued','running','waiting_external','paused')`).all() as {
       id: string; kind: string; status: JobStatus; recovery_json: string | null;
     }[];
   let interrupted = 0;
   for (const row of rows) {
     const recovery = parseJson<Record<string, unknown>>(row.recovery_json);
     const current = getJob(row.id);
+    const receipt = current?.commandId ? getCommandReceipt(current.user, current.commandId) : null;
+    if (receipt && ["succeeded", "failed", "cancelled"].includes(receipt.status)) {
+      const progress = current?.progress && typeof current.progress === "object"
+        ? { ...(current.progress as Record<string, unknown>), status: current.kind === "auto" ? receipt.status === "succeeded" ? "done" : "stopped" : receipt.status, phase: receipt.status }
+        : undefined;
+      const recovery = current?.recovery && typeof current.recovery === "object"
+        ? { ...(current.recovery as Record<string, unknown>) }
+        : undefined;
+      if (current?.kind === "auto" && recovery?.session && typeof recovery.session === "object") {
+        recovery.session = { ...(recovery.session as Record<string, unknown>), status: receipt.status === "succeeded" ? "done" : "stopped", phase: receipt.status };
+      }
+      updateJob(row.id, {
+        status: receipt.status,
+        phase: receipt.status,
+        progress,
+        recovery,
+        result: receipt.result,
+        error: receipt.error ?? null,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      });
+      interrupted++;
+      continue;
+    }
+    if (row.status === "paused") continue;
     const resumableVideo = (row.kind === "video" || row.kind === "media-regenerate") && typeof recovery?.videoId === "string" && Boolean(recovery.videoId);
     const resumableAuto = row.kind === "auto";
     const scheduledMedia = row.kind === "media-auto-generate" && row.status === "queued";

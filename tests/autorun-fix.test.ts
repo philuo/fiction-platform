@@ -67,6 +67,7 @@ const { writeOneChapter, regenerateChapter, retryChapter, ReviewFailedError, Int
 const { autoReportJobOutcome, runAuto } = await import("../src/api/autorun");
 const { requestInterrupt } = await import("../src/api/steering");
 const { subscribeSync } = await import("../src/api/sync");
+const { findLatestJob, listJobs, updateJob } = await import("../src/api/control-plane");
 
 let tmp: string;
 let oldCwd: string;
@@ -300,6 +301,29 @@ describe("自动连载修复回归", () => {
     expect(loadWorld(TITLE)!.chapters.length).toBe(2);
     expect(loadWorld(TITLE)!.nextChapter).toBe(3);
     expect(loadAutoSession(TITLE)?.status).toBe("done");
+  });
+
+  test("新一轮 running 会话创建新 job，不复活上一轮终态", () => {
+    const TITLE = "连载轮次隔离";
+    makeWorld(TITLE);
+    const at = new Date().toISOString();
+    saveAutoSession(TITLE, { status: "done", target: 1, written: 1, phase: "完成", startedAt: at, updatedAt: at });
+    saveAutoSession(TITLE, { status: "running", target: 2, written: 1, phase: "新一轮", startedAt: at, updatedAt: at });
+    const jobs = listJobs(null, TITLE).filter((job) => job.kind === "auto");
+    expect(jobs).toHaveLength(2);
+    expect(jobs.map((job) => job.status).sort()).toEqual(["running", "succeeded"]);
+    expect(loadAutoSession(TITLE)).toMatchObject({ status: "running", target: 2, phase: "新一轮" });
+  });
+
+  test("loadAutoSession 以 job 终态收敛旧 progress，避免升级后幽灵运行态", () => {
+    const TITLE = "旧进度收敛";
+    makeWorld(TITLE);
+    const at = new Date().toISOString();
+    saveAutoSession(TITLE, { status: "running", target: 1, written: 0, phase: "写作中", startedAt: at, updatedAt: at });
+    const job = findLatestJob(null, "auto", TITLE)!;
+    updateJob(job.id, { status: "cancelled", phase: "cancelled" });
+    expect(job.progress).toMatchObject({ status: "running", phase: "写作中" });
+    expect(loadAutoSession(TITLE)).toMatchObject({ status: "stopped", phase: "cancelled" });
   });
 
   test("resumeAutoSessions：running 会话自动恢复续跑，paused 不恢复", async () => {

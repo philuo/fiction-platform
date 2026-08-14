@@ -119,6 +119,31 @@ describe("durable jobs", () => {
     expect(getJob(auto.id)?.status).toBe("queued");
   });
 
+  test("启动恢复用终态 command receipt 收敛被晚到帧复活的活动 job", () => {
+    const req = { commandId: "cmd-cancelled-late-job", type: "CMD-N02" as const, scope: { title: "幽灵任务书" }, payload: {} };
+    acceptCommand("recovery-user", req);
+    updateCommand(req.commandId, "cancelled", undefined, "用户取消");
+    const job = createJob({
+      commandId: req.commandId,
+      user: "recovery-user",
+      title: "幽灵任务书",
+      kind: "auto",
+      dedupeKey: "auto:ghost",
+      status: "paused",
+      phase: "late-review",
+      recovery: { session: { status: "paused", phase: "late-review" } },
+    }).job;
+    updateJob(job.id, { progress: { status: "paused", phase: "late-review" } });
+    settleOrphanedJobs();
+    expect(getJob(job.id)).toMatchObject({
+      status: "cancelled",
+      phase: "cancelled",
+      error: "用户取消",
+      progress: { status: "stopped", phase: "cancelled" },
+      recovery: { session: { status: "stopped", phase: "cancelled" } },
+    });
+  });
+
   test("普通任务更新保留租约，只有显式 null 才清除", () => {
     const leased = createJob({ user: "lease-user", kind: "auto", dedupeKey: "lease-preserve" }).job;
     updateJob(leased.id, { leaseOwner: "worker-1", leaseExpiresAt: "2099-01-01T00:00:00.000Z" });
@@ -127,6 +152,42 @@ describe("durable jobs", () => {
     expect(getJob(leased.id)?.leaseExpiresAt).toBe("2099-01-01T00:00:00.000Z");
     updateJob(leased.id, { leaseOwner: null, leaseExpiresAt: null });
     expect(getJob(leased.id)?.leaseOwner).toBeUndefined();
+  });
+
+  test("job 终态不被晚到回调回滚，原终态证据保持一致", () => {
+    for (const terminal of ["succeeded", "failed", "interrupted", "cancelled"] as const) {
+      const job = createJob({
+        user: "late-callback-user",
+        kind: "auto",
+        dedupeKey: `late-callback:${terminal}`,
+        status: terminal,
+        phase: terminal,
+      }).job;
+      updateJob(job.id, {
+        status: "paused",
+        phase: "review-failed",
+        progress: { status: "paused" },
+        error: "晚到审查帧",
+      });
+      expect(getJob(job.id)).toMatchObject({ status: terminal, phase: terminal });
+      expect(getJob(job.id)?.progress).toBeUndefined();
+      expect(getJob(job.id)?.error).toBeUndefined();
+    }
+  });
+
+  test("相同 job 终态可补充结果，但不能改写为另一终态", () => {
+    const job = createJob({
+      user: "terminal-enrichment-user",
+      kind: "image",
+      dedupeKey: "terminal-enrichment",
+      status: "succeeded",
+      phase: "provider-complete",
+    }).job;
+    updateJob(job.id, { status: "succeeded", phase: "ready", result: { path: "ready.png" } });
+    expect(getJob(job.id)).toMatchObject({ status: "succeeded", phase: "ready", result: { path: "ready.png" } });
+    updateJob(job.id, { status: "failed", phase: "late-failure", error: "晚到失败" });
+    expect(getJob(job.id)).toMatchObject({ status: "succeeded", phase: "ready", result: { path: "ready.png" } });
+    expect(getJob(job.id)?.error).toBeUndefined();
   });
 });
 

@@ -427,8 +427,10 @@ function sessionPath(title: string): string {
 export function saveAutoSession(title: string, s: AutoSession): void {
   const status = s.status === "done" ? "succeeded" : s.status === "stopped" ? "cancelled" : s.status === "paused" ? "paused" : "running";
   const existing = findLatestJob(currentUser(), "auto", title);
-  const recovery = { ...((existing?.recovery ?? {}) as Record<string, unknown>), session: s };
-  const job = existing ?? createJob({ user: currentUser(), title, kind: "auto", dedupeKey: `auto:${title}`, status, phase: s.phase, recovery }).job;
+  const terminal = existing && ["succeeded", "failed", "interrupted", "cancelled"].includes(existing.status);
+  const reusable = status === "running" && terminal ? null : existing;
+  const recovery = { ...((reusable?.recovery ?? {}) as Record<string, unknown>), session: s };
+  const job = reusable ?? createJob({ user: currentUser(), title, kind: "auto", dedupeKey: `auto:${title}`, status, phase: s.phase, recovery }).job;
   updateJob(job.id, { status, phase: s.phase, progress: s, recovery, result: s.status === "done" ? s : undefined, error: null });
 }
 
@@ -443,7 +445,13 @@ export function loadAutoSession(title: string): AutoSession | null {
       rmSync(legacy, { force: true });
     } catch { return null; }
   }
-  return (job?.progress ?? (job?.recovery as { session?: AutoSession } | undefined)?.session ?? null) as AutoSession | null;
+  const session = (job?.progress ?? (job?.recovery as { session?: AutoSession } | undefined)?.session ?? null) as AutoSession | null;
+  if (!job || !session) return session;
+  if (job.status === "succeeded") return { ...session, status: "done", phase: job.phase || session.phase };
+  if (["failed", "interrupted", "cancelled"].includes(job.status)) {
+    return { ...session, status: "stopped", phase: job.phase || session.phase };
+  }
+  return session;
 }
 
 export function clearAutoSession(title: string): void {
