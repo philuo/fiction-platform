@@ -297,6 +297,21 @@ export function explicitSettingsQuery(prompt: string): IntentResult | null {
     : null;
 }
 
+/** 产品能力类事实走本地注册表口径，避免 provider 按通用写作软件惯例杜撰功能。 */
+export function explicitCapabilityQuery(prompt: string): IntentResult | null {
+  const text = prompt.replace(/\s+/g, "").trim();
+  if (!text) return null;
+  const asksExportFormats = /(?:导出).*(?:哪些|什么|几种|支持).*(?:格式)|(?:支持).*(?:哪些|什么|几种).*(?:导出格式)/.test(text);
+  if (asksExportFormats && !/(?:请|现在|直接|马上)?导出(?:全书|小说)|开始导出/.test(text)) {
+    return {
+      intent: "read_help",
+      params: { topic: "export_formats" },
+      reply: "当前支持 Markdown（.md）和 EPUB（.epub）两种导出格式；这次只说明能力，不会开始下载。",
+    };
+  }
+  return null;
+}
+
 /**
  * 明确写入句式的本地确定性识别。这些句式若交给带历史的模型分类，
  * 容易被上一回合的写操作串话，进而执行无关副作用。只接管语义强、参数可确定的指令；
@@ -1662,6 +1677,7 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
     const hist = (session?.messages ?? []).slice(-6).map((m) => `${m.role === "user" ? "用户" : "中枢"}：${(m.text ?? "").slice(0, 200)}`);
     const { intent, params, reply } = explicitMediaIntent(activePrompt)
       ?? explicitSettingsQuery(activePrompt)
+      ?? explicitCapabilityQuery(activePrompt)
       ?? explicitActionIntent(activePrompt)
       ?? await recognizeIntent(w, activePrompt, ctx.ctx, hist);
 
@@ -2022,9 +2038,12 @@ export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
 
     // —— 中枢能力清单：回复文本（流式）+ 固定摘要卡 ——
     if (intent === "read_help") {
+      const exportFormats = params.topic === "export_formats";
       const card: BrainChatCard = {
-        kind: "result", title: "中枢能力清单", success: true,
-        detail: "数据询问：章节目录/角色（立绘·关系·出场·后续安排）/某章出场角色/人物关系/大纲/脉络时间线/伏笔/新角色提案/卡池/计划进度/任务（质量债与重写队列）/台账日志/审查报告/媒体资源/整书评估/设定世界书\n写作治理：推进剧情写一章/AI 重写章节/回溯重写/自动连载（开始·暂停·停止·跳过·确认草稿）/生成插画与视频/抽卡/设定一致性巡检/导出全书\n编辑计划：编辑设定与角色/新建·修改·删除角色/建立人物关系（如「给张三和李四建立仇人关系」）/伏笔增删改/展开弧章纲/调整生成参数/制定方案/征求意见\n打开面板：设置（含角色页）/关系图/任务中心/伏笔账/审查面板/卡池/整书评估/记忆·台账/自动连载/新角色提案区",
+        kind: "result", title: exportFormats ? "支持的导出格式" : "中枢能力清单", success: true,
+        detail: exportFormats
+          ? "Markdown（.md）：保留标题与章节结构，适合继续编辑。\nEPUB（.epub）：生成带目录的电子书文件。\n当前不支持 PDF、TXT、批注版或分卷导出。"
+          : "数据询问：章节目录/角色（立绘·关系·出场·后续安排）/某章出场角色/人物关系/大纲/脉络时间线/伏笔/新角色提案/卡池/计划进度/任务（质量债与重写队列）/台账日志/审查报告/媒体资源/整书评估/设定世界书\n写作治理：推进剧情写一章/AI 重写章节/回溯重写/自动连载（开始·暂停·停止·跳过·确认草稿）/生成插画与视频/抽卡/设定一致性巡检/导出全书\n编辑计划：编辑设定与角色/新建·修改·删除角色/建立人物关系（如「给张三和李四建立仇人关系」）/伏笔增删改/展开弧章纲/调整生成参数/制定方案/征求意见\n打开面板：设置（含角色页）/关系图/任务中心/伏笔账/审查面板/卡池/整书评估/记忆·台账/自动连载/新角色提案区",
       };
       markMessageDone(title, sessionId, messageId, [card]);
       send({ type: "card", messageId, card });

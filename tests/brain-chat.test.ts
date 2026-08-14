@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { emptyWorld, type WorldState } from "../src/api/world";
 import type { Card as WorldCard } from "../src/api/world";
-import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, explicitSettingsQuery, explicitActionIntent, extractNameFromHistory, authorFromEditPrompt, currentFromEditPrompt, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard } from "../src/api/brain-chat";
+import { executeQuery, INTENTS, brainChatStream, brainChatDeps, buildFormCard, flattenFormValues, buildMediaCard, chapterIndexFromPrompt, explicitMediaIntent, explicitSettingsQuery, explicitCapabilityQuery, explicitActionIntent, extractNameFromHistory, authorFromEditPrompt, currentFromEditPrompt, isHollowReply, l0QueryReply, isAmbiguousChapterPrompt, chapterAskCard } from "../src/api/brain-chat";
 import { getSession as sessGet, lastPendingMessage as sessLastPending } from "../src/api/brain-sessions";
 import type { ChatMessage } from "../src/api/agnes";
 
@@ -573,6 +573,29 @@ describe("buildFormCard（表单卡构建）", () => {
     expect(card?.detail).toContain("自动抽卡：关");
     expect(card?.detail).toContain("人工确认入册：关");
     expect(card?.data).toMatchObject({ autoGacha: false, commitPolicy: "auto" });
+  });
+
+  test("导出格式能力查询走本地事实口径，不触发导出", async () => {
+    expect(explicitCapabilityQuery("现在能导出哪些格式？先说明，不要导出。"))
+      .toMatchObject({ intent: "read_help", params: { topic: "export_formats" } });
+    expect(explicitCapabilityQuery("请导出全书为 Markdown")).toBeNull();
+
+    mockWorld = mkWorld();
+    let cloudCalls = 0;
+    const original = brainChatDeps.chatJson;
+    brainChatDeps.chatJson = (async () => { cloudCalls += 1; throw new Error("cloud should not run"); }) as typeof brainChatDeps.chatJson;
+    try {
+      const events = await runTurn("现在能导出哪些格式？先说明，不要导出。", { sessionId: "export-capability-fast-path" });
+      expect(cloudCalls).toBe(0);
+      const card = events.find((event) => event.type === "card")?.card as { title?: string; detail?: string; action?: unknown } | undefined;
+      expect(card?.title).toBe("支持的导出格式");
+      expect(card?.detail).toContain("Markdown（.md）");
+      expect(card?.detail).toContain("EPUB（.epub）");
+      expect(card?.detail).toContain("不支持 PDF、TXT");
+      expect(card?.action).toBeUndefined();
+    } finally {
+      brainChatDeps.chatJson = original;
+    }
   });
 
   test("非表单意图 → null", () => {
