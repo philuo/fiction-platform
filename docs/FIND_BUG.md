@@ -1,5 +1,44 @@
 # fiction-platform 重构后缺陷审计报告
 
+## 2026-08-15 真实浏览器深度验收（第三批）
+
+### BROWSER-BUG-038 [P1] 中枢 open_* 意图打开系统弹窗后中枢抽屉被顶掉且不恢复
+
+- **首次发现**：2026-08-15 18:37（Asia/Shanghai）。
+- **场景 / testId / Tab**：`BRAIN-A-020`（批次 A 第 20 条）；隔离实例 `C:\workspace\moshift-qa0814`（端口 3300）、账号 `qa0814`、书《镜像罪案》。真实 UI 在中枢抽屉打开状态下发送「人物关系图」。
+- **预期**：`open_relationships`（或同类 open_* 意图）打开对应面板/弹窗后，中枢聊天抽屉保持打开或在其关闭后自动恢复，用户可无缝继续聊天。
+- **实际 / 证据**：发送「人物关系图」后 LLM 判为 `open_relationships`，`handleOpenPanel` 以 `dispatchModal({type:"open-relationship"})` 打开「角色与关系」弹窗；`modalState` 为单槽位（`src/frontend/app/modal-state.ts`），`open` 从 `brain` 被直接替换为 `relationship`，`.brain-cabin` 整体从 DOM 卸载（`brainCabin:1→0`、`cabinInput:1→0`、`textareaVisible:null`）。关闭弹窗后 `open` 回到 `null`，中枢抽屉**不会自动恢复**，用户必须重新点击底部状态钮才能回到聊天。同样影响 `open_settings`/`open_taskcenter`/`open_foreshadow`/`open_gacha`/`open_memory` 六个 target（均走 `dispatchModal` 单槽位替换）；`open_eval`/`open_autostart`/`open_review` 走独立 useState 不受影响。截图 `shots/qa0814/diag-rel-closed.jpg`（视觉通道确认中枢面板不存在、仅剩三栏+指令条）。应用 console warning/error 为 0。
+- **影响范围**：所有在中枢聊天中通过自然语言打开系统面板的用户；聊天上下文虽已持久化不丢失，但交互流被中断，且自动化/真实用户都会误以为面板"吞掉"了聊天入口。
+- **根因**：`Home.tsx handleOpenPanel`（259-290 行）对六个 target 直接 dispatch 单槽位 modalState，没有保留"中枢打开中"的返回语义；modalReducer 无 overlay/stack 概念。
+- **修复**：`b0edee2`（`fix: restore brain cabin after open_* panels`）在 `handleOpenPanel` 记录"中枢发起的面板打开"返回语义（`brainReturnRef`），`useEffect` 监听 `modalState.open` 回到 `null` 时自动重新打开 brain 抽屉；仅对真正替换单槽位 modalState 的 6 个 target 生效。
+- **自动验证**：完整 `bun test` 750 pass / 0 fail（4174 assertions），typecheck 通过；`bun run build` client/SSR 构建通过。
+- **真实浏览器复验**：部署 `b0edee2` 构建后重发「人物关系图」：发送后 9s 弹窗打开（brainCabin 0/modal 1），点击关闭弹窗 2s 后 `brainCabin:1, modalMask:0, textarea:true` 中枢自动恢复，console warning/error 为 0。证据图 `shots/qa0814/verify-038-modal.jpg`、`shots/qa0814/verify-038-after-close.jpg`。
+- **commit / push**：`b0edee2`；已推送到 `origin/codex/brain-reliability-ui`。
+- **严重度 / 当前状态**：P1；已修复，真实浏览器复验通过并已推送。
+
+### BROWSER-BUG-039 [P1] 新产生的预览/确认卡经 SSE 下发时缺 cardId，当回合点「执行」被静默吞掉
+
+- **首次发现**：2026-08-15 22:10（Asia/Shanghai）。
+- **场景 / testId**：`BRAIN-C-INTEGRITY-EXEC`；隔离实例《镜像罪案》，真实 UI 发送「运行一致性巡检」/「帮我评估一下整本书」，立即点击新产生的预览卡「执行」按钮。
+- **复现步骤**：1）打开中枢发送「运行一致性巡检」；2）流结束后展开最后一条消息，点击预览卡的「执行」；3）观察网络请求与 SQLite receipt。
+- **预期**：点击后发出 `POST /api/novel/integrity`（命令契约头齐备），卡片翻为 submitting→succeeded，receipt 新增 CMD-S01 succeeded。
+- **实际 / 证据**：点击后**零网络请求**（instrumented window.fetch 日志为空、clickLog 确认事件命中 BUTTON.btn-save）、零 console 报错、卡片停留「已准备…当前尚未执行」，receipt 数量不变。React fiber 读取渲染中的卡：`cardId: null, executionState: null`；而同一条卡经落盘（brain-sessions.json）后 `cardId: card-xxx` 已存在——**刷新页面后同样的卡可以正常点击执行**（批次 C 中 eval-r2 在刷新后点击即成功 CMD-S09 succeeded）。
+- **影响范围**：所有写操作/执行类意图（integrity/eval/导出/推进/连载启停/重写/删章/抽卡应用等）在**产生卡片的当回合**点击执行全部失效且无任何反馈；用户必须刷新页面或切换会话后才能点击。多 tab 场景下另一 tab 收到的 card-replaced 才带 cardId。
+- **根因**：`brainChatStream` 直接 `send({ type: "card", card })` 下发未归一化的卡；`cardId`/`executionState` 仅在落盘路径 `markMessageDone → normalizeCard` 补赋。前端 `executeCard → settleCard`（BrainCabin.tsx:1350）要求 `activeId && messageId && cardId`，缺失即 `return false` 且调用方静默 return——点击被吞，无请求无提示。
+- **修复**：`brain-sessions.ts` 导出 `normalizeCard`；`brainChatStream` 的 SSE 出口包装 `send`：所有 `type:"card"` 事件经 `normalizeCard` 归一化（原地补 cardId/executionState）后再下发，落盘路径 `markMessageDone` 复用同一对象上的 cardId——实时流与落盘卡一致，当回合即可点击执行。
+- **自动验证**：typecheck 通过；完整 `bun test` 750 pass / 0 fail（4174 assertions）；`bun run build` 通过。
+- **真实浏览器复验**：同步修复后 src 并重启隔离实例，重发「运行一致性巡检」：React fiber 确认实时卡 `cardId: card-83e9b7ad-...`、`executionState: idle`；点击「执行」立即发出 `POST /api/novel/integrity`（+ 两次 update-card），卡片翻为「✓ 一致性巡检 已完成：发现 9 个问题；自动修复 0 项」，无需刷新。同法复验「帮我评估一下整本书」：`POST /api/novel/eval` 发出，receipt CMD-S09 succeeded。注：integrity `action=scan` 按设计不走命令契约（commands.ts 仅 repair/resettle 生成 receipt），卡片翻态即终态证据。应用 console warning/error 为 0。证据图 `shots/qa0814/verify-039-integrity.jpg`、`shots/qa0814/verify-039-eval.jpg`。
+- **commit / push**：（本次提交）。
+- **严重度 / 当前状态**：P1；已修复，真实浏览器复验通过。
+
+### 批次 A：105 条中枢聊天话题问法实测小结
+
+- **范围**：隔离实例《镜像罪案》，覆盖 `read_*` 只读查询（章节/角色/伏笔/关系/大纲/脉络/计划/任务/日志/世界书/媒体/审查/卡池/提案）、`open_*` 面板打开（9 类）、写类确认卡（新建/修改/删除角色、伏笔增删、署名/当前状态/简介、推进/重写/删章/重算/巡检/导出/展开弧/连载启停）、`plan`/`opinion`/`eval`/`gacha`/`chat` 兜底，共 105 条。
+- **结果**：93/105 首跑通过；12 条首跑超时（id 48/56/57/58/60/70/86/89/91/93/96/101，均卡满 ~121s）。
+- **超时复验**：12 条超时项逐条重试 **12/12 全部通过**（4.4s~19.3s），意图与卡片均正确（如「书名合适吗」→意见征询卡、「把字数上限调到3500」→生成参数设置卡、「aaaaaaaaaa1111」→兜底澄清）。判定为**高频连续发送下的偶发排队/节流超时**，非稳定缺陷；单条正常节奏发送无此问题。应用 console warning/error 全程为 0。
+- **写类确认流验证**：批次 A 仅发送文本、未点击确认按钮，世界状态（author/current/characters/foreshadow/chapters）保持不变，符合"L2/L3 写操作须经确认卡点击才落盘"的设计；写操作真实执行与异步任务验证在批次 C/D 覆盖。
+- **发现的真实缺陷**：BROWSER-BUG-038（open_* 顶掉中枢抽屉，已修复推送）。
+
 ## 2026-08-14 真实浏览器深度验收（第二批）
 
 ### BROWSER-BUG-037 [P1] 视频重生成复用 mediaId 建 watcher 导致主键冲突并遗失 provider 任务

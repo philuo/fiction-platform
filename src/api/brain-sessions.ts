@@ -19,7 +19,10 @@ const CARD_EXECUTION_STATES = new Set([
 ]);
 const TERMINAL_CARD_STATES = new Set(["succeeded", "failed", "interrupted", "cancelled"]);
 
-function normalizeCard(card: BrainChatCard): BrainChatCard {
+/** 卡片归一化：补 cardId/executionState/panelIntent（原地补赋并返回副本）。
+ * 导出供 brain-chat SSE 出口复用：实时下发的卡与落盘卡共享同一稳定 cardId，
+ * 避免当回合点击执行因缺 cardId 被 settleCard 静默吞掉（BUG-039）。 */
+export function normalizeCard(card: BrainChatCard): BrainChatCard {
   // Mutate the outgoing object as well as returning a copy. brain-chat persists a card
   // immediately before emitting the same object over SSE; this keeps both channels on
   // the same stable cardId instead of letting the current tab briefly create a ghost card.

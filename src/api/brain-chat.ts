@@ -37,6 +37,7 @@ import {
   markMessageDone,
   markMessageInterrupted,
   markStreaming,
+  normalizeCard,
   updateMessageText,
   updateMessageThinking,
   type BrainChatCard,
@@ -2024,7 +2025,15 @@ const OPEN_PANELS: Record<
  * 4. 回合完成 {done} / 中断 {interrupted}；增量写入会话（brain-sessions 持久化）
  */
 export async function brainChatStream(ctx: BrainChatContext): Promise<void> {
-  const { title, prompt, sessionId, send, signal, resume } = ctx;
+  const { title, prompt, sessionId, send: rawSend, signal, resume } = ctx;
+  // BUG-039：SSE 下发的卡片统一归一化（补 cardId/executionState）。
+  // 落盘路径 markMessageDone 复用同一对象上的 cardId，实时流与落盘卡保持一致；
+  // 否则当回合新卡 cardId 为空，前端 executeCard→settleCard 静默 return，点击「执行」零请求无反馈。
+  const send = (obj: unknown) => {
+    const evt = obj as { type?: string; card?: BrainChatCard } | null;
+    if (evt && evt.type === "card" && evt.card) evt.card = normalizeCard(evt.card);
+    rawSend(obj);
+  };
   const w = brainChatDeps.loadWorld(title);
   if (!w) {
     send({ error: "故事不存在: " + title });
