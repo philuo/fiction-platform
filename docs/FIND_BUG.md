@@ -28,7 +28,7 @@
 - **修复**：`brain-sessions.ts` 导出 `normalizeCard`；`brainChatStream` 的 SSE 出口包装 `send`：所有 `type:"card"` 事件经 `normalizeCard` 归一化（原地补 cardId/executionState）后再下发，落盘路径 `markMessageDone` 复用同一对象上的 cardId——实时流与落盘卡一致，当回合即可点击执行。
 - **自动验证**：typecheck 通过；完整 `bun test` 750 pass / 0 fail（4174 assertions）；`bun run build` 通过。
 - **真实浏览器复验**：同步修复后 src 并重启隔离实例，重发「运行一致性巡检」：React fiber 确认实时卡 `cardId: card-83e9b7ad-...`、`executionState: idle`；点击「执行」立即发出 `POST /api/novel/integrity`（+ 两次 update-card），卡片翻为「✓ 一致性巡检 已完成：发现 9 个问题；自动修复 0 项」，无需刷新。同法复验「帮我评估一下整本书」：`POST /api/novel/eval` 发出，receipt CMD-S09 succeeded。注：integrity `action=scan` 按设计不走命令契约（commands.ts 仅 repair/resettle 生成 receipt），卡片翻态即终态证据。应用 console warning/error 为 0。证据图 `shots/qa0814/verify-039-integrity.jpg`、`shots/qa0814/verify-039-eval.jpg`。
-- **commit / push**：（本次提交）。
+- **commit / push**：`ecf1866`（`fix: normalize cards before SSE emit`）；已推送到 `origin/codex/brain-reliability-ui`。
 - **严重度 / 当前状态**：P1；已修复，真实浏览器复验通过。
 
 ### 批次 A：105 条中枢聊天话题问法实测小结
