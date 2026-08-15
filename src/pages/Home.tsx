@@ -255,8 +255,22 @@ const Home: React.FC<HomeProps> = (props) => {
   const [proposalExpanded, setProposalExpanded] = useState(false); // 底部新角色提案区：抽屉展开态（覆盖三栏）
   // Sync is authoritative after bootstrap. SSR only prevents a first-paint flash on direct navigation.
   const proposalClosed = syncedSystem?.proposalClosed ?? props.initialData?.propClosed ?? false;
+  /** 中枢发起的面板打开后待返回中枢：单槽位 modalState 会顶掉 brain 抽屉（BUG-038），
+   *  面板关闭（open 回到 null）时自动重新打开中枢，保持聊天流不中断。
+   *  仅对真正替换 modalState 的 target 置位；proposals/review/eval/autostart 不顶掉中枢。 */
+  const brainReturnRef = useRef(false);
+  useEffect(() => {
+    if (modalState.open === null && brainReturnRef.current) {
+      brainReturnRef.current = false;
+      dispatchModal({ type: "open", modal: "brain" });
+    }
+  }, [modalState.open]);
   /** 中枢打开系统面板/弹窗（open_* 意图 result 卡带 open 字段）统一分发：target → 对应弹窗/区域 */
   function handleOpenPanel(target: string, opts?: Record<string, unknown>) {
+    // 中枢抽屉打开中且目标会顶掉单槽位 modalState → 记住返回语义
+    if (modalState.open === "brain" && ["settings", "relationships", "taskcenter", "foreshadow", "gacha", "memory"].includes(target)) {
+      brainReturnRef.current = true;
+    }
     switch (target) {
       case "proposals": savePropClosed(false); break;
       case "settings":
