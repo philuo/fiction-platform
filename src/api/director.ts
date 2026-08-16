@@ -16,6 +16,7 @@ import { deleteMediaFile } from "./images";
 import { auditWorld, deleteChapterCascade } from "./integrity";
 import { buildAutoLore, sanitizeLore } from "./lore";
 import { formatChapterRange } from "../shared/chapterRange";
+import { findRelationshipTarget } from "../shared/relationships";
 import {
   activeForeshadows, emptyWorld, genOf, worldSummary, DEFAULT_GEN,
   type Card, type Character, type Chapter, type ChapterPlan, type ChapterVersion, type ConsistencyReport, type GenProfile,
@@ -977,12 +978,15 @@ export function editWorld(world: WorldState, patch: {
       if (typeof pc.identity === "string") target.identity = pc.identity.trim().slice(0, 30) || undefined;
       if (typeof pc.look === "string") target.look = pc.look.trim().slice(0, 120) || undefined;
       // 关系图保存：整体替换该角色的关系表（键=对方姓名，值=关系描述）——持久化后注入写作/审查 prompt
+      // 键归一：LLM patch 可能写「与XX」脏键，解析为真实角色名后落盘，保证关系图可连线
       if (pc.relations && typeof pc.relations === "object" && !Array.isArray(pc.relations)) {
         const rel: Record<string, string> = {};
         for (const [k, v] of Object.entries(pc.relations as Record<string, unknown>)) {
-          const key = String(k).trim().slice(0, 40);
           const val = String(v ?? "").trim().slice(0, 60);
-          if (key && val) rel[key] = val;
+          if (!val) continue;
+          const ref = findRelationshipTarget(world.characters, String(k));
+          const key = (ref && ref.id !== target.id ? ref.name : String(k).trim()).slice(0, 40);
+          if (key) rel[key] = val;
         }
         target.relations = rel;
       }

@@ -6,6 +6,7 @@ import { activeForeshadows, genOf, type Chapter, type ChapterDelta, type Chapter
 import { upsertSummary } from "./memory";
 import { logChange } from "./steering";
 import { appearedInChapter, normCharName } from "../shared/appearance";
+import { findRelationshipTarget } from "../shared/relationships";
 
 export type SettleOutput = {
   summary: string;
@@ -54,7 +55,7 @@ const SETTLE_SYSTEM = `你是小说的"记账者"（Chronicler）。给定一章
 规则：
 - resolved_foreshadowing 的 id 必须严格引用[伏笔账本]中方括号内的 ID；plot_threads 的 id 必须引用[弧线列表]中的 ID，不得自造
 - new_foreshadowing 只登记正文确实埋下的悬念；new_characters 只登记正文确实登场（有台词或行动）的新角色，gender/age/identity 必须给出，reason 给出一句话推荐原因（为什么值得让该角色登场，可空）
-- character_relations 只登记正文明确展现的关系（互动/称呼/立场），对方名尽量与现有角色名一致；仅记录本章出现或变化的关系
+- character_relations 只登记正文明确展现的关系（互动/称呼/立场），仅记录本章出现或变化的关系；relations 的键必须且只能是与现有角色名完全一致的名字（如"林墨"），严禁写成"与林墨""同林墨""和林墨"等带介词前缀的形式
 - setting_rules 只提取正文明确确立的新规则/禁忌/限制（如"入梦需在月圆之夜"），每条一句话，≤3 条
 - look 只记正文中明确的容貌/装扮/伤情变化（如受伤、换装、易容），无变化不填；world_current 必须给出一句话
 - appeared 中的名字必须与现有角色名完全一致；新角色除外。appeared 指本章正文中被提及或出场的所有角色（有台词/行动/被旁白或他人提及/回忆均算），名单宁全勿漏
@@ -189,6 +190,7 @@ function applySettle(w: WorldState, out: Partial<SettleOutput>, chapterIndex: nu
   }
   delta.characterUpdates = charUpdates;
   // 角色关系（增量合并：只写 LLM 明确提到的对向，手动编辑的未提及关系保留；含旧值快照）
+  // 目标键归一（修「与伊芙琳」脏键）：把 LLM 自由格式的键解析为真实角色名，解析不到丢弃——否则关系图匹配不到连线
   let relUpdates = 0;
   const relationUpdates: ChapterDelta["relationUpdates"] = [];
   for (const rr of Array.isArray(out.character_relations) ? out.character_relations : []) {
@@ -198,10 +200,13 @@ function applySettle(w: WorldState, out: Partial<SettleOutput>, chapterIndex: nu
     for (const [target, val] of Object.entries(rels)) {
       const desc = String(val ?? "").trim().slice(0, 40);
       if (!desc) continue;
-      const old = c.relations?.[target];
+      const ref = findRelationshipTarget(w.characters, target);
+      if (!ref || ref.id === c.id) { dropped++; continue; }
+      const key = ref.name; // 统一用真实角色名作键
+      const old = c.relations?.[key];
       if (old === desc) continue;
-      relationUpdates.push({ id: c.id, name: c.name, target, old, neu: desc });
-      c.relations = { ...(c.relations ?? {}), [target]: desc };
+      relationUpdates.push({ id: c.id, name: c.name, target: key, old, neu: desc });
+      c.relations = { ...(c.relations ?? {}), [key]: desc };
       relUpdates++;
     }
   }

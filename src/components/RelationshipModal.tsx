@@ -6,7 +6,7 @@ import { Plus, Trash2, X } from "../components/icons";
 import type { Character, WorldState } from "../api/world";
 import { formatChapterRange } from "../shared/appearance";
 import { RelationshipGraphCanvas } from "./RelationshipGraphCanvas";
-import { extractRelationshipSubgraph } from "../shared/relationships";
+import { extractRelationshipSubgraph, findRelationshipTarget } from "../shared/relationships";
 
 type GNode = { id: string; name: string; role: string; x: number; y: number };
 type GEdge = { from: string; to: string; label: string };
@@ -30,14 +30,9 @@ function buildGraphData(chars: { id: string; name: string; role: string; relatio
   }));
   const edges: GEdge[] = [];
   const seen = new Set<string>();
-  // 模糊匹配：关系目标名可能包含额外描述（如“魏无咎（东厂提督）”）
+  // 共享匹配：精确/归一/介词前缀剥离（「与伊芙琳」→「伊芙琳」）/包含（如“魏无咎（东厂提督）”）
   function findChar(targetName: string) {
-    // 精确匹配
-    let c = chars.find((t) => t.name === targetName);
-    if (c) return c;
-    // 包含匹配：角色名包含在目标名中，或目标名包含在角色名中
-    c = chars.find((t) => targetName.includes(t.name) || t.name.includes(targetName));
-    return c ?? null;
+    return findRelationshipTarget(chars, targetName) ?? null;
   }
   for (const c of chars) {
     if (!c.relations) continue;
