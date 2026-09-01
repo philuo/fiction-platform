@@ -2,7 +2,7 @@
 
 ## 背景与问题诊断
 
-生图链路：`agnes-2.5-flash`（弱思考文本模型）经 `planSystem(kind)` 把章节正文转写为 `{anchor,scene,caption,type,subject}` JSON → `scene` 字段喂给 `agnes-image-2.1-flash` 生图。
+生图链路：`agnes-2.5-flash`（弱思考文本模型）经 `planSystem(kind)` 把章节正文转写为 `{anchor,scene,caption,type,subject}` JSON → `scene` 字段喂给 `agnes-image-2.5-flash` 生图。
 
 **实测产出问题（来自 `data/断梦录` 真实 prompt）**：
 1. 主客混淆：主体标 `魏无咎`，scene 却大段描摹 `沈夜`，视觉焦点错位。

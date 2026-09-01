@@ -1,5 +1,5 @@
 // 全局速率/并发限制器：滑动窗口 RPM + 异步信号量并发。进程内单例。
-// 三类模型各自独立限流池：文本（TEXT_MODEL 可配，默认 agnes-2.5-flash）、图片(agnes-image-2.1-flash 1K 档)、视频(agnes-video-v2.0)。
+// 三类模型各自独立限流池：文本（TEXT_MODEL 可配，默认 agnes-2.5-flash）、图片(agnes-image-2.5-flash 1K 档)、视频(agnes-video-2.5-flash)。
 // 限流器是「排队」语义：超 RPM/并发时 await 排队，不主动触发 429--服务端看到的发起速率 ≤ 上限。
 // 企业认证默认值（实际 RPM：文本/图片 1K 各 40、视频 2）；env 可覆盖。docs: https://www.agnes-ai.cn/zh-Hans/docs/tokenplan
 

@@ -648,7 +648,7 @@ export function sceneGuardClause(scene: string, roster: string[]): string {
 }
 
 /**
- * i2i（图生图）保持前缀（纯函数，可单测）：按官方 agnes-image-2.1-flash Prompting Guide 的 i2i 结构
+ * i2i（图生图）保持前缀（纯函数，可单测）：按官方 agnes-image-2.5-flash Prompting Guide 的 i2i 结构
  * `[Change Request] + [Elements to Preserve]`，显式告诉模型参考图要"保持"什么--否则幻觉大、理解差的
  * 模型会换人/变样貌/照搬参考图场景。前缀置顶（弱模型对句首注意力最强，保持人物身份是首要约束），
  * 后接原 T2I 提示词作为"按此重绘/生成"的 Change 部分。
@@ -874,7 +874,7 @@ const PLAN_FEWSHOT = `【输出示例（仅示范格式，不要照搬其中的�
 则可输出：
 {"scenes":[{"anchor":"林舟立在城门洞下，雨水顺着铁盔的边沿成串落下","scene":"身披残破甲胄的青年武将独自立在拱形城门洞下，铁盔边沿雨水成串垂落，身后是漆黑雨夜与远处一点昏黄灯笼光，电影感冷色调，侧逆光勾勒湿润甲片轮廓，画面中不要出现文字，无水印","caption":"守将林舟立于城门雨幕之中","type":"事件","subject":"林舟"}]}`;
 
-// —— 分镜系统提示词：忠于正文 + 官方提示词结构（agnes-image-2.1-flash Prompting Guide）+ 分型策略 ——
+// —— 分镜系统提示词：忠于正文 + 官方提示词结构（agnes-image-2.5-flash Prompting Guide）+ 分型策略 ——
 // scene 结构对齐官方：[主体]+[场景/环境]+[风格]+[光照]+[构图]+[质量要求]；条款精简去重，降低思考负担
 function planSystem(kind: "image" | "video"): string {
   const structure = kind === "image"

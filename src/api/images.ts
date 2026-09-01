@@ -1,5 +1,5 @@
-// 图像生成服务：强制 Agnes 云端生图（agnes-image-2.1-flash，当前免费）
-// 硬性约束（用户确认）：① 模型固定 agnes-image-2.1-flash；② 尺寸严格 1K 档位；
+// 图像生成服务：强制 Agnes 云端生图（agnes-image-2.5-flash，当前免费）
+// 硬性约束（用户确认）：① 模型固定 agnes-image-2.5-flash；② 尺寸严格 1K 档位；
 // ③ 图生图/多图合成经 extra_body.image 传参考图（Data URI 或 URL）——用于角色形象一致性。
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -9,7 +9,7 @@ import { imageLimiter } from "./limiter";
 const AGNES_IMAGE_BASE = (process.env.AGNES_BASE_URL ?? "https://api.agnes-ai.cn/v1").replace(/\/$/, "");
 const AGNES_IMAGE_KEY = process.env.AGNES_API_KEY ?? "";
 // 模型硬绑定：不允许 env 覆盖（用户强制要求）
-const AGNES_IMAGE_MODEL = "agnes-image-2.1-flash";
+const AGNES_IMAGE_MODEL = "agnes-image-2.5-flash";
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 与上传一致：10MB
 
 /** 项目尺寸 "WxH" → Agnes 档位 + 宽高比。硬性约束：size 恒为 1K（用户限定），仅映射 ratio */
@@ -69,7 +69,7 @@ export async function generateImageAgnes(prompt: string, size = "768x768", opts:
   return new Uint8Array(buf);
 }
 
-/** 入口：强制 Agnes 云端生图（无本地回退——用户强制 agnes-image-2.1-flash），失败直接抛错由路由层处理 */
+/** 入口：强制 Agnes 云端生图（无本地回退——用户强制 agnes-image-2.5-flash），失败直接抛错由路由层处理 */
 export async function generateImage(prompt: string, size = "768x768", opts: AgnesImageOpts = {}): Promise<Uint8Array> {
   return generateImageAgnes(prompt, size, opts);
 }

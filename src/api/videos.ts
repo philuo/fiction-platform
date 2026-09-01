@@ -1,5 +1,5 @@
 // 视频生成服务：Agnes Video V2.0（异步任务 API，当前免费 $0/秒）
-// 硬性约束（用户确认）：① 模型固定 agnes-video-v2.0；② 宽高只要 720p 16:9（1280x720）；
+// 硬性约束（用户确认）：① 模型固定 agnes-video-2.5-flash；② 宽高只要 720p 16:9（1280x720）；
 // ③ 时长严格 5~15 秒；④ frame_rate 固定 24（文档推荐）
 // 流程：createVideoTask 创建任务 → pollVideoTask 轮询 → completed 时 downloadVideo 落盘
 // 视频为异步任务；创建走 videoLimiter（企业版默认 1 并发 / 2 RPM），状态查询间歇 429（需容忍，由前端轮询频率控制）
@@ -13,7 +13,7 @@ const AGNES_VIDEO_BASE = (process.env.AGNES_BASE_URL ?? "https://api.agnes-ai.cn
 // 旧版另起 HOST 并剥 /v1，当 BASE 不以 /v1 结尾时会导致创建与轮询 host 不一致
 const AGNES_VIDEO_KEY = process.env.AGNES_API_KEY ?? "";
 // 模型硬绑定：不允许 env 覆盖（用户强制要求）
-const AGNES_VIDEO_MODEL = "agnes-video-v2.0";
+const AGNES_VIDEO_MODEL = "agnes-video-2.5-flash";
 export const VIDEO_FRAME_RATE = 24; // 文档推荐帧率
 export const VIDEO_WIDTH = 1280; // 720p 16:9（用户限定，仅此一种宽高比）
 export const VIDEO_HEIGHT = 720;
