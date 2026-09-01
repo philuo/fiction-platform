@@ -1,135 +1,149 @@
-# 墨枢 — 故事创作引擎
+<div align="center">
 
-像玩游戏一样智能生成小说：LLM（Agnes AI）担任"导演"，持续维护世界观 / 人物 / 时间线 / 伏笔，
-每个回合观察状态 → 决策 → 生成正文 → 更新状态 → 存档；AnySearch 提供实时考据搜索增强。
+# 🎴 墨枢 Moshi
 
-## 技术栈
+**像玩游戏一样写小说 —— LLM 担任导演的智能故事创作引擎**
 
-- **bun 1.4**（runtime / 包管理 / 脚本 / 开发服务器，零 node 脚本、零 vite）
-- **react 19 + react-dom**（DOM / SSR 运行时，`renderToString` + `hydrateRoot`）
-- **SSR**：dev 用 `bun --hot`（原生热重启，改代码即生效）；prod 用 `bun build` 打包 + **Bun.serve**
+LLM「导演」持续维护世界观 / 人物 / 时间线 / 伏笔,每个回合
+观察状态 → 决策 → 生成正文 → 更新状态 → 存档;
+独立「审查者」与导演对抗把关,AnySearch 提供实时考据。
 
-## 快速开始
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](./LICENSE)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg?style=for-the-badge)](../../releases)
+[![Bun](https://img.shields.io/badge/Bun-%E2%89%A51.4-FBF0DF.svg?style=for-the-badge&logo=bun&logoColor=black)](https://bun.sh)
+[![React](https://img.shields.io/badge/React-19-61DAFB.svg?style=for-the-badge&logo=react&logoColor=black)](https://react.dev)
+[![TypeScript](https://img.shields.io/badge/TypeScript-7.0-3178C6.svg?style=for-the-badge&logo=typescript&logoColor=white)](https://www.typescriptlang.org)
+[![Tests](https://img.shields.io/badge/tests-75%20files-2EA043.svg?style=for-the-badge)](#-开发)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-ff6c60.svg?style=for-the-badge)](#-贡献)
 
-```bash
-bun install          # 安装依赖（缓存已配置到 .bun-cache，避开 ~/.bun TCC 限制）
-bun run dev          # 开发服务器 http://localhost:3000（bun --hot 热重启）
-bun run build        # 生产构建（dist/client + dist/server）
-bun run start        # 生产服务器 http://localhost:3000（Bun.serve）
-```
+[快速开始](#-快速开始) · [特性](#-特性) · [核心玩法](#-核心玩法) · [API](#api) · [Roadmap](#-roadmap) · [English](./README.en.md)
 
-## 环境变量（.env，已 gitignore）
+</div>
 
-```
-# 文本模型（中枢/写手/审查/记账等，可整体切换；端点须 OpenAI 兼容）
-TEXT_BASE_URL=https://tokenrhythm.studio/v1
-TEXT_API_KEY=sk_tr_...
-TEXT_MODEL=deepseek-v4-flash-0731
-# 未配置 TEXT_* 时回落以下 Agnes 配置（插画/视频固定使用）
-AGNES_API_KEY=sk-...            # Agnes AI（https://agnes-ai.cn，免费额度）
-AGNES_BASE_URL=https://api.agnes-ai.cn/v1
-AGNES_MODEL=agnes-2.5-flash
-ANYSEARCH_API_KEY=as_sk_...     # AnySearch（https://anysearch.com，可匿名）
-```
+---
 
-bun 会自动加载项目根 `.env`。密钥不进入代码 / git。
+## ✨ 特性
 
-## 核心玩法（游戏化创作闭环）
+- 🎴 **抽卡式创作** — LLM 按当前世界状态生成候选卡池(人物 / 事件 / 道具 / 场景 / 伏笔卡,稀有度 N/R/SR/SSR),手动挑选或自动抽取;伏笔卡直接登记入伏笔账本
+- ⚔️ **AI 写、AI 审(对抗性审查)** — 导演与审查者是两个独立角色,合作会产生谄媚,必须对垒:审查必须引用原文证据,5 维评分(连贯 / 张力 / 文笔 / 节奏 / 对话),coherence 或 tension < 6 分强制驳回重写(≤ 2 次)
+- 🧵 **伏笔记忆不断层** — 伏笔账本状态机(埋设 → 呼应 → 回收)每轮注入导演上下文;上下文压缩(设定摘要 + 人物状态 + 时间线 + 活跃伏笔 + 上节结尾)保证长篇一致
+- 🧠 **中枢 Brain** — 报头常驻「中枢之眼·印灵」指示器,由四维状态驱动(存在态 / 动作态 / 治理裁决态 / 全书健康脉象),零 LLM 确定性派生
+- 💬 **对话舱自然语言控制** — 与中枢聊天即可触发全部 16 类操作(推进 / 连载 / 抽卡 / 编辑 / 删章 / 导出…),supervised 半自动:L0/L1 直接执行,L2/L3 出确认卡三选一
+- 🔍 **实时考据** — AnySearch 搜索增强,写作中随查随引
+- 🖼 **插画与视频生成** — Agnes 多模态,同一 Key 免费额度,自动限流排队
+- 📰 **日式报纸 × 游戏 HUD 界面** — 纸色 / 衬线 / 报头双线 / 朱印 / 竖排标签,配左目录、中正文、右状态面板、底部控制条
+- ⚡ **全 Bun 技术栈** — 零 Node 脚本、零 Vite:React 19 SSR(`renderToString` + `hydrateRoot`),dev 用 `bun --hot`,prod 用 `bun build` + `Bun.serve`
 
-```
+## 🎮 核心玩法
+
+人在界面上的操作极小:**立项一句话 → 推进剧情 → 抽卡筛选 → 看审查报告**,其余全部由 AI 完成。
+
+```text
 [抽卡] → [导演写一节] → [独立审查者对抗审查] → [伏笔/状态更新] → [存档]
               ↑                    │
-              └──── 不通过 → 带着指摘意见重写（≤2 次）────┘
+              └──── 不通过 → 带着指摘意见重写(≤2 次)────┘
 ```
 
-- **抽卡模式**：LLM 按当前世界状态生成候选卡池（人物/事件/道具/场景/伏笔卡，稀有度 N/R/SR/SSR），
-  可手动选择或自动抽取；伏笔卡直接登记入伏笔账本，其余卡注入下一节写作指令
-- **AI 写、AI 审（对抗性审查）**：导演（Writer）与审查者（Critic）是两个独立角色（参考 agent-writing：
-  合作产生谄媚，必须对垒）。审查必须引用原文证据，5 维评分（连贯/张力/文笔/节奏/对话），
-  地板机制：coherence 或 tension < 6 分强制驳回重写
-- **伏笔记忆不断层**：伏笔账本状态机（埋设→呼应→回收），每轮注入导演上下文；
-  上下文压缩（设定摘要+人物状态+时间线+活跃伏笔+上节结尾）保证长文一致
+每一回合,引擎像跑一场游戏对局:
+
+| 阶段 | 做什么 |
+|---|---|
+| 🎴 抽卡 | 生成候选卡池注入下一节写作指令;伏笔卡入账本 |
+| ✍️ 写作 | 导演依据世界状态 + 活跃伏笔 + 上节结尾生成正文 |
+| 🛡 审查 | 独立审查者按 5 维评分 + 原文证据裁决,地板机制强制驳回 |
+| 📖 记账 | 伏笔状态机推进、人物状态与时间线更新、上下文压缩 |
+| 💾 存档 | `data/<title>/state.json` 落盘,随时恢复与导出 |
+
+## 🚀 快速开始
+
+```bash
+git clone https://github.com/philuo/fiction-platform.git
+cd fiction-platform
+cp .env.example .env    # 填入你的 API Key(至少 AGNES_API_KEY)
+bun install
+bun run dev             # 开发服务器 http://localhost:3000(bun --hot 热重启)
+```
+
+生产模式:
+
+```bash
+bun run build           # 产出 dist/client + dist/server
+bun run start           # 生产服务器 http://localhost:3000(Bun.serve)
+```
+
+> 需要 [Bun](https://bun.sh) ≥ 1.4。`.env` 与 `data/` 已被 gitignore,密钥不会进入代码与 git;`data/` 目录由服务端自动创建。
+
+### 环境变量
+
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `AGNES_API_KEY` | ✅ | [Agnes AI](https://agnes-ai.cn) 密钥(OpenAI 兼容,有免费额度),文本 / 插画 / 视频共用 |
+| `AGNES_BASE_URL` | — | 默认 `https://api.agnes-ai.cn/v1` |
+| `AGNES_MODEL` | — | 默认 `agnes-2.5-flash` |
+| `TEXT_BASE_URL` / `TEXT_API_KEY` / `TEXT_MODEL` | 可选 | 配置后中枢 / 写手 / 审查 / 记账等全部文本任务改走该 OpenAI 兼容端点;插画 / 视频仍固定使用 Agnes |
+| `ANYSEARCH_API_KEY` | 可选 | [AnySearch](https://anysearch.com) 实时搜索(考据增强),可匿名 |
+| `AGNES_*_CONCURRENCY` / `AGNES_*_RPM` | 可选 | 文本 / 图片 / 视频分模型限流,限流器排队、不主动触发 429 |
+
+恢复已存故事:`http://localhost:3000/?title=断梦录` · 导出全书:`GET /api/novel/export?title=`
 
 ## API
 
 | 端点 | 说明 |
 |---|---|
 | `GET /api/health` | 服务健康 + 密钥就绪状态 |
-| `POST /api/chat` | Agnes 生成（`{prompt}` → `{text}`） |
-| `POST /api/chat/stream` | SSE 流式生成 |
-| `POST /api/search` | AnySearch 实时搜索（考据增强） |
-| `POST /api/novel/new` | 立项：一句话灵感 → 世界设定 + 人物（LLM） |
-| `POST /api/novel/step` | 回合：写→审→重写→存档（SSE 阶段事件） |
-| `POST /api/novel/gacha` | 抽卡：生成卡池 / 自动抽取 / 指定抽取 |
-| `POST /api/novel/state` | 世界状态（响应附带 `brainState` 中枢四维状态） |
-| `POST /api/brain/state` | 中枢四维状态（presence/activity/governance/vitals，零 LLM 确定性派生） |
-| `POST /api/brain/chat` | 中枢对话编排（SSE）：意图识别 → 回复 + 卡片（查询直接执行/写操作预览/L2·L3 确认） |
+| `POST /api/chat` / `POST /api/chat/stream` | Agnes 生成 / SSE 流式生成 |
+| `POST /api/search` | AnySearch 实时搜索(考据增强) |
+| `POST /api/novel/new` | 立项:一句话灵感 → 世界设定 + 人物(LLM) |
+| `POST /api/novel/step` | 回合:写 → 审 → 重写 → 存档(SSE 阶段事件) |
+| `POST /api/novel/gacha` | 抽卡:生成卡池 / 自动抽取 / 指定抽取 |
+| `POST /api/novel/state` | 世界状态(响应附带 `brainState` 中枢四维状态) |
+| `POST /api/brain/state` | 中枢四维状态(presence / activity / governance / vitals) |
+| `POST /api/brain/chat` | 中枢对话编排(SSE):意图识别 → 回复 + 卡片 |
 | `GET /api/novel/export?title=` | 导出全书 Markdown |
 
-## 界面
-
-日式报纸风格（纸色/衬线/报头双线/朱印/竖排标签）+ 游戏 HUD（左目录/中正文/右状态面板/底部控制条）。
-人在界面上的操作极小：立项一句话 → [推进剧情] → 抽卡筛选 → 看审查报告；其余全部由 AI 完成。
-
-### 中枢（brain）
-
-报头常驻「中枢之眼·印灵」指示器：半具象拟人化视觉（SVG 同心圆朱印 + Canvas 环绕粒子 + motion 瞳孔开合），
-由四维状态驱动——① presence 存在态（休眠/待命/觉醒/专注/深思/警觉/疲倦，7 档色相与神态）；
-② activity 动作态（导演写作/对抗审查/章末记账… 12 档，驱动符纹转速与粒子流速）；
-③ governance 治理裁决态（放行/认可/建议修正/驳回/干预待决/降级放行，角标显示）；
-④ vitals 全书健康脉象（连贯度/伏笔回收率/质量债/完整性/目标 disposition）。
-
-点击印灵打开「对话舱」侧边抽屉：与中枢聊天实现卡片式浏览与智能控制——
-所有手动操作（推进/连载/抽卡/编辑/删章/媒体/评估/巡检/导出等 16 类入口）均可通过自然语言触发，
-supervised 半自动（L0/L1 直接执行，L2/L3 出确认卡三选一），治理结果以主动卡片推送。
-恢复已存故事：`http://localhost:3000/?title=断梦录`
-
-## 目录结构
+## 🗂 目录结构
 
 ```
-server/dev.ts          开发服务器（bun --hot + Bun.serve + SSR，无 vite）
-server/prod.ts         生产服务器（Bun.serve）
-server/entry-server.tsx  SSR 入口（dev/prod 共用，react-dom/server）
-server/render.ts       HTML 模板组装（SSR 注入 + 初始数据）
-src/entry-client.tsx   客户端 hydrate（hydrateRoot）+ CSS 入口
-src/App.tsx            根组件
-src/pages/Home.tsx     启动页 + 游戏界面
-src/components/        报头/状态面板/正文/审查报告/抽卡/印章
-src/styles/newspaper.css  日式报纸风格
-src/api/agnes.ts       Agnes LLM 客户端（streaming / tool calling / 重试回退）
-src/api/anysearch.ts   AnySearch JSON-RPC 客户端
-src/api/world.ts       世界状态类型 + 摘要压缩
-src/api/writer.ts      导演（写作，结构化伏笔/人物输出）
-src/api/critic.ts      审查者（对抗审查，evidence + 地板机制）
-src/api/cards.ts       抽卡系统
-src/api/director.ts    回合编排
-data/                  小说存档（state.json + .bak）
-src/contracts/         跨端契约（命令、世界、sync、认证）
+server/                dev / prod 服务器 + SSR 入口 + HTML 模板组装
+src/api/               导演、写作、审查、抽卡、世界状态、LLM 客户端
+src/contracts/         跨端契约(命令、世界、sync、认证)
 src/application/       用例与端口
 src/infrastructure/    SQLite、存档和 provider 适配
 src/transport/         HTTP、SSE、WS 传输层
+src/components/        报头 / 状态面板 / 正文 / 审查报告 / 抽卡 / 中枢对话舱
 src/frontend/          前端功能迁移目录
+data/                  小说存档(gitignore,运行时生成)
+docs/                  开发规范、中枢协议、命令注册表等文档
 ```
 
-## 已知环境注意
+## 🛠 开发
 
-- `~/.bun` 被 macOS TCC 保护不可写 → bun 缓存通过 `bunfig.toml [install.cache].dir` 指向 `.bun-cache`
-- dev 使用 `bun --hot`：进程启动时 `Bun.build` 打包客户端（dist/dev/，无缓存头），代码改动自动重启并重建
-- 客户端 CSS 由 `bun build` 打包（字体 base64 内联，自包含）；SSR 端不 import CSS，样式经 `<link>` 加载避免 FOUC
+```bash
+bun run check          # 架构检查 + 类型检查 + 测试 + 构建一条龙
+bun test               # 75 个测试文件,覆盖叙事引擎 / 中枢 / 传输层
+bun run check:architecture   # 仅分层架构检查
+```
 
-## 路线
+深入文档:
 
-- Phase 0 ✅ 技术栈 + SSR 骨架 + dev/prod + API 打通
-- Phase 1 ✅ 叙事引擎（回合循环 / 世界状态 / 存档）
-- Phase 2 ✅ 日式报纸游戏化界面（抽卡 / 对抗审查 / 伏笔账本）
-- Phase 3 ✅ 增强（参数系统/世界书/弧线/图像/版本/脉络/流派模板）
-
-## 文档索引（后续开发必读）
-
-- **[docs/INSTRUCTION.md](docs/INSTRUCTION.md)** — 当前开发规范、模块边界、状态源和验收清单
+- **[docs/INSTRUCTION.md](docs/INSTRUCTION.md)** — 开发规范、模块边界、状态源和验收清单
 - **[docs/BRAIN.md](docs/BRAIN.md)** — 中枢与 sync 协议详解
 - **[docs/HARNESS.md](docs/HARNESS.md)** — 命令注册表、治理级别和恢复语义
-- **[docs/PLAN.md](docs/PLAN.md)** — 可靠性重构实施记录（历史计划）
-- **[docs/FIND_BUG.md](docs/FIND_BUG.md)** — 缺陷审计证据和剩余风险（历史记录）
 
-`src/api/routes.ts`、`src/pages/Home.tsx`、`src/components/` 仍是兼容入口和迁移中的旧实现；新增代码应按 `docs/INSTRUCTION.md` 归属到目标层。
+> `src/api/routes.ts`、`src/pages/Home.tsx`、`src/components/` 是兼容入口和迁移中的旧实现;新增代码应按 `docs/INSTRUCTION.md` 归属到目标层。
+
+## 🗺 Roadmap
+
+- ✅ **Phase 0** — 技术栈 + SSR 骨架 + dev/prod + API 打通
+- ✅ **Phase 1** — 叙事引擎(回合循环 / 世界状态 / 存档)
+- ✅ **Phase 2** — 日式报纸游戏化界面(抽卡 / 对抗审查 / 伏笔账本)
+- ✅ **Phase 3** — 增强(参数系统 / 世界书 / 弧线 / 图像 / 版本 / 脉络 / 流派模板)
+- 🔜 下一阶段规划中,欢迎提 [Issue](../../issues) 讨论
+
+## 🤝 贡献
+
+欢迎 Issue 与 PR!提交前请跑 `bun run check` 确保架构检查、类型、测试与构建全绿。
+
+## 📄 License
+
+[MIT](./LICENSE) © 2025 Perfumere (philuo)
